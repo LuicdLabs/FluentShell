@@ -1,0 +1,544 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - link "Skip to main content" [ref=e4] [cursor=pointer]:
+        - /url: "#main"
+      - link "Skip to Ask Learn chat experience" [ref=e5] [cursor=pointer]:
+        - /url: "#"
+      - generic [ref=e6]:
+        - text: Ｏ Ｐ 
+        - generic [ref=e7]:
+          - link "Microsoft" [ref=e8] [cursor=pointer]:
+            - /url: https://www.microsoft.com
+            - img [ref=e9]
+          - link "Learn" [ref=e15] [cursor=pointer]:
+            - /url: /en-us/
+            - generic [ref=e16]: Learn
+          - generic [ref=e17]:
+            - navigation "Global" [ref=e19]:
+              - text: Ｒ
+              - list [ref=e20]:
+                - listitem [ref=e21]:
+                  - button "Documentation" [ref=e23] [cursor=pointer]:
+                    - generic [ref=e24]: Documentation
+                    - generic [ref=e26]: Ｓ
+                - listitem [ref=e27]:
+                  - button "Training & Labs" [ref=e29] [cursor=pointer]:
+                    - generic [ref=e30]: Training & Labs
+                    - generic [ref=e32]: Ｓ
+                - listitem [ref=e33]:
+                  - button "Q&A" [ref=e35] [cursor=pointer]:
+                    - generic [ref=e36]: Q&A
+                    - generic [ref=e38]: Ｓ
+                - listitem [ref=e39]:
+                  - button "Topics" [ref=e41] [cursor=pointer]:
+                    - generic [ref=e42]: Topics
+                    - generic [ref=e44]: Ｓ
+              - text: Ｔ
+            - generic [ref=e45]:
+              - text: Ｐ
+              - button "Open search" [ref=e46] [cursor=pointer]:
+                - generic [ref=e48]: 
+          - link "Sign in" [ref=e49] [cursor=pointer]:
+            - /url: "#"
+        - generic [ref=e51]:
+          - link "Windows App Development" [ref=e52] [cursor=pointer]:
+            - /url: /en-us/windows/apps
+            - generic [ref=e53]: Windows App Development
+          - navigation "Site" [ref=e54]:
+            - list [ref=e55]:
+              - listitem [ref=e56]:
+                - button "Essentials" [ref=e57] [cursor=pointer]:
+                  - generic [ref=e58]: Essentials
+                  - generic [ref=e60]: Ｓ
+              - listitem [ref=e61]:
+                - button "Design" [ref=e62] [cursor=pointer]:
+                  - generic [ref=e63]: Design
+                  - generic [ref=e65]: Ｓ
+              - listitem [ref=e66]:
+                - button "Develop" [ref=e67] [cursor=pointer]:
+                  - generic [ref=e68]: Develop
+                  - generic [ref=e70]: Ｓ
+              - listitem [ref=e71]:
+                - button "Package and deploy" [ref=e72] [cursor=pointer]:
+                  - generic [ref=e73]: Package and deploy
+                  - generic [ref=e75]: Ｓ
+              - listitem [ref=e76]:
+                - button "Publish" [ref=e77] [cursor=pointer]:
+                  - generic [ref=e78]: Publish
+                  - generic [ref=e80]: Ｓ
+              - text: Ｓ Ｔ Ｔ Ｔ Ｔ Ｔ
+          - generic [ref=e81]:
+            - link "What's new" [ref=e82] [cursor=pointer]:
+              - /url: /windows/apps/whats-new/whats-new-for-developers
+            - link "Dashboard" [ref=e83] [cursor=pointer]:
+              - /url: https://partner.microsoft.com/dashboard
+  - navigation "Primary" [ref=e87]:
+    - button "Collapse" [expanded] [ref=e89] [cursor=pointer]:
+      - generic [ref=e90]:
+        - generic [ref=e91]: ﾝ
+        - text: ﾜ
+  - main [ref=e92]:
+    - generic: Ｏ ，
+    - generic [ref=e93]:
+      - generic [ref=e94]:
+        - generic [ref=e96]:
+          - text: 
+          - group "Breadcrumbs"
+          - generic [ref=e97]:
+            - text: 󿄐
+            - button "Ask Learn" [ref=e98] [cursor=pointer]:
+              - generic [ref=e100]: 󿄐
+              - generic [ref=e101]: Ask Learn
+            - text: 󿄐
+            - group [ref=e102]:
+              - generic "More actions" [ref=e103] [cursor=pointer]:
+                - generic [ref=e105]: 
+        - text: ﾁ
+        - heading "DWMWINDOWATTRIBUTE enumeration (dwmapi.h)" [level=1] [ref=e107]
+        - generic: 
+        - generic [ref=e109]:
+          - generic [ref=e111]: ﾃ
+          - button "Summarize this article for me" [ref=e112] [cursor=pointer]:
+            - generic [ref=e113]: Summarize this article for me
+        - navigation "In this article" [ref=e114]:
+          - heading "In this article" [level=2] [ref=e115]
+          - list [ref=e116]:
+            - listitem [ref=e117]:
+              - link "Syntax" [ref=e118] [cursor=pointer]:
+                - /url: "#syntax"
+            - listitem [ref=e119]:
+              - link "Constants" [ref=e120] [cursor=pointer]:
+                - /url: "#constants"
+            - listitem [ref=e121]:
+              - link "Requirements" [ref=e122] [cursor=pointer]:
+                - /url: "#requirements"
+            - listitem [ref=e123]:
+              - link "See also" [ref=e124] [cursor=pointer]:
+                - /url: "#see-also"
+        - generic [ref=e125]:
+          - paragraph [ref=e126]:
+            - text: Options used by the
+            - link "DwmGetWindowAttribute" [ref=e127] [cursor=pointer]:
+              - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+            - text: and
+            - link "DwmSetWindowAttribute" [ref=e128] [cursor=pointer]:
+              - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+            - text: functions.
+          - generic [ref=e129]:
+            - 'link "Section titled: Syntax" [ref=e130] [cursor=pointer]':
+              - /url: "#syntax"
+              - text: 
+            - heading "Syntax" [level=2] [ref=e131]
+          - generic [ref=e132]:
+            - generic [ref=e133]: C++
+            - button "Copy" [ref=e135] [cursor=pointer]:
+              - generic [ref=e136]:
+                - generic [ref=e137]: ＝
+                - generic [ref=e138]: 
+              - generic [ref=e139]: Copy
+          - code [ref=e141]: "typedef enum DWMWINDOWATTRIBUTE { DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_ALLOW_NCPAINT, DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_NONCLIENT_RTL_LAYOUT, DWMWA_FORCE_ICONIC_REPRESENTATION, DWMWA_FLIP3D_POLICY, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_HAS_ICONIC_BITMAP, DWMWA_DISALLOW_PEEK, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_CLOAK, DWMWA_CLOAKED, DWMWA_FREEZE_REPRESENTATION, DWMWA_PASSIVE_UPDATE_MODE, DWMWA_USE_HOSTBACKDROPBRUSH, DWMWA_USE_IMMERSIVE_DARK_MODE = 20, DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_VISIBLE_FRAME_BORDER_THICKNESS, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_REDIRECTIONBITMAP_ALPHA, DWMWA_BORDER_MARGINS, DWMWA_LAST } ;"
+          - generic [ref=e142]:
+            - 'link "Section titled: Constants" [ref=e143] [cursor=pointer]':
+              - /url: "#constants"
+              - text: 
+            - heading "Constants" [level=2] [ref=e144]
+          - button "Expand table" [ref=e146] [cursor=pointer]:
+            - generic [ref=e148]: ﾉ
+            - generic [ref=e149]: Expand table
+          - table "Constants" [ref=e151]:
+            - rowgroup [ref=e152]:
+              - row [ref=e153]:
+                - columnheader [ref=e154]
+            - rowgroup [ref=e155]:
+              - 'row "DWMWA_NCRENDERING_ENABLED IMPORTANT. The value of DWMWA_NCRENDERING_ENABLED is 1. syntax Copy typedef enum DWMWINDOWATTRIBUTE { DWMWA_NCRENDERING_ENABLED = 1, DWMWA_NCRENDERING_POLICY, ... Use with DwmGetWindowAttribute. Discovers whether non-client rendering is enabled. The retrieved value is of type BOOL. TRUE if non-client rendering is enabled; otherwise, FALSE." [ref=e156]':
+                - 'cell "DWMWA_NCRENDERING_ENABLED IMPORTANT. The value of DWMWA_NCRENDERING_ENABLED is 1. syntax Copy typedef enum DWMWINDOWATTRIBUTE { DWMWA_NCRENDERING_ENABLED = 1, DWMWA_NCRENDERING_POLICY, ... Use with DwmGetWindowAttribute. Discovers whether non-client rendering is enabled. The retrieved value is of type BOOL. TRUE if non-client rendering is enabled; otherwise, FALSE." [ref=e157]':
+                  - code [ref=e158]: DWMWA_NCRENDERING_ENABLED
+                  - strong [ref=e159]: IMPORTANT
+                  - text: . The value of
+                  - strong [ref=e160]: DWMWA_NCRENDERING_ENABLED
+                  - text: is 1.
+                  - generic [ref=e161]:
+                    - generic [ref=e162]: syntax
+                    - button "Copy" [ref=e164] [cursor=pointer]:
+                      - generic [ref=e165]:
+                        - generic [ref=e166]: ＝
+                        - generic [ref=e167]: 
+                      - generic [ref=e168]: Copy
+                  - code [ref=e170]:
+                    - text: "typedef enum DWMWINDOWATTRIBUTE {"
+                    - text: DWMWA_NCRENDERING_ENABLED = 1,
+                    - text: DWMWA_NCRENDERING_POLICY,
+                    - text: ...
+                  - text: Use with
+                  - link "DwmGetWindowAttribute" [ref=e171] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+                  - text: . Discovers whether non-client rendering is enabled. The retrieved value is of type BOOL. TRUE if non-client rendering is enabled; otherwise, FALSE.
+              - row "DWMWA_NCRENDERING_POLICY Use with DwmSetWindowAttribute. Sets the non-client rendering policy. The pvAttribute parameter points to a value from the DWMNCRENDERINGPOLICY enumeration." [ref=e172]:
+                - cell "DWMWA_NCRENDERING_POLICY Use with DwmSetWindowAttribute. Sets the non-client rendering policy. The pvAttribute parameter points to a value from the DWMNCRENDERINGPOLICY enumeration." [ref=e173]:
+                  - code [ref=e174]: DWMWA_NCRENDERING_POLICY
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e175] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Sets the non-client rendering policy. The pvAttribute parameter points to a value from the
+                  - link "DWMNCRENDERINGPOLICY" [ref=e176] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmncrenderingpolicy
+                  - text: enumeration.
+              - row "DWMWA_TRANSITIONS_FORCEDISABLED Use with DwmSetWindowAttribute. Enables or forcibly disables DWM transitions. The pvAttribute parameter points to a value of type BOOL. TRUE to disable transitions, or FALSE to enable transitions." [ref=e177]:
+                - cell "DWMWA_TRANSITIONS_FORCEDISABLED Use with DwmSetWindowAttribute. Enables or forcibly disables DWM transitions. The pvAttribute parameter points to a value of type BOOL. TRUE to disable transitions, or FALSE to enable transitions." [ref=e178]:
+                  - code [ref=e179]: DWMWA_TRANSITIONS_FORCEDISABLED
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e180] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Enables or forcibly disables DWM transitions. The pvAttribute parameter points to a value of type BOOL. TRUE to disable transitions, or FALSE to enable transitions.
+              - row "DWMWA_ALLOW_NCPAINT Use with DwmSetWindowAttribute. Enables content rendered in the non-client area to be visible on the frame drawn by DWM. The pvAttribute parameter points to a value of type BOOL. TRUE to enable content rendered in the non-client area to be visible on the frame; otherwise, FALSE." [ref=e181]:
+                - cell "DWMWA_ALLOW_NCPAINT Use with DwmSetWindowAttribute. Enables content rendered in the non-client area to be visible on the frame drawn by DWM. The pvAttribute parameter points to a value of type BOOL. TRUE to enable content rendered in the non-client area to be visible on the frame; otherwise, FALSE." [ref=e182]:
+                  - code [ref=e183]: DWMWA_ALLOW_NCPAINT
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e184] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Enables content rendered in the non-client area to be visible on the frame drawn by DWM. The pvAttribute parameter points to a value of type BOOL. TRUE to enable content rendered in the non-client area to be visible on the frame; otherwise, FALSE.
+              - row "DWMWA_CAPTION_BUTTON_BOUNDS Use with DwmGetWindowAttribute. Retrieves the bounds of the caption button area in the window-relative space. The retrieved value is of type RECT. If the window is minimized or otherwise not visible to the user, then the value of the RECT retrieved is undefined. You should check whether the retrieved RECT contains a boundary that you can work with, and if it doesn't then you can conclude that the window is minimized or otherwise not visible." [ref=e185]:
+                - cell "DWMWA_CAPTION_BUTTON_BOUNDS Use with DwmGetWindowAttribute. Retrieves the bounds of the caption button area in the window-relative space. The retrieved value is of type RECT. If the window is minimized or otherwise not visible to the user, then the value of the RECT retrieved is undefined. You should check whether the retrieved RECT contains a boundary that you can work with, and if it doesn't then you can conclude that the window is minimized or otherwise not visible." [ref=e186]:
+                  - code [ref=e187]: DWMWA_CAPTION_BUTTON_BOUNDS
+                  - text: Use with
+                  - link "DwmGetWindowAttribute" [ref=e188] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+                  - text: . Retrieves the bounds of the caption button area in the window-relative space. The retrieved value is of type
+                  - link "RECT" [ref=e189] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/windef/ns-windef-rect
+                  - text: . If the window is minimized or otherwise not visible to the user, then the value of the
+                  - strong [ref=e190]: RECT
+                  - text: retrieved is undefined. You should check whether the retrieved
+                  - strong [ref=e191]: RECT
+                  - text: contains a boundary that you can work with, and if it doesn't then you can conclude that the window is minimized or otherwise not visible.
+              - row "DWMWA_NONCLIENT_RTL_LAYOUT Use with DwmSetWindowAttribute. Specifies whether non-client content is right-to-left (RTL) mirrored. The pvAttribute parameter points to a value of type BOOL. TRUE if the non-client content is right-to-left (RTL) mirrored; otherwise, FALSE." [ref=e192]:
+                - cell "DWMWA_NONCLIENT_RTL_LAYOUT Use with DwmSetWindowAttribute. Specifies whether non-client content is right-to-left (RTL) mirrored. The pvAttribute parameter points to a value of type BOOL. TRUE if the non-client content is right-to-left (RTL) mirrored; otherwise, FALSE." [ref=e193]:
+                  - code [ref=e194]: DWMWA_NONCLIENT_RTL_LAYOUT
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e195] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Specifies whether non-client content is right-to-left (RTL) mirrored. The pvAttribute parameter points to a value of type BOOL. TRUE if the non-client content is right-to-left (RTL) mirrored; otherwise, FALSE.
+              - row "DWMWA_FORCE_ICONIC_REPRESENTATION Use with DwmSetWindowAttribute. Forces the window to display an iconic thumbnail or peek representation (a static bitmap), even if a live or snapshot representation of the window is available. This value is normally set during a window's creation, and not changed throughout the window's lifetime. Some scenarios, however, might require the value to change over time. The pvAttribute parameter points to a value of type BOOL. TRUE to require a iconic thumbnail or peek representation; otherwise, FALSE." [ref=e196]:
+                - cell "DWMWA_FORCE_ICONIC_REPRESENTATION Use with DwmSetWindowAttribute. Forces the window to display an iconic thumbnail or peek representation (a static bitmap), even if a live or snapshot representation of the window is available. This value is normally set during a window's creation, and not changed throughout the window's lifetime. Some scenarios, however, might require the value to change over time. The pvAttribute parameter points to a value of type BOOL. TRUE to require a iconic thumbnail or peek representation; otherwise, FALSE." [ref=e197]:
+                  - code [ref=e198]: DWMWA_FORCE_ICONIC_REPRESENTATION
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e199] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Forces the window to display an iconic thumbnail or peek representation (a static bitmap), even if a live or snapshot representation of the window is available. This value is normally set during a window's creation, and not changed throughout the window's lifetime. Some scenarios, however, might require the value to change over time. The pvAttribute parameter points to a value of type BOOL. TRUE to require a iconic thumbnail or peek representation; otherwise, FALSE.
+              - row "DWMWA_FLIP3D_POLICY Use with DwmSetWindowAttribute. Sets how Flip3D treats the window. The pvAttribute parameter points to a value from the DWMFLIP3DWINDOWPOLICY enumeration." [ref=e200]:
+                - cell "DWMWA_FLIP3D_POLICY Use with DwmSetWindowAttribute. Sets how Flip3D treats the window. The pvAttribute parameter points to a value from the DWMFLIP3DWINDOWPOLICY enumeration." [ref=e201]:
+                  - code [ref=e202]: DWMWA_FLIP3D_POLICY
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e203] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Sets how Flip3D treats the window. The pvAttribute parameter points to a value from the
+                  - link "DWMFLIP3DWINDOWPOLICY" [ref=e204] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmflip3dwindowpolicy
+                  - text: enumeration.
+              - row "DWMWA_EXTENDED_FRAME_BOUNDS Use with DwmGetWindowAttribute. Retrieves the extended frame bounds rectangle in screen space. The retrieved value is of type RECT." [ref=e205]:
+                - cell "DWMWA_EXTENDED_FRAME_BOUNDS Use with DwmGetWindowAttribute. Retrieves the extended frame bounds rectangle in screen space. The retrieved value is of type RECT." [ref=e206]:
+                  - code [ref=e207]: DWMWA_EXTENDED_FRAME_BOUNDS
+                  - text: Use with
+                  - link "DwmGetWindowAttribute" [ref=e208] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+                  - text: . Retrieves the extended frame bounds rectangle in screen space. The retrieved value is of type
+                  - link "RECT" [ref=e209] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/windef/ns-windef-rect
+                  - text: .
+              - 'row "DWMWA_HAS_ICONIC_BITMAP Use with DwmSetWindowAttribute. The window will provide a bitmap for use by DWM as an iconic thumbnail or peek representation (a static bitmap) for the window. DWMWA_HAS_ICONIC_BITMAP can be specified with DWMWA_FORCE_ICONIC_REPRESENTATION. DWMWA_HAS_ICONIC_BITMAP normally is set during a window''s creation and not changed throughout the window''s lifetime. Some scenarios, however, might require the value to change over time. The pvAttribute parameter points to a value of type BOOL. TRUE to inform DWM that the window will provide an iconic thumbnail or peek representation; otherwise, FALSE. Windows Vista and earlier: This value is not supported." [ref=e210]':
+                - 'cell "DWMWA_HAS_ICONIC_BITMAP Use with DwmSetWindowAttribute. The window will provide a bitmap for use by DWM as an iconic thumbnail or peek representation (a static bitmap) for the window. DWMWA_HAS_ICONIC_BITMAP can be specified with DWMWA_FORCE_ICONIC_REPRESENTATION. DWMWA_HAS_ICONIC_BITMAP normally is set during a window''s creation and not changed throughout the window''s lifetime. Some scenarios, however, might require the value to change over time. The pvAttribute parameter points to a value of type BOOL. TRUE to inform DWM that the window will provide an iconic thumbnail or peek representation; otherwise, FALSE. Windows Vista and earlier: This value is not supported." [ref=e211]':
+                  - code [ref=e212]: DWMWA_HAS_ICONIC_BITMAP
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e213] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . The window will provide a bitmap for use by DWM as an iconic thumbnail or peek representation (a static bitmap) for the window. DWMWA_HAS_ICONIC_BITMAP can be specified with DWMWA_FORCE_ICONIC_REPRESENTATION. DWMWA_HAS_ICONIC_BITMAP normally is set during a window's creation and not changed throughout the window's lifetime. Some scenarios, however, might require the value to change over time. The pvAttribute parameter points to a value of type BOOL. TRUE to inform DWM that the window will provide an iconic thumbnail or peek representation; otherwise, FALSE.
+                  - text: "Windows Vista and earlier: This value is not supported."
+              - 'row "DWMWA_DISALLOW_PEEK Use with DwmSetWindowAttribute. Do not show peek preview for the window. The peek view shows a full-sized preview of the window when the mouse hovers over the window''s thumbnail in the taskbar. If this attribute is set, hovering the mouse pointer over the window''s thumbnail dismisses peek (in case another window in the group has a peek preview showing). The pvAttribute parameter points to a value of type BOOL. TRUE to prevent peek functionality, or FALSE to allow it. Windows Vista and earlier: This value is not supported." [ref=e214]':
+                - 'cell "DWMWA_DISALLOW_PEEK Use with DwmSetWindowAttribute. Do not show peek preview for the window. The peek view shows a full-sized preview of the window when the mouse hovers over the window''s thumbnail in the taskbar. If this attribute is set, hovering the mouse pointer over the window''s thumbnail dismisses peek (in case another window in the group has a peek preview showing). The pvAttribute parameter points to a value of type BOOL. TRUE to prevent peek functionality, or FALSE to allow it. Windows Vista and earlier: This value is not supported." [ref=e215]':
+                  - code [ref=e216]: DWMWA_DISALLOW_PEEK
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e217] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Do not show peek preview for the window. The peek view shows a full-sized preview of the window when the mouse hovers over the window's thumbnail in the taskbar. If this attribute is set, hovering the mouse pointer over the window's thumbnail dismisses peek (in case another window in the group has a peek preview showing). The pvAttribute parameter points to a value of type BOOL. TRUE to prevent peek functionality, or FALSE to allow it.
+                  - text: "Windows Vista and earlier: This value is not supported."
+              - 'row "DWMWA_EXCLUDED_FROM_PEEK Use with DwmSetWindowAttribute. Prevents a window from fading to a glass sheet when peek is invoked. The pvAttribute parameter points to a value of type BOOL. TRUE to prevent the window from fading during another window''s peek, or FALSE for normal behavior. Windows Vista and earlier: This value is not supported." [ref=e218]':
+                - 'cell "DWMWA_EXCLUDED_FROM_PEEK Use with DwmSetWindowAttribute. Prevents a window from fading to a glass sheet when peek is invoked. The pvAttribute parameter points to a value of type BOOL. TRUE to prevent the window from fading during another window''s peek, or FALSE for normal behavior. Windows Vista and earlier: This value is not supported." [ref=e219]':
+                  - code [ref=e220]: DWMWA_EXCLUDED_FROM_PEEK
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e221] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Prevents a window from fading to a glass sheet when peek is invoked. The pvAttribute parameter points to a value of type BOOL. TRUE to prevent the window from fading during another window's peek, or FALSE for normal behavior.
+                  - text: "Windows Vista and earlier: This value is not supported."
+              - 'row "DWMWA_CLOAK Use with DwmSetWindowAttribute. Cloaks the window such that it is not visible to the user. The window is still composed by DWM. Using with DirectComposition: Use the DWMWA_CLOAK flag to cloak the layered child window when animating a representation of the window''s content via a DirectComposition visual that has been associated with the layered child window. For more details on this usage case, see How to animate the bitmap of a layered child window. Windows 7 and earlier: This value is not supported." [ref=e222]':
+                - 'cell "DWMWA_CLOAK Use with DwmSetWindowAttribute. Cloaks the window such that it is not visible to the user. The window is still composed by DWM. Using with DirectComposition: Use the DWMWA_CLOAK flag to cloak the layered child window when animating a representation of the window''s content via a DirectComposition visual that has been associated with the layered child window. For more details on this usage case, see How to animate the bitmap of a layered child window. Windows 7 and earlier: This value is not supported." [ref=e223]':
+                  - code [ref=e224]: DWMWA_CLOAK
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e225] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Cloaks the window such that it is not visible to the user. The window is still composed by DWM.
+                  - text: "Using with DirectComposition: Use the DWMWA_CLOAK flag to cloak the layered child window when animating a representation of the window's content via a DirectComposition visual that has been associated with the layered child window. For more details on this usage case, see"
+                  - link "How to animate the bitmap of a layered child window" [ref=e226] [cursor=pointer]:
+                    - /url: /en-us/windows/desktop/directcomp/how-to--animate-the-bitmap-of-a-layered-child-window
+                  - text: .
+                  - text: "Windows 7 and earlier: This value is not supported."
+              - 'row "DWMWA_CLOAKED Use with DwmGetWindowAttribute. If the window is cloaked, provides one of the following values explaining why. DWM_CLOAKED_APP (value 0x00000001). The window was cloaked by its owner application. DWM_CLOAKED_SHELL (value 0x00000002). The window was cloaked by the Shell. DWM_CLOAKED_INHERITED (value 0x00000004). The cloak value was inherited from its owner window. Windows 7 and earlier: This value is not supported." [ref=e227]':
+                - 'cell "DWMWA_CLOAKED Use with DwmGetWindowAttribute. If the window is cloaked, provides one of the following values explaining why. DWM_CLOAKED_APP (value 0x00000001). The window was cloaked by its owner application. DWM_CLOAKED_SHELL (value 0x00000002). The window was cloaked by the Shell. DWM_CLOAKED_INHERITED (value 0x00000004). The cloak value was inherited from its owner window. Windows 7 and earlier: This value is not supported." [ref=e228]':
+                  - code [ref=e229]: DWMWA_CLOAKED
+                  - text: Use with
+                  - link "DwmGetWindowAttribute" [ref=e230] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+                  - text: . If the window is cloaked, provides one of the following values explaining why.
+                  - text: DWM_CLOAKED_APP (value 0x00000001). The window was cloaked by its owner application.
+                  - text: DWM_CLOAKED_SHELL (value 0x00000002). The window was cloaked by the Shell.
+                  - text: DWM_CLOAKED_INHERITED (value 0x00000004). The cloak value was inherited from its owner window.
+                  - text: "Windows 7 and earlier: This value is not supported."
+              - 'row "DWMWA_FREEZE_REPRESENTATION Use with DwmSetWindowAttribute. Freeze the window''s thumbnail image with its current visuals. Do no further live updates on the thumbnail image to match the window''s contents. Windows 7 and earlier: This value is not supported." [ref=e231]':
+                - 'cell "DWMWA_FREEZE_REPRESENTATION Use with DwmSetWindowAttribute. Freeze the window''s thumbnail image with its current visuals. Do no further live updates on the thumbnail image to match the window''s contents. Windows 7 and earlier: This value is not supported." [ref=e232]':
+                  - code [ref=e233]: DWMWA_FREEZE_REPRESENTATION
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e234] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Freeze the window's thumbnail image with its current visuals. Do no further live updates on the thumbnail image to match the window's contents.
+                  - text: "Windows 7 and earlier: This value is not supported."
+              - row "DWMWA_USE_HOSTBACKDROPBRUSH Use with DwmSetWindowAttribute. Enables a non-UWP window to use host backdrop brushes. If this flag is set, then a Win32 app that calls Windows::UI::Composition APIs can build transparency effects using the host backdrop brush (see Compositor.CreateHostBackdropBrush). The pvAttribute parameter points to a value of type BOOL. TRUE to enable host backdrop brushes for the window, or FALSE to disable it. This value is supported starting with Windows 11 Build 22000." [ref=e235]:
+                - cell "DWMWA_USE_HOSTBACKDROPBRUSH Use with DwmSetWindowAttribute. Enables a non-UWP window to use host backdrop brushes. If this flag is set, then a Win32 app that calls Windows::UI::Composition APIs can build transparency effects using the host backdrop brush (see Compositor.CreateHostBackdropBrush). The pvAttribute parameter points to a value of type BOOL. TRUE to enable host backdrop brushes for the window, or FALSE to disable it. This value is supported starting with Windows 11 Build 22000." [ref=e236]:
+                  - code [ref=e237]: DWMWA_USE_HOSTBACKDROPBRUSH
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e238] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Enables a non-UWP window to use host backdrop brushes. If this flag is set, then a Win32 app that calls
+                  - link "Windows::UI::Composition" [ref=e239] [cursor=pointer]:
+                    - /url: /en-us/uwp/api/windows.ui.composition
+                  - text: APIs can build transparency effects using the host backdrop brush (see
+                  - link "Compositor.CreateHostBackdropBrush" [ref=e240] [cursor=pointer]:
+                    - /url: /en-us/uwp/api/windows.ui.composition.compositor.createhostbackdropbrush
+                  - text: ). The pvAttribute parameter points to a value of type BOOL. TRUE to enable host backdrop brushes for the window, or FALSE to disable it.
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_USE_IMMERSIVE_DARK_MODE Use with DwmSetWindowAttribute. Allows the window frame for this window to be drawn in dark mode colors when the dark mode system setting is enabled. For compatibility reasons, all windows default to light mode regardless of the system setting. The pvAttribute parameter points to a value of type BOOL. TRUE to honor dark mode for the window, FALSE to always use light mode. This value is supported starting with Windows 11 Build 22000." [ref=e241]:
+                - cell "DWMWA_USE_IMMERSIVE_DARK_MODE Use with DwmSetWindowAttribute. Allows the window frame for this window to be drawn in dark mode colors when the dark mode system setting is enabled. For compatibility reasons, all windows default to light mode regardless of the system setting. The pvAttribute parameter points to a value of type BOOL. TRUE to honor dark mode for the window, FALSE to always use light mode. This value is supported starting with Windows 11 Build 22000." [ref=e242]:
+                  - code [ref=e243]: DWMWA_USE_IMMERSIVE_DARK_MODE
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e244] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Allows the window frame for this window to be drawn in dark mode colors when the dark mode system setting is enabled. For compatibility reasons, all windows default to light mode regardless of the system setting. The pvAttribute parameter points to a value of type
+                  - strong [ref=e245]: BOOL
+                  - text: . TRUE to honor dark mode for the window, FALSE to always use light mode.
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_WINDOW_CORNER_PREFERENCE Use with DwmSetWindowAttribute. Specifies the rounded corner preference for a window. The pvAttribute parameter points to a value of type DWM_WINDOW_CORNER_PREFERENCE. This value is supported starting with Windows 11 Build 22000." [ref=e246]:
+                - cell "DWMWA_WINDOW_CORNER_PREFERENCE Use with DwmSetWindowAttribute. Specifies the rounded corner preference for a window. The pvAttribute parameter points to a value of type DWM_WINDOW_CORNER_PREFERENCE. This value is supported starting with Windows 11 Build 22000." [ref=e247]:
+                  - code [ref=e248]: DWMWA_WINDOW_CORNER_PREFERENCE
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e249] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Specifies the rounded corner preference for a window. The pvAttribute parameter points to a value of type
+                  - link "DWM_WINDOW_CORNER_PREFERENCE" [ref=e250] [cursor=pointer]:
+                    - /url: ne-dwmapi-dwm_window_corner_preference
+                  - text: .
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_BORDER_COLOR Use with DwmSetWindowAttribute. Specifies the color of the window border. The pvAttribute parameter points to a value of type COLORREF. The app is responsible for changing the border color according to state changes, such as a change in window activation. Specifying DWMWA_COLOR_NONE (value 0xFFFFFFFE) for the color will suppress the drawing of the window border. This makes it possible to have a rounded window with no border. Specifying DWMWA_COLOR_DEFAULT (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the border color. This value is supported starting with Windows 11 Build 22000." [ref=e251]:
+                - cell "DWMWA_BORDER_COLOR Use with DwmSetWindowAttribute. Specifies the color of the window border. The pvAttribute parameter points to a value of type COLORREF. The app is responsible for changing the border color according to state changes, such as a change in window activation. Specifying DWMWA_COLOR_NONE (value 0xFFFFFFFE) for the color will suppress the drawing of the window border. This makes it possible to have a rounded window with no border. Specifying DWMWA_COLOR_DEFAULT (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the border color. This value is supported starting with Windows 11 Build 22000." [ref=e252]:
+                  - code [ref=e253]: DWMWA_BORDER_COLOR
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e254] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Specifies the color of the window border. The pvAttribute parameter points to a value of type
+                  - link "COLORREF" [ref=e255] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/gdi/colorref
+                  - text: . The app is responsible for changing the border color according to state changes, such as a change in window activation.
+                  - text: Specifying
+                  - strong [ref=e256]: DWMWA_COLOR_NONE
+                  - text: (value 0xFFFFFFFE) for the color will suppress the drawing of the window border. This makes it possible to have a rounded window with no border.
+                  - text: Specifying
+                  - strong [ref=e257]: DWMWA_COLOR_DEFAULT
+                  - text: (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the border color.
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_CAPTION_COLOR Use with DwmSetWindowAttribute. Specifies the color of the caption. The pvAttribute parameter points to a value of type COLORREF. Specifying DWMWA_COLOR_DEFAULT (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the caption color. This value is supported starting with Windows 11 Build 22000." [ref=e258]:
+                - cell "DWMWA_CAPTION_COLOR Use with DwmSetWindowAttribute. Specifies the color of the caption. The pvAttribute parameter points to a value of type COLORREF. Specifying DWMWA_COLOR_DEFAULT (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the caption color. This value is supported starting with Windows 11 Build 22000." [ref=e259]:
+                  - code [ref=e260]: DWMWA_CAPTION_COLOR
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e261] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Specifies the color of the caption. The pvAttribute parameter points to a value of type
+                  - link "COLORREF" [ref=e262] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/gdi/colorref
+                  - text: .
+                  - text: Specifying
+                  - strong [ref=e263]: DWMWA_COLOR_DEFAULT
+                  - text: (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the caption color.
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_TEXT_COLOR Use with DwmSetWindowAttribute. Specifies the color of the caption text. The pvAttribute parameter points to a value of type COLORREF. Specifying DWMWA_COLOR_DEFAULT (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the caption text color. This value is supported starting with Windows 11 Build 22000." [ref=e264]:
+                - cell "DWMWA_TEXT_COLOR Use with DwmSetWindowAttribute. Specifies the color of the caption text. The pvAttribute parameter points to a value of type COLORREF. Specifying DWMWA_COLOR_DEFAULT (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the caption text color. This value is supported starting with Windows 11 Build 22000." [ref=e265]:
+                  - code [ref=e266]: DWMWA_TEXT_COLOR
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e267] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Specifies the color of the caption text. The pvAttribute parameter points to a value of type
+                  - link "COLORREF" [ref=e268] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/gdi/colorref
+                  - text: .
+                  - text: Specifying
+                  - strong [ref=e269]: DWMWA_COLOR_DEFAULT
+                  - text: (value 0xFFFFFFFF) for the color will reset the window back to using the system's default behavior for the caption text color.
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_VISIBLE_FRAME_BORDER_THICKNESS Use with DwmGetWindowAttribute. Retrieves the width of the outer border that the DWM would draw around this window. The value can vary depending on the DPI of the window. The pvAttribute parameter points to a value of type UINT. This value is supported starting with Windows 11 Build 22000." [ref=e270]:
+                - cell "DWMWA_VISIBLE_FRAME_BORDER_THICKNESS Use with DwmGetWindowAttribute. Retrieves the width of the outer border that the DWM would draw around this window. The value can vary depending on the DPI of the window. The pvAttribute parameter points to a value of type UINT. This value is supported starting with Windows 11 Build 22000." [ref=e271]:
+                  - code [ref=e272]: DWMWA_VISIBLE_FRAME_BORDER_THICKNESS
+                  - text: Use with
+                  - link "DwmGetWindowAttribute" [ref=e273] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+                  - text: . Retrieves the width of the outer border that the DWM would draw around this window. The value can vary depending on the DPI of the window. The pvAttribute parameter points to a value of type
+                  - strong [ref=e274]: UINT
+                  - text: .
+                  - text: This value is supported starting with Windows 11 Build 22000.
+              - row "DWMWA_SYSTEMBACKDROP_TYPE Use with DwmGetWindowAttribute or DwmSetWindowAttribute. Retrieves or specifies the system-drawn backdrop material of a window, including behind the non-client area. The pvAttribute parameter points to a value of type DWM_SYSTEMBACKDROP_TYPE. This value is supported starting with Windows 11 Build 22621." [ref=e275]:
+                - cell "DWMWA_SYSTEMBACKDROP_TYPE Use with DwmGetWindowAttribute or DwmSetWindowAttribute. Retrieves or specifies the system-drawn backdrop material of a window, including behind the non-client area. The pvAttribute parameter points to a value of type DWM_SYSTEMBACKDROP_TYPE. This value is supported starting with Windows 11 Build 22621." [ref=e276]:
+                  - code [ref=e277]: DWMWA_SYSTEMBACKDROP_TYPE
+                  - text: Use with
+                  - link "DwmGetWindowAttribute" [ref=e278] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+                  - text: or
+                  - link "DwmSetWindowAttribute" [ref=e279] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Retrieves or specifies the system-drawn backdrop material of a window, including behind the non-client area. The
+                  - emphasis [ref=e280]: pvAttribute
+                  - text: parameter points to a value of type
+                  - link "DWM_SYSTEMBACKDROP_TYPE" [ref=e281] [cursor=pointer]:
+                    - /url: ne-dwmapi-dwm_systembackdrop_type
+                  - text: .
+                  - text: This value is supported starting with Windows 11 Build 22621.
+              - row "DWMWA_REDIRECTIONBITMAP_ALPHA Use with DwmSetWindowAttribute . Enables or disables the use of the alpha channel in the window's redirection bitmap. If this attribute is set to true, the window must contain premultiplied alpha values in each pixel. If it is false, the alpha is ignored and the redirection bitmap is treated as fully opaque. This attribute defaults to false. This value is supported starting with Windows 11 Build 26100." [ref=e282]:
+                - cell "DWMWA_REDIRECTIONBITMAP_ALPHA Use with DwmSetWindowAttribute . Enables or disables the use of the alpha channel in the window's redirection bitmap. If this attribute is set to true, the window must contain premultiplied alpha values in each pixel. If it is false, the alpha is ignored and the redirection bitmap is treated as fully opaque. This attribute defaults to false. This value is supported starting with Windows 11 Build 26100." [ref=e283]:
+                  - code [ref=e284]: DWMWA_REDIRECTIONBITMAP_ALPHA
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e285] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Enables or disables the use of the alpha channel in the window's redirection
+                  - text: bitmap. If this attribute is set to true, the window must contain premultiplied
+                  - text: alpha values in each pixel. If it is false, the alpha is ignored and the
+                  - text: redirection bitmap is treated as fully opaque. This attribute defaults to false.
+                  - text: This value is supported starting with Windows 11 Build 26100.
+              - row "DWMWA_BORDER_MARGINS Use with DwmSetWindowAttribute . Specifies the override location of the window border, as a distance from each edge. The pvAttribute parameter points to a value of type FRAME_MARGIN. A value of all zeros disables the override set by this attribute, resulting in default window borders. Otherwise, all values must be greater than or equal to 1. Each value in the FRAME_MARGIN (left, right, top, bottom) indicates a distance inwards from each edge of the window. Non-zero border margins forces the window to have a border and sets the location of the border. Window contents covered by or outside the border are clipped. This value will be supported in an upcoming update to Windows 11 build 26100." [ref=e286]:
+                - cell "DWMWA_BORDER_MARGINS Use with DwmSetWindowAttribute . Specifies the override location of the window border, as a distance from each edge. The pvAttribute parameter points to a value of type FRAME_MARGIN. A value of all zeros disables the override set by this attribute, resulting in default window borders. Otherwise, all values must be greater than or equal to 1. Each value in the FRAME_MARGIN (left, right, top, bottom) indicates a distance inwards from each edge of the window. Non-zero border margins forces the window to have a border and sets the location of the border. Window contents covered by or outside the border are clipped. This value will be supported in an upcoming update to Windows 11 build 26100." [ref=e287]:
+                  - code [ref=e288]: DWMWA_BORDER_MARGINS
+                  - text: Use with
+                  - link "DwmSetWindowAttribute" [ref=e289] [cursor=pointer]:
+                    - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+                  - text: . Specifies the override location of the window border, as a distance from each
+                  - text: edge. The
+                  - emphasis [ref=e290]: pvAttribute
+                  - text: parameter points to a value of type FRAME_MARGIN.
+                  - text: A value of all zeros disables the override set by this attribute, resulting in
+                  - text: default window borders. Otherwise, all values must be greater than or equal to 1.
+                  - text: Each value in the FRAME_MARGIN (left, right, top, bottom) indicates a distance
+                  - text: inwards from each edge of the window. Non-zero border margins forces the window
+                  - text: to have a border and sets the location of the border. Window contents covered
+                  - text: by or outside the border are clipped.
+                  - text: This value will be supported in an upcoming update to Windows 11 build 26100.
+              - row "DWMWA_LAST The maximum recognized DWMWINDOWATTRIBUTE value, used for validation purposes." [ref=e291]:
+                - cell "DWMWA_LAST The maximum recognized DWMWINDOWATTRIBUTE value, used for validation purposes." [ref=e292]:
+                  - code [ref=e293]: DWMWA_LAST
+                  - text: The maximum recognized DWMWINDOWATTRIBUTE value, used for validation purposes.
+          - generic [ref=e294]:
+            - 'link "Section titled: Requirements" [ref=e295] [cursor=pointer]':
+              - /url: "#requirements"
+              - text: 
+            - heading "Requirements" [level=2] [ref=e296]
+          - button "Expand table" [ref=e298] [cursor=pointer]:
+            - generic [ref=e300]: ﾉ
+            - generic [ref=e301]: Expand table
+          - table "Requirements" [ref=e303]:
+            - rowgroup [ref=e304]:
+              - row "Requirement Value" [ref=e305]:
+                - columnheader "Requirement" [ref=e306]
+                - columnheader "Value" [ref=e307]
+            - rowgroup [ref=e308]:
+              - row "Minimum supported client Windows Vista [desktop apps only]" [ref=e309]:
+                - cell "Minimum supported client" [ref=e310]:
+                  - strong [ref=e311]: Minimum supported client
+                - cell "Windows Vista [desktop apps only]" [ref=e312]
+              - row "Minimum supported server Windows Server 2008 [desktop apps only]" [ref=e313]:
+                - cell "Minimum supported server" [ref=e314]:
+                  - strong [ref=e315]: Minimum supported server
+                - cell "Windows Server 2008 [desktop apps only]" [ref=e316]
+              - row "Header dwmapi.h" [ref=e317]:
+                - cell "Header" [ref=e318]:
+                  - strong [ref=e319]: Header
+                - cell "dwmapi.h" [ref=e320]
+          - generic [ref=e321]:
+            - 'link "Section titled: See also" [ref=e322] [cursor=pointer]':
+              - /url: "#see-also"
+              - text: 
+            - heading "See also" [level=2] [ref=e323]
+          - list [ref=e324]:
+            - listitem [ref=e325]:
+              - link "DwmGetWindowAttribute function" [ref=e326] [cursor=pointer]:
+                - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+            - listitem [ref=e327]:
+              - link "DwmSetWindowAttribute function" [ref=e328] [cursor=pointer]:
+                - /url: /en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+            - listitem [ref=e329]:
+              - link "Enable and control DWM composition" [ref=e330] [cursor=pointer]:
+                - /url: /en-us/windows/desktop/dwm/composition-ovw
+        - alert [ref=e331]
+        - status [ref=e332]
+        - generic [ref=e333]:
+          - separator [ref=e334]
+          - heading "Feedback" [level=2] [ref=e335]
+          - generic [ref=e336]:
+            - paragraph [ref=e337]: Was this page helpful?
+            - generic [ref=e338]:
+              - button "Yes" [ref=e339] [cursor=pointer]:
+                - generic [ref=e341]: 
+                - generic [ref=e342]: "Yes"
+              - button "No" [ref=e343] [cursor=pointer]:
+                - generic [ref=e345]: 
+                - generic [ref=e346]: "No"
+              - text: 
+      - generic [ref=e347]:
+        - separator [ref=e348]
+        - list [ref=e349]:
+          - listitem [ref=e350]:
+            - generic [ref=e352]: Last updated on 03/10/2026
+  - complementary "Additional resources":   
+  - text: 󿄐 Ｐ
+  - contentinfo [ref=e354]:
+    - generic [ref=e355]:
+      - link "Content language selector. Currently set to English (United States)." [ref=e356] [cursor=pointer]:
+        - /url: /en-us/locale?target=https%3A%2F%2Flearn.microsoft.com%2Fen-us%2Fwindows%2Fwin32%2Fapi%2Fdwmapi%2Fne-dwmapi-dwmwindowattribute
+        - generic [ref=e358]: 
+        - generic [ref=e359]: English (United States)
+      - link "Your Privacy Choices" [ref=e361] [cursor=pointer]:
+        - /url: https://aka.ms/yourcaliforniaprivacychoices
+        - img [ref=e362]
+        - generic [ref=e367]: Your Privacy Choices
+      - button "Theme" [ref=e370] [cursor=pointer]:
+        - generic [ref=e372]: ０
+        - generic [ref=e373]: Theme
+        - generic [ref=e375]: Ｓ
+    - list [ref=e376]:
+      - listitem [ref=e377]:
+        - link "AI Disclaimer" [ref=e378] [cursor=pointer]:
+          - /url: https://learn.microsoft.com/en-us/principles-for-ai-generated-content
+      - listitem [ref=e379]:
+        - link "Previous Versions" [ref=e380] [cursor=pointer]:
+          - /url: https://learn.microsoft.com/en-us/previous-versions/
+      - listitem [ref=e381]:
+        - link "Blog" [ref=e382] [cursor=pointer]:
+          - /url: https://techcommunity.microsoft.com/t5/microsoft-learn-blog/bg-p/MicrosoftLearnBlog
+      - listitem [ref=e383]:
+        - link "Contribute" [ref=e384] [cursor=pointer]:
+          - /url: https://learn.microsoft.com/en-us/contribute
+      - listitem [ref=e385]:
+        - link "Privacy" [ref=e386] [cursor=pointer]:
+          - /url: https://go.microsoft.com/fwlink/?LinkId=521839
+      - listitem [ref=e387]:
+        - link "Consumer Health Privacy" [ref=e388] [cursor=pointer]:
+          - /url: https://go.microsoft.com/fwlink/?linkid=2259814
+      - listitem [ref=e389]:
+        - link "Terms of Use" [ref=e390] [cursor=pointer]:
+          - /url: https://learn.microsoft.com/en-us/legal/termsofuse
+      - listitem [ref=e391]:
+        - link "Trademarks" [ref=e392] [cursor=pointer]:
+          - /url: https://www.microsoft.com/legal/intellectualproperty/Trademarks/
+      - listitem [ref=e393]: © Microsoft 2026
