@@ -1,0 +1,637 @@
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using FluentShell.Renderer.Protocol;
+using FluentShell.Renderer.Runtime;
+using FluentShell.Renderer.ViewModels;
+using Microsoft.UI;
+using Microsoft.UI.Composition.SystemBackdrops;
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Automation;
+using Windows.Graphics;
+
+namespace FluentShell.Renderer.Windows;
+
+public sealed class TranslatedWindow : Window
+{
+    private readonly Grid _root = new();
+    private readonly Canvas _canvas = new();
+    private readonly Func<ActionInvokeMessage, ulong, Task> _sendAction;
+    private readonly Func<string> _nextEventId;
+    private readonly Dictionary<string, (ControlNodeViewModel? Node, string Property)> _pending = new(StringComparer.Ordinal);
+    private readonly TaskCompletionSource _loaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly AppWindow _appWindow;
+    private readonly Dictionary<string, FrameworkElement> _controls = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _placementEventIds = new(StringComparer.Ordinal);
+    private readonly PresenterActionCoordinator _presenterActions = new();
+    private bool _applyingCanonical;
+    private bool _allowClose;
+    private bool _committed;
+    private bool _closePending;
+    private bool _retired;
+    private bool _interactionBlocked;
+    private uint _renderDpi;
+
+    public WindowViewModel ViewModel { get; }
+    public nint Hwnd { get; }
+    public bool IsCommitted => _committed;
+    internal bool InteractionBlocked => _interactionBlocked;
+
+    public TranslatedWindow(WindowSnapshot snapshot, Func<ActionInvokeMessage, ulong, Task> sendAction, Func<string> nextEventId)
+    {
+        ViewModel = WindowViewModel.FromSnapshot(snapshot);
+        _sendAction = sendAction;
+        _nextEventId = nextEventId;
+        Title = ViewModel.Title;
+        _root.Children.Add(_canvas);
+        Content = _root;
+        _canvas.KeyDown += OnCanvasKeyDown;
+        if (MicaController.IsSupported()) SystemBackdrop = new MicaBackdrop();
+        ExtendsContentIntoTitleBar = false;
+        Hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        _renderDpi = ReadWindowDpi();
+        _appWindow = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(Hwnd));
+        // WinUI requires an owner before an overlapped presenter can be marked
+        // modal.  The owner proxy is resolved by WindowRegistry after this
+        // window is constructed, so defer IsModal until SetOwner.
+        _root.Loaded += (_, _) => _loaded.TrySetResult();
+        if (!SetCloaked(true)) throw new InvalidOperationException("Unable to cloak renderer proxy.");
+        _appWindow.Title = ViewModel.Title;
+        _appWindow.IsShownInSwitchers = ViewModel.ShowInTaskbar;
+        _appWindow.Closing += OnClosing;
+        _appWindow.Changed += OnAppWindowChanged;
+        Closed += (_, _) => RendererDiagnostics.Log($"window closed hwnd=0x{(ulong)(nuint)Hwnd:X} surface={ViewModel.SurfaceId}");
+        RebuildControls();
+        ApplyWindowState();
+        RefreshRenderDpi();
+    }
+
+    public void SetOwner(nint ownerHwnd)
+    {
+        if (ViewModel.Modal && ownerHwnd != 0)
+        {
+            SetWindowLongPtr(Hwnd, -8, ownerHwnd);
+            if (_appWindow.Presenter is OverlappedPresenter presenter) presenter.IsModal = true;
+        }
+    }
+
+    public void SetInteractionEnabled(bool enabled)
+    {
+        _interactionBlocked = !enabled;
+        ApplyInteractionState();
+    }
+
+    public void Reactivate()
+    {
+        if (_committed && ViewModel.Visible)
+        {
+            Activate();
+            FocusDefaultButton();
+        }
+    }
+
+    public async Task<(PixelRect Bounds, int NodeCount, bool UiaReady)> PrepareSurfaceAsync()
+    {
+        _applyingCanonical = true;
+        try
+        {
+            Activate();
+            var readiness = await ReadSurfaceReadinessAsync();
+            // Keep the HWND materialized for UIA while DWM cloak keeps it out of
+            // the user's surface until the Bridge commits the cutover.
+            if (!SetCloaked(true)) throw new InvalidOperationException("Unable to retain ready proxy cloak.");
+            return readiness;
+        }
+        finally
+        {
+            _applyingCanonical = false;
+        }
+    }
+
+    public async Task<(PixelRect Bounds, int NodeCount, bool UiaReady)> ReadSurfaceReadinessAsync()
+    {
+        var keepHidden = !_committed;
+        if (keepHidden) _appWindow.Show(false);
+        try
+        {
+        await _loaded.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        _root.UpdateLayout();
+        await WaitForRenderAsync();
+        _root.UpdateLayout();
+        RefreshRenderDpi();
+        var bounds = new PixelRect
+        {
+            X = _appWindow.Position.X,
+            Y = _appWindow.Position.Y,
+            Width = _appWindow.Size.Width,
+            Height = _appWindow.Size.Height,
+        };
+        return (bounds, ViewModel.Nodes.Count, Content.XamlRoot is not null && Hwnd != 0);
+        }
+        finally
+        {
+            if (keepHidden && !SetCloaked(true))
+                RendererDiagnostics.Log("ready proxy cloak failed after layout");
+        }
+    }
+
+    private static async Task WaitForRenderAsync()
+    {
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        EventHandler<object>? handler = null;
+        handler = (_, _) =>
+        {
+            if (handler is not null) CompositionTarget.Rendering -= handler;
+            completion.TrySetResult();
+        };
+        CompositionTarget.Rendering += handler;
+        try
+        {
+            await completion.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            if (handler is not null) CompositionTarget.Rendering -= handler;
+        }
+    }
+
+    public void ApplyPatch(WindowPatchMessage patch)
+    {
+        PresenterActionIntent? presenterReplay = null;
+        RendererDiagnostics.Log($"window.patch event={patch.EventId ?? "-"} rev={patch.Revision} stateBefore={ViewModel.State} inFlight={_presenterActions.InFlightEventId ?? "-"}");
+        _applyingCanonical = true;
+        try
+        {
+            var placementBefore = (
+                ViewModel.State, ViewModel.Visible,
+                ViewModel.Bounds.X, ViewModel.Bounds.Y,
+                ViewModel.Bounds.Width, ViewModel.Bounds.Height);
+            var placementActionPatch = patch.EventId is not null &&
+                _placementEventIds.Remove(patch.EventId);
+            var structural = patch.Operations.Any(operation => operation.Op is "add" or "remove") ||
+                (patch.Snapshot is not null && !ViewModel.CanMergeSnapshot(patch.Snapshot));
+            ViewModel.ApplyPatch(patch);
+            var placementChanged = placementBefore != (
+                ViewModel.State, ViewModel.Visible,
+                ViewModel.Bounds.X, ViewModel.Bounds.Y,
+                ViewModel.Bounds.Width, ViewModel.Bounds.Height);
+            if (patch.EventId is not null && _pending.Remove(patch.EventId, out var committed))
+            {
+                committed.Node?.AcceptPending(committed.Property, patch.EventId);
+            }
+            presenterReplay = _presenterActions.CompletePatch(patch.EventId, ViewModel.State);
+            if (structural) RebuildControls();
+            ApplyWindowState(ShouldApplyCanonicalPlacement(
+                _committed, placementChanged, placementActionPatch));
+        }
+        finally
+        {
+            _applyingCanonical = false;
+        }
+        RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"}");
+        if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
+    }
+
+    public void ApplyActionResult(ActionResultMessage result)
+    {
+        RendererDiagnostics.Log($"action.result event={result.EventId} status={result.Status} rev={result.Revision} inFlight={_presenterActions.InFlightEventId ?? "-"}");
+        var resultRevision = ProtocolSerializer.ParseCanonicalUInt64(result.Revision, "action.result.revision");
+        if (resultRevision < ViewModel.Revision)
+            throw new ProtocolException("action.result revision precedes canonical renderer state.");
+        _applyingCanonical = true;
+        try
+        {
+            if (result.Snapshot is not null)
+            {
+                if (resultRevision <= ViewModel.Revision)
+                    throw new ProtocolException("action.result snapshot does not advance canonical renderer state.");
+                ViewModel.ApplySnapshot(result.Snapshot);
+                RebuildControls();
+                ApplyWindowState();
+            }
+            if (_pending.TryGetValue(result.EventId, out var pending))
+            {
+                if (result.Status is "rejected" or "stale" or "closeRejected")
+                {
+                    _pending.Remove(result.EventId);
+                    pending.Node?.RejectPending(pending.Property, result.EventId);
+                    if (pending.Property == "close") _closePending = false;
+                }
+                else if (result.Snapshot is not null ||
+                         (result.Status == "accepted" && pending.Property == "invoke"))
+                {
+                    _pending.Remove(result.EventId);
+                    pending.Node?.AcceptPending(pending.Property, result.EventId);
+                }
+            }
+            if (result.Status == "stale") _presenterActions.MarkStale(result.EventId);
+            if (result.Status == "rejected")
+            {
+                _placementEventIds.Remove(result.EventId);
+                _presenterActions.CancelIfMatches(result.EventId);
+            }
+        }
+        finally
+        {
+            _applyingCanonical = false;
+        }
+    }
+
+    public void Commit(bool show, ulong revision)
+    {
+        if (revision != ViewModel.Revision) throw new ProtocolException("surface.commit revision does not match renderer state.");
+        _applyingCanonical = true;
+        try
+        {
+            if (show)
+            {
+                _committed = true;
+                ApplyWindowState();
+                if (ViewModel.Visible)
+                {
+                    Activate();
+                    FocusDefaultButton();
+                }
+            }
+            else
+            {
+                _committed = false;
+                _appWindow.Hide();
+                if (!SetCloaked(true)) RendererDiagnostics.Log("proxy cloak failed while hiding surface");
+            }
+        }
+        finally { _applyingCanonical = false; }
+    }
+
+    public void RetireFromBridge()
+    {
+        _applyingCanonical = true;
+        try
+        {
+            _committed = false;
+            _retired = true;
+            _closePending = false;
+            _pending.Clear();
+            _placementEventIds.Clear();
+            _presenterActions.Reset();
+            _appWindow.IsShownInSwitchers = false;
+            SetInteractionEnabled(false);
+            _appWindow.Hide();
+            if (!SetCloaked(true)) RendererDiagnostics.Log("retired proxy cloak failed after hide");
+            _canvas.Children.Clear();
+            _controls.Clear();
+        }
+        finally
+        {
+            _applyingCanonical = false;
+        }
+    }
+
+    public void CloseFromBridge()
+    {
+        _applyingCanonical = true;
+        try
+        {
+            _committed = false;
+            _retired = true;
+            _closePending = false;
+            _pending.Clear();
+            _placementEventIds.Clear();
+            _presenterActions.Reset();
+            _appWindow.Hide();
+            if (!SetCloaked(true)) RendererDiagnostics.Log("closing proxy cloak failed after hide");
+            _allowClose = true;
+            Close();
+        }
+        finally
+        {
+            _applyingCanonical = false;
+        }
+    }
+
+    private void RebuildControls()
+    {
+        _canvas.Children.Clear();
+        _controls.Clear();
+        var dpi = RenderDpi;
+        _canvas.Width = ViewModel.ClientBounds.Width * 96.0 / dpi;
+        _canvas.Height = ViewModel.ClientBounds.Height * 96.0 / dpi;
+        var factory = new ControlFactory(
+            Math.Max(1, (int)Math.Round(dpi)), ViewModel.Nodes, EmitNodeAction,
+            () => !CanEmitActions,
+            IsImeComposing);
+        var icon = CreateDialogIcon();
+        if (icon is not null) _canvas.Children.Add(icon);
+        foreach (var node in ViewModel.Nodes)
+        {
+            var control = factory.Create(node);
+            _controls[node.NodeId] = control;
+            _canvas.Children.Add(control);
+        }
+    }
+
+    private FontIcon? CreateDialogIcon()
+    {
+        var (glyph, name) = ViewModel.Icon switch
+        {
+            "warning" => ("\uE7BA", "Warning"),
+            "error" => ("\uEA39", "Error"),
+            "info" => ("\uE946", "Information"),
+            "question" => ("\uE9CE", "Question"),
+            "shield" => ("\uEA18", "Security"),
+            _ => (string.Empty, string.Empty),
+        };
+        if (glyph.Length == 0) return null;
+        var icon = new FontIcon { Glyph = glyph, FontSize = 32 };
+        AutomationProperties.SetName(icon, name);
+        Canvas.SetLeft(icon, 16);
+        Canvas.SetTop(icon, 16);
+        Canvas.SetZIndex(icon, 512);
+        return icon;
+    }
+
+    internal static bool ShouldApplyCanonicalBounds(bool committed, string canonicalState) =>
+        !committed || canonicalState == "normal";
+
+    internal static bool ShouldEmitGeometry(
+        string canonicalState,
+        OverlappedPresenterState presenterState) =>
+        canonicalState == "normal" && presenterState == OverlappedPresenterState.Restored;
+
+    internal static bool ShouldApplyCanonicalPlacement(
+        bool committed,
+        bool placementChanged,
+        bool placementActionPatch) =>
+        !committed || placementChanged || placementActionPatch;
+
+    private void ApplyWindowState(bool applyCanonicalPlacement = true)
+    {
+        Title = ViewModel.Title;
+        _appWindow.Title = ViewModel.Title;
+        _appWindow.IsShownInSwitchers = ViewModel.ShowInTaskbar;
+        _root.FlowDirection = ViewModel.Rtl ? FlowDirection.RightToLeft : FlowDirection.LeftToRight;
+        var dpi = RenderDpi;
+        _canvas.Width = ViewModel.ClientBounds.Width * 96.0 / dpi;
+        _canvas.Height = ViewModel.ClientBounds.Height * 96.0 / dpi;
+        if (_appWindow.Presenter is OverlappedPresenter presenter)
+        {
+            presenter.IsResizable = ViewModel.IsResizable;
+            presenter.IsMinimizable = ViewModel.IsMinimizable;
+            presenter.IsMaximizable = ViewModel.IsMaximizable;
+            presenter.IsAlwaysOnTop = ViewModel.IsAlwaysOnTop;
+            if (applyCanonicalPlacement &&
+                ShouldApplyCanonicalBounds(_committed, ViewModel.State))
+            {
+                if (_committed && presenter.State != OverlappedPresenterState.Restored)
+                    presenter.Restore();
+                _appWindow.MoveAndResize(new RectInt32(
+                    ViewModel.Bounds.X, ViewModel.Bounds.Y,
+                    ViewModel.Bounds.Width, ViewModel.Bounds.Height));
+            }
+        }
+        else if (applyCanonicalPlacement)
+        {
+            _appWindow.MoveAndResize(new RectInt32(
+                ViewModel.Bounds.X, ViewModel.Bounds.Y,
+                ViewModel.Bounds.Width, ViewModel.Bounds.Height));
+        }
+        RefreshRenderDpi();
+        ApplyInteractionState();
+        if (_committed)
+        {
+            if (ViewModel.Visible)
+            {
+                if (!SetCloaked(false)) throw new InvalidOperationException("Unable to uncloak renderer proxy.");
+                _appWindow.Show(false);
+                if (applyCanonicalPlacement) ApplyPresenterState();
+            }
+            else
+            {
+                _appWindow.Hide();
+                if (!SetCloaked(true)) RendererDiagnostics.Log("hidden canonical proxy cloak failed after hide");
+            }
+        }
+    }
+
+    private bool CanEmitActions =>
+        !_applyingCanonical && _committed && !_retired &&
+        ViewModel.Visible && ViewModel.Enabled && !_interactionBlocked;
+
+    private void ApplyInteractionState() =>
+        EnableWindow(Hwnd, ViewModel.Enabled && !_interactionBlocked && !_retired);
+
+    private void FocusDefaultButton()
+    {
+        var node = ViewModel.Nodes.FirstOrDefault(candidate =>
+            candidate.Kind == "button" && candidate.IsDefault && candidate.Enabled && candidate.Visible);
+        if (node is not null && _controls.TryGetValue(node.NodeId, out var control))
+            control.Focus(FocusState.Programmatic);
+    }
+
+    private void ApplyPresenterState()
+    {
+        if (_appWindow.Presenter is not OverlappedPresenter presenter) return;
+        switch (ViewModel.State)
+        {
+            case "minimized": presenter.Minimize(); break;
+            case "maximized": presenter.Maximize(); break;
+            default: presenter.Restore(); break;
+        }
+    }
+
+    private void EmitNodeAction(ControlNodeViewModel node, string action, object? value)
+    {
+        var property = action switch
+        {
+            "setText" => "text",
+            "setCheck" => "checked",
+            "select" => "selectedIndex",
+            _ => action,
+        };
+        EmitAction(node, property, action, value);
+    }
+
+    private string? EmitAction(ControlNodeViewModel? node, string property, string action, object? value)
+    {
+        if (!CanEmitActions) return null;
+        if ((property == "invoke" || property == "close") &&
+            _pending.Values.Any(pending =>
+                ReferenceEquals(pending.Node, node) && pending.Property == property))
+        {
+            return null;
+        }
+        var eventId = _nextEventId();
+        node?.RegisterPending(property, eventId);
+        _pending[eventId] = (node, property);
+        if (property is "state" or "bounds") _placementEventIds.Add(eventId);
+        var message = new ActionInvokeMessage
+        {
+            SessionNonce = string.Empty, // WindowRegistry stamps the session nonce.
+            SurfaceId = ViewModel.SurfaceId,
+            NodeId = node?.NodeId,
+            EventId = eventId,
+            ExpectedRevision = ViewModel.Revision.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            Action = action,
+            Value = JsonSerializer.SerializeToElement(value),
+        };
+        _ = _sendAction(message, ViewModel.Revision);
+        return eventId;
+    }
+
+    private void QueueOrEmitPresenterAction(string action) =>
+        QueueOrEmitPresenterAction(new PresenterActionIntent(action, 0));
+
+    private void QueueOrEmitPresenterAction(PresenterActionIntent intent)
+    {
+        if (_presenterActions.HasInFlight)
+        {
+            _presenterActions.QueueLatest(intent.Action);
+            RendererDiagnostics.Log($"presenter queued action={intent.Action} retry={intent.RetryCount} inFlight={_presenterActions.InFlightEventId}");
+            return;
+        }
+
+        var eventId = EmitAction(null, "state", intent.Action, null);
+        if (eventId is not null)
+        {
+            _presenterActions.MarkSent(eventId, intent);
+            RendererDiagnostics.Log($"presenter sent action={intent.Action} retry={intent.RetryCount} event={eventId} rev={ViewModel.Revision}");
+        }
+    }
+
+    private void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    {
+        if (_allowClose) return;
+        args.Cancel = true;
+        if (ViewModel.CanCancel && !_closePending)
+        {
+            _closePending = true;
+            EmitAction(null, "close", "close", null);
+        }
+    }
+
+    private void OnCanvasKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
+    {
+        if (args.Key == global::Windows.System.VirtualKey.Enter)
+        {
+            var defaultButton = ViewModel.Nodes.FirstOrDefault(node => node.Kind == "button" && node.IsDefault && node.Enabled && node.Visible);
+            if (defaultButton is not null)
+            {
+                EmitNodeAction(defaultButton, "invoke", null);
+                args.Handled = true;
+            }
+        }
+        else if (args.Key == global::Windows.System.VirtualKey.Escape && ViewModel.CanCancel)
+        {
+            EmitAction(null, "close", "close", null);
+            args.Handled = true;
+        }
+    }
+
+    private void OnAppWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
+    {
+        if (_applyingCanonical || !_committed) return;
+        RefreshRenderDpi();
+        if (args.DidPresenterChange && sender.Presenter is OverlappedPresenter presenter)
+        {
+            var (state, action) = presenter.State switch
+            {
+                OverlappedPresenterState.Minimized => ("minimized", "minimize"),
+                OverlappedPresenterState.Maximized => ("maximized", "maximize"),
+                _ => ("normal", "restore"),
+            };
+            RendererDiagnostics.Log($"presenter changed state={state} action={action} canonical={ViewModel.State} applying={_applyingCanonical} inFlight={_presenterActions.InFlightEventId ?? "-"}");
+            var desiredState = _presenterActions.DesiredState(ViewModel.State);
+            if (!string.Equals(state, desiredState, StringComparison.Ordinal))
+            {
+                QueueOrEmitPresenterAction(action);
+                return;
+            }
+        }
+        if (args.DidPositionChange || args.DidSizeChange)
+        {
+            if (sender.Presenter is OverlappedPresenter boundsPresenter &&
+                !ShouldEmitGeometry(ViewModel.State, boundsPresenter.State))
+            {
+                return;
+            }
+            var action = args.DidSizeChange && !args.DidPositionChange ? "resize" : "move";
+            EmitAction(null, "bounds", action, new
+            {
+                x = sender.Position.X,
+                y = sender.Position.Y,
+                width = sender.Size.Width,
+                height = sender.Size.Height,
+            });
+        }
+    }
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern nint SetWindowLongPtr(nint hwnd, int index, nint newValue);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnableWindow(nint hwnd, bool enabled);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint hwnd);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
+
+    [DllImport("imm32.dll")]
+    private static extern nint ImmGetContext(nint hwnd);
+
+    [DllImport("imm32.dll")]
+    private static extern int ImmGetCompositionStringW(
+        nint inputContext,
+        uint index,
+        nint buffer,
+        uint bufferLength);
+
+    [DllImport("imm32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ImmReleaseContext(nint hwnd, nint inputContext);
+
+    private bool IsImeComposing()
+    {
+        const uint GcsCompositionString = 0x0008;
+        var context = ImmGetContext(Hwnd);
+        if (context == 0) return false;
+        try
+        {
+            return ImmGetCompositionStringW(
+                context, GcsCompositionString, 0, 0) > 0;
+        }
+        finally
+        {
+            ImmReleaseContext(Hwnd, context);
+        }
+    }
+
+    private bool SetCloaked(bool cloaked)
+    {
+        var value = cloaked ? 1 : 0;
+        return DwmSetWindowAttribute(Hwnd, 13, ref value, sizeof(int)) >= 0;
+    }
+
+    private double RenderDpi => _renderDpi == 0
+        ? Math.Max(1u, ViewModel.Dpi)
+        : _renderDpi;
+
+    private uint ReadWindowDpi()
+    {
+        var dpi = GetDpiForWindow(Hwnd);
+        return dpi == 0 ? (uint)Math.Max(1, ViewModel.Dpi) : dpi;
+    }
+
+    private void RefreshRenderDpi()
+    {
+        var dpi = ReadWindowDpi();
+        if (_renderDpi == dpi) return;
+        _renderDpi = dpi;
+        RebuildControls();
+    }
+}

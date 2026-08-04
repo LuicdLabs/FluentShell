@@ -1,67 +1,93 @@
 # AnyFluent
 
-把舊版 Win32 對話框（`#32770` / TaskDialog）在**執行期**轉換成現代化的深色 **Fluent Design** UI 的 C++ 引擎與研究專案。不需要原始碼、不修改系統檔案、不碰核心（no `win32k.sys`），全程在使用者態運作且可還原。
+AnyFluent translates supported Win32 top-level windows into real WinUI 3 Fluent windows. It is not a DWM recoloring layer and it does not initialize WinUI inside an injected third-party process.
 
-這是對 `xaml islands.txt` 與 `dwm method 1.txt` 兩份分析的**驗證與落地**：確認「XAML Islands 全域注入」不可行，改用 **DWM 視覺層屬性 + 使用者態 API Hook/注入 + Direct2D/DirectWrite 控件重繪**，並在本機（Windows 11 25H2 / build 26200、Visual Studio 2026 / MSVC 14.51）實際編譯與測試。
+## Architecture
 
-## 成果一覽（before → after）
-
-| Tier | 說明 | 截圖 |
-| :--- | :--- | :--- |
-| 1 | 自包含 before/after 示範（重現 `Untitled.png`） | `docs/images/tier1_before_after.png` |
-| 2 | DLL 注入到獨立黑盒程式（classic 全轉換；TaskDialog 邊框+按鈕） | `docs/images/tier2_classic_injected.png` |
-| 3 | 全域 WH_CBT 勾（未直接注入的程式也被轉換） | `docs/images/tier3_global_uninjected.png` |
-| 3 | **真實系統程序** `SystemPropertiesProtection.exe` 被注入改造 | `docs/images/tier3_sysprotection.png` |
-
-![Tier 1 before/after](docs/images/tier1_before_after.png)
-
-## 專案結構
-
-```
-src/common/FluentCore.{h,cpp}   共用核心：DWM、未公開 uxtheme 深色、Direct2D 重繪、子類化、#32770 調度
-src/demo/                       Tier 1：資源對話框 before/after 示範
-src/testtarget/                 Tier 2：故意做舊的黑盒測試程式（classic + TaskDialog）
-src/hookdll/dllmain.cpp         被注入的轉換 DLL（WinEvent + 子類化；匯出 CbtProc 供全域勾）
-src/injector/main.cpp           注入器：--pid / --exe / --global / --watch
-src/tools/capture.cpp           GDI+ 截圖工具（測試用）
-docs/                           研究報告（多份 .md）+ images/
-build.ps1                       載入 VS2026 開發環境並用 MSVC 建置
+```text
+native Win32 HWND/control tree (canonical state)
+        | snapshot / patch                 ^ semantic action / result
+        v                                  |
+FluentShell.Bridge.dll -- versioned pipe -- FluentShell.Renderer.exe
+      target process                         separate WinUI 3 process
 ```
 
-## 建置
+- `FluentShell.Bridge.dll` is the only injected production DLL. It captures supported native controls on their owning UI thread and owns rollback.
+- `Renderer\FluentShell.Renderer.exe` is a self-contained, unpackaged x64 WinUI 3 process. It owns XAML windows, typed view models, binding, and temporary input state.
+- The native HWND tree remains authoritative. A renderer or protocol failure restores the complete native top-level window.
+- Unsupported controls cause whole-window fallback. AnyFluent does not mix a native subtree into a translated WinUI surface.
+
+The v1 control boundary is standard Static, Button/check/radio, Edit, ComboBox, and ListBox controls plus supported MessageBox and static TaskDialog shapes. Owner-draw, custom HWND classes, RichEdit, virtual controls, embedded browser/XAML, layered/nonrectangular windows, and custom non-client rendering remain native.
+
+## Safety Boundary
+
+Injection is explicit and path-bound:
+
+- The target is an existing absolute executable image path, resolved through a file handle.
+- The path read from the selected process must match that canonical path.
+- If multiple processes use the same image, `--pid` is required.
+- `--sha256` can pin the target file. Signer pinning is intentionally rejected until implemented.
+- Shell, security, XAML hosts, the AnyFluent renderer, and AnyFluent tools are hard-denied.
+- There is no process-name injection, system-wide discovery, or injection watch mode.
+
+The one-shot `l0` command is the only diagnostic exposed by the production Injector. `IslandDemo` remains a source-level diagnostic and is excluded from the default production build.
+
+## Build And Test
+
+Requirements are Visual Studio with the x64 C++ toolchain, Windows SDK 10.0.26100, and the .NET 8 or newer SDK.
 
 ```powershell
-# 需要 Visual Studio 2026（含 C++ 桌面工作負載）+ Windows 11 SDK
-cd C:\Users\User\anyfluent
-.\build.ps1 all      # 或 demo / testtarget / hookdll / injector / capture
-# 產物：build\bin\*.exe, build\bin\anyfluenthook.dll
+.\build.ps1 -Configuration Release
+.\test.ps1 -Configuration Release
 ```
 
-## 執行 / 測試
+Production output is isolated as follows:
+
+```text
+build\bin\x64\Release\
+  FluentShell.Injector.exe
+  FluentShell.Bridge.dll
+  LegacyDialogHost.exe
+  Renderer\
+    FluentShell.Renderer.exe
+    ... WinUI 3, Windows App SDK, and .NET runtime payload ...
+```
+
+The build clears this configuration's output directory before compiling, publishes the renderer only under `Renderer`, and fails if Bootstrap or renderer runtime files appear at the production root.
+
+## Run The Translation Oracle
+
+Open PowerShell in the production output directory:
 
 ```powershell
-$bin = "C:\Users\User\anyfluent\build\bin"
-
-# Tier 1：並排 before/after
-& "$bin\demo.exe"
-
-# Tier 2：目標式注入
-$tt = Start-Process "$bin\testtarget.exe" -PassThru
-& "$bin\injector.exe" --pid $tt.Id      # 之後點測試程式的按鈕
-
-# Tier 3：全域勾（任何 #32770 都會被現代化；系統程序需以系統管理員執行）
-& "$bin\injector.exe" --global          # Ctrl+C 解除
+$target = (Resolve-Path .\LegacyDialogHost.exe).Path
+$process = Start-Process $target -PassThru
+.\FluentShell.Injector.exe inject $target --pid $process.Id
 ```
 
-> ⚠️ **安全**：真實 System Protection 的「刪除還原點」確認框是**破壞性**的。測試時只看樣式、一律按 **Cancel**，絕不按 Continue。本專案不做持久化、不做防毒規避。
+When there is exactly one matching process, `--pid` may be omitted. To pin the binary:
 
-## 研究報告（`docs/`）
+```powershell
+$hash = (Get-FileHash $target -Algorithm SHA256).Hash
+.\FluentShell.Injector.exe inject $target --pid $process.Id --sha256 $hash
+```
 
-- [00 — 執行摘要](docs/00-executive-summary.md)
-- [01 — 為什麼 XAML Islands 全域注入行不通](docs/01-why-xaml-islands-fails.md)
-- [02 — DWM 視覺層現代化](docs/02-dwm-visual-layer.md)
-- [03 — 注入與 Hook 機制](docs/03-injection-and-hooking.md)
-- [04 — Direct2D/DirectWrite 控件重繪](docs/04-control-repaint-direct2d.md)
-- [05 — 實作與本機測試結果](docs/05-implementation-and-test-results.md)
-- [06 — 風險、限制與路線圖](docs/06-risks-limitations-roadmap.md)
-- [參考來源](docs/references.md)
+`LegacyDialogHost` exposes Edit, CheckBox, ComboBox, ListBox, an app-updated timer value, MessageBox/TaskDialog result reporting, a close-veto toggle, and a button that creates an unsupported custom child. The log is `%TEMP%\FluentShell.LegacyDialogHost.log`; Bridge diagnostics use `%TEMP%\FluentShell.log`.
+
+Expected behavior:
+
+- UI Automation identifies the projected controls as XAML and exposes their normal patterns.
+- User edits and selections return to the native controls; native timer text patches the WinUI view.
+- Dialog button IDs and verification state return to the native host and appear in its result field/log.
+- Selecting close veto rejects a proxy close because the native `WM_CLOSE` handler keeps the HWND alive.
+- Creating the custom child or terminating the renderer restores the whole native window without terminating the target.
+
+## Diagnostics
+
+```powershell
+.\FluentShell.Injector.exe l0
+```
+
+The default solution lists `FluentShell.Island` and `IslandDemo` for manual research but does not build them. When that legacy diagnostic is needed, build `src\PoC\IslandDemo\IslandDemo.vcxproj` explicitly with an `OutDir` outside the production folder and run `IslandDemo.exe` there; it is not an Injector entry point.
+
+Reference source under `ref_src` is read-only. WinUIShell informs the server/IPC/lifetime shape; its reflection RPC layer is not copied. The GPL-licensed modernizer sample is behavioral research only and contributes no copied implementation.

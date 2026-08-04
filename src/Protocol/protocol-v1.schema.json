@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lucidlabs.local/anyfluent/protocol-v1.schema.json",
+  "title": "AnyFluent renderer protocol v1 payload",
+  "description": "JSON payload carried after the fixed 32-byte little-endian FLSH frame header.",
+  "$comment": "Same-major minor revisions may add JSON fields. Consumers ignore unknown fields while continuing to enforce known required fields and resource caps.",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/windowOpen" },
+    { "$ref": "#/$defs/windowPatch" },
+    { "$ref": "#/$defs/actionInvoke" },
+    { "$ref": "#/$defs/actionResult" },
+    { "$ref": "#/$defs/surfaceReady" },
+    { "$ref": "#/$defs/surfaceCommit" },
+    { "$ref": "#/$defs/windowClose" },
+    { "$ref": "#/$defs/heartbeat" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/shutdown" }
+  ],
+  "$defs": {
+    "u64String": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$",
+      "maxLength": 20
+    },
+    "hwndString": {
+      "type": "string",
+      "pattern": "^0x[0-9A-Fa-f]{1,16}$",
+      "maxLength": 18
+    },
+    "nonce": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{32}$",
+      "maxLength": 32
+    },
+    "surfaceId": {
+      "type": "string",
+      "format": "uuid",
+      "maxLength": 36
+    },
+    "text": {
+      "type": "string",
+      "maxLength": 65536
+    },
+    "rect": {
+      "type": "object",
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "y": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "width": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "height": { "type": "integer", "minimum": 0, "maximum": 2147483647 }
+      }
+    },
+    "messageBase": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce"],
+      "properties": {
+        "messageType": { "type": "string", "maxLength": 32 },
+        "sessionNonce": { "$ref": "#/$defs/nonce" }
+      }
+    },
+    "hello": {
+      "allOf": [
+        { "$ref": "#/$defs/messageBase" },
+        {
+          "type": "object",
+          "required": ["messageType", "sessionNonce", "role", "processId", "processCreated", "protocolMajor", "protocolMinor"],
+          "properties": {
+            "messageType": { "const": "hello" },
+            "sessionNonce": { "$ref": "#/$defs/nonce" },
+            "role": { "enum": ["bridge", "renderer"] },
+            "processId": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+            "processCreated": { "$ref": "#/$defs/u64String" },
+            "protocolMajor": { "const": 1 },
+            "protocolMinor": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        }
+      ]
+    },
+    "controlNode": {
+      "type": "object",
+      "required": ["nodeId", "generation", "nativeHwnd", "kind", "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "items"],
+      "properties": {
+        "nodeId": { "$ref": "#/$defs/u64String" },
+        "generation": { "$ref": "#/$defs/u64String" },
+        "nativeHwnd": { "$ref": "#/$defs/hwndString" },
+        "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
+        "kind": { "enum": ["static", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox"] },
+        "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
+        "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
+        "rect": { "$ref": "#/$defs/rect" },
+        "style": { "$ref": "#/$defs/hwndString" },
+        "exStyle": { "$ref": "#/$defs/hwndString" },
+        "visible": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "tabStop": { "type": "boolean" },
+        "dialogCode": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "text": { "$ref": "#/$defs/text" },
+        "automationName": { "$ref": "#/$defs/text" },
+        "checked": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "selectedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
+        "selectionStart": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "selectionLength": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "readOnly": { "type": "boolean" },
+        "multiline": { "type": "boolean" },
+        "isDefault": { "type": "boolean" },
+        "groupStart": { "type": "boolean" },
+        "items": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/text" }
+        }
+      }
+    },
+    "windowSnapshot": {
+      "type": "object",
+      "required": ["surfaceId", "surfaceKind", "modal", "canCancel", "icon", "generation", "revision", "nativeHwnd", "title", "dpi", "bounds", "clientBounds", "windowStyle", "windowExStyle", "visible", "enabled", "state", "showInTaskbar", "rtl", "nodes"],
+      "properties": {
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "surfaceKind": { "enum": ["window", "messageBox", "taskDialog"] },
+        "modal": { "type": "boolean" },
+        "canCancel": { "type": "boolean" },
+        "icon": { "enum": ["none", "warning", "error", "info", "question", "shield"] },
+        "generation": { "$ref": "#/$defs/u64String" },
+        "revision": { "$ref": "#/$defs/u64String" },
+        "nativeHwnd": { "$ref": "#/$defs/hwndString" },
+        "ownerHwnd": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hwndString" }] },
+        "title": { "$ref": "#/$defs/text" },
+        "dpi": { "type": "integer", "minimum": 48, "maximum": 960 },
+        "bounds": { "$ref": "#/$defs/rect" },
+        "clientBounds": { "$ref": "#/$defs/rect" },
+        "windowStyle": { "$ref": "#/$defs/hwndString" },
+        "windowExStyle": { "$ref": "#/$defs/hwndString" },
+        "visible": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "state": { "enum": ["normal", "minimized", "maximized"] },
+        "showInTaskbar": { "type": "boolean" },
+        "rtl": { "type": "boolean" },
+        "nodes": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/controlNode" }
+        }
+      }
+    },
+    "windowOpen": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "window"],
+      "properties": {
+        "messageType": { "const": "window.open" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "window": { "$ref": "#/$defs/windowSnapshot" }
+      }
+    },
+    "patchOperation": {
+      "type": "object",
+      "required": ["op", "property", "value"],
+      "properties": {
+        "op": { "enum": ["replace", "add", "remove"] },
+        "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
+        "property": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "value": {},
+        "eventId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] }
+      }
+    },
+    "windowPatch": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "surfaceId", "baseRevision", "revision", "operations"],
+      "properties": {
+        "messageType": { "const": "window.patch" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "baseRevision": { "$ref": "#/$defs/u64String" },
+        "revision": { "$ref": "#/$defs/u64String" },
+        "eventId": { "$ref": "#/$defs/u64String" },
+        "operations": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/patchOperation" } },
+        "snapshot": { "$ref": "#/$defs/windowSnapshot" }
+      }
+    },
+    "actionInvoke": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "surfaceId", "eventId", "expectedRevision", "action", "value"],
+      "properties": {
+        "messageType": { "const": "action.invoke" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
+        "eventId": { "$ref": "#/$defs/u64String" },
+        "expectedRevision": { "$ref": "#/$defs/u64String" },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "value": {}
+      }
+    },
+    "actionResult": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "surfaceId", "eventId", "status", "revision"],
+      "properties": {
+        "messageType": { "const": "action.result" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "eventId": { "$ref": "#/$defs/u64String" },
+        "status": { "enum": ["accepted", "rejected", "stale", "closeRejected"] },
+        "revision": { "$ref": "#/$defs/u64String" },
+        "reason": { "$ref": "#/$defs/text" },
+        "snapshot": { "$ref": "#/$defs/windowSnapshot" }
+      }
+    },
+    "surfaceReady": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "surfaceId", "revision", "proxyHwnd", "bounds", "nodeCount", "uiaReady"],
+      "properties": {
+        "messageType": { "const": "surface.ready" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "revision": { "$ref": "#/$defs/u64String" },
+        "proxyHwnd": { "$ref": "#/$defs/hwndString" },
+        "bounds": { "$ref": "#/$defs/rect" },
+        "nodeCount": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "uiaReady": { "type": "boolean" }
+      }
+    },
+    "surfaceCommit": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "surfaceId", "revision", "show"],
+      "properties": {
+        "messageType": { "const": "surface.commit" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "revision": { "$ref": "#/$defs/u64String" },
+        "show": { "type": "boolean" }
+      }
+    },
+    "windowClose": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "surfaceId", "reason"],
+      "properties": {
+        "messageType": { "const": "window.close" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "$ref": "#/$defs/surfaceId" },
+        "reason": { "enum": ["nativeDestroyed", "unsupported", "restore", "shutdown"] }
+      }
+    },
+    "heartbeat": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "sentAt"],
+      "properties": {
+        "messageType": { "const": "heartbeat" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "sentAt": { "$ref": "#/$defs/u64String" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "code", "detail", "fatal"],
+      "properties": {
+        "messageType": { "const": "error" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "surfaceId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/surfaceId" }] },
+        "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "detail": { "$ref": "#/$defs/text" },
+        "fatal": { "type": "boolean" }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "required": ["messageType", "sessionNonce", "reason"],
+      "properties": {
+        "messageType": { "const": "shutdown" },
+        "sessionNonce": { "$ref": "#/$defs/nonce" },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    }
+  }
+}

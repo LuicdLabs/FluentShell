@@ -1,0 +1,16 @@
+{
+  "messageType": "action.invoke",
+  "sessionNonce": "00112233445566778899aabbccddeeff",
+  "surfaceId": "4f17d4bb-b2bf-42b8-a334-2f9ad8d54d42",
+  "nodeId": "9",
+  "eventId": "19",
+  "expectedRevision": "8",
+  "action": "setText",
+  "value": "繁體中文與 English 可以共存。",
+  "futureMinorField": {
+    "displayName": "未來欄位 Future field",
+    "nested": {
+      "enabled": true
+    }
+  }
+}
