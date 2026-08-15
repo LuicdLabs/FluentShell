@@ -39,9 +39,19 @@
 
 ## V1 Support Boundary
 
-Supported: standard rectangular overlapped/dialog windows; Static text/separators; push/default/check/three-state/radio Button; standard Edit including multiline/read-only/password; string ComboBox and ListBox; standard MessageBox; static TaskDialog.
+Supported: standard rectangular overlapped/dialog windows; bounded textual HMENU
+command bars; Static text/separators; push/default/check/three-state/radio Button;
+noninteractive GroupBox; standard Edit including multiline/read-only/password;
+string dropdown-list and editable dropdown ComboBox; string ListBox;
+determinate horizontal ProgressBar; standard MessageBox; static TaskDialog.
 
-Native fallback: owner/custom draw, RichEdit, virtual data, foreign/custom HWND, tree/tab/list-view, menu/toolbar/status, MDI, ActiveX/OLE, browser/XAML children, layered/nonrectangular/custom nonclient windows, custom accelerator/focus/IME behavior.
+Native fallback: owner/custom draw, RichEdit, virtual data, foreign/custom HWND,
+tree/tab/list-view, owner-draw/callback/MDI menus, toolbar/status, MDI,
+ActiveX/OLE, browser/XAML children, layered/nonrectangular/custom nonclient
+windows, custom accelerator/focus/IME behavior.
+
+The staged expansion program and the non-goals of universal pixel translation
+are defined in `CONTROL-ADAPTER-ROADMAP.md`.
 
 ## Verification
 

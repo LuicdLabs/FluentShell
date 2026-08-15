@@ -44,9 +44,26 @@ public sealed record ControlNode
     public int? SelectionLength { get; init; }
     public bool? ReadOnly { get; init; }
     public bool? Multiline { get; init; }
+    public bool Editable { get; init; }
     public bool? IsDefault { get; init; }
     public bool? GroupStart { get; init; }
+    public int? Minimum { get; init; }
+    public int? Maximum { get; init; }
+    public int? Position { get; init; }
     public List<string> Items { get; init; } = [];
+}
+
+public sealed record MenuItemSnapshot
+{
+    public string ItemId { get; init; } = string.Empty;
+    public string Kind { get; init; } = string.Empty;
+    public string Text { get; init; } = string.Empty;
+    public int CommandId { get; init; }
+    public bool Enabled { get; init; }
+    public bool Checked { get; init; }
+    public bool Radio { get; init; }
+    public bool IsDefault { get; init; }
+    public List<MenuItemSnapshot> Items { get; init; } = [];
 }
 
 public sealed record WindowSnapshot
@@ -71,6 +88,7 @@ public sealed record WindowSnapshot
     public string State { get; init; } = "normal";
     public bool ShowInTaskbar { get; init; }
     public bool Rtl { get; init; }
+    public List<MenuItemSnapshot> Menu { get; init; } = [];
     public List<ControlNode> Nodes { get; init; } = [];
 }
 

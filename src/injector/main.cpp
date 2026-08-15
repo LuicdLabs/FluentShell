@@ -482,7 +482,8 @@ bool InjectBridge(DWORD pid, const std::wstring& expectedTargetPath) {
                 DWORD readyResult = 0;
                 if (InvokeRemoteExport(pid, bridge, "FluentShell_IsRendererReady", 2000,
                         &readyResult) && readyResult == TRUE) {
-                    std::wcout << L"Bridge renderer ready in PID " << pid << L"\n";
+                    std::wcout << L"Bridge renderer connected in PID " << pid << L"\n"
+                               << L"Projection is evaluated per window; see %TEMP%\\FluentShell.log for results.\n";
                     return true;
                 }
                 const ULONGLONG now = GetTickCount64();

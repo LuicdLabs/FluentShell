@@ -17,7 +17,14 @@ FluentShell.Bridge.dll -- versioned pipe -- FluentShell.Renderer.exe
 - The native HWND tree remains authoritative. A renderer or protocol failure restores the complete native top-level window.
 - Unsupported controls cause whole-window fallback. AnyFluent does not mix a native subtree into a translated WinUI surface.
 
-The v1 control boundary is standard Static, Button/check/radio, Edit, ComboBox, and ListBox controls plus supported MessageBox and static TaskDialog shapes. Owner-draw, custom HWND classes, RichEdit, virtual controls, embedded browser/XAML, layered/nonrectangular windows, and custom non-client rendering remain native.
+The current control boundary is bounded textual HMENU command bars, standard
+Static, Button/check/radio/GroupBox, Edit, dropdown-list/editable dropdown
+ComboBox, ListBox, and determinate horizontal ProgressBar controls plus
+supported MessageBox and static TaskDialog shapes. Owner-draw, custom HWND
+classes, RichEdit, virtual controls, embedded browser/XAML,
+layered/nonrectangular windows, and custom non-client rendering remain native.
+The staged adapter expansion is documented in
+`docs/goals/win32-to-winui-translation/CONTROL-ADAPTER-ROADMAP.md`.
 
 ## Safety Boundary
 
@@ -72,7 +79,11 @@ $hash = (Get-FileHash $target -Algorithm SHA256).Hash
 .\FluentShell.Injector.exe inject $target --pid $process.Id --sha256 $hash
 ```
 
-`LegacyDialogHost` exposes Edit, CheckBox, ComboBox, ListBox, an app-updated timer value, MessageBox/TaskDialog result reporting, a close-veto toggle, and a button that creates an unsupported custom child. The log is `%TEMP%\FluentShell.LegacyDialogHost.log`; Bridge diagnostics use `%TEMP%\FluentShell.log`.
+`LegacyDialogHost` exposes Edit, CheckBox, ComboBox, ListBox, GroupBox, a
+native-updated ProgressBar and timer value, MessageBox/TaskDialog result
+reporting, a close-veto toggle, and a button that creates an unsupported custom
+child. The log is `%TEMP%\FluentShell.LegacyDialogHost.log`; Bridge diagnostics
+use `%TEMP%\FluentShell.log`.
 
 Expected behavior:
 

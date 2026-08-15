@@ -19,6 +19,7 @@ public sealed class TranslatedWindow : Window
 {
     private readonly Grid _root = new();
     private readonly Canvas _canvas = new();
+    private MenuBar? _menuBar;
     private readonly Func<ActionInvokeMessage, ulong, Task> _sendAction;
     private readonly Func<string> _nextEventId;
     private readonly Dictionary<string, (ControlNodeViewModel? Node, string Property)> _pending = new(StringComparer.Ordinal);
@@ -46,6 +47,9 @@ public sealed class TranslatedWindow : Window
         _sendAction = sendAction;
         _nextEventId = nextEventId;
         Title = ViewModel.Title;
+        _root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        Grid.SetRow(_canvas, 1);
         _root.Children.Add(_canvas);
         Content = _root;
         _canvas.KeyDown += OnCanvasKeyDown;
@@ -282,6 +286,8 @@ public sealed class TranslatedWindow : Window
             _appWindow.Hide();
             if (!SetCloaked(true)) RendererDiagnostics.Log("retired proxy cloak failed after hide");
             _canvas.Children.Clear();
+            if (_menuBar is not null) _root.Children.Remove(_menuBar);
+            _menuBar = null;
             _controls.Clear();
         }
         finally
@@ -316,6 +322,14 @@ public sealed class TranslatedWindow : Window
     {
         _canvas.Children.Clear();
         _controls.Clear();
+        if (_menuBar is not null) _root.Children.Remove(_menuBar);
+        _menuBar = null;
+        if (ViewModel.Menu.Count != 0)
+        {
+            _menuBar = new MenuProjectionFactory(EmitMenuAction).Create(ViewModel.Menu);
+            Grid.SetRow(_menuBar, 0);
+            _root.Children.Insert(0, _menuBar);
+        }
         var dpi = RenderDpi;
         _canvas.Width = ViewModel.ClientBounds.Width * 96.0 / dpi;
         _canvas.Height = ViewModel.ClientBounds.Height * 96.0 / dpi;
@@ -454,10 +468,13 @@ public sealed class TranslatedWindow : Window
         EmitAction(node, property, action, value);
     }
 
+    private void EmitMenuAction(MenuItemViewModel item) =>
+        EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId);
+
     private string? EmitAction(ControlNodeViewModel? node, string property, string action, object? value)
     {
         if (!CanEmitActions) return null;
-        if ((property == "invoke" || property == "close") &&
+        if ((property == "invoke" || property == "close" || property.StartsWith("menu:", StringComparison.Ordinal)) &&
             _pending.Values.Any(pending =>
                 ReferenceEquals(pending.Node, node) && pending.Property == property))
         {

@@ -15,6 +15,8 @@ namespace FluentShell::Bridge::Translation {
 namespace {
 
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
+constexpr size_t kMaxMenuDepth = 8;
+constexpr size_t kMaxMenuItems = 256;
 
 class PhysicalCoordinateScope final {
 public:
@@ -63,6 +65,20 @@ std::wstring WindowClass(HWND hwnd) {
     return length > 0 ? std::wstring(value, static_cast<size_t>(length)) : std::wstring();
 }
 
+void AppendWindowEvidence(HWND hwnd, std::wstring& reason) {
+    reason.append(L" [hwnd=");
+    reason.append(std::to_wstring(reinterpret_cast<uintptr_t>(hwnd)));
+    reason.append(L" class=");
+    reason.append(WindowClass(hwnd));
+    reason.append(L" style=");
+    reason.append(std::to_wstring(
+        static_cast<uint64_t>(GetWindowLongPtrW(hwnd, GWL_STYLE))));
+    reason.append(L" exStyle=");
+    reason.append(std::to_wstring(
+        static_cast<uint64_t>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE))));
+    reason.push_back(L']');
+}
+
 bool WindowText(HWND hwnd, std::wstring& value, std::wstring& reason) {
     const int reported = GetWindowTextLengthW(hwnd);
     if (reported < 0 || static_cast<size_t>(reported) > Ipc::kMaxStringChars) {
@@ -101,8 +117,8 @@ bool IsStandardTopLevel(HWND root, std::wstring& reason) {
         reason = L"owned top-level window is outside the v1 owner graph";
         return false;
     }
-    if (GetMenu(root)) {
-        reason = L"top-level menu is not supported in v1";
+    if ((exStyle & WS_EX_MDICHILD) != 0) {
+        reason = L"MDI child top-level window";
         return false;
     }
     HRGN region = CreateRectRgn(0, 0, 0, 0);
@@ -159,6 +175,13 @@ bool ClassifyControl(
         case BS_AUTORADIOBUTTON:
             kind = ControlKind::RadioButton;
             return true;
+        case BS_GROUPBOX:
+            if ((style & WS_TABSTOP) != 0) {
+                reason = L"tab-stop GroupBox is not supported";
+                return false;
+            }
+            kind = ControlKind::GroupBox;
+            return true;
         default:
             reason = L"unsupported Button type";
             return false;
@@ -175,8 +198,10 @@ bool ClassifyControl(
             reason = L"owner-draw ComboBox";
             return false;
         }
-        if ((style & 0x0003u) != CBS_DROPDOWNLIST) {
-            reason = L"editable ComboBox is not supported in v1";
+        const DWORD type = style & 0x0003u;
+        if (type != CBS_DROPDOWNLIST &&
+            (type != CBS_DROPDOWN || (style & CBS_HASSTRINGS) == 0)) {
+            reason = L"ComboBox is simple, non-string-backed, or has an unsupported type";
             return false;
         }
         kind = ControlKind::ComboBox;
@@ -190,6 +215,15 @@ bool ClassifyControl(
             return false;
         }
         kind = ControlKind::ListBox;
+        return true;
+    }
+
+    if (FluentShell::EqualsIgnoreCase(className, PROGRESS_CLASSW)) {
+        if ((style & (PBS_MARQUEE | PBS_VERTICAL | WS_TABSTOP)) != 0) {
+            reason = L"marquee, vertical, or tab-stop ProgressBar is not supported";
+            return false;
+        }
+        kind = ControlKind::ProgressBar;
         return true;
     }
 
@@ -230,6 +264,14 @@ bool ReadStringItems(
     return true;
 }
 
+bool IsComboBoxImplementationChild(HWND hwnd) {
+    const HWND parent = GetParent(hwnd);
+    if (!parent || !FluentShell::EqualsIgnoreCase(WindowClass(parent), L"ComboBox")) return false;
+    COMBOBOXINFO info{sizeof(info)};
+    return GetComboBoxInfo(parent, &info) &&
+        (hwnd == info.hwndItem || hwnd == info.hwndList);
+}
+
 struct Enumeration final {
     std::vector<HWND> handles;
 };
@@ -247,6 +289,7 @@ bool CaptureNativeTabOrder(
     std::wstring& reason) {
     std::unordered_set<HWND> candidates;
     for (const HWND child : handles) {
+        if (IsComboBoxImplementationChild(child)) continue;
         const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
         if (IsWindowVisible(child) && IsWindowEnabled(child) &&
             (style & WS_TABSTOP) != 0) {
@@ -293,7 +336,134 @@ void HashString(uint64_t& hash, std::wstring_view value) noexcept {
     for (const wchar_t character : value) HashBytes(hash, character);
 }
 
+bool HasMdiClient(HWND root) {
+    return FindWindowExW(root, nullptr, L"MDIClient", nullptr) != nullptr;
+}
+
+struct MenuCaptureState final {
+    size_t count = 0;
+    std::unordered_set<HMENU> menus;
+    std::unordered_set<uint32_t> commandIds;
+};
+
+bool CaptureMenuLevel(
+    HMENU menu,
+    size_t depth,
+    std::wstring_view path,
+    bool topLevel,
+    bool ancestorEnabled,
+    MenuCaptureState& state,
+    std::vector<MenuItemSnapshot>& result,
+    std::wstring& reason) {
+    if (!menu || !IsMenu(menu) || depth > kMaxMenuDepth || !state.menus.insert(menu).second) {
+        reason = L"invalid, deep, or cyclic menu shape";
+        return false;
+    }
+    MENUINFO menuInfo{sizeof(menuInfo)};
+    menuInfo.fMask = MIM_STYLE;
+    if (!GetMenuInfo(menu, &menuInfo) ||
+        (menuInfo.dwStyle & (MNS_NOTIFYBYPOS | MNS_MODELESS | MNS_DRAGDROP)) != 0) {
+        reason = L"callback or modeless menu semantics are not supported";
+        return false;
+    }
+    const int count = GetMenuItemCount(menu);
+    if (count < 0 || state.count + static_cast<size_t>(count) > kMaxMenuItems) {
+        reason = L"invalid or excessive menu item count";
+        return false;
+    }
+    bool foundDefault = false;
+    result.reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        MENUITEMINFOW info{sizeof(info)};
+        std::wstring text(Ipc::kMaxStringChars + 1, L'\0');
+        info.fMask = MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU |
+            MIIM_STRING | MIIM_BITMAP | MIIM_CHECKMARKS | MIIM_DATA;
+        info.dwTypeData = text.data();
+        info.cch = static_cast<UINT>(text.size());
+        if (!GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &info) ||
+            info.cch > Ipc::kMaxStringChars) {
+            reason = L"invalid or excessive menu label";
+            return false;
+        }
+        text.resize(info.cch);
+        const UINT unsupportedType = MFT_OWNERDRAW | MFT_BITMAP | MFT_MENUBARBREAK |
+            MFT_MENUBREAK | MFT_RIGHTJUSTIFY;
+        if ((info.fType & unsupportedType) != 0 || info.hbmpItem != nullptr ||
+            info.hbmpChecked != nullptr || info.hbmpUnchecked != nullptr ||
+            info.dwItemData != 0) {
+            reason = L"owner-draw, bitmap, or custom menu item";
+            return false;
+        }
+        MenuItemSnapshot item;
+        item.itemId = path.empty()
+            ? std::to_wstring(index)
+            : std::wstring(path) + L"." + std::to_wstring(index);
+        item.text = std::move(text);
+        item.enabled = ancestorEnabled &&
+            (info.fState & (MFS_DISABLED | MFS_GRAYED)) == 0;
+        item.checked = (info.fState & MFS_CHECKED) != 0;
+        item.radio = (info.fType & MFT_RADIOCHECK) != 0;
+        item.isDefault = (info.fState & MFS_DEFAULT) != 0;
+        if (item.isDefault && foundDefault) {
+            reason = L"menu level has multiple default items";
+            return false;
+        }
+        foundDefault = foundDefault || item.isDefault;
+        ++state.count;
+        if ((info.fType & MFT_SEPARATOR) != 0) {
+            if (topLevel || info.hSubMenu || !item.text.empty()) {
+                reason = L"invalid menu separator shape";
+                return false;
+            }
+            item.kind = MenuItemKind::Separator;
+        } else if (info.hSubMenu) {
+            if (item.text.empty()) {
+                reason = L"popup menu has no textual label";
+                return false;
+            }
+            item.kind = MenuItemKind::Popup;
+            if (!CaptureMenuLevel(info.hSubMenu, depth + 1, item.itemId,
+                    false, item.enabled, state, item.items, reason) || item.items.empty()) return false;
+        } else {
+            if (topLevel || item.text.empty() || info.wID == 0 || info.wID >= 0xf000) {
+                reason = L"menu command cannot use standard WM_COMMAND semantics";
+                return false;
+            }
+            item.kind = MenuItemKind::Command;
+            item.commandId = info.wID;
+            if (!state.commandIds.insert(item.commandId).second) {
+                reason = L"ambiguous duplicate executable menu command ID";
+                return false;
+            }
+        }
+        result.push_back(std::move(item));
+    }
+    return true;
+}
+
 } // namespace
+
+bool CaptureTopLevelMenu(
+    HWND root,
+    std::vector<MenuItemSnapshot>& menu,
+    std::wstring& rejectionReason) noexcept {
+    try {
+        menu.clear();
+        const HMENU nativeMenu = GetMenu(root);
+        if (!nativeMenu) return true;
+        if (HasMdiClient(root) || nativeMenu == GetSystemMenu(root, FALSE)) {
+            rejectionReason = L"MDI or system menu cannot be projected as a menu bar";
+            return false;
+        }
+        MenuCaptureState state;
+        return CaptureMenuLevel(nativeMenu, 1, L"", true, true,
+            state, menu, rejectionReason) &&
+            !menu.empty();
+    } catch (...) {
+        rejectionReason = L"exception while capturing native menu";
+        return false;
+    }
+}
 
 bool CaptureWindow(
     HWND root,
@@ -306,7 +476,10 @@ bool CaptureWindow(
             rejectionReason = L"cannot establish physical-coordinate DPI context";
             return false;
         }
-        if (!IsStandardTopLevel(root, rejectionReason)) return false;
+        if (!IsStandardTopLevel(root, rejectionReason)) {
+            AppendWindowEvidence(root, rejectionReason);
+            return false;
+        }
 
         WindowSnapshot next;
         next.surfaceId = context.surfaceId;
@@ -336,6 +509,7 @@ bool CaptureWindow(
         next.state = minimized ? L"minimized" : (maximized ? L"maximized" : L"normal");
         next.showInTaskbar = next.ownerHwnd == nullptr || (next.windowExStyle & WS_EX_APPWINDOW) != 0;
         next.rtl = (next.windowExStyle & WS_EX_LAYOUTRTL) != 0;
+        if (!CaptureTopLevelMenu(root, next.menu, rejectionReason)) return false;
 
         Enumeration enumeration;
         EnumChildWindows(root, CollectChild, reinterpret_cast<LPARAM>(&enumeration));
@@ -353,6 +527,7 @@ bool CaptureWindow(
         int zIndex = 0;
         for (const HWND child : enumeration.handles) {
             if (!IsWindowVisible(child)) continue;
+            if (IsComboBoxImplementationChild(child)) continue;
             DWORD childProcess = 0;
             const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
             if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
@@ -361,7 +536,10 @@ bool CaptureWindow(
             }
 
             ControlNode node;
-            if (!ClassifyControl(child, node.kind, rejectionReason)) return false;
+            if (!ClassifyControl(child, node.kind, rejectionReason)) {
+                AppendWindowEvidence(child, rejectionReason);
+                return false;
+            }
             uint64_t lifecycleGeneration = reinterpret_cast<uintptr_t>(
                 GetPropW(child, kNodeGenerationProperty));
             if (lifecycleGeneration == 0) {
@@ -435,9 +613,21 @@ bool CaptureWindow(
                 node.selectionLength = static_cast<int>(end >= start ? end - start : 0);
             } else if (node.kind == ControlKind::ComboBox || node.kind == ControlKind::ListBox) {
                 const bool combo = node.kind == ControlKind::ComboBox;
+                node.editable = combo && (controlStyle & 0x0003u) == CBS_DROPDOWN;
                 if (!ReadStringItems(child, combo, node.items, rejectionReason)) return false;
                 node.selectedIndex = static_cast<int>(SendMessageW(
                     child, combo ? CB_GETCURSEL : LB_GETCURSEL, 0, 0));
+            } else if (node.kind == ControlKind::ProgressBar) {
+                PBRANGE range{};
+                SendMessageW(child, PBM_GETRANGE, FALSE, reinterpret_cast<LPARAM>(&range));
+                node.minimum = range.iLow;
+                node.maximum = range.iHigh;
+                node.position = static_cast<int>(SendMessageW(child, PBM_GETPOS, 0, 0));
+                if (node.maximum <= node.minimum || node.position < node.minimum ||
+                    node.position > node.maximum) {
+                    rejectionReason = L"ProgressBar has an invalid native range or position";
+                    return false;
+                }
             }
 
             visibleNodeIds.emplace(child, node.nodeId);
@@ -468,6 +658,22 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
     HashString(hash, snapshot.state);
     HashBytes(hash, snapshot.showInTaskbar);
     HashBytes(hash, snapshot.rtl);
+    const auto hashMenu = [&](const auto& self,
+                              const std::vector<MenuItemSnapshot>& items) -> void {
+        HashBytes(hash, items.size());
+        for (const auto& item : items) {
+            HashString(hash, item.itemId);
+            HashBytes(hash, item.kind);
+            HashString(hash, item.text);
+            HashBytes(hash, item.commandId);
+            HashBytes(hash, item.enabled);
+            HashBytes(hash, item.checked);
+            HashBytes(hash, item.radio);
+            HashBytes(hash, item.isDefault);
+            self(self, item.items);
+        }
+    };
+    hashMenu(hashMenu, snapshot.menu);
     HashBytes(hash, snapshot.nodes.size());
     for (const auto& node : snapshot.nodes) {
         HashBytes(hash, node.nodeId);
@@ -495,8 +701,12 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.selectionLength);
         HashBytes(hash, node.readOnly);
         HashBytes(hash, node.multiline);
+        HashBytes(hash, node.editable);
         HashBytes(hash, node.isDefault);
         HashBytes(hash, node.groupStart);
+        HashBytes(hash, node.minimum);
+        HashBytes(hash, node.maximum);
+        HashBytes(hash, node.position);
         HashBytes(hash, node.items.size());
         for (const auto& item : node.items) HashString(hash, item);
     }

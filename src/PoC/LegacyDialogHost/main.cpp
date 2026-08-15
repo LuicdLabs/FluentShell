@@ -25,12 +25,16 @@ enum ControlId : int {
     IdResult = 1106,
     IdCloseVeto = 1107,
     IdCreateUnsupported = 1108,
+    IdProgress = 1109,
+    IdMenuResetProgress = 1201,
+    IdMenuExit = 1202,
 };
 
 HWND gMain = nullptr;
 HWND gOracle = nullptr;
 HWND gResult = nullptr;
 HWND gUnsupported = nullptr;
+HWND gProgress = nullptr;
 unsigned long long gOracleTick = 0;
 
 void AppendLog(const std::wstring& message) {
@@ -190,10 +194,16 @@ void CreateDemoControls(HWND window) {
     AddControl(0, L"BUTTON", L"Create &unsupported child", BS_PUSHBUTTON | WS_TABSTOP,
         430, 154, 220, 34, window, IdCreateUnsupported);
 
+    AddControl(0, L"BUTTON", L"Live native status", BS_GROUPBOX,
+        10, 264, 680, 92, window, 0);
     gOracle = AddControl(0, L"STATIC", L"Native oracle tick: 0", SS_LEFT,
-        20, 276, 360, 24, window, IdOracle);
+        24, 286, 300, 24, window, IdOracle);
+    gProgress = AddControl(0, PROGRESS_CLASSW, L"", PBS_SMOOTH,
+        350, 282, 320, 24, window, IdProgress);
+    SendMessageW(gProgress, PBM_SETRANGE32, 0, 100);
+    SendMessageW(gProgress, PBM_SETPOS, 0, 0);
     gResult = AddControl(WS_EX_CLIENTEDGE, L"STATIC", L"Dialog result: not run",
-        SS_LEFT | SS_CENTERIMAGE, 20, 310, 650, 32, window, IdResult);
+        SS_LEFT | SS_CENTERIMAGE, 24, 316, 646, 28, window, IdResult);
     AddControl(0, L"STATIC",
         L"The timer text is updated by the native app every second. Creating the custom child "
         L"must trigger whole-window fallback, never a hybrid surface.",
@@ -212,6 +222,8 @@ LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam
             wchar_t text[128]{};
             swprintf_s(text, L"Native oracle tick: %llu", ++gOracleTick);
             SetWindowTextW(gOracle, text);
+            SendMessageW(gProgress, PBM_SETPOS,
+                static_cast<WPARAM>((gOracleTick * 10) % 101), 0);
             if ((gOracleTick % 10) == 0) AppendLog(text);
         }
         return 0;
@@ -236,6 +248,16 @@ LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam
                 AppendLog(L"dynamic unsupported child created");
                 SetWindowTextW(gResult, L"Unsupported child created: expect native fallback");
             }
+            break;
+        case IdMenuResetProgress:
+            gOracleTick = 0;
+            SetWindowTextW(gOracle, L"Native oracle tick: 0");
+            SendMessageW(gProgress, PBM_SETPOS, 0, 0);
+            SetWindowTextW(gResult, L"Menu command: progress reset");
+            AppendLog(L"menu command reset progress");
+            break;
+        case IdMenuExit:
+            PostMessageW(window, WM_CLOSE, 0, 0);
             break;
         }
         return 0;
@@ -278,9 +300,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     hostClass.lpszClassName = kHostClass;
     RegisterClassExW(&hostClass);
 
+    HMENU menuBar = CreateMenu();
+    HMENU fileMenu = CreatePopupMenu();
+    HMENU toolsMenu = CreatePopupMenu();
+    AppendMenuW(fileMenu, MF_STRING, IdMessageBox, L"&MessageBox\tCtrl+M");
+    AppendMenuW(fileMenu, MF_STRING, IdTaskDialog, L"&TaskDialog\tCtrl+T");
+    AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(toolsMenu, MF_STRING, IdMenuResetProgress, L"&Reset progress");
+    AppendMenuW(fileMenu, MF_POPUP,
+        reinterpret_cast<UINT_PTR>(toolsMenu), L"&Tools");
+    AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(fileMenu, MF_STRING, IdMenuExit, L"E&xit");
+    AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"&File");
+
     gMain = CreateWindowExW(0, hostClass.lpszClassName, L"AnyFluent Win32 Translation Oracle",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 720, 500,
-        nullptr, nullptr, instance, nullptr);
+        nullptr, menuBar, instance, nullptr);
     ShowWindow(gMain, show);
     UpdateWindow(gMain);
 

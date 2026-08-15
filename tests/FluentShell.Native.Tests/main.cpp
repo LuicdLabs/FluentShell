@@ -1,5 +1,6 @@
 #include "../../src/Bridge/Ipc/FrameCodec.h"
 #include "../../src/Bridge/Translation/WindowSnapshot.h"
+#include "../../src/Bridge/Translation/WindowCapture.h"
 
 #include <winrt/base.h>
 #include <objbase.h>
@@ -367,6 +368,10 @@ void TestActionSemanticValidation() {
     combo.kind = Translation::ControlKind::ComboBox;
     combo.items = { L"one", L"two" };
     snapshot.nodes.push_back(combo);
+    Translation::ControlNode editableCombo = combo;
+    editableCombo.nodeId = 7;
+    editableCombo.editable = true;
+    snapshot.nodes.push_back(editableCombo);
 
     std::wstring error;
     Translation::ActionRequest action;
@@ -401,6 +406,13 @@ void TestActionSemanticValidation() {
     action.integerValue = -1;
     Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
         "selection clear was rejected");
+    action.action = L"setText";
+    action.text = L"typed";
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "non-editable ComboBox accepted setText");
+    action.nodeId = 7;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "editable ComboBox rejected setText");
 }
 
 void TestActionRevisionPolicy() {
@@ -412,12 +424,195 @@ void TestActionRevisionPolicy() {
           !Translation::IsRequestSemanticAction(L"setText") &&
           !Translation::IsRequestSemanticAction(L"setCheck") &&
           !Translation::IsRequestSemanticAction(L"select") &&
+          !Translation::IsRequestSemanticAction(L"menuCommand") &&
           !Translation::IsRequestSemanticAction(L"move") &&
           !Translation::IsRequestSemanticAction(L"resize") &&
           !Translation::IsRequestSemanticAction(L"minimize") &&
           !Translation::IsRequestSemanticAction(L"maximize") &&
           !Translation::IsRequestSemanticAction(L"restore"),
         "property actions must retain stale-revision rejection");
+}
+
+void TestExpandedControlSerialization() {
+    Translation::WindowSnapshot snapshot;
+    snapshot.surfaceId = L"11111111-2222-3333-4444-555555555555";
+    Translation::ControlNode group;
+    group.nodeId = 1;
+    group.generation = 1;
+    group.kind = Translation::ControlKind::GroupBox;
+    group.text = L"Status";
+    snapshot.nodes.push_back(group);
+    Translation::ControlNode progress;
+    progress.nodeId = 2;
+    progress.generation = 1;
+    progress.kind = Translation::ControlKind::ProgressBar;
+    progress.minimum = -10;
+    progress.maximum = 30;
+    progress.position = 12;
+    snapshot.nodes.push_back(progress);
+    Translation::ControlNode combo;
+    combo.nodeId = 3;
+    combo.generation = 1;
+    combo.kind = Translation::ControlKind::ComboBox;
+    combo.editable = true;
+    combo.text = L"custom";
+    combo.selectedIndex = 1;
+    combo.items = { L"one", L"two" };
+    snapshot.nodes.push_back(combo);
+
+    const auto json = Translation::SerializeWindowOpen(
+        L"00112233445566778899aabbccddeeff", snapshot);
+    Check(json.find("\"kind\":\"groupBox\"") != std::string::npos,
+        "GroupBox kind was not serialized");
+    Check(json.find("\"kind\":\"progressBar\"") != std::string::npos &&
+          json.find("\"minimum\":-10") != std::string::npos &&
+          json.find("\"maximum\":30") != std::string::npos &&
+          json.find("\"position\":12") != std::string::npos,
+        "ProgressBar state was not serialized");
+    Check(json.find("\"editable\":true") != std::string::npos &&
+          json.find("\"text\":\"custom\"") != std::string::npos &&
+          json.find("\"selectedIndex\":1") != std::string::npos,
+        "editable ComboBox state was not serialized");
+
+    const auto editableFingerprint = Translation::SnapshotFingerprint(snapshot);
+    snapshot.nodes.back().editable = false;
+    Check(editableFingerprint != Translation::SnapshotFingerprint(snapshot),
+        "editable state was omitted from the snapshot fingerprint");
+}
+
+bool CaptureSingleCombo(DWORD comboStyle, Translation::WindowSnapshot& snapshot) {
+    HWND window = CreateWindowExW(0, L"Static", L"combo-capture", WS_OVERLAPPEDWINDOW,
+        0, 0, 320, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!window) return false;
+    HWND combo = CreateWindowExW(0, L"ComboBox", L"", WS_CHILD | WS_VISIBLE | comboStyle,
+        10, 10, 200, 120, window, reinterpret_cast<HMENU>(100), GetModuleHandleW(nullptr), nullptr);
+    if (combo) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"one"));
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"two"));
+        SendMessageW(combo, CB_SETCURSEL, 1, 0);
+        if ((comboStyle & 0x0003u) == CBS_DROPDOWN) SetWindowTextW(combo, L"custom");
+    }
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    Translation::CaptureContext context;
+    context.surfaceId = L"11111111-2222-3333-4444-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    std::wstring error;
+    const bool captured = combo && Translation::CaptureWindow(window, context, snapshot, error);
+    DestroyWindow(window);
+    return captured;
+}
+
+void TestEditableComboCaptureBoundary() {
+    Translation::WindowSnapshot snapshot;
+    Check(CaptureSingleCombo(CBS_DROPDOWNLIST, snapshot) &&
+          snapshot.nodes.size() == 1 && !snapshot.nodes[0].editable,
+        "standard CBS_DROPDOWNLIST was rejected");
+    Check(CaptureSingleCombo(CBS_DROPDOWN | CBS_HASSTRINGS, snapshot) &&
+          snapshot.nodes.size() == 1 && snapshot.nodes[0].editable &&
+          snapshot.nodes[0].text == L"custom" && snapshot.nodes[0].selectedIndex == 1 &&
+          snapshot.nodes[0].items.size() == 2,
+        "string-backed editable ComboBox state was not captured canonically");
+    Check(!CaptureSingleCombo(CBS_SIMPLE | CBS_HASSTRINGS, snapshot),
+        "CBS_SIMPLE was accepted");
+    Check(CaptureSingleCombo(CBS_DROPDOWN, snapshot) &&
+          snapshot.nodes.size() == 1 && snapshot.nodes[0].editable,
+        "Win32-normalized string-backed CBS_DROPDOWN was rejected");
+    Check(!CaptureSingleCombo(CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, snapshot),
+        "owner-draw ComboBox was accepted");
+}
+
+void TestStandardMenuCapture() {
+    HWND window = CreateWindowExW(0, L"Static", L"menu-test", WS_OVERLAPPED,
+        0, 0, 300, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Check(window != nullptr, "menu test window creation failed");
+    if (!window) return;
+    HMENU bar = CreateMenu();
+    HMENU file = CreatePopupMenu();
+    AppendMenuW(file, MF_STRING | MF_CHECKED, 100, L"&Open\tCtrl+O");
+    AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(file, MF_STRING | MF_DISABLED, 101, L"E&xit");
+    AppendMenuW(bar, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"&File");
+    SetMenu(window, bar);
+
+    std::vector<Translation::MenuItemSnapshot> menu;
+    std::wstring error;
+    Check(Translation::CaptureTopLevelMenu(window, menu, error),
+        "standard textual menu was rejected");
+    Check(menu.size() == 1 && menu[0].itemId == L"0" && menu[0].text == L"&File" &&
+        menu[0].items.size() == 3 && menu[0].items[0].commandId == 100 &&
+        menu[0].items[0].checked && !menu[0].items[2].enabled,
+        "captured menu lost labels, identities, or state");
+
+    AppendMenuW(file, MF_STRING, 100, L"Duplicate");
+    Check(!Translation::CaptureTopLevelMenu(window, menu, error),
+        "duplicate executable command ID was accepted");
+    RemoveMenu(file, 3, MF_BYPOSITION);
+    AppendMenuW(file, MF_OWNERDRAW, 102, reinterpret_cast<LPCWSTR>(1));
+    Check(!Translation::CaptureTopLevelMenu(window, menu, error),
+        "owner-draw menu item was accepted");
+    RemoveMenu(file, 3, MF_BYPOSITION);
+    MENUINFO callbackInfo{sizeof(callbackInfo)};
+    callbackInfo.fMask = MIM_STYLE;
+    callbackInfo.dwStyle = MNS_NOTIFYBYPOS;
+    SetMenuInfo(file, &callbackInfo);
+    Check(!Translation::CaptureTopLevelMenu(window, menu, error),
+        "position-callback menu was accepted");
+    callbackInfo.dwStyle = 0;
+    SetMenuInfo(file, &callbackInfo);
+    for (UINT id = 1000; id < 1257; ++id) AppendMenuW(file, MF_STRING, id, L"Item");
+    Check(!Translation::CaptureTopLevelMenu(window, menu, error),
+        "excessive menu item tree was accepted");
+
+    SetMenu(window, nullptr);
+    DestroyMenu(bar);
+
+    HMENU deepBar = CreateMenu();
+    HMENU current = CreatePopupMenu();
+    AppendMenuW(deepBar, MF_POPUP, reinterpret_cast<UINT_PTR>(current), L"Root");
+    for (int depth = 0; depth < 8; ++depth) {
+        HMENU next = CreatePopupMenu();
+        AppendMenuW(current, MF_POPUP, reinterpret_cast<UINT_PTR>(next), L"Nested");
+        current = next;
+    }
+    AppendMenuW(current, MF_STRING, 200, L"Command");
+    SetMenu(window, deepBar);
+    Check(!Translation::CaptureTopLevelMenu(window, menu, error),
+        "deep menu tree was accepted");
+    SetMenu(window, nullptr);
+    DestroyMenu(deepBar);
+    DestroyWindow(window);
+}
+
+void TestMenuActionValidationAndSerialization() {
+    Translation::WindowSnapshot snapshot;
+    Translation::MenuItemSnapshot root;
+    root.itemId = L"0";
+    root.kind = Translation::MenuItemKind::Popup;
+    root.text = L"&File";
+    Translation::MenuItemSnapshot command;
+    command.itemId = L"0.0";
+    command.kind = Translation::MenuItemKind::Command;
+    command.text = L"&Open";
+    command.commandId = 77;
+    root.items.push_back(command);
+    snapshot.menu.push_back(root);
+    Translation::ActionRequest action;
+    action.action = L"menuCommand";
+    action.menuCommandId = 77;
+    std::wstring error;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "known enabled menu command was rejected");
+    action.menuCommandId = 78;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "unknown menu command was accepted");
+    snapshot.surfaceId = L"11111111-2222-3333-4444-555555555555";
+    const auto json = Translation::SerializeWindowOpen(
+        L"00112233445566778899aabbccddeeff", snapshot);
+    Check(json.find("\"menu\":[") != std::string::npos &&
+        json.find("\"commandId\":77") != std::string::npos &&
+        json.find("\"itemId\":\"0.0\"") != std::string::npos,
+        "typed menu snapshot was not serialized");
 }
 
 } // namespace
@@ -433,6 +628,10 @@ int wmain() {
     TestStrictMessageValidation();
     TestActionSemanticValidation();
     TestActionRevisionPolicy();
+    TestExpandedControlSerialization();
+    TestEditableComboCaptureBoundary();
+    TestStandardMenuCapture();
+    TestMenuActionValidationAndSerialization();
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";
         return 1;

@@ -126,4 +126,133 @@ public sealed class ProtocolSerializerTests
         Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
             FrameMessageType.WindowOpen, payload));
     }
+
+    [Fact]
+    public void AcceptsSemanticGroupAndProgressNodes()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot = snapshot with { Nodes =
+        [
+            snapshot.Nodes[0] with
+            {
+                Kind = "groupBox",
+                TabIndex = -1,
+                TabStop = false,
+                Text = "Status",
+            },
+            snapshot.Nodes[0] with
+            {
+                NodeId = "11",
+                NativeHwnd = "0x5679",
+                Kind = "progressBar",
+                ZIndex = 1,
+                TabIndex = -1,
+                TabStop = false,
+                Text = string.Empty,
+                Minimum = -10,
+                Maximum = 30,
+                Position = 12,
+            },
+        ] };
+
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = snapshot,
+        });
+        var message = Assert.IsType<WindowOpenMessage>(
+            ProtocolSerializer.Deserialize(FrameMessageType.WindowOpen, payload));
+
+        Assert.Equal("groupBox", message.Window.Nodes[0].Kind);
+        Assert.Equal(12, message.Window.Nodes[1].Position);
+    }
+
+    [Theory]
+    [InlineData(null, 100, 50)]
+    [InlineData(0, 0, 0)]
+    [InlineData(0, 100, 101)]
+    public void RejectsInvalidProgressState(int? minimum, int? maximum, int? position)
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "progressBar",
+            TabIndex = -1,
+            TabStop = false,
+            Minimum = minimum,
+            Maximum = maximum,
+            Position = position,
+        };
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = snapshot,
+        });
+
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen, payload));
+    }
+
+    [Fact]
+    public void PreservesEditableComboBoxState()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "comboBox",
+            Editable = true,
+            Text = "custom",
+            SelectedIndex = 1,
+            Items = ["one", "two"],
+        };
+
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = snapshot,
+        });
+        var message = Assert.IsType<WindowOpenMessage>(
+            ProtocolSerializer.Deserialize(FrameMessageType.WindowOpen, payload));
+
+        Assert.True(message.Window.Nodes[0].Editable);
+        Assert.Equal("custom", message.Window.Nodes[0].Text);
+        Assert.Equal(1, message.Window.Nodes[0].SelectedIndex);
+        Assert.Equal(["one", "two"], message.Window.Nodes[0].Items);
+    }
+
+    [Fact]
+    public void RejectsMissingEditableState()
+    {
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = TestData.Snapshot(),
+        });
+        var json = JsonNode.Parse(payload)!.AsObject();
+        json["window"]!["nodes"]![0]!.AsObject().Remove("editable");
+
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen, Encoding.UTF8.GetBytes(json.ToJsonString())));
+    }
+
+    [Fact]
+    public void RejectsEditableNonComboBoxAndInvalidComboSelection()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with { Editable = true };
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage { SessionNonce = TestData.Nonce, Window = snapshot })));
+
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "comboBox",
+            Editable = true,
+            SelectedIndex = 1,
+            Items = ["only"],
+        };
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage { SessionNonce = TestData.Nonce, Window = snapshot })));
+    }
 }

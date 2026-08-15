@@ -42,7 +42,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>bcrypt.lib;ole32.lib;runtimeobject.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>bcrypt.lib;ole32.lib;runtimeobject.lib;comctl32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -56,6 +56,7 @@
     <ClCompile Include="..\..\src\Bridge\Ipc\FrameCodec.cpp" />
     <ClCompile Include="..\..\src\Bridge\Ipc\Protocol.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\WindowSnapshot.cpp" />
+    <ClCompile Include="..\..\src\Bridge\Translation\WindowCapture.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Import Project="$(MSBuildThisFileDirectory)..\..\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets" Condition="Exists('$(MSBuildThisFileDirectory)..\..\packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets')" />

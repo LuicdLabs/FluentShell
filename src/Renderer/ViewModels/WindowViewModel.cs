@@ -39,6 +39,7 @@ public sealed class WindowViewModel : ObservableObject
     public bool Enabled { get => _enabled; private set => SetProperty(ref _enabled, value); }
     public string State { get => _state; private set => SetProperty(ref _state, value); }
     public ObservableCollection<ControlNodeViewModel> Nodes { get; } = [];
+    public ObservableCollection<MenuItemViewModel> Menu { get; } = [];
 
     public static WindowViewModel FromSnapshot(WindowSnapshot snapshot)
     {
@@ -50,6 +51,8 @@ public sealed class WindowViewModel : ObservableObject
     public bool CanMergeSnapshot(WindowSnapshot snapshot)
     {
         if (snapshot.Dpi != Dpi) return false;
+        if (snapshot.Menu.Count != Menu.Count ||
+            !Menu.Zip(snapshot.Menu).All(pair => pair.First.HasSameShape(pair.Second))) return false;
         if (snapshot.Nodes.Count != Nodes.Count) return false;
         var ordered = snapshot.Nodes.OrderBy(node => node.ZIndex).ToArray();
         for (var index = 0; index < ordered.Length; index++)
@@ -63,6 +66,7 @@ public sealed class WindowViewModel : ObservableObject
                 incoming.TabStop != current.TabStop ||
                 (incoming.ReadOnly ?? false) != current.ReadOnly ||
                 (incoming.Multiline ?? false) != current.Multiline ||
+                incoming.Editable != current.Editable ||
                 (incoming.IsDefault ?? false) != current.IsDefault ||
                 (incoming.GroupStart ?? false) != current.GroupStart)
             {
@@ -99,6 +103,16 @@ public sealed class WindowViewModel : ObservableObject
         ShowInTaskbar = snapshot.ShowInTaskbar;
         Rtl = snapshot.Rtl;
         var ordered = snapshot.Nodes.OrderBy(node => node.ZIndex).ToArray();
+        if (merge)
+        {
+            for (var index = 0; index < Menu.Count; index++)
+                Menu[index].ApplySnapshot(snapshot.Menu[index], true);
+        }
+        else
+        {
+            Menu.Clear();
+            foreach (var item in snapshot.Menu) Menu.Add(MenuItemViewModel.FromSnapshot(item));
+        }
         if (merge)
         {
             for (var index = 0; index < ordered.Length; index++)

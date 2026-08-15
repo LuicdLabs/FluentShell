@@ -26,6 +26,8 @@ enum class ControlKind {
     Password,
     ComboBox,
     ListBox,
+    GroupBox,
+    ProgressBar,
 };
 
 struct ControlNode final {
@@ -54,9 +56,31 @@ struct ControlNode final {
     int selectionLength = 0;
     bool readOnly = false;
     bool multiline = false;
+    bool editable = false;
     bool isDefault = false;
     bool groupStart = false;
+    int minimum = 0;
+    int maximum = 100;
+    int position = 0;
     std::vector<std::wstring> items;
+};
+
+enum class MenuItemKind {
+    Popup,
+    Command,
+    Separator,
+};
+
+struct MenuItemSnapshot final {
+    std::wstring itemId;
+    MenuItemKind kind = MenuItemKind::Command;
+    std::wstring text;
+    uint32_t commandId = 0;
+    bool enabled = true;
+    bool checked = false;
+    bool radio = false;
+    bool isDefault = false;
+    std::vector<MenuItemSnapshot> items;
 };
 
 struct WindowSnapshot final {
@@ -80,6 +104,7 @@ struct WindowSnapshot final {
     std::wstring state = L"normal";
     bool showInTaskbar = true;
     bool rtl = false;
+    std::vector<MenuItemSnapshot> menu;
     std::vector<ControlNode> nodes;
 };
 
@@ -93,6 +118,7 @@ struct ActionRequest final {
     int integerValue = 0;
     int selectionStart = 0;
     int selectionLength = 0;
+    uint32_t menuCommandId = 0;
     RECT rect{};
     bool hasRect = false;
 };
@@ -178,5 +204,6 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept;
 
 const wchar_t* ControlKindName(ControlKind kind) noexcept;
 const wchar_t* SurfaceKindName(SurfaceKind kind) noexcept;
+const wchar_t* MenuItemKindName(MenuItemKind kind) noexcept;
 
 } // namespace FluentShell::Bridge::Translation

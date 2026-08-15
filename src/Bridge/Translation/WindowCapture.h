@@ -27,6 +27,11 @@ bool CaptureWindow(
     WindowSnapshot& snapshot,
     std::wstring& rejectionReason) noexcept;
 
+bool CaptureTopLevelMenu(
+    HWND root,
+    std::vector<MenuItemSnapshot>& menu,
+    std::wstring& rejectionReason) noexcept;
+
 uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept;
 
 } // namespace FluentShell::Bridge::Translation

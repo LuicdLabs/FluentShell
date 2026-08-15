@@ -1,6 +1,7 @@
 using FluentShell.Renderer.ViewModels;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Data;
 using Microsoft.UI.Xaml.Media;
@@ -46,6 +47,8 @@ internal sealed class ControlFactory
             "password" => CreatePasswordBox(viewModel),
             "comboBox" => CreateComboBox(viewModel),
             "listBox" => CreateListBox(viewModel),
+            "groupBox" => CreateGroupBox(viewModel),
+            "progressBar" => CreateProgressBar(viewModel),
             _ => throw new InvalidOperationException($"Unsupported translated control kind '{viewModel.Kind}'."),
         };
 
@@ -80,6 +83,60 @@ internal sealed class ControlFactory
     {
         var control = new TextBlock { TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
         Bind(control, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay);
+        return control;
+    }
+
+    private static ContentControl CreateGroupBox(ControlNodeViewModel viewModel)
+    {
+        var border = new Border
+        {
+            Margin = new Thickness(0, 8, 0, 0),
+            BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Gray),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(4),
+        };
+        var caption = new TextBlock
+        {
+            Margin = new Thickness(10, 0, 0, 0),
+            Padding = new Thickness(4, 0, 4, 0),
+            VerticalAlignment = VerticalAlignment.Top,
+        };
+        Bind(caption, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+        var layout = new Grid();
+        layout.Children.Add(border);
+        layout.Children.Add(caption);
+        return new SemanticGroupControl
+        {
+            Content = layout,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+            IsHitTestVisible = false,
+        };
+    }
+
+    private static ProgressBar CreateProgressBar(ControlNodeViewModel viewModel)
+    {
+        var control = new ProgressBar { IsIndeterminate = false };
+        void ApplyNativeState()
+        {
+            if (viewModel.Minimum > control.Maximum)
+            {
+                control.Maximum = viewModel.Maximum;
+                control.Minimum = viewModel.Minimum;
+            }
+            else
+            {
+                control.Minimum = viewModel.Minimum;
+                control.Maximum = viewModel.Maximum;
+            }
+            control.Value = viewModel.Position;
+        }
+        ApplyNativeState();
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Minimum) or nameof(viewModel.Maximum) or nameof(viewModel.Position))
+                ApplyNativeState();
+        };
         return control;
     }
 
@@ -202,14 +259,56 @@ internal sealed class ControlFactory
 
     private ComboBox CreateComboBox(ControlNodeViewModel viewModel)
     {
-        var control = new ComboBox { ItemsSource = viewModel.Items, SelectedIndex = viewModel.SelectedIndex };
+        var control = new ComboBox
+        {
+            ItemsSource = viewModel.Items,
+            SelectedIndex = viewModel.SelectedIndex,
+            IsEditable = viewModel.Editable,
+            Text = viewModel.DraftText,
+        };
+        Bind(control, ComboBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
+        var retryTimer = control.DispatcherQueue.CreateTimer();
+        retryTimer.Interval = TimeSpan.FromMilliseconds(100);
+        retryTimer.IsRepeating = false;
+        string? pendingText = null;
+        void CommitDraft()
+        {
+            retryTimer.Stop();
+            if (!viewModel.Editable || _isApplyingCanonical() ||
+                control.Text == viewModel.Text || control.Text == pendingText) return;
+            if (_isImeComposing())
+            {
+                retryTimer.Start();
+                return;
+            }
+            viewModel.DraftText = control.Text;
+            pendingText = control.Text;
+            _action(viewModel, "setText", control.Text);
+        }
+        retryTimer.Tick += (_, _) => CommitDraft();
+        control.TextSubmitted += (_, _) => CommitDraft();
+        control.LostFocus += (_, _) => CommitDraft();
         control.SelectionChanged += (_, _) =>
         {
-            if (!_isApplyingCanonical() && control.SelectedIndex != viewModel.SelectedIndex) _action(viewModel, "select", control.SelectedIndex);
+            if (!_isApplyingCanonical() && control.SelectedIndex != viewModel.SelectedIndex)
+            {
+                retryTimer.Stop();
+                if (viewModel.Editable && control.SelectedIndex == -1 &&
+                    control.Text != viewModel.Text)
+                {
+                    retryTimer.Start();
+                    return;
+                }
+                _action(viewModel, "select", control.SelectedIndex);
+            }
         };
         viewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.SelectedIndex = viewModel.SelectedIndex;
+            if (args.PropertyName == nameof(viewModel.Editable)) control.IsEditable = viewModel.Editable;
+            if (args.PropertyName == nameof(viewModel.DraftText) && control.Text != viewModel.DraftText)
+                control.Text = viewModel.DraftText;
+            if (args.PropertyName == nameof(viewModel.Text)) pendingText = null;
         };
         return control;
     }
@@ -285,4 +384,15 @@ internal sealed class ControlFactory
 
     private static void Bind(FrameworkElement target, DependencyProperty property, string path, BindingMode mode, IValueConverter? converter = null) =>
         target.SetBinding(property, new Binding { Path = new PropertyPath(path), Mode = mode, Converter = converter });
+}
+
+internal sealed class SemanticGroupControl : ContentControl
+{
+    protected override AutomationPeer OnCreateAutomationPeer() => new SemanticGroupAutomationPeer(this);
+}
+
+internal sealed class SemanticGroupAutomationPeer(SemanticGroupControl owner) : FrameworkElementAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.Group;
+    protected override string GetClassNameCore() => "GroupBox";
 }

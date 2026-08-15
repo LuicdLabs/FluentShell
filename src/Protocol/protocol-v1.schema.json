@@ -80,13 +80,27 @@
     },
     "controlNode": {
       "type": "object",
-      "required": ["nodeId", "generation", "nativeHwnd", "kind", "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "items"],
+      "required": ["nodeId", "generation", "nativeHwnd", "kind", "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "editable", "items"],
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "progressBar" } }, "required": ["kind"] },
+          "then": { "required": ["minimum", "maximum", "position"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "comboBox" } }, "required": ["kind"] },
+          "then": { "required": ["selectedIndex"] }
+        },
+        {
+          "if": { "properties": { "editable": { "const": true } }, "required": ["editable"] },
+          "then": { "properties": { "kind": { "const": "comboBox" } }, "required": ["kind"] }
+        }
+      ],
       "properties": {
         "nodeId": { "$ref": "#/$defs/u64String" },
         "generation": { "$ref": "#/$defs/u64String" },
         "nativeHwnd": { "$ref": "#/$defs/hwndString" },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox"] },
+        "kind": { "enum": ["static", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar"] },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -105,8 +119,12 @@
         "selectionLength": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "readOnly": { "type": "boolean" },
         "multiline": { "type": "boolean" },
+        "editable": { "type": "boolean" },
         "isDefault": { "type": "boolean" },
         "groupStart": { "type": "boolean" },
+        "minimum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "maximum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "position": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "items": {
           "type": "array",
           "maxItems": 4096,
@@ -138,11 +156,31 @@
         "state": { "enum": ["normal", "minimized", "maximized"] },
         "showInTaskbar": { "type": "boolean" },
         "rtl": { "type": "boolean" },
+        "menu": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/menuItem" }
+        },
         "nodes": {
           "type": "array",
           "maxItems": 512,
           "items": { "$ref": "#/$defs/controlNode" }
         }
+      }
+    },
+    "menuItem": {
+      "type": "object",
+      "required": ["itemId", "kind", "text", "commandId", "enabled", "checked", "radio", "isDefault", "items"],
+      "properties": {
+        "itemId": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[0-9]+(\\.[0-9]+)*$" },
+        "kind": { "enum": ["popup", "command", "separator"] },
+        "text": { "$ref": "#/$defs/text" },
+        "commandId": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "enabled": { "type": "boolean" },
+        "checked": { "type": "boolean" },
+        "radio": { "type": "boolean" },
+        "isDefault": { "type": "boolean" },
+        "items": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/menuItem" } }
       }
     },
     "windowOpen": {
@@ -189,7 +227,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "menuCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

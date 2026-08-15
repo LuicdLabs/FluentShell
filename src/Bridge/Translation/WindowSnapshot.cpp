@@ -123,12 +123,32 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"selectionLength", JsonValue::CreateNumberValue(node.selectionLength));
     result.Insert(L"readOnly", JsonValue::CreateBooleanValue(node.readOnly));
     result.Insert(L"multiline", JsonValue::CreateBooleanValue(node.multiline));
+    result.Insert(L"editable", JsonValue::CreateBooleanValue(node.editable));
     result.Insert(L"isDefault", JsonValue::CreateBooleanValue(node.isDefault));
     result.Insert(L"groupStart", JsonValue::CreateBooleanValue(node.groupStart));
+    result.Insert(L"minimum", JsonValue::CreateNumberValue(node.minimum));
+    result.Insert(L"maximum", JsonValue::CreateNumberValue(node.maximum));
+    result.Insert(L"position", JsonValue::CreateNumberValue(node.position));
     JsonArray items;
     for (const auto& item : node.items) {
         items.Append(JsonValue::CreateStringValue(item));
     }
+    result.Insert(L"items", items);
+    return result;
+}
+
+JsonObject MenuItemToJson(const MenuItemSnapshot& item) {
+    JsonObject result;
+    result.Insert(L"itemId", JsonValue::CreateStringValue(item.itemId));
+    result.Insert(L"kind", JsonValue::CreateStringValue(MenuItemKindName(item.kind)));
+    result.Insert(L"text", JsonValue::CreateStringValue(item.text));
+    result.Insert(L"commandId", JsonValue::CreateNumberValue(item.commandId));
+    result.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
+    result.Insert(L"checked", JsonValue::CreateBooleanValue(item.checked));
+    result.Insert(L"radio", JsonValue::CreateBooleanValue(item.radio));
+    result.Insert(L"isDefault", JsonValue::CreateBooleanValue(item.isDefault));
+    JsonArray items;
+    for (const auto& child : item.items) items.Append(MenuItemToJson(child));
     result.Insert(L"items", items);
     return result;
 }
@@ -159,6 +179,9 @@ JsonObject SnapshotToJson(const WindowSnapshot& snapshot) {
     result.Insert(L"state", JsonValue::CreateStringValue(snapshot.state));
     result.Insert(L"showInTaskbar", JsonValue::CreateBooleanValue(snapshot.showInTaskbar));
     result.Insert(L"rtl", JsonValue::CreateBooleanValue(snapshot.rtl));
+    JsonArray menu;
+    for (const auto& item : snapshot.menu) menu.Append(MenuItemToJson(item));
+    result.Insert(L"menu", menu);
     JsonArray nodes;
     for (const auto& node : snapshot.nodes) nodes.Append(NodeToJson(node));
     result.Insert(L"nodes", nodes);
@@ -260,9 +283,10 @@ bool ParseActionValue(
         action.text = value.GetString();
         return true;
     }
-    if (action.action == L"setCheck" || action.action == L"select") {
+    if (action.action == L"setCheck" || action.action == L"select" ||
+        action.action == L"menuCommand") {
         if (value.ValueType() != JsonValueType::Number) {
-            error = L"setCheck/select requires an integer value";
+            error = L"setCheck/select/menuCommand requires an integer value";
             return false;
         }
         const double number = value.GetNumber();
@@ -273,6 +297,13 @@ bool ParseActionValue(
             return false;
         }
         action.integerValue = static_cast<int>(number);
+        if (action.action == L"menuCommand") {
+            if (action.integerValue <= 0 || action.integerValue > 0xffff) {
+                error = L"menuCommand ID is outside WM_COMMAND range";
+                return false;
+            }
+            action.menuCommandId = static_cast<uint32_t>(action.integerValue);
+        }
         return true;
     }
     if (action.action == L"move" || action.action == L"resize") {
@@ -309,6 +340,8 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::Password: return L"password";
     case ControlKind::ComboBox: return L"comboBox";
     case ControlKind::ListBox: return L"listBox";
+    case ControlKind::GroupBox: return L"groupBox";
+    case ControlKind::ProgressBar: return L"progressBar";
     }
     return L"static";
 }
@@ -320,6 +353,15 @@ const wchar_t* SurfaceKindName(SurfaceKind kind) noexcept {
     case SurfaceKind::TaskDialog: return L"taskDialog";
     }
     return L"window";
+}
+
+const wchar_t* MenuItemKindName(MenuItemKind kind) noexcept {
+    switch (kind) {
+    case MenuItemKind::Popup: return L"popup";
+    case MenuItemKind::Command: return L"command";
+    case MenuItemKind::Separator: return L"separator";
+    }
+    return L"command";
 }
 
 std::string SerializeHello(
@@ -538,7 +580,7 @@ bool ParseActionInvoke(
         }
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
-            L"activate", L"invoke", L"setText", L"setCheck", L"select",
+            L"activate", L"invoke", L"setText", L"setCheck", L"select", L"menuCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -650,6 +692,25 @@ bool ValidateActionForSnapshot(
     const ActionRequest& action,
     const WindowSnapshot& snapshot,
     std::wstring& error) noexcept {
+    if (action.action == L"menuCommand") {
+        if (action.nodeId || action.menuCommandId == 0) {
+            error = L"menuCommand identity is invalid";
+            return false;
+        }
+        const auto contains = [&](const auto& self,
+                                  const std::vector<MenuItemSnapshot>& items) -> bool {
+            for (const auto& item : items) {
+                if (item.kind == MenuItemKind::Command &&
+                    item.commandId == action.menuCommandId)
+                    return item.enabled;
+                if (self(self, item.items)) return true;
+            }
+            return false;
+        };
+        if (contains(contains, snapshot.menu)) return true;
+        error = L"menuCommand references an unknown or disabled command";
+        return false;
+    }
     if (!action.nodeId) return true;
     const auto found = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(), [&](const ControlNode& node) {
         return node.nodeId == *action.nodeId;
@@ -669,11 +730,12 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"setText") {
-        if ((node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
+        if ((node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
+             (node.kind == ControlKind::ComboBox && node.editable)) &&
             !node.readOnly && action.text.size() <= Ipc::kMaxStringChars) {
             return true;
         }
-        error = L"setText requires a writable edit node";
+        error = L"setText requires a writable edit or editable ComboBox node";
         return false;
     }
     if (action.action == L"setCheck") {

@@ -15,6 +15,10 @@ public sealed class ControlNodeViewModel : ObservableObject
     private int _selectedIndex = -1;
     private int _selectionStart;
     private int _selectionLength;
+    private int _minimum;
+    private int _maximum = 100;
+    private int _position;
+    private bool _editable;
     private PixelRect _rect = new();
     private readonly Dictionary<string, string> _pendingEventIds = new(StringComparer.Ordinal);
 
@@ -30,6 +34,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     public uint DialogCode { get; private set; }
     public bool ReadOnly { get; private set; }
     public bool Multiline { get; private set; }
+    public bool Editable { get => _editable; private set => SetProperty(ref _editable, value); }
     public bool IsDefault { get; private set; }
     public bool GroupStart { get; private set; }
     public string Text { get => _text; private set => SetProperty(ref _text, value); }
@@ -41,6 +46,9 @@ public sealed class ControlNodeViewModel : ObservableObject
     public int SelectedIndex { get => _selectedIndex; private set => SetProperty(ref _selectedIndex, value); }
     public int SelectionStart { get => _selectionStart; private set => SetProperty(ref _selectionStart, value); }
     public int SelectionLength { get => _selectionLength; private set => SetProperty(ref _selectionLength, value); }
+    public int Minimum { get => _minimum; private set => SetProperty(ref _minimum, value); }
+    public int Maximum { get => _maximum; private set => SetProperty(ref _maximum, value); }
+    public int Position { get => _position; private set => SetProperty(ref _position, value); }
     public PixelRect Rect { get => _rect; private set => SetProperty(ref _rect, value); }
     public ObservableCollection<string> Items { get; } = [];
 
@@ -81,11 +89,22 @@ public sealed class ControlNodeViewModel : ObservableObject
         SelectionLength = node.SelectionLength ?? 0;
         ReadOnly = node.ReadOnly ?? false;
         Multiline = node.Multiline ?? false;
+        Editable = node.Editable;
         IsDefault = node.IsDefault ?? false;
         GroupStart = node.GroupStart ?? false;
+        ApplyProgressState(node.Minimum ?? 0, node.Maximum ?? 100, node.Position ?? 0);
         ReplaceItems(node.Items);
         if (!preserveTransient) _pendingEventIds.Clear();
-        else if (matchingTextEcho) _pendingEventIds.Remove("text");
+        else if (eventId is not null)
+        {
+            foreach (var property in _pendingEventIds
+                .Where(entry => entry.Value == eventId)
+                .Select(entry => entry.Key)
+                .ToArray())
+            {
+                _pendingEventIds.Remove(property);
+            }
+        }
     }
 
     public void RegisterPending(string property, string eventId) => _pendingEventIds[property] = eventId;
@@ -122,6 +141,10 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "selectedIndex": SelectedIndex = value.GetInt32(); break;
             case "selectionStart": SelectionStart = value.GetInt32(); break;
             case "selectionLength": SelectionLength = value.GetInt32(); break;
+            case "editable": Editable = value.GetBoolean(); break;
+            case "minimum": Minimum = value.GetInt32(); break;
+            case "maximum": Maximum = value.GetInt32(); break;
+            case "position": Position = value.GetInt32(); break;
             case "rect": Rect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid node rect patch."); break;
             case "items": ReplaceItems(value.Deserialize<List<string>>() ?? []); break;
             default: throw new ProtocolException($"Unsupported node patch property '{property}'.");
@@ -134,5 +157,20 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (Items.SequenceEqual(items, StringComparer.Ordinal)) return;
         Items.Clear();
         foreach (var item in items) Items.Add(item);
+    }
+
+    private void ApplyProgressState(int minimum, int maximum, int position)
+    {
+        if (minimum > Maximum)
+        {
+            Maximum = maximum;
+            Minimum = minimum;
+        }
+        else
+        {
+            Minimum = minimum;
+            Maximum = maximum;
+        }
+        Position = position;
     }
 }

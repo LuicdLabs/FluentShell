@@ -13,6 +13,8 @@ public static class ProtocolConstants
     public const int MaxNodes = 512;
     public const int MaxItems = 4_096;
     public const int MaxPatchOperations = 1_024;
+    public const int MaxMenuItems = 256;
+    public const int MaxMenuDepth = 8;
 }
 
 public enum FrameMessageType : ushort

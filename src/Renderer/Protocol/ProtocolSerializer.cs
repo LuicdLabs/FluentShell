@@ -151,6 +151,9 @@ public static class ProtocolSerializer
                         throw new ProtocolException("setText requires a string value.");
                     case "setCheck" or "select" when action.Value.ValueKind != JsonValueKind.Number || !action.Value.TryGetInt32(out _):
                         throw new ProtocolException("setCheck/select requires an integer value.");
+                    case "menuCommand" when action.Value.ValueKind != JsonValueKind.Number ||
+                        !action.Value.TryGetInt32(out var commandId) || commandId is <= 0 or > 0xffff:
+                        throw new ProtocolException("menuCommand requires a standard WM_COMMAND ID.");
                     case "move" or "resize":
                         if (action.Value.ValueKind != JsonValueKind.Object ||
                             !action.Value.TryGetProperty("x", out var x) || !x.TryGetInt32(out _) ||
@@ -162,7 +165,7 @@ public static class ProtocolSerializer
                     case "activate" or "invoke" or "minimize" or "maximize" or "restore" or "close"
                         when action.Value.ValueKind != JsonValueKind.Null:
                         throw new ProtocolException("Request action requires a null value.");
-                    case "activate" or "invoke" or "setText" or "setCheck" or "select" or
+                    case "activate" or "invoke" or "setText" or "setCheck" or "select" or "menuCommand" or
                          "move" or "resize" or "minimize" or "maximize" or "restore" or "close":
                         break;
                     default:
@@ -235,6 +238,7 @@ public static class ProtocolSerializer
         if (snapshot.OwnerHwnd is not null) ParseCanonicalHex64(snapshot.OwnerHwnd, "ownerHwnd");
         ParseCanonicalHex64(snapshot.WindowStyle, "windowStyle");
         ParseCanonicalHex64(snapshot.WindowExStyle, "windowExStyle");
+        ValidateMenu(snapshot.Menu);
         var nodeIds = new HashSet<string>(StringComparer.Ordinal);
         var tabIndexes = new HashSet<int>();
         foreach (var node in snapshot.Nodes)
@@ -250,13 +254,23 @@ public static class ProtocolSerializer
             if (node.Items is null || node.Items.Count > ProtocolConstants.MaxItems)
                 throw new ProtocolException("Item count exceeds the protocol cap or items is null.");
             ValidateRect(node.Rect, "node.rect");
-            if (node.Kind is not ("static" or "separator" or "button" or "checkBox" or "threeState" or "radioButton" or "edit" or "password" or "comboBox" or "listBox"))
+            if (node.Kind is not ("static" or "separator" or "button" or "checkBox" or "threeState" or "radioButton" or "edit" or "password" or "comboBox" or "listBox" or "groupBox" or "progressBar"))
                 throw new ProtocolException("Unknown control node kind.");
             if (node.ZIndex is < 0 or >= ProtocolConstants.MaxNodes ||
                 node.TabIndex is < -1 or >= ProtocolConstants.MaxNodes ||
                 node.Checked is < 0 or > 2 || node.SelectedIndex is < -1 or > 4095 ||
                 node.SelectionStart is < 0 || node.SelectionLength is < 0)
                 throw new ProtocolException("Control node state is outside the protocol range.");
+            if (node.Kind == "progressBar" &&
+                (node.Minimum is null || node.Maximum is null || node.Position is null ||
+                 node.Maximum <= node.Minimum || node.Position < node.Minimum || node.Position > node.Maximum))
+                throw new ProtocolException("Progress node range or position is missing or invalid.");
+            if (node.Editable && node.Kind != "comboBox")
+                throw new ProtocolException("Only ComboBox nodes can be editable.");
+            if (node.Kind == "comboBox" &&
+                (node.SelectedIndex is not { } selectedIndex ||
+                 selectedIndex < -1 || selectedIndex >= node.Items.Count))
+                throw new ProtocolException("ComboBox selectedIndex is outside its item range.");
             if (node.TabIndex is { } tabIndex)
             {
                 if (node.TabStop && node.Enabled)
@@ -272,6 +286,46 @@ public static class ProtocolSerializer
                 }
             }
         }
+    }
+
+    private static void ValidateMenu(List<MenuItemSnapshot>? menu)
+    {
+        if (menu is null) throw new ProtocolException("Snapshot menu is null.");
+        var count = 0;
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        var commands = new HashSet<int>();
+        void Visit(IReadOnlyList<MenuItemSnapshot> items, int depth, bool topLevel, string parentPath)
+        {
+            if (depth > ProtocolConstants.MaxMenuDepth)
+                throw new ProtocolException("Menu exceeds the protocol depth cap.");
+            for (var index = 0; index < items.Count; index++)
+            {
+                var item = items[index];
+                var expectedPath = parentPath.Length == 0 ? index.ToString() : $"{parentPath}.{index}";
+                if (++count > ProtocolConstants.MaxMenuItems || item.ItemId != expectedPath ||
+                    !ids.Add(item.ItemId) || item.Items is null)
+                    throw new ProtocolException("Menu identity or item count is invalid.");
+                if (item.Kind == "popup")
+                {
+                    if (string.IsNullOrEmpty(item.Text) || item.CommandId != 0 || item.Items.Count == 0)
+                        throw new ProtocolException("Popup menu shape is invalid.");
+                    Visit(item.Items, depth + 1, false, item.ItemId);
+                }
+                else if (item.Kind == "command")
+                {
+                    if (topLevel || string.IsNullOrEmpty(item.Text) || item.Items.Count != 0 ||
+                        item.CommandId is <= 0 or > 0xffff || !commands.Add(item.CommandId))
+                        throw new ProtocolException("Menu command identity is invalid or ambiguous.");
+                }
+                else if (item.Kind == "separator")
+                {
+                    if (topLevel || item.Text.Length != 0 || item.CommandId != 0 || item.Items.Count != 0)
+                        throw new ProtocolException("Menu separator shape is invalid.");
+                }
+                else throw new ProtocolException("Unknown menu item kind.");
+            }
+        }
+        Visit(menu, 1, true, string.Empty);
     }
 
     private static void ValidateRect(PixelRect rect, string field)
@@ -362,12 +416,27 @@ public static class ProtocolSerializer
         ValidateRequiredRectFields(snapshot.GetProperty("bounds"), $"{context}.bounds");
         ValidateRequiredRectFields(snapshot.GetProperty("clientBounds"), $"{context}.clientBounds");
         var nodes = RequireKind(snapshot.GetProperty("nodes"), JsonValueKind.Array, $"{context}.nodes");
+        if (snapshot.TryGetProperty("menu", out var menu))
+            ValidateRequiredMenuFields(RequireKind(menu, JsonValueKind.Array, $"{context}.menu"), $"{context}.menu", 1);
         foreach (var node in nodes.EnumerateArray())
         {
             RequireProperties(node, $"{context}.node", "nodeId", "generation", "nativeHwnd", "kind",
-                "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "items");
+                "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "editable", "items");
             ValidateRequiredRectFields(node.GetProperty("rect"), $"{context}.node.rect");
             RequireKind(node.GetProperty("items"), JsonValueKind.Array, $"{context}.node.items");
+        }
+    }
+
+    private static void ValidateRequiredMenuFields(JsonElement menu, string context, int depth)
+    {
+        if (depth > ProtocolConstants.MaxMenuDepth)
+            throw new ProtocolException("Menu exceeds the protocol depth cap.");
+        foreach (var item in menu.EnumerateArray())
+        {
+            RequireProperties(item, context, "itemId", "kind", "text", "commandId", "enabled",
+                "checked", "radio", "isDefault", "items");
+            var children = RequireKind(item.GetProperty("items"), JsonValueKind.Array, $"{context}.items");
+            ValidateRequiredMenuFields(children, $"{context}.items", depth + 1);
         }
     }
 

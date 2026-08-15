@@ -206,6 +206,9 @@ bool RelevantMessage(UINT message) noexcept {
     case WM_WINDOWPOSCHANGED:
     case WM_STYLECHANGED:
     case WM_COMMAND:
+    case WM_INITMENU:
+    case WM_INITMENUPOPUP:
+    case WM_MENUSELECT:
     case WM_NOTIFY:
     case WM_PARENTNOTIFY:
     case WM_DPICHANGED:
@@ -353,6 +356,13 @@ void ExecuteCommandImpl(Command* command) {
             command->outcome.destroyed = !IsWindow(agent->Root());
             command->outcome.closeRejected = !command->outcome.destroyed;
             command->success = true;
+        } else if (action.action == L"menuCommand") {
+            if (AbortIfCancelled(command)) return;
+            // Menu handlers may enter a modal loop. Queue the validated
+            // WM_COMMAND so this bounded source-thread command can return;
+            // periodic reconciliation captures the resulting native state.
+            command->success = PostMessageW(agent->Root(), WM_COMMAND,
+                MAKEWPARAM(action.menuCommandId, 0), 0) != FALSE;
         } else if (action.nodeId) {
             for (const auto& node : before.nodes) {
                 if (node.nodeId != *action.nodeId) continue;
@@ -369,13 +379,17 @@ void ExecuteCommandImpl(Command* command) {
                     if (!AbortIfCancelled(command))
                         command->success = PostMessageW(target, BM_CLICK, 0, 0) != FALSE;
                 } else if (action.action == L"setText" &&
-                           (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
-                           !node.readOnly && interactive) {
+                            (node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
+                             (node.kind == ControlKind::ComboBox && node.editable)) &&
+                            !node.readOnly && interactive) {
                     if (AbortIfCancelled(command)) return;
                     command->success = SetWindowTextW(target, action.text.c_str()) != FALSE;
                     if (command->success && !command->cancelled.load(std::memory_order_acquire)) {
-                        SendMessageW(agent->Root(), WM_COMMAND,
-                            MAKEWPARAM(node.controlId, EN_CHANGE),
+                        const HWND notificationTarget = node.kind == ControlKind::ComboBox
+                            ? GetParent(target) : agent->Root();
+                        SendMessageW(notificationTarget ? notificationTarget : agent->Root(), WM_COMMAND,
+                            MAKEWPARAM(node.controlId,
+                                node.kind == ControlKind::ComboBox ? CBN_EDITCHANGE : EN_CHANGE),
                             reinterpret_cast<LPARAM>(target));
                     }
                 } else if (action.action == L"setCheck" &&
@@ -415,7 +429,8 @@ void ExecuteCommandImpl(Command* command) {
                         const int selected = static_cast<int>(SendMessageW(
                             target, combo ? CB_GETCURSEL : LB_GETCURSEL, 0, 0));
                         if (selected == action.integerValue && !command->cancelled.load(std::memory_order_acquire)) {
-                            SendMessageW(agent->Root(), WM_COMMAND,
+                            const HWND notificationTarget = combo ? GetParent(target) : agent->Root();
+                            SendMessageW(notificationTarget ? notificationTarget : agent->Root(), WM_COMMAND,
                                 MAKEWPARAM(node.controlId,
                                     combo ? CBN_SELCHANGE : LBN_SELCHANGE),
                                 reinterpret_cast<LPARAM>(target));

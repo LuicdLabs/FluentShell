@@ -47,6 +47,7 @@
         "selectionLength": 0,
         "readOnly": false,
         "multiline": false,
+        "editable": false,
         "isDefault": true,
         "groupStart": false,
         "items": []

@@ -850,10 +850,22 @@ bool RendererSession::OpenSurface(
         options.requireVisible = surface->snapshot.visible && surface->snapshot.state != L"minimized";
         options.requireFocus = options.requireVisible &&
             (nativeWasForeground || surface->snapshot.modal);
+
+        // DWM visibility and the desktop UIA hit-test are published on
+        // different asynchronous paths.  A proxy can be visible and
+        // uncloaked while ElementFromPoint still returns the old provider for
+        // one or two compositor turns.  Do not restore the native window for
+        // that transient state; keep the gate strict and retry it briefly.
+        constexpr unsigned kCommittedValidationAttempts = 8;
         std::wstring error;
-        if (!ValidateProjectedSurface(options, surface->snapshot, error)) {
-            FluentShell::Log(L"Committed UIA gate failed: " + error);
-            return reject(L"committed UIA validation failed");
+        for (unsigned attempt = 1; attempt <= kCommittedValidationAttempts; ++attempt) {
+            if (ValidateProjectedSurface(options, surface->snapshot, error)) break;
+            FluentShell::Log(L"Committed UIA gate attempt " + std::to_wstring(attempt) +
+                L" failed: " + error);
+            if (attempt == kCommittedValidationAttempts) {
+                return reject(L"committed UIA validation failed");
+            }
+            Sleep(50 * attempt);
         }
     }
     {
@@ -881,8 +893,6 @@ void RendererSession::DiscoverTopLevelWindows() {
         if (!FluentShell::IsShellOrXamlWindowClass(className)) context.windows.push_back(hwnd);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&context));
-    FluentShell::Log(L"Top-level discovery found " +
-        std::to_wstring(context.windows.size()) + L" candidate window(s)");
     for (const HWND window : context.windows) {
         bool attempt = false;
         {
@@ -1228,6 +1238,11 @@ void RendererSession::RestoreSurface(
     bool nativeRestored = false;
     bool scheduleRetry = false;
     try {
+        const std::wstring_view protocolReason =
+            reason == L"nativeDestroyed" || reason == L"unsupported" ||
+            reason == L"restore" || reason == L"shutdown"
+            ? reason
+            : std::wstring_view(L"restore");
         // This is the single native-operation barrier.  Action and reconcile
         // workers take the same lock, so neither can issue a source-thread call
         // after rollback has begun.
@@ -1313,7 +1328,7 @@ void RendererSession::RestoreSurface(
                     SerializeSurfaceCommit(nonce_, surfaceId, revision, false),
                     250, false);
                 Send(Ipc::MessageType::WindowClose, revision,
-                    SerializeWindowClose(nonce_, surfaceId, reason), 250, false);
+                    SerializeWindowClose(nonce_, surfaceId, protocolReason), 250, false);
             } catch (...) {
                 // Keep the native fallback even when serialization/allocation
                 // fails while the pipe is already faulted.

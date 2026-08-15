@@ -255,4 +255,104 @@ public sealed class ViewModelTests
 
         Assert.Equal(4, WindowViewModel.FromSnapshot(snapshot).GetNode("10").TabIndex);
     }
+
+    [Fact]
+    public void PeriodicSnapshotReconcilesNativeProgressState()
+    {
+        var progress = TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "progressBar",
+            TabIndex = -1,
+            TabStop = false,
+            Minimum = 10,
+            Maximum = 90,
+            Position = 25,
+        };
+        var snapshot = TestData.Snapshot() with { Nodes = [progress] };
+        var viewModel = WindowViewModel.FromSnapshot(snapshot);
+        var node = viewModel.GetNode("10");
+
+        viewModel.ApplyPatch(new WindowPatchMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = snapshot.SurfaceId,
+            BaseRevision = "7",
+            Revision = "8",
+            Operations = [],
+            Snapshot = snapshot with
+            {
+                Revision = "8",
+                Nodes = [progress with { Minimum = 100, Maximum = 120, Position = 110 }],
+            },
+        });
+
+        Assert.Same(node, viewModel.GetNode("10"));
+        Assert.Equal(100, node.Minimum);
+        Assert.Equal(120, node.Maximum);
+        Assert.Equal(110, node.Position);
+    }
+
+    [Fact]
+    public void EditableComboPreservesCanonicalTextSelectionAndItems()
+    {
+        var combo = TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "comboBox",
+            Editable = true,
+            Text = "custom",
+            SelectedIndex = 1,
+            Items = ["one", "two"],
+        };
+
+        var node = ControlNodeViewModel.FromSnapshot(combo);
+
+        Assert.True(node.Editable);
+        Assert.Equal("custom", node.Text);
+        Assert.Equal("custom", node.DraftText);
+        Assert.Equal(1, node.SelectedIndex);
+        Assert.Equal(["one", "two"], node.Items);
+    }
+
+    [Fact]
+    public void EditableComboSelectionEchoReconcilesCanonicalText()
+    {
+        var original = TestData.Snapshot() with
+        {
+            Nodes =
+            [
+                TestData.Snapshot().Nodes[0] with
+                {
+                    Kind = "comboBox",
+                    Editable = true,
+                    Text = "typed",
+                    SelectedIndex = -1,
+                    Items = ["one", "two"],
+                },
+            ],
+        };
+        var viewModel = WindowViewModel.FromSnapshot(original);
+        var node = viewModel.GetNode("10");
+        node.DraftText = "two";
+        node.RegisterPending("selectedIndex", "55");
+
+        viewModel.ApplyPatch(new WindowPatchMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = original.SurfaceId,
+            BaseRevision = "7",
+            Revision = "8",
+            EventId = "55",
+            Operations = [],
+            Snapshot = original with
+            {
+                Revision = "8",
+                Nodes = [original.Nodes[0] with { Text = "two", SelectedIndex = 1 }],
+            },
+        });
+
+        Assert.Equal("two", node.Text);
+        Assert.Equal("two", node.DraftText);
+        Assert.Equal(1, node.SelectedIndex);
+        Assert.False(node.IsPendingEcho("selectedIndex", "55"));
+    }
 }

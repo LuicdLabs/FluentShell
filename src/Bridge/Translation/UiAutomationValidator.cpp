@@ -63,6 +63,7 @@ enum class RequiredPattern {
     Value,
     Selection,
     ExpandCollapse,
+    RangeValue,
 };
 
 std::wstring HResultText(HRESULT result) {
@@ -150,6 +151,8 @@ int ExpectedControlType(ControlKind kind) noexcept {
     case ControlKind::Password: return UIA_EditControlTypeId;
     case ControlKind::ComboBox: return UIA_ComboBoxControlTypeId;
     case ControlKind::ListBox: return UIA_ListControlTypeId;
+    case ControlKind::GroupBox: return UIA_GroupControlTypeId;
+    case ControlKind::ProgressBar: return UIA_ProgressBarControlTypeId;
     default: return 0;
     }
 }
@@ -164,6 +167,7 @@ RequiredPattern PatternFor(ControlKind kind) noexcept {
     case ControlKind::Password: return RequiredPattern::None;
     case ControlKind::ComboBox: return RequiredPattern::Selection;
     case ControlKind::ListBox: return RequiredPattern::Selection;
+    case ControlKind::ProgressBar: return RequiredPattern::RangeValue;
     default: return RequiredPattern::None;
     }
 }
@@ -195,6 +199,9 @@ bool HasPattern(
     case RequiredPattern::ExpandCollapse:
         patternId = UIA_ExpandCollapsePatternId; iid = &IID_IUIAutomationExpandCollapsePattern;
         availableProperty = UIA_IsExpandCollapsePatternAvailablePropertyId; break;
+    case RequiredPattern::RangeValue:
+        patternId = UIA_RangeValuePatternId; iid = &IID_IUIAutomationRangeValuePattern;
+        availableProperty = UIA_IsRangeValuePatternAvailablePropertyId; break;
     default: break;
     }
     VARIANT value{};
@@ -488,6 +495,15 @@ bool ValidateOnMta(
     std::vector<std::pair<int, size_t>> tabOrder;
     std::vector<bool> used(elements.size(), false);
     std::unordered_set<std::wstring> expectedAutomationIds;
+    LONG projectedContentTop = clientOrigin.y;
+    if (!snapshot.menu.empty()) {
+        const auto menuBar = std::find_if(elements.begin(), elements.end(), [](const ElementInfo& info) {
+            return info.framework == L"XAML" && info.controlType == UIA_MenuBarControlTypeId;
+        });
+        if (menuBar == elements.end() || menuBar->bounds.bottom <= menuBar->bounds.top)
+            return Fail(error, L"projected menu bar is absent from the proxy UIA tree");
+        projectedContentTop = menuBar->bounds.bottom;
+    }
     for (const auto& node : snapshot.nodes) {
         const auto expectedId = L"FluentShell.Node." + std::to_wstring(node.nodeId) +
             L"." + std::to_wstring(node.generation);
@@ -498,9 +514,9 @@ bool ValidateOnMta(
         const auto expectedName = DisplayText(node.automationName);
         RECT expectedBounds{
             clientOrigin.x + node.rect.left,
-            clientOrigin.y + node.rect.top,
+            projectedContentTop + node.rect.top,
             clientOrigin.x + node.rect.right,
-            clientOrigin.y + node.rect.bottom,
+            projectedContentTop + node.rect.bottom,
         };
         size_t match = elements.size();
         for (size_t index = 0; index < elements.size(); ++index) {
@@ -531,6 +547,8 @@ bool ValidateOnMta(
         if (!HasPattern(matched.element.Get(), PatternFor(node.kind), error)) return false;
         if (node.kind == ControlKind::ComboBox &&
             !HasPattern(matched.element.Get(), RequiredPattern::ExpandCollapse, error)) return false;
+        if (node.kind == ControlKind::ComboBox && node.editable &&
+            !HasPattern(matched.element.Get(), RequiredPattern::Value, error)) return false;
         if (node.kind == ControlKind::Password) {
             BOOL password = FALSE;
             if (FAILED(matched.element->get_CurrentIsPassword(&password)) || !password)
@@ -546,6 +564,51 @@ bool ValidateOnMta(
         if (element.automationId.starts_with(L"FluentShell.Node.") &&
             !expectedAutomationIds.contains(element.automationId))
             return Fail(error, L"proxy UIA tree contains an unexpected FluentShell node");
+    }
+
+    const auto findMenuElement = [&](std::wstring_view automationId,
+                                     ComPtr<IUIAutomationElement>& found) -> bool {
+        VARIANT value{};
+        VariantInit(&value);
+        value.vt = VT_BSTR;
+        value.bstrVal = SysAllocStringLen(automationId.data(),
+            static_cast<UINT>(automationId.size()));
+        if (!value.bstrVal) return Fail(error, L"menu UIA identity allocation failed");
+        ComPtr<IUIAutomationCondition> condition;
+        const HRESULT conditionResult = automation->CreatePropertyCondition(
+            UIA_AutomationIdPropertyId, value, &condition);
+        VariantClear(&value);
+        if (FAILED(conditionResult) || !condition)
+            return FailHr(error, L"menu UIA identity condition failed", conditionResult);
+        ComPtr<IUIAutomationElementArray> matches;
+        const HRESULT findResult = projectionRoot->FindAll(TreeScope_Descendants,
+            condition.Get(), &matches);
+        int matchCount = 0;
+        if (FAILED(findResult) || !matches || FAILED(matches->get_Length(&matchCount)))
+            return FailHr(error, L"menu UIA identity query failed", findResult);
+        if (matchCount != 1)
+            return Fail(error, L"projected menu AutomationId is missing or duplicated");
+        if (FAILED(matches->GetElement(0, &found)) || !found)
+            return Fail(error, L"projected menu element is unavailable");
+        return true;
+    };
+    // MenuFlyout descendants live in transient popup HWNDs and are not part of
+    // the desktop UIA tree until a user expands their parent. The commit gate
+    // validates the persistent menu bar contract only; protocol validation and
+    // renderer construction validate the complete closed flyout hierarchy.
+    for (const auto& item : snapshot.menu) {
+        const auto expectedId = L"FluentShell.Menu." + item.itemId;
+        ComPtr<IUIAutomationElement> element;
+        if (!findMenuElement(expectedId, element)) return false;
+        ElementInfo info;
+        if (!ReadElementInfo(element.Get(), info, error)) return false;
+        if (item.kind != MenuItemKind::Popup ||
+            info.processId != static_cast<int>(options.rendererProcessId) ||
+            info.framework != L"XAML" || info.controlType != UIA_MenuItemControlTypeId ||
+            info.name != DisplayText(item.text) ||
+            info.isEnabled != (item.enabled ? TRUE : FALSE) || !info.isControl)
+            return Fail(error, L"projected top-level menu role, name, or enabled state is incorrect");
+        if (!HasPattern(element.Get(), RequiredPattern::ExpandCollapse, error)) return false;
     }
     std::sort(tabOrder.begin(), tabOrder.end());
     for (size_t index = 1; index < tabOrder.size(); ++index) {
