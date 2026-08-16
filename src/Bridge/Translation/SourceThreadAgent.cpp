@@ -224,6 +224,15 @@ bool RelevantMessage(UINT message) noexcept {
     case LB_DELETESTRING:
     case LB_RESETCONTENT:
     case LB_SETCURSEL:
+    // ProgressBar state is driven entirely by these messages.  Without them a
+    // dirty-gated reconcile would never notice a native progress update.
+    case PBM_SETPOS:
+    case PBM_DELTAPOS:
+    case PBM_STEPIT:
+    case PBM_SETRANGE:
+    case PBM_SETRANGE32:
+    case PBM_SETSTEP:
+    case PBM_SETSTATE:
         return true;
     default:
         return false;
@@ -765,7 +774,9 @@ bool SourceThreadAgent::Capture(
     WindowSnapshot& snapshot,
     std::wstring& error,
     DWORD timeoutMs,
-    HANDLE cancelEvent) {
+    HANDLE cancelEvent,
+    bool* timedOut) {
+    if (timedOut) *timedOut = false;
     Command* command = CreateCommand(kCommandCapture, this);
     if (!command) {
         error = L"source command allocation failed";
@@ -777,6 +788,7 @@ bool SourceThreadAgent::Capture(
     const bool posted = Post(command, timeoutMs, cancelEvent);
     if (!posted) {
         error = L"source UI thread did not acknowledge capture";
+        if (timedOut) *timedOut = true;
         Release(command);
         return false;
     }

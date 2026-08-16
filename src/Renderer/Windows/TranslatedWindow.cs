@@ -28,6 +28,10 @@ public sealed class TranslatedWindow : Window
     private readonly Dictionary<string, FrameworkElement> _controls = new(StringComparer.Ordinal);
     private readonly HashSet<string> _placementEventIds = new(StringComparer.Ordinal);
     private readonly PresenterActionCoordinator _presenterActions = new();
+    private readonly BoundsActionCoordinator _boundsActions = new();
+    private readonly SubclassProc _subclassProc;
+    private bool _inSizeMove;
+    private PixelRect? _sizeMoveStart;
     private bool _applyingCanonical;
     private bool _allowClose;
     private bool _committed;
@@ -67,6 +71,12 @@ public sealed class TranslatedWindow : Window
         _appWindow.IsShownInSwitchers = ViewModel.ShowInTaskbar;
         _appWindow.Closing += OnClosing;
         _appWindow.Changed += OnAppWindowChanged;
+        // AppWindow raises no enter/exit size-move signal, so observe the modal
+        // move/size loop directly.  The delegate is held in a field because the
+        // subclass keeps an unmanaged pointer to it.
+        _subclassProc = OnSubclassMessage;
+        if (!SetWindowSubclass(Hwnd, _subclassProc, SizeMoveSubclassId, 0))
+            throw new InvalidOperationException("Unable to observe the renderer proxy move/size loop.");
         Closed += (_, _) => RendererDiagnostics.Log($"window closed hwnd=0x{(ulong)(nuint)Hwnd:X} surface={ViewModel.SurfaceId}");
         RebuildControls();
         ApplyWindowState();
@@ -126,13 +136,7 @@ public sealed class TranslatedWindow : Window
         await WaitForRenderAsync();
         _root.UpdateLayout();
         RefreshRenderDpi();
-        var bounds = new PixelRect
-        {
-            X = _appWindow.Position.X,
-            Y = _appWindow.Position.Y,
-            Width = _appWindow.Size.Width,
-            Height = _appWindow.Size.Height,
-        };
+        var bounds = CurrentBounds();
         return (bounds, ViewModel.Nodes.Count, Content.XamlRoot is not null && Hwnd != 0);
         }
         finally
@@ -165,6 +169,7 @@ public sealed class TranslatedWindow : Window
     public void ApplyPatch(WindowPatchMessage patch)
     {
         PresenterActionIntent? presenterReplay = null;
+        BoundsActionIntent? boundsReplay = null;
         RendererDiagnostics.Log($"window.patch event={patch.EventId ?? "-"} rev={patch.Revision} stateBefore={ViewModel.State} inFlight={_presenterActions.InFlightEventId ?? "-"}");
         _applyingCanonical = true;
         try
@@ -187,9 +192,12 @@ public sealed class TranslatedWindow : Window
                 committed.Node?.AcceptPending(committed.Property, patch.EventId);
             }
             presenterReplay = _presenterActions.CompletePatch(patch.EventId, ViewModel.State);
+            // Clear the bounds action before reading LocalPlacementPending so the
+            // patch that answers a move is free to apply the canonical result.
+            boundsReplay = _boundsActions.CompletePatch(patch.EventId, ViewModel.Bounds);
             if (structural) RebuildControls();
             ApplyWindowState(ShouldApplyCanonicalPlacement(
-                _committed, placementChanged, placementActionPatch));
+                _committed, placementChanged, placementActionPatch, LocalPlacementPending));
         }
         finally
         {
@@ -197,6 +205,7 @@ public sealed class TranslatedWindow : Window
         }
         RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"}");
         if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
+        if (boundsReplay is { } boundsIntent) QueueOrEmitBoundsAction(boundsIntent);
     }
 
     public void ApplyActionResult(ActionResultMessage result)
@@ -231,11 +240,16 @@ public sealed class TranslatedWindow : Window
                     pending.Node?.AcceptPending(pending.Property, result.EventId);
                 }
             }
-            if (result.Status == "stale") _presenterActions.MarkStale(result.EventId);
+            if (result.Status == "stale")
+            {
+                _presenterActions.MarkStale(result.EventId);
+                _boundsActions.MarkStale(result.EventId);
+            }
             if (result.Status == "rejected")
             {
                 _placementEventIds.Remove(result.EventId);
                 _presenterActions.CancelIfMatches(result.EventId);
+                _boundsActions.CancelIfMatches(result.EventId);
             }
         }
         finally
@@ -281,6 +295,7 @@ public sealed class TranslatedWindow : Window
             _pending.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
+            ResetSizeMove();
             _appWindow.IsShownInSwitchers = false;
             SetInteractionEnabled(false);
             _appWindow.Hide();
@@ -307,6 +322,7 @@ public sealed class TranslatedWindow : Window
             _pending.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
+            ResetSizeMove();
             _appWindow.Hide();
             if (!SetCloaked(true)) RendererDiagnostics.Log("closing proxy cloak failed after hide");
             _allowClose = true;
@@ -378,8 +394,18 @@ public sealed class TranslatedWindow : Window
     internal static bool ShouldApplyCanonicalPlacement(
         bool committed,
         bool placementChanged,
-        bool placementActionPatch) =>
-        !committed || placementChanged || placementActionPatch;
+        bool placementActionPatch,
+        bool localPlacementPending) =>
+        !committed ||
+        (!localPlacementPending && (placementChanged || placementActionPatch));
+
+    /// <summary>
+    /// True while this proxy, not the Bridge, owns the window's geometry: the user
+    /// is inside a move/size gesture, or a bounds action they started has not been
+    /// answered yet.  Re-applying canonical placement in either case yanks the
+    /// window out from under the pointer.
+    /// </summary>
+    private bool LocalPlacementPending => _inSizeMove || _boundsActions.HasInFlight;
 
     private void ApplyWindowState(bool applyCanonicalPlacement = true)
     {
@@ -569,21 +595,118 @@ public sealed class TranslatedWindow : Window
         }
         if (args.DidPositionChange || args.DidSizeChange)
         {
+            // The OS owns geometry for the duration of a move/size gesture.  One
+            // authoritative action follows on WM_EXITSIZEMOVE, so emitting per
+            // frame here would only round-trip positions the user already left.
+            if (_inSizeMove) return;
             if (sender.Presenter is OverlappedPresenter boundsPresenter &&
                 !ShouldEmitGeometry(ViewModel.State, boundsPresenter.State))
             {
                 return;
             }
             var action = args.DidSizeChange && !args.DidPositionChange ? "resize" : "move";
-            EmitAction(null, "bounds", action, new
-            {
-                x = sender.Position.X,
-                y = sender.Position.Y,
-                width = sender.Size.Width,
-                height = sender.Size.Height,
-            });
+            QueueOrEmitBoundsAction(new BoundsActionIntent(action, CurrentBounds(), 0));
         }
     }
+
+    private PixelRect CurrentBounds() => new()
+    {
+        X = _appWindow.Position.X,
+        Y = _appWindow.Position.Y,
+        Width = _appWindow.Size.Width,
+        Height = _appWindow.Size.Height,
+    };
+
+    private nint OnSubclassMessage(
+        nint hwnd, uint message, nint wParam, nint lParam, nuint subclassId, nuint refData)
+    {
+        if (message == WmEnterSizeMove)
+        {
+            _inSizeMove = true;
+            _sizeMoveStart = CurrentBounds();
+        }
+        var result = DefSubclassProc(hwnd, message, wParam, lParam);
+        switch (message)
+        {
+            case WmExitSizeMove:
+                _inSizeMove = false;
+                CommitSizeMove();
+                break;
+            case WmNcDestroy:
+                RemoveWindowSubclass(hwnd, _subclassProc, SizeMoveSubclassId);
+                break;
+        }
+        return result;
+    }
+
+    private void CommitSizeMove()
+    {
+        var start = _sizeMoveStart;
+        _sizeMoveStart = null;
+        if (_applyingCanonical || !_committed) return;
+        var bounds = CurrentBounds();
+        if (start is null || start == bounds) return;
+        if (_appWindow.Presenter is OverlappedPresenter presenter &&
+            !ShouldEmitGeometry(ViewModel.State, presenter.State))
+        {
+            return;
+        }
+        var sizeChanged = start.Width != bounds.Width || start.Height != bounds.Height;
+        var positionChanged = start.X != bounds.X || start.Y != bounds.Y;
+        var action = sizeChanged && !positionChanged ? "resize" : "move";
+        RendererDiagnostics.Log(
+            $"size-move committed action={action} bounds={bounds.X},{bounds.Y} " +
+            $"{bounds.Width}x{bounds.Height}");
+        QueueOrEmitBoundsAction(new BoundsActionIntent(action, bounds, 0));
+    }
+
+    private void QueueOrEmitBoundsAction(BoundsActionIntent intent)
+    {
+        if (_boundsActions.HasInFlight)
+        {
+            _boundsActions.QueueLatest(intent);
+            RendererDiagnostics.Log($"bounds queued action={intent.Action} inFlight={_boundsActions.InFlightEventId}");
+            return;
+        }
+
+        var eventId = EmitAction(null, "bounds", intent.Action, new
+        {
+            x = intent.Bounds.X,
+            y = intent.Bounds.Y,
+            width = intent.Bounds.Width,
+            height = intent.Bounds.Height,
+        });
+        if (eventId is not null) _boundsActions.MarkSent(eventId, intent);
+    }
+
+    private void ResetSizeMove()
+    {
+        _inSizeMove = false;
+        _sizeMoveStart = null;
+        _boundsActions.Reset();
+    }
+
+    private const uint WmEnterSizeMove = 0x0231;
+    private const uint WmExitSizeMove = 0x0232;
+    private const uint WmNcDestroy = 0x0082;
+    private const nuint SizeMoveSubclassId = 1;
+
+    private delegate nint SubclassProc(
+        nint hwnd, uint message, nint wParam, nint lParam, nuint subclassId, nuint refData);
+
+    [DllImport("comctl32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowSubclass(
+        nint hwnd, SubclassProc callback, nuint subclassId, nuint refData);
+
+    [DllImport("comctl32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RemoveWindowSubclass(
+        nint hwnd, SubclassProc callback, nuint subclassId);
+
+    [DllImport("comctl32.dll")]
+    private static extern nint DefSubclassProc(
+        nint hwnd, uint message, nint wParam, nint lParam);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
     private static extern nint SetWindowLongPtr(nint hwnd, int index, nint newValue);

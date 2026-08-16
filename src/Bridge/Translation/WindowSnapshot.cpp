@@ -634,7 +634,13 @@ bool ParseHeartbeat(
 bool ParseErrorMessage(
     std::string_view payload,
     std::wstring_view nonce,
-    std::wstring& error) noexcept {
+    std::wstring& error,
+    bool* fatal,
+    std::wstring* surfaceId) noexcept {
+    // Default to session scope: an error we cannot fully classify must not be
+    // downgraded to a recoverable one.
+    if (fatal) *fatal = true;
+    if (surfaceId) surfaceId->clear();
     try {
         if (!ValidateJsonLimits(payload, error)) return false;
         const auto root = ParseJson(payload);
@@ -644,11 +650,12 @@ bool ParseErrorMessage(
         }
         const auto code = root.GetNamedString(L"code");
         const auto detail = root.GetNamedString(L"detail");
-        (void)root.GetNamedBoolean(L"fatal");
+        const bool isFatal = root.GetNamedBoolean(L"fatal");
         if (code.empty() || code.size() > 64 || detail.size() > Ipc::kMaxStringChars) {
             error = L"invalid error payload";
             return false;
         }
+        std::wstring scopedSurfaceId;
         if (root.HasKey(L"surfaceId")) {
             const auto surface = root.GetNamedValue(L"surfaceId");
             if (surface.ValueType() != JsonValueType::Null &&
@@ -656,7 +663,14 @@ bool ParseErrorMessage(
                 error = L"invalid error surfaceId";
                 return false;
             }
+            if (surface.ValueType() == JsonValueType::String) {
+                scopedSurfaceId = surface.GetString();
+            }
         }
+        // Publish scope only once the payload is fully validated, so a rejected
+        // message can never downgrade a session fault to a recoverable one.
+        if (fatal) *fatal = isFatal;
+        if (surfaceId) *surfaceId = std::move(scopedSurfaceId);
         error = L"renderer error " + std::wstring(code) + L": " + std::wstring(detail);
         return true;
     } catch (...) {
@@ -763,7 +777,13 @@ bool ValidateActionForSnapshot(
 }
 
 bool IsRequestSemanticAction(std::wstring_view action) noexcept {
-    return action == L"invoke" || action == L"close";
+    // Geometry is latest-wins: the pointer, not a snapshot revision, is the truth
+    // for where the window is.  Revision-gating move/resize turns every frame of a
+    // drag that raced a reconcile capture into a stale rejection plus a full
+    // resync, so these carry the same request semantics as invoke/close and are
+    // rebased onto the current revision by HandleNativeAction.
+    return action == L"invoke" || action == L"close" ||
+        action == L"move" || action == L"resize";
 }
 
 } // namespace FluentShell::Bridge::Translation

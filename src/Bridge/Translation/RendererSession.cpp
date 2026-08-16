@@ -28,6 +28,13 @@ constexpr DWORD kHandshakeTimeoutMs = 5000;
 // Renderer heartbeats are gated by a 900 ms dispatcher probe.  Allow the
 // third scheduled probe to complete before declaring three consecutive misses.
 constexpr uint64_t kRendererHeartbeatTimeoutMs = 4250;
+// Reconcile ticks a quiet surface every fourth 250 ms pass.  The dirty whitelist
+// cannot prove it observes every way native state can change, so a slow poll stays
+// as the backstop instead of trusting the flag alone.
+constexpr unsigned kQuietReconcileTicks = 4;
+// A source thread inside a modal loop can miss a bounded capture deadline without
+// being broken.  Tolerate a few misses before discarding a working projection.
+constexpr unsigned kMaxCaptureTimeouts = 3;
 
 DWORD RemainingTimeout(uint64_t deadline) noexcept {
     const uint64_t now = GetTickCount64();
@@ -184,6 +191,9 @@ struct RendererSession::Surface final {
     bool restoreRetryScheduled = false;
     bool agentRetained = false;
     unsigned restoreAttempts = 0;
+    // Reconcile bookkeeping.  Written only by the supervisor thread.
+    unsigned captureTimeouts = 0;
+    unsigned reconcileSkips = 0;
     std::optional<uint64_t> verificationNode;
     std::unordered_map<uint64_t, int> buttonResults;
     std::optional<int> cancelResult;
@@ -548,9 +558,29 @@ void RendererSession::HandleFrame(const Ipc::Frame& frame) {
         }
         lastHeartbeatTick_ = GetTickCount64();
     } else if (type == Ipc::MessageType::Error) {
-        if (frame.header.revision != 0 || !ParseErrorMessage(frame.payload, nonce_, error)) {
+        bool fatal = true;
+        std::wstring faultedSurfaceId;
+        if (frame.header.revision != 0 ||
+            !ParseErrorMessage(frame.payload, nonce_, error, &fatal, &faultedSurfaceId)) {
             Fail(error.empty() ? L"error frame must have revision zero" : error);
             return;
+        }
+        // A non-fatal error that names one surface is a per-surface fault.  Roll that
+        // window back to native and leave the rest of the session projecting; the
+        // other windows in this process are still correct.
+        if (!fatal && !faultedSurfaceId.empty()) {
+            std::shared_ptr<Surface> surface;
+            {
+                std::scoped_lock lock(surfacesMutex_);
+                const auto found = surfaces_.find(faultedSurfaceId);
+                if (found != surfaces_.end()) surface = found->second;
+            }
+            if (surface) {
+                try { FluentShell::Log(L"Renderer surface fault: " + error); } catch (...) {}
+                RestoreSurface(surface, L"rendererSurfaceFault");
+                return;
+            }
+            if (IsRetiredSurface(faultedSurfaceId)) return;
         }
         Fail(error.empty() ? L"renderer reported a protocol error" : error);
     } else if (type == Ipc::MessageType::Shutdown) {
@@ -1189,12 +1219,30 @@ void RendererSession::ReconcileNativeSurfaces() {
         const uint64_t baseRevision = next.revision;
         next.revision = baseRevision + 1;
         lock.unlock();
-        std::wstring error;
-        if (!agent->Capture(next, error, 2000, shutdownEvent_)) {
-            canonicalLock.unlock();
-            RestoreSurface(surface, L"unsupported");
+        // A quiet source thread does not need a full capture on every tick.  This is
+        // what keeps a drag or an open menu from being hammered with 2 s-deadline
+        // source-thread work that it cannot service in time.
+        if (!agent->IsDirty() && ++surface->reconcileSkips < kQuietReconcileTicks) {
             continue;
         }
+        surface->reconcileSkips = 0;
+        std::wstring error;
+        bool timedOut = false;
+        if (!agent->Capture(next, error, 2000, shutdownEvent_, &timedOut)) {
+            if (timedOut && !stopping_.load() && !failed_.load() &&
+                ++surface->captureTimeouts < kMaxCaptureTimeouts) {
+                try {
+                    FluentShell::Log(L"Reconcile capture missed its deadline (" +
+                        std::to_wstring(surface->captureTimeouts) + L" of " +
+                        std::to_wstring(kMaxCaptureTimeouts) + L"); keeping the projection");
+                } catch (...) {}
+                continue;
+            }
+            canonicalLock.unlock();
+            RestoreSurface(surface, timedOut ? L"timeout" : L"unsupported");
+            continue;
+        }
+        surface->captureTimeouts = 0;
         const uint64_t fingerprint = SnapshotFingerprint(next);
         lock.lock();
         if (surface->state != SurfaceState::Projected ||
@@ -1243,6 +1291,12 @@ void RendererSession::RestoreSurface(
             reason == L"restore" || reason == L"shutdown"
             ? reason
             : std::wstring_view(L"restore");
+        // The wire reason is a closed enum, so record the specific cause here.
+        // Without this a fallback leaves no trace of why it happened.
+        try {
+            FluentShell::Log(L"Restoring native window: reason=" + std::wstring(reason) +
+                L" wire=" + std::wstring(protocolReason));
+        } catch (...) {}
         // This is the single native-operation barrier.  Action and reconcile
         // workers take the same lock, so neither can issue a source-thread call
         // after rollback has begun.
@@ -1493,12 +1547,15 @@ void RendererSession::Stop() noexcept {
         try { heartbeatWorker_.join(); } catch (...) {}
     }
     RestoreAll(L"shutdown");
-    if (!failed_.load()) {
-        try {
-            Send(Ipc::MessageType::Shutdown, 0,
-                SerializeShutdown(nonce_, L"bridge shutdown"), 250, false);
-        } catch (...) {}
-    }
+    // Announce the close even on the fault path.  Tearing the pipe down without a
+    // shutdown frame makes an ordinary fault indistinguishable from a crash on the
+    // renderer side, where it surfaces as a mid-FLSH-frame end of stream.
+    try {
+        Send(Ipc::MessageType::Shutdown, 0,
+            SerializeShutdown(nonce_,
+                failed_.load() ? L"bridge session failed" : L"bridge shutdown"),
+            250, false);
+    } catch (...) {}
     HANDLE pipeToCancel = INVALID_HANDLE_VALUE;
     {
         std::scoped_lock lock(writeMutex_);

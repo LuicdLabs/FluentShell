@@ -126,6 +126,13 @@ public sealed class PipeClient : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
+        catch (PipeClosedException)
+        {
+            // The Bridge is gone at a frame boundary: an ordinary end of session, not
+            // a fault.  There is nothing left to report it to, and reporting it as a
+            // protocol fault would make every normal exit look like a crash.
+            RendererDiagnostics.Log("Bridge pipe closed; ending renderer session");
+        }
         catch (Exception exception)
         {
             failure = exception;

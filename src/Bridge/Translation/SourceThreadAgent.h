@@ -25,11 +25,15 @@ public:
     SourceThreadAgent(const SourceThreadAgent&) = delete;
     SourceThreadAgent& operator=(const SourceThreadAgent&) = delete;
 
+    // timedOut distinguishes a source thread that did not acknowledge within the
+    // deadline -- a transient condition -- from a capture that ran and rejected the
+    // window.  Only the latter means the window is unsupported.
     bool Capture(
         WindowSnapshot& snapshot,
         std::wstring& error,
         DWORD timeoutMs = 2000,
-        HANDLE cancelEvent = nullptr);
+        HANDLE cancelEvent = nullptr,
+        bool* timedOut = nullptr);
     bool Invoke(
         const ActionRequest& action,
         ActionOutcome& outcome,

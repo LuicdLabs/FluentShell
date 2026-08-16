@@ -68,3 +68,10 @@ public static class MessageTypeNames
 }
 
 public sealed class ProtocolException(string message) : IOException(message);
+
+/// <summary>
+/// The Bridge closed the pipe at a frame boundary.  This is how an ordinary session
+/// ends -- the target process exited, taking the pipe with it -- and is distinct from
+/// a frame that was cut in half, which is a genuine truncation.
+/// </summary>
+public sealed class PipeClosedException() : IOException("The Bridge closed the pipe at a frame boundary.");

@@ -53,6 +53,20 @@ public sealed class FrameCodecTests
     }
 
     [Fact]
+    public async Task ClosingAtAFrameBoundaryIsAnOrdinaryEndOfSession()
+    {
+        await using var empty = new MemoryStream([]);
+        await Assert.ThrowsAsync<PipeClosedException>(async () => await FrameCodec.ReadAsync(empty));
+    }
+
+    [Fact]
+    public async Task ClosingPartWayThroughAHeaderIsATruncation()
+    {
+        await using var partial = new MemoryStream(new byte[ProtocolConstants.HeaderSize - 1]);
+        await Assert.ThrowsAsync<EndOfStreamException>(async () => await FrameCodec.ReadAsync(partial));
+    }
+
+    [Fact]
     public async Task AcceptsNewerSameMajorMinorVersion()
     {
         var bytes = new byte[ProtocolConstants.HeaderSize];

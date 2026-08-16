@@ -188,10 +188,14 @@ bool ParseActionInvoke(
     ActionRequest& action,
     std::wstring& error) noexcept;
 bool ParseHeartbeat(std::string_view payload, std::wstring_view nonce, std::wstring& error) noexcept;
+// fatal and surfaceId report the renderer's own scoping for the fault.  A non-fatal
+// error naming a live surface is a per-surface fault, not a session fault.
 bool ParseErrorMessage(
     std::string_view payload,
     std::wstring_view nonce,
-    std::wstring& error) noexcept;
+    std::wstring& error,
+    bool* fatal = nullptr,
+    std::wstring* surfaceId = nullptr) noexcept;
 bool ParseShutdownMessage(
     std::string_view payload,
     std::wstring_view nonce,

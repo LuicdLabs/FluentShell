@@ -23,6 +23,63 @@ public sealed class WindowRegistry
 
     public async Task HandleAsync(IProtocolMessage message, ulong headerRevision)
     {
+        // A violation that names a single surface must not take the session down:
+        // every other window in this target process is still projecting correctly.
+        // Report it to the Bridge as a non-fatal, surface-scoped error so it rolls
+        // that one window back to native, and keep reading frames.
+        var scope = SurfaceScopeOf(message);
+        if (scope is not { } faultedSurfaceId)
+        {
+            await DispatchAsync(message, headerRevision);
+            return;
+        }
+
+        try
+        {
+            await DispatchAsync(message, headerRevision);
+        }
+        catch (ProtocolException exception)
+        {
+            RendererDiagnostics.Log(
+                $"surface fault {faultedSurfaceId} on {message.MessageType}: {exception.Message}");
+            FaultSurface(faultedSurfaceId);
+            await _send(new ErrorMessage
+            {
+                SessionNonce = _sessionNonce,
+                SurfaceId = faultedSurfaceId,
+                Code = "surface_protocol_fault",
+                Detail = exception.Message,
+                Fatal = false,
+            }, 0);
+        }
+    }
+
+    /// <summary>
+    /// The surface a fault while handling this message belongs to, or null when the
+    /// message is session-scoped and any violation in it is genuinely fatal.
+    /// </summary>
+    private static Guid? SurfaceScopeOf(IProtocolMessage message) => message switch
+    {
+        WindowOpenMessage open => open.Window.SurfaceId,
+        WindowPatchMessage patch => patch.SurfaceId,
+        ActionResultMessage result => result.SurfaceId,
+        SurfaceCommitMessage commit => commit.SurfaceId,
+        WindowCloseMessage close => close.SurfaceId,
+        _ => null,
+    };
+
+    private void FaultSurface(Guid surfaceId)
+    {
+        if (_windows.ContainsKey(surfaceId))
+        {
+            Close(surfaceId);
+            return;
+        }
+        _retiredSurfaces.Remember(surfaceId);
+    }
+
+    private async Task DispatchAsync(IProtocolMessage message, ulong headerRevision)
+    {
         switch (message)
         {
             case WindowOpenMessage open:

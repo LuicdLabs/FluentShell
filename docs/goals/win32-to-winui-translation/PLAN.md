@@ -23,6 +23,12 @@
 - The Bridge is the pipe server and authenticates the exact renderer PID, process creation time, current logon SID, and a 128-bit nonce.
 - Frame header is the fixed 32-byte little-endian v1 layout specified by `protocol-v1.schema.json`; payload limits and ordering violations fail native.
 - Every native object has a generation ID; sequence is monotonic per pipe direction and revision is monotonic per top-level window.
+- Property actions carry an expected revision and are rejected as stale when it no
+  longer matches. Request-semantic actions -- `invoke`, `close`, `move`, and
+  `resize` -- are rebased onto the current revision instead, because the user's
+  pointer, not a snapshot revision, is the truth for whether they still apply.
+  Geometry is coalesced latest-wins by the renderer and emitted once per move/size
+  gesture rather than once per frame.
 - Native reads and writes run on the owning GUI thread. The IPC thread only queues commands.
 - Renderer ViewModels use typed binding. Native patches are canonical; matching event IDs suppress only their own echoes.
 - Any unsupported visible descendant or runtime capability change restores the entire native top-level window.

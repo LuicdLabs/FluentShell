@@ -420,17 +420,55 @@ void TestActionRevisionPolicy() {
         "button invoke must use the latest canonical revision");
     Check(Translation::IsRequestSemanticAction(L"close"),
         "close must remain request semantic");
+    Check(Translation::IsRequestSemanticAction(L"move") &&
+          Translation::IsRequestSemanticAction(L"resize"),
+        "geometry is latest-wins and must not reject a stale revision");
     Check(!Translation::IsRequestSemanticAction(L"activate") &&
           !Translation::IsRequestSemanticAction(L"setText") &&
           !Translation::IsRequestSemanticAction(L"setCheck") &&
           !Translation::IsRequestSemanticAction(L"select") &&
           !Translation::IsRequestSemanticAction(L"menuCommand") &&
-          !Translation::IsRequestSemanticAction(L"move") &&
-          !Translation::IsRequestSemanticAction(L"resize") &&
           !Translation::IsRequestSemanticAction(L"minimize") &&
           !Translation::IsRequestSemanticAction(L"maximize") &&
           !Translation::IsRequestSemanticAction(L"restore"),
         "property actions must retain stale-revision rejection");
+}
+
+void TestErrorScopeParsing() {
+    const wchar_t* nonce = L"00112233445566778899aabbccddeeff";
+    const std::string prefix =
+        R"({"messageType":"error","sessionNonce":"00112233445566778899aabbccddeeff",)";
+    std::wstring error;
+
+    bool fatal = true;
+    std::wstring surfaceId = L"stale";
+    const std::string scoped = prefix +
+        R"("surfaceId":"11111111-2222-3333-4444-555555555555",)"
+        R"("code":"surface_protocol_fault","detail":"bad patch","fatal":false})";
+    Check(Translation::ParseErrorMessage(scoped, nonce, error, &fatal, &surfaceId),
+        "surface-scoped error payload did not parse");
+    Check(!fatal, "non-fatal error was reported as fatal");
+    Check(surfaceId == L"11111111-2222-3333-4444-555555555555",
+        "surface-scoped error lost its surfaceId");
+
+    // No surfaceId means the fault cannot be attributed to one window.
+    fatal = false;
+    surfaceId = L"stale";
+    const std::string unscoped = prefix +
+        R"("code":"protocol_fault","detail":"bad frame","fatal":true})";
+    Check(Translation::ParseErrorMessage(unscoped, nonce, error, &fatal, &surfaceId),
+        "session error payload did not parse");
+    Check(fatal && surfaceId.empty(),
+        "session error must stay fatal and unscoped");
+
+    // An unparseable payload must never be downgraded to a recoverable fault.
+    fatal = false;
+    surfaceId = L"11111111-2222-3333-4444-555555555555";
+    Check(!Translation::ParseErrorMessage(prefix + R"("code":"","detail":"x","fatal":false})",
+        nonce, error, &fatal, &surfaceId),
+        "empty error code was accepted");
+    Check(fatal && surfaceId.empty(),
+        "rejected error payload must default to session scope");
 }
 
 void TestExpandedControlSerialization() {
@@ -628,6 +666,7 @@ int wmain() {
     TestStrictMessageValidation();
     TestActionSemanticValidation();
     TestActionRevisionPolicy();
+    TestErrorScopeParsing();
     TestExpandedControlSerialization();
     TestEditableComboCaptureBoundary();
     TestStandardMenuCapture();

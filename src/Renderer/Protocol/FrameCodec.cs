@@ -39,7 +39,7 @@ public static class FrameCodec
     public static async ValueTask<ProtocolFrame> ReadAsync(Stream stream, CancellationToken cancellationToken = default)
     {
         var bytes = new byte[ProtocolConstants.HeaderSize];
-        await ReadExactlyAsync(stream, bytes, cancellationToken).ConfigureAwait(false);
+        await ReadExactlyAsync(stream, bytes, cancellationToken, atFrameBoundary: true).ConfigureAwait(false);
         if (BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(0, 4)) != ProtocolConstants.Magic)
         {
             throw new ProtocolException("Invalid FLSH frame magic.");
@@ -83,7 +83,11 @@ public static class FrameCodec
         _ = MessageTypeNames.FromFrameType(header.MessageType);
     }
 
-    private static async ValueTask ReadExactlyAsync(Stream stream, Memory<byte> destination, CancellationToken cancellationToken)
+    private static async ValueTask ReadExactlyAsync(
+        Stream stream,
+        Memory<byte> destination,
+        CancellationToken cancellationToken,
+        bool atFrameBoundary = false)
     {
         var read = 0;
         while (read < destination.Length)
@@ -91,7 +95,12 @@ public static class FrameCodec
             var count = await stream.ReadAsync(destination[read..], cancellationToken).ConfigureAwait(false);
             if (count == 0)
             {
-                throw new EndOfStreamException("The pipe closed in the middle of an FLSH frame.");
+                // Zero bytes before any of a header has arrived means the Bridge is
+                // simply gone, which is the normal end of a session.  Only a frame
+                // that was already partly consumed is a truncation.
+                throw atFrameBoundary && read == 0
+                    ? new PipeClosedException()
+                    : new EndOfStreamException("The pipe closed in the middle of an FLSH frame.");
             }
             read += count;
         }

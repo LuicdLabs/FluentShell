@@ -30,15 +30,32 @@ public sealed class WindowStatePolicyTests
         Assert.Equal(expected, TranslatedWindow.ShouldEmitGeometry(state, presenterState));
 
     [Theory]
-    [InlineData(false, false, false, true)]
-    [InlineData(true, true, false, true)]
-    [InlineData(true, false, true, true)]
-    [InlineData(true, false, false, false)]
+    [InlineData(false, false, false, false, true)]
+    [InlineData(true, true, false, false, true)]
+    [InlineData(true, false, true, false, true)]
+    [InlineData(true, false, false, false, false)]
     public void EventlessBindingPatchesDoNotReapplyCanonicalPlacement(
         bool committed,
         bool placementChanged,
         bool placementActionPatch,
+        bool localPlacementPending,
         bool expected) =>
         Assert.Equal(expected, TranslatedWindow.ShouldApplyCanonicalPlacement(
-            committed, placementChanged, placementActionPatch));
+            committed, placementChanged, placementActionPatch, localPlacementPending));
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void CanonicalPlacementNeverFightsAPendingLocalGesture(
+        bool placementChanged,
+        bool placementActionPatch) =>
+        Assert.False(TranslatedWindow.ShouldApplyCanonicalPlacement(
+            committed: true, placementChanged, placementActionPatch,
+            localPlacementPending: true));
+
+    [Fact]
+    public void UncommittedWindowsStillTakeCanonicalPlacementDuringAGesture() =>
+        Assert.True(TranslatedWindow.ShouldApplyCanonicalPlacement(
+            committed: false, placementChanged: false, placementActionPatch: false,
+            localPlacementPending: true));
 }
