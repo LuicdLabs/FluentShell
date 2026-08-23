@@ -1,9 +1,11 @@
 using FluentShell.Renderer.ViewModels;
+using FluentShell.Renderer.Runtime;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Data;
+using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Media;
 using Windows.System;
 
@@ -11,6 +13,7 @@ namespace FluentShell.Renderer.Windows;
 
 internal sealed class ControlFactory
 {
+    private const double NativeFontSize = 12;
     private static readonly BooleanToVisibilityConverter VisibilityConverter = new();
     private static readonly Win32MnemonicTextConverter MnemonicTextConverter = new();
     private readonly double _scale;
@@ -49,11 +52,14 @@ internal sealed class ControlFactory
             "listBox" => CreateListBox(viewModel),
             "groupBox" => CreateGroupBox(viewModel),
             "progressBar" => CreateProgressBar(viewModel),
+            "sysLink" => CreateSysLink(viewModel),
+            "listView" => CreateListView(viewModel),
+            "statusBar" => CreateStatusBar(viewModel),
             _ => throw new InvalidOperationException($"Unsupported translated control kind '{viewModel.Kind}'."),
         };
 
         element.DataContext = viewModel;
-        element.IsTabStop = viewModel.TabStop;
+        element.IsTabStop = viewModel.Kind == "sysLink" ? false : viewModel.TabStop;
         element.TabIndex = Math.Max(0, viewModel.TabIndex);
         ApplyAutomationAndAccessKey(element, viewModel);
         Bind(element, UIElement.VisibilityProperty, nameof(viewModel.Visible), BindingMode.OneWay, VisibilityConverter);
@@ -81,7 +87,12 @@ internal sealed class ControlFactory
 
     private static TextBlock CreateStatic(ControlNodeViewModel viewModel)
     {
-        var control = new TextBlock { TextWrapping = TextWrapping.Wrap, VerticalAlignment = VerticalAlignment.Center };
+        var control = new TextBlock
+        {
+            FontSize = NativeFontSize,
+            TextWrapping = TextWrapping.Wrap,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
         Bind(control, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay);
         return control;
     }
@@ -97,6 +108,7 @@ internal sealed class ControlFactory
         };
         var caption = new TextBlock
         {
+            FontSize = NativeFontSize,
             Margin = new Thickness(10, 0, 0, 0),
             Padding = new Thickness(4, 0, 4, 0),
             VerticalAlignment = VerticalAlignment.Top,
@@ -142,7 +154,14 @@ internal sealed class ControlFactory
 
     private Button CreateButton(ControlNodeViewModel viewModel)
     {
-        var control = new Button { HorizontalContentAlignment = HorizontalAlignment.Center };
+        var control = new Button
+        {
+            FontSize = NativeFontSize,
+            MinWidth = 0,
+            MinHeight = 0,
+            Padding = new Thickness(4, 0, 4, 0),
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+        };
         Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
         control.Click += (_, _) =>
         {
@@ -153,7 +172,13 @@ internal sealed class ControlFactory
 
     private CheckBox CreateCheckBox(ControlNodeViewModel viewModel, bool threeState)
     {
-        var control = new CheckBox { IsThreeState = threeState, IsChecked = ToNullableBool(viewModel.Checked) };
+        var control = new CheckBox
+        {
+            FontSize = NativeFontSize,
+            MinHeight = 0,
+            IsThreeState = threeState,
+            IsChecked = ToNullableBool(viewModel.Checked),
+        };
         Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
         RoutedEventHandler changed = (_, _) =>
         {
@@ -174,6 +199,8 @@ internal sealed class ControlFactory
     {
         var control = new RadioButton
         {
+            FontSize = NativeFontSize,
+            MinHeight = 0,
             IsChecked = viewModel.Checked == 1,
             GroupName = _radioGroups[viewModel.NodeId],
         };
@@ -193,7 +220,10 @@ internal sealed class ControlFactory
     {
         var control = new TextBox
         {
-            AcceptsReturn = viewModel.Multiline,
+            FontSize = NativeFontSize,
+            MinHeight = 0,
+            Padding = new Thickness(4, 0, 4, 0),
+            AcceptsReturn = AcceptsReturnFor(viewModel),
             TextWrapping = viewModel.Multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
             IsReadOnly = viewModel.ReadOnly,
         };
@@ -217,6 +247,7 @@ internal sealed class ControlFactory
         control.TextChanged += (_, _) =>
         {
             if (_isApplyingCanonical()) return;
+            RendererDiagnostics.Log($"textBox draft changed length={control.Text.Length}");
             timer.Stop();
             timer.Start();
         };
@@ -224,8 +255,13 @@ internal sealed class ControlFactory
         control.LostFocus += (_, _) => CommitDraft();
         control.KeyDown += (_, args) =>
         {
+            RendererDiagnostics.Log($"textBox keyDown key={args.Key}");
             if (!viewModel.Multiline && args.Key == VirtualKey.Enter) CommitDraft();
         };
+        control.GotFocus += (_, _) => RendererDiagnostics.Log("textBox got focus");
+        control.Loaded += (_, _) => RendererDiagnostics.Log(
+            $"textBox loaded readOnly={viewModel.ReadOnly} multiline={viewModel.Multiline} " +
+            $"dialogCode=0x{viewModel.DialogCode:X} enabled={viewModel.Enabled}");
         void ApplySelection()
         {
             var start = Math.Clamp(viewModel.SelectionStart, 0, control.Text.Length);
@@ -244,7 +280,13 @@ internal sealed class ControlFactory
 
     private PasswordBox CreatePasswordBox(ControlNodeViewModel viewModel)
     {
-        var control = new PasswordBox { Password = viewModel.DraftText };
+        var control = new PasswordBox
+        {
+            FontSize = NativeFontSize,
+            MinHeight = 0,
+            Padding = new Thickness(4, 0, 4, 0),
+            Password = viewModel.DraftText,
+        };
         control.PasswordChanged += (_, _) =>
         {
             viewModel.DraftText = control.Password;
@@ -261,6 +303,8 @@ internal sealed class ControlFactory
     {
         var control = new ComboBox
         {
+            FontSize = NativeFontSize,
+            MinHeight = 0,
             ItemsSource = viewModel.Items,
             SelectedIndex = viewModel.SelectedIndex,
             IsEditable = viewModel.Editable,
@@ -321,6 +365,7 @@ internal sealed class ControlFactory
         itemStyle.Setters.Add(new Setter(Control.VerticalContentAlignmentProperty, VerticalAlignment.Center));
         var control = new ListBox
         {
+            FontSize = NativeFontSize,
             ItemsSource = viewModel.Items,
             SelectedIndex = viewModel.SelectedIndex,
             ItemContainerStyle = itemStyle,
@@ -335,6 +380,253 @@ internal sealed class ControlFactory
         };
         return control;
     }
+
+    private ContentControl CreateSysLink(ControlNodeViewModel viewModel)
+    {
+        var text = new RichTextBlock
+        {
+            FontSize = NativeFontSize,
+            TextWrapping = TextWrapping.Wrap,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        var control = new SemanticSysLinkControl
+        {
+            Content = text,
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+        };
+        void RebuildText()
+        {
+            if (viewModel.Items.Count != 1 ||
+                !TrySplitSysLinkText(viewModel.Text, viewModel.Items[0], out var segments)) return;
+            var paragraph = new Paragraph();
+            if (segments.Prefix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Prefix });
+            var link = new Hyperlink
+            {
+                IsTabStop = viewModel.TabStop,
+                TabIndex = Math.Max(0, viewModel.TabIndex),
+            };
+            link.Inlines.Add(new Run { Text = segments.Label });
+            AutomationProperties.SetName(link, segments.Label);
+            link.Click += (_, _) =>
+            {
+                if (!_isApplyingCanonical()) _action(viewModel, "invoke", null);
+            };
+            paragraph.Inlines.Add(link);
+            if (segments.Suffix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Suffix });
+            text.Blocks.Clear();
+            text.Blocks.Add(paragraph);
+        }
+        RebuildText();
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Text) or nameof(viewModel.Items)) RebuildText();
+        };
+        return control;
+    }
+
+    private ListView CreateListView(ControlNodeViewModel viewModel)
+    {
+        var itemStyle = new Style(typeof(ListViewItem));
+        itemStyle.Setters.Add(new Setter(Control.MinHeightProperty, 22d));
+        itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
+        itemStyle.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Left));
+        itemStyle.Setters.Add(new Setter(Control.VerticalContentAlignmentProperty, VerticalAlignment.Center));
+        var control = new ListView
+        {
+            ItemContainerStyle = itemStyle,
+            SelectionMode = SelectionModeFor(viewModel.MultiSelect),
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+        };
+        var applyingSelection = false;
+
+        Grid BuildCells(IReadOnlyList<string> cells, bool header)
+        {
+            var grid = new Grid { HorizontalAlignment = HorizontalAlignment.Left };
+            for (var index = 0; index < viewModel.Columns.Count; index++)
+            {
+                grid.ColumnDefinitions.Add(new ColumnDefinition
+                {
+                    Width = new GridLength(viewModel.ColumnWidths[index] * _scale),
+                });
+                var content = new TextBlock
+                {
+                    FontSize = NativeFontSize,
+                    Text = cells[index],
+                    Margin = new Thickness(6, 0, 6, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    FontWeight = new global::Windows.UI.Text.FontWeight
+                    {
+                        Weight = header ? (ushort)600 : (ushort)400,
+                    },
+                };
+                Grid.SetColumn(content, index);
+                grid.Children.Add(content);
+            }
+            AutomationProperties.SetName(grid, string.Join(" ", cells));
+            return grid;
+        }
+
+        void ApplyCanonicalSelection()
+        {
+            applyingSelection = true;
+            try
+            {
+                if (viewModel.MultiSelect)
+                {
+                    control.SelectedItems.Clear();
+                    foreach (var index in viewModel.SelectedIndices)
+                    {
+                        if (index >= 0 && index < control.Items.Count)
+                            control.SelectedItems.Add(control.Items[index]);
+                    }
+                }
+                else
+                    control.SelectedIndex = viewModel.SelectedIndices.FirstOrDefault(-1);
+            }
+            finally
+            {
+                applyingSelection = false;
+            }
+        }
+
+        void RebuildRows()
+        {
+            if (!HasRenderableListViewShape(viewModel)) return;
+            applyingSelection = true;
+            try
+            {
+                control.Header = BuildCells(viewModel.Columns, header: true);
+                control.Items.Clear();
+                foreach (var row in viewModel.Rows) control.Items.Add(BuildCells(row, header: false));
+            }
+            finally
+            {
+                applyingSelection = false;
+            }
+            ApplyCanonicalSelection();
+        }
+
+        control.SelectionChanged += (_, _) =>
+        {
+            if (applyingSelection || _isApplyingCanonical()) return;
+            var selection = CanonicalSelectionIndices(control.SelectedItems
+                .Cast<object>()
+                .Select(item => control.Items.IndexOf(item)));
+            if (!viewModel.SelectedIndices.SequenceEqual(selection))
+                _action(viewModel, "setSelection", selection);
+        };
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Columns) or nameof(viewModel.ColumnWidths) or nameof(viewModel.Rows))
+                RebuildRows();
+            else if (args.PropertyName == nameof(viewModel.MultiSelect))
+            {
+                control.SelectionMode = SelectionModeFor(viewModel.MultiSelect);
+                ApplyCanonicalSelection();
+            }
+            else if (args.PropertyName == nameof(viewModel.SelectedIndices))
+                ApplyCanonicalSelection();
+        };
+        RebuildRows();
+        return control;
+    }
+
+    private ContentControl CreateStatusBar(ControlNodeViewModel viewModel)
+    {
+        var grid = new Grid();
+        var control = new SemanticStatusBarControl
+        {
+            Content = grid,
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+        };
+        void RebuildParts()
+        {
+            grid.ColumnDefinitions.Clear();
+            grid.Children.Clear();
+            var hasWidths = viewModel.ColumnWidths.Count == viewModel.Items.Count;
+            for (var index = 0; index < viewModel.Items.Count; index++)
+            {
+                grid.ColumnDefinitions.Add(new ColumnDefinition
+                {
+                    Width = hasWidths
+                        ? new GridLength(viewModel.ColumnWidths[index] * _scale)
+                        : new GridLength(1, GridUnitType.Star),
+                });
+                var part = new Border
+                {
+                    BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Gray),
+                    BorderThickness = index + 1 < viewModel.Items.Count
+                        ? new Thickness(0, 0, 1, 0)
+                        : new Thickness(0),
+                    Child = new TextBlock
+                    {
+                        FontSize = NativeFontSize,
+                        Text = viewModel.Items[index],
+                        Margin = new Thickness(6, 0, 6, 0),
+                        VerticalAlignment = VerticalAlignment.Center,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                    },
+                };
+                AutomationProperties.SetName(part, viewModel.Items[index]);
+                Grid.SetColumn(part, index);
+                grid.Children.Add(part);
+            }
+        }
+        RebuildParts();
+        control.Loaded += (_, _) => RendererDiagnostics.Log(
+            $"statusBar layout requested={viewModel.Rect.Width}x{viewModel.Rect.Height} " +
+            $"scale={_scale:F3} owner={control.ActualWidth:F1}x{control.ActualHeight:F1} " +
+            $"grid={grid.ActualWidth:F1}x{grid.ActualHeight:F1} parts={viewModel.Items.Count}");
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ColumnWidths)) RebuildParts();
+        };
+        return control;
+    }
+
+    internal static SysLinkSegments SplitSysLinkText(string text, string label)
+    {
+        if (!TrySplitSysLinkText(text, label, out var segments))
+            throw new ArgumentException("SysLink label must occur exactly once in its text.", nameof(label));
+        return segments;
+    }
+
+    private static bool TrySplitSysLinkText(string text, string label, out SysLinkSegments segments)
+    {
+        segments = default;
+        if (string.IsNullOrEmpty(label)) return false;
+        var start = text.IndexOf(label, StringComparison.Ordinal);
+        if (start < 0 || text.IndexOf(label, start + label.Length, StringComparison.Ordinal) >= 0) return false;
+        segments = new SysLinkSegments(text[..start], label, text[(start + label.Length)..]);
+        return true;
+    }
+
+    internal static int[] CanonicalSelectionIndices(IEnumerable<int> indices) =>
+        indices.Where(index => index >= 0).Distinct().Order().ToArray();
+
+    internal static ListViewSelectionMode SelectionModeFor(bool multiSelect) =>
+        multiSelect ? ListViewSelectionMode.Extended : ListViewSelectionMode.Single;
+
+    internal static bool HasRenderableListViewShape(ControlNodeViewModel viewModel) =>
+        viewModel.Columns.Count != 0 &&
+        viewModel.ColumnWidths.Count == viewModel.Columns.Count &&
+        viewModel.Rows.All(row => row.Count == viewModel.Columns.Count);
+
+    internal static bool AcceptsReturnFor(ControlNodeViewModel viewModel) =>
+        viewModel.Multiline && (viewModel.DialogCode & 0x0004u) != 0;
+
+    internal static AutomationControlType AutomationControlTypeFor(string kind) => kind switch
+    {
+        "sysLink" => AutomationControlType.Pane,
+        "listView" => AutomationControlType.List,
+        "statusBar" => AutomationControlType.StatusBar,
+        _ => AutomationControlType.Custom,
+    };
 
     private void ApplyBounds(FrameworkElement element, ControlNodeViewModel viewModel)
     {
@@ -395,4 +687,43 @@ internal sealed class SemanticGroupAutomationPeer(SemanticGroupControl owner) : 
 {
     protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.Group;
     protected override string GetClassNameCore() => "GroupBox";
+}
+
+internal readonly record struct SysLinkSegments(string Prefix, string Label, string Suffix);
+
+internal sealed class SemanticSysLinkControl : ContentControl
+{
+    protected override AutomationPeer OnCreateAutomationPeer() => new SemanticSysLinkAutomationPeer(this);
+}
+
+internal sealed class SemanticSysLinkAutomationPeer(SemanticSysLinkControl owner) : FrameworkElementAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        ControlFactory.AutomationControlTypeFor("sysLink");
+
+    protected override string GetClassNameCore() => "SysLink";
+    protected override string GetNameCore() => AutomationProperties.GetName(owner);
+}
+
+internal sealed class SemanticStatusBarControl : ContentControl
+{
+    protected override AutomationPeer OnCreateAutomationPeer() => new SemanticStatusBarAutomationPeer(this);
+}
+
+internal sealed class SemanticStatusBarAutomationPeer(SemanticStatusBarControl owner) : FrameworkElementAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        ControlFactory.AutomationControlTypeFor("statusBar");
+
+    protected override string GetClassNameCore() => "StatusBar";
+    protected override string GetNameCore() => AutomationProperties.GetName(owner);
+    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
+    {
+        var reported = base.GetBoundingRectangleCore();
+        if (owner.ActualWidth <= 0 || owner.ActualHeight <= 0 || reported.Width <= 0)
+            return reported;
+        var scale = reported.Width / owner.ActualWidth;
+        return new global::Windows.Foundation.Rect(
+            reported.X, reported.Y, reported.Width, owner.ActualHeight * scale);
+    }
 }

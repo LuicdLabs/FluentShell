@@ -36,6 +36,20 @@ constexpr unsigned kQuietReconcileTicks = 4;
 // being broken.  Tolerate a few misses before discarding a working projection.
 constexpr unsigned kMaxCaptureTimeouts = 3;
 
+class PhysicalCoordinateScope final {
+public:
+    PhysicalCoordinateScope() noexcept
+        : previous_(SetThreadDpiAwarenessContext(
+              DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {}
+    ~PhysicalCoordinateScope() {
+        if (previous_) SetThreadDpiAwarenessContext(previous_);
+    }
+    bool IsValid() const noexcept { return previous_ != nullptr; }
+
+private:
+    DPI_AWARENESS_CONTEXT previous_ = nullptr;
+};
+
 DWORD RemainingTimeout(uint64_t deadline) noexcept {
     const uint64_t now = GetTickCount64();
     if (now >= deadline) return 0;
@@ -387,7 +401,8 @@ bool RendererSession::Handshake(DWORD timeoutMs) {
         message.nonce != nonce_ || message.processId != rendererProcessId_ ||
         message.processCreated != rendererCreated_ ||
         message.protocolMajor != frame.header.major ||
-        message.protocolMinor != frame.header.minor) {
+        message.protocolMinor != frame.header.minor ||
+        message.protocolMinor < Ipc::kProtocolMinor) {
         FluentShell::Log(L"Renderer hello identity mismatch: " + error);
         return false;
     }
@@ -634,6 +649,15 @@ bool RendererSession::OpenSurface(
         return false;
     };
     if (!surface) return reject(L"null surface");
+    // WindowCapture and the renderer exchange physical pixel bounds.  The
+    // injected process can be system-DPI-aware or DPI-unaware, so querying the
+    // proxy from its inherited thread context would virtualize GetWindowRect
+    // (for example 900x625 becomes 720x500 at 125% DPI) and falsely fail the
+    // strict pre-commit geometry gate.
+    PhysicalCoordinateScope dpiScope;
+    if (!dpiScope.IsValid()) {
+        return reject(L"cannot establish physical-coordinate DPI context");
+    }
     // Projection, initial revision resync, and native rollback all share this
     // barrier.  It prevents a source-thread capture from being published after
     // a concurrent restore has started.
@@ -696,12 +720,27 @@ bool RendererSession::OpenSurface(
     }
     RECT actualProxyBounds{};
     DWORD readyProxyCloak = 0;
-    if (!GetWindowRect(ready.proxyHwnd, &actualProxyBounds) ||
-        !RectClose(actualProxyBounds, surface->snapshot.bounds) ||
-        !IsWindowVisible(ready.proxyHwnd) ||
-        FAILED(DwmGetWindowAttribute(
-            ready.proxyHwnd, DWMWA_CLOAKED, &readyProxyCloak, sizeof(readyProxyCloak))) ||
+    const BOOL boundsRead = GetWindowRect(ready.proxyHwnd, &actualProxyBounds);
+    const BOOL proxyVisible = IsWindowVisible(ready.proxyHwnd);
+    const HRESULT cloakRead = DwmGetWindowAttribute(
+        ready.proxyHwnd, DWMWA_CLOAKED, &readyProxyCloak, sizeof(readyProxyCloak));
+    const bool boundsMatch = boundsRead &&
+        RectClose(actualProxyBounds, surface->snapshot.bounds);
+    if (!boundsMatch || !proxyVisible || FAILED(cloakRead) ||
         (readyProxyCloak & DWM_CLOAKED_APP) == 0) {
+        FluentShell::Log(L"Hidden proxy gate values: rectRead=" +
+            std::to_wstring(boundsRead != FALSE) + L" visible=" +
+            std::to_wstring(proxyVisible != FALSE) + L" cloakHr=" +
+            std::to_wstring(static_cast<long>(cloakRead)) + L" cloakBits=" +
+            std::to_wstring(readyProxyCloak) + L" actual=" +
+            std::to_wstring(actualProxyBounds.left) + L"," +
+            std::to_wstring(actualProxyBounds.top) + L"," +
+            std::to_wstring(actualProxyBounds.right - actualProxyBounds.left) + L"x" +
+            std::to_wstring(actualProxyBounds.bottom - actualProxyBounds.top) +
+            L" expected=" + std::to_wstring(surface->snapshot.bounds.left) + L"," +
+            std::to_wstring(surface->snapshot.bounds.top) + L"," +
+            std::to_wstring(surface->snapshot.bounds.right - surface->snapshot.bounds.left) + L"x" +
+            std::to_wstring(surface->snapshot.bounds.bottom - surface->snapshot.bounds.top));
         return reject(L"hidden proxy geometry or visibility failed");
     }
     surface->state = SurfaceState::SurfaceReady;
@@ -824,7 +863,7 @@ bool RendererSession::OpenSurface(
     }
     if (!Send(Ipc::MessageType::SurfaceCommit, surface->snapshot.revision,
             SerializeSurfaceCommit(nonce_, surface->snapshot.surfaceId,
-                surface->snapshot.revision, true))) {
+                surface->snapshot.revision, true, false))) {
         if (cloakNative && surface->agent) {
             std::wstring ignored;
             surface->agent->Restore(ignored, 2000, shutdownEvent_);
@@ -898,9 +937,23 @@ bool RendererSession::OpenSurface(
             Sleep(50 * attempt);
         }
     }
+    // The provisional commit above makes the proxy visible for committed UIA
+    // validation but deliberately leaves renderer input gated.  Release that
+    // gate only after the complete proxy/isolation contract has passed.  Mark
+    // the Bridge side projected first so an action emitted immediately after
+    // the renderer consumes this frame cannot race the local state transition.
     {
         std::scoped_lock stateLock(surface->mutex);
         surface->state = SurfaceState::Projected;
+    }
+    if (!Send(Ipc::MessageType::SurfaceCommit, surface->snapshot.revision,
+            SerializeSurfaceCommit(nonce_, surface->snapshot.surfaceId,
+                surface->snapshot.revision, true, true))) {
+        if (cloakNative && surface->agent) {
+            std::wstring ignored;
+            surface->agent->Restore(ignored, 2000, shutdownEvent_);
+        }
+        return reject(L"surface.interactive commit send failed");
     }
     return true;
 }
@@ -920,6 +973,11 @@ void RendererSession::DiscoverTopLevelWindows() {
         }
         wchar_t className[256]{};
         GetClassNameW(hwnd, className, static_cast<int>(std::size(className)));
+        // A visible #32768 is the system-owned popup surface for an HMENU, not
+        // an application top-level contract.  The projected MenuBar owns that
+        // command surface; trying to attach a source agent to the transient
+        // popup only produces a false owner-graph rejection.
+        if (FluentShell::EqualsIgnoreCase(className, L"#32768")) return TRUE;
         if (!FluentShell::IsShellOrXamlWindowClass(className)) context.windows.push_back(hwnd);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&context));

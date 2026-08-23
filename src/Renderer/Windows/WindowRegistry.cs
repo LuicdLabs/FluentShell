@@ -103,7 +103,8 @@ public sealed class WindowRegistry
             case SurfaceCommitMessage commit:
                 RequireHeaderRevision(headerRevision, commit.Revision, "surface.commit");
                 if (_retiredSurfaces.Contains(commit.SurfaceId)) break;
-                RequireWindow(commit.SurfaceId).Commit(commit.Show, ParseRevision(commit.Revision));
+                RequireWindow(commit.SurfaceId).Commit(
+                    commit.Show, ParseRevision(commit.Revision), commit.Interactive);
                 break;
             case WindowCloseMessage close:
                 if (!_retiredSurfaces.Contains(close.SurfaceId))

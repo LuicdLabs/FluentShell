@@ -355,4 +355,71 @@ public sealed class ViewModelTests
         Assert.Equal(1, node.SelectedIndex);
         Assert.False(node.IsPendingEcho("selectedIndex", "55"));
     }
+
+    [Fact]
+    public void MapsBoundedSysLinkAndListViewFields()
+    {
+        var source = TestData.Snapshot().Nodes[0];
+        var link = ControlNodeViewModel.FromSnapshot(source with
+        {
+            Kind = "sysLink",
+            Text = "Open advanced settings.",
+            Items = ["advanced settings"],
+        });
+        var list = ControlNodeViewModel.FromSnapshot(source with
+        {
+            Kind = "listView",
+            Text = string.Empty,
+            Items = ["Alpha", "Beta"],
+            Columns = ["Name", "State"],
+            ColumnWidths = [120, 80],
+            Rows = [["Alpha", "Ready"], ["Beta", "Busy"]],
+            SelectedIndices = [1],
+            FocusedIndex = 1,
+            MultiSelect = true,
+        });
+
+        Assert.Equal("Open advanced settings.", link.Text);
+        Assert.Equal("advanced settings", link.Items.Single());
+        Assert.Equal(["Name", "State"], list.Columns);
+        Assert.Equal([120, 80], list.ColumnWidths);
+        Assert.Equal(["Alpha", "Ready"], list.Rows[0]);
+        Assert.Equal([1], list.SelectedIndices);
+        Assert.Equal(1, list.FocusedIndex);
+        Assert.True(list.MultiSelect);
+    }
+
+    [Fact]
+    public void CanonicalListViewPatchReconcilesRowsColumnsAndSelection()
+    {
+        var node = ControlNodeViewModel.FromSnapshot(TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "listView",
+            Columns = ["Old"],
+            ColumnWidths = [80],
+            Rows = [["One"], ["Two"]],
+            SelectedIndices = [0],
+            FocusedIndex = 0,
+        });
+        node.RegisterPending("selectedIndices", "42");
+
+        node.ApplyCanonical("columns", JsonSerializer.SerializeToElement(new[] { "Name", "State" }), null);
+        node.ApplyCanonical("columnWidths", JsonSerializer.SerializeToElement(new[] { 120, 80 }), null);
+        node.ApplyCanonical("rows", JsonSerializer.SerializeToElement(new[]
+        {
+            new[] { "One", "Ready" },
+            new[] { "Two", "Busy" },
+        }), null);
+        node.ApplyCanonical("multiSelect", JsonSerializer.SerializeToElement(true), null);
+        node.ApplyCanonical("focusedIndex", JsonSerializer.SerializeToElement(1), null);
+        node.ApplyCanonical("selectedIndices", JsonSerializer.SerializeToElement(new[] { 0, 1 }), "42");
+
+        Assert.Equal(["Name", "State"], node.Columns);
+        Assert.Equal([120, 80], node.ColumnWidths);
+        Assert.Equal(["Two", "Busy"], node.Rows[1]);
+        Assert.Equal([0, 1], node.SelectedIndices);
+        Assert.Equal(1, node.FocusedIndex);
+        Assert.True(node.MultiSelect);
+        Assert.False(node.IsPendingEcho("selectedIndices", "42"));
+    }
 }

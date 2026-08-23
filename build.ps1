@@ -45,9 +45,15 @@ function Reset-ProductionOutput {
         throw "Refusing to clean output outside build/bin: $resolvedOutput"
     }
     if (Test-Path -LiteralPath $resolvedOutput) {
-        Remove-Item -LiteralPath $resolvedOutput -Recurse -Force
+        # Keep the verified configuration root itself so a developer terminal
+        # whose current directory is the production output cannot block an
+        # otherwise clean rebuild.  Removing every child preserves the clean
+        # payload guarantee without requiring the directory handle to close.
+        Get-ChildItem -LiteralPath $resolvedOutput -Force |
+            Remove-Item -Recurse -Force
+    } else {
+        New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
     }
-    New-Item -ItemType Directory -Path $resolvedOutput -Force | Out-Null
 }
 
 $msbuild = Find-MSBuild

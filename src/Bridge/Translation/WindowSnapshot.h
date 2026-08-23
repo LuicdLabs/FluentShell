@@ -28,6 +28,12 @@ enum class ControlKind {
     ListBox,
     GroupBox,
     ProgressBar,
+    SysLink,
+    ListView,
+    TreeView,
+    TabControl,
+    Slider,
+    StatusBar,
 };
 
 struct ControlNode final {
@@ -52,6 +58,9 @@ struct ControlNode final {
     std::wstring automationName;
     int checked = 0;
     int selectedIndex = -1;
+    std::vector<int> selectedIndices;
+    int focusedIndex = -1;
+    bool multiSelect = false;
     int selectionStart = 0;
     int selectionLength = 0;
     bool readOnly = false;
@@ -62,7 +71,16 @@ struct ControlNode final {
     int minimum = 0;
     int maximum = 100;
     int position = 0;
+    int smallChange = 1;
+    int largeChange = 10;
+    bool vertical = false;
+    bool reversed = false;
     std::vector<std::wstring> items;
+    std::vector<std::wstring> columns;
+    std::vector<int> columnWidths;
+    std::vector<std::vector<std::wstring>> rows;
+    std::vector<int> itemDepths;
+    std::vector<bool> itemExpanded;
 };
 
 enum class MenuItemKind {
@@ -116,6 +134,9 @@ struct ActionRequest final {
     std::wstring action;
     std::wstring text;
     int integerValue = 0;
+    std::vector<int> integerValues;
+    int itemIndex = -1;
+    bool booleanValue = false;
     int selectionStart = 0;
     int selectionLength = 0;
     uint32_t menuCommandId = 0;
@@ -162,7 +183,8 @@ std::string SerializeSurfaceCommit(
     std::wstring_view nonce,
     std::wstring_view surfaceId,
     uint64_t revision,
-    bool show);
+    bool show,
+    bool interactive = true);
 std::string SerializeWindowClose(
     std::wstring_view nonce,
     std::wstring_view surfaceId,

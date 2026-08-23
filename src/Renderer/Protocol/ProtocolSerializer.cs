@@ -70,6 +70,15 @@ public static class ProtocolSerializer
                 FrameMessageType.Shutdown => JsonSerializer.Deserialize<ShutdownMessage>(raw, Options),
                 _ => null,
             } ?? throw new ProtocolException("Payload deserialized to null.");
+            // System.Text.Json source generation initializes an omitted bool to
+            // false even when the record property has a true initializer.  An
+            // older Bridge has no interaction-gate field and means "show and
+            // hand off input", so preserve that wire behavior explicitly.
+            if (message is SurfaceCommitMessage legacyCommit &&
+                !document.RootElement.TryGetProperty("interactive", out _))
+            {
+                message = legacyCommit with { Interactive = true };
+            }
             ValidateCommon(message);
             ValidateSemanticCaps(message);
             return message;
@@ -142,7 +151,7 @@ public static class ProtocolSerializer
                 ParseCanonicalUInt64(action.EventId, "eventId");
                 ParseCanonicalUInt64(action.ExpectedRevision, "expectedRevision");
                 if (action.NodeId is not null) ParseCanonicalUInt64(action.NodeId, "nodeId");
-                var requiresNode = action.Action is "invoke" or "setText" or "setCheck" or "select";
+                var requiresNode = action.Action is "invoke" or "setText" or "setCheck" or "select" or "setSelection";
                 if (requiresNode != (action.NodeId is not null))
                     throw new ProtocolException("action.invoke nodeId does not match action semantics.");
                 switch (action.Action)
@@ -151,6 +160,9 @@ public static class ProtocolSerializer
                         throw new ProtocolException("setText requires a string value.");
                     case "setCheck" or "select" when action.Value.ValueKind != JsonValueKind.Number || !action.Value.TryGetInt32(out _):
                         throw new ProtocolException("setCheck/select requires an integer value.");
+                    case "setSelection":
+                        ValidateCanonicalIndices(action.Value, "setSelection");
+                        break;
                     case "menuCommand" when action.Value.ValueKind != JsonValueKind.Number ||
                         !action.Value.TryGetInt32(out var commandId) || commandId is <= 0 or > 0xffff:
                         throw new ProtocolException("menuCommand requires a standard WM_COMMAND ID.");
@@ -165,7 +177,7 @@ public static class ProtocolSerializer
                     case "activate" or "invoke" or "minimize" or "maximize" or "restore" or "close"
                         when action.Value.ValueKind != JsonValueKind.Null:
                         throw new ProtocolException("Request action requires a null value.");
-                    case "activate" or "invoke" or "setText" or "setCheck" or "select" or "menuCommand" or
+                    case "activate" or "invoke" or "setText" or "setCheck" or "select" or "setSelection" or "menuCommand" or
                          "move" or "resize" or "minimize" or "maximize" or "restore" or "close":
                         break;
                     default:
@@ -251,14 +263,14 @@ public static class ProtocolSerializer
             if (node.ParentNodeId is not null) ParseCanonicalUInt64(node.ParentNodeId, "parentNodeId");
             if (node.Style is not null) ParseCanonicalHex64(node.Style, "node.style");
             if (node.ExStyle is not null) ParseCanonicalHex64(node.ExStyle, "node.exStyle");
-            if (node.Items is null || node.Items.Count > ProtocolConstants.MaxItems)
-                throw new ProtocolException("Item count exceeds the protocol cap or items is null.");
+            ValidateNodeCollections(node);
             ValidateRect(node.Rect, "node.rect");
-            if (node.Kind is not ("static" or "separator" or "button" or "checkBox" or "threeState" or "radioButton" or "edit" or "password" or "comboBox" or "listBox" or "groupBox" or "progressBar"))
+            if (node.Kind is not ("static" or "separator" or "button" or "checkBox" or "threeState" or "radioButton" or "edit" or "password" or "comboBox" or "listBox" or "groupBox" or "progressBar" or "sysLink" or "listView" or "statusBar"))
                 throw new ProtocolException("Unknown control node kind.");
             if (node.ZIndex is < 0 or >= ProtocolConstants.MaxNodes ||
                 node.TabIndex is < -1 or >= ProtocolConstants.MaxNodes ||
                 node.Checked is < 0 or > 2 || node.SelectedIndex is < -1 or > 4095 ||
+                node.FocusedIndex is < -1 or >= ProtocolConstants.MaxItems ||
                 node.SelectionStart is < 0 || node.SelectionLength is < 0)
                 throw new ProtocolException("Control node state is outside the protocol range.");
             if (node.Kind == "progressBar" &&
@@ -271,6 +283,9 @@ public static class ProtocolSerializer
                 (node.SelectedIndex is not { } selectedIndex ||
                  selectedIndex < -1 || selectedIndex >= node.Items.Count))
                 throw new ProtocolException("ComboBox selectedIndex is outside its item range.");
+            if (node.Kind == "sysLink") ValidateSysLink(node);
+            if (node.Kind == "listView") ValidateListView(node);
+            if (node.Kind == "statusBar") ValidateStatusBar(node);
             if (node.TabIndex is { } tabIndex)
             {
                 if (node.TabStop && node.Enabled)
@@ -424,6 +439,12 @@ public static class ProtocolSerializer
                 "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "editable", "items");
             ValidateRequiredRectFields(node.GetProperty("rect"), $"{context}.node.rect");
             RequireKind(node.GetProperty("items"), JsonValueKind.Array, $"{context}.node.items");
+            var kind = RequireKind(node.GetProperty("kind"), JsonValueKind.String, $"{context}.node.kind").GetString();
+            if (kind == "listView")
+            {
+                RequireProperties(node, $"{context}.listView", "selectedIndices", "focusedIndex",
+                    "multiSelect", "columns", "columnWidths", "rows");
+            }
         }
     }
 
@@ -438,6 +459,88 @@ public static class ProtocolSerializer
             var children = RequireKind(item.GetProperty("items"), JsonValueKind.Array, $"{context}.items");
             ValidateRequiredMenuFields(children, $"{context}.items", depth + 1);
         }
+    }
+
+    private static void ValidateNodeCollections(ControlNode node)
+    {
+        if (node.Items is null || node.Items.Count > ProtocolConstants.MaxItems)
+            throw new ProtocolException("Item count exceeds the protocol cap or items is null.");
+        if (node.SelectedIndices is null || node.SelectedIndices.Count > ProtocolConstants.MaxItems)
+            throw new ProtocolException("selectedIndices exceeds the protocol cap or is null.");
+        if (node.Columns is null || node.Columns.Count > ProtocolConstants.MaxColumns ||
+            node.Columns.Any(column => column is null))
+            throw new ProtocolException("Column count exceeds the protocol cap or columns is null.");
+        if (node.ColumnWidths is null || node.ColumnWidths.Count > ProtocolConstants.MaxColumns ||
+            node.ColumnWidths.Any(width => width < 0))
+            throw new ProtocolException("columnWidths is null, exceeds the protocol cap, or contains a negative width.");
+        if (node.Rows is null || node.Rows.Count > ProtocolConstants.MaxItems)
+            throw new ProtocolException("Row count exceeds the protocol cap or rows is null.");
+        if (node.Rows.Any(row => row is null || row.Count > ProtocolConstants.MaxColumns ||
+                row.Any(cell => cell is null)))
+            throw new ProtocolException("A ListView row is null or exceeds the column cap.");
+        ValidateCanonicalIndices(node.SelectedIndices, "selectedIndices");
+    }
+
+    private static void ValidateSysLink(ControlNode node)
+    {
+        if (node.Items.Count != 1 || string.IsNullOrEmpty(node.Items[0]) || node.Text is null)
+            throw new ProtocolException("SysLink requires exactly one nonempty link label.");
+        var label = node.Items[0];
+        var first = node.Text.IndexOf(label, StringComparison.Ordinal);
+        if (first < 0 || node.Text.IndexOf(label, first + label.Length, StringComparison.Ordinal) >= 0)
+            throw new ProtocolException("SysLink label must occur exactly once in text.");
+    }
+
+    private static void ValidateListView(ControlNode node)
+    {
+        if (node.Columns.Count == 0 || node.ColumnWidths.Count != node.Columns.Count)
+            throw new ProtocolException("ListView requires one width for each nonempty column set.");
+        if (node.Rows.Any(row => row.Count != node.Columns.Count))
+            throw new ProtocolException("Every ListView row must contain exactly one cell per column.");
+        if (node.SelectedIndices.Any(index => index >= node.Rows.Count))
+            throw new ProtocolException("ListView selectedIndices contains an index outside its rows.");
+        if (!node.MultiSelect && node.SelectedIndices.Count > 1)
+            throw new ProtocolException("A single-select ListView cannot contain multiple selectedIndices.");
+        if (node.FocusedIndex is not { } focusedIndex ||
+            focusedIndex < -1 || focusedIndex >= node.Rows.Count)
+            throw new ProtocolException("ListView focusedIndex is missing or outside its rows.");
+    }
+
+    private static void ValidateStatusBar(ControlNode node)
+    {
+        if (node.Items.Count > ProtocolConstants.MaxColumns || node.Items.Any(item => item is null))
+            throw new ProtocolException("StatusBar item count exceeds the part cap or contains null text.");
+        if (node.ColumnWidths.Count != 0 && node.ColumnWidths.Count != node.Items.Count)
+            throw new ProtocolException("StatusBar columnWidths must be empty or contain one width per part.");
+    }
+
+    private static void ValidateCanonicalIndices(IReadOnlyList<int> indices, string field)
+    {
+        if (indices.Count > ProtocolConstants.MaxItems)
+            throw new ProtocolException($"{field} exceeds the item cap.");
+        var previous = -1;
+        foreach (var index in indices)
+        {
+            if (index is < 0 or >= ProtocolConstants.MaxItems || index <= previous)
+                throw new ProtocolException($"{field} must contain unique, strictly increasing in-range indices.");
+            previous = index;
+        }
+    }
+
+    private static void ValidateCanonicalIndices(JsonElement value, string field)
+    {
+        if (value.ValueKind != JsonValueKind.Array)
+            throw new ProtocolException($"{field} requires an integer array.");
+        var indices = new List<int>();
+        foreach (var entry in value.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Number || !entry.TryGetInt32(out var index))
+                throw new ProtocolException($"{field} requires integer indices.");
+            indices.Add(index);
+            if (indices.Count > ProtocolConstants.MaxItems)
+                throw new ProtocolException($"{field} exceeds the item cap.");
+        }
+        ValidateCanonicalIndices(indices, field);
     }
 
     private static void ValidateRequiredRectFields(JsonElement rect, string context)

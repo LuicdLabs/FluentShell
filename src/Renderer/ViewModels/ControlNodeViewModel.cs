@@ -13,6 +13,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _enabled;
     private int _checked;
     private int _selectedIndex = -1;
+    private int _focusedIndex = -1;
+    private bool _multiSelect;
     private int _selectionStart;
     private int _selectionLength;
     private int _minimum;
@@ -44,6 +46,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool Enabled { get => _enabled; private set => SetProperty(ref _enabled, value); }
     public int Checked { get => _checked; private set => SetProperty(ref _checked, value); }
     public int SelectedIndex { get => _selectedIndex; private set => SetProperty(ref _selectedIndex, value); }
+    public int FocusedIndex { get => _focusedIndex; private set => SetProperty(ref _focusedIndex, value); }
+    public bool MultiSelect { get => _multiSelect; private set => SetProperty(ref _multiSelect, value); }
     public int SelectionStart { get => _selectionStart; private set => SetProperty(ref _selectionStart, value); }
     public int SelectionLength { get => _selectionLength; private set => SetProperty(ref _selectionLength, value); }
     public int Minimum { get => _minimum; private set => SetProperty(ref _minimum, value); }
@@ -51,6 +55,10 @@ public sealed class ControlNodeViewModel : ObservableObject
     public int Position { get => _position; private set => SetProperty(ref _position, value); }
     public PixelRect Rect { get => _rect; private set => SetProperty(ref _rect, value); }
     public ObservableCollection<string> Items { get; } = [];
+    public ObservableCollection<int> SelectedIndices { get; } = [];
+    public ObservableCollection<string> Columns { get; } = [];
+    public ObservableCollection<int> ColumnWidths { get; } = [];
+    public ObservableCollection<IReadOnlyList<string>> Rows { get; } = [];
 
     public static ControlNodeViewModel FromSnapshot(ControlNode node)
     {
@@ -85,6 +93,8 @@ public sealed class ControlNodeViewModel : ObservableObject
         AutomationName = node.AutomationName ?? node.Text;
         Checked = node.Checked ?? 0;
         SelectedIndex = node.SelectedIndex ?? -1;
+        FocusedIndex = node.FocusedIndex ?? -1;
+        MultiSelect = node.MultiSelect;
         SelectionStart = node.SelectionStart ?? 0;
         SelectionLength = node.SelectionLength ?? 0;
         ReadOnly = node.ReadOnly ?? false;
@@ -94,6 +104,10 @@ public sealed class ControlNodeViewModel : ObservableObject
         GroupStart = node.GroupStart ?? false;
         ApplyProgressState(node.Minimum ?? 0, node.Maximum ?? 100, node.Position ?? 0);
         ReplaceItems(node.Items);
+        ReplaceSelectedIndices(node.SelectedIndices);
+        ReplaceColumns(node.Columns);
+        ReplaceColumnWidths(node.ColumnWidths);
+        ReplaceRows(node.Rows);
         if (!preserveTransient) _pendingEventIds.Clear();
         else if (eventId is not null)
         {
@@ -139,6 +153,9 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "enabled": Enabled = value.GetBoolean(); break;
             case "checked": Checked = value.GetInt32(); break;
             case "selectedIndex": SelectedIndex = value.GetInt32(); break;
+            case "selectedIndices": ReplaceSelectedIndices(value.Deserialize<List<int>>() ?? []); break;
+            case "focusedIndex": FocusedIndex = value.GetInt32(); break;
+            case "multiSelect": MultiSelect = value.GetBoolean(); break;
             case "selectionStart": SelectionStart = value.GetInt32(); break;
             case "selectionLength": SelectionLength = value.GetInt32(); break;
             case "editable": Editable = value.GetBoolean(); break;
@@ -147,6 +164,9 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "position": Position = value.GetInt32(); break;
             case "rect": Rect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid node rect patch."); break;
             case "items": ReplaceItems(value.Deserialize<List<string>>() ?? []); break;
+            case "columns": ReplaceColumns(value.Deserialize<List<string>>() ?? []); break;
+            case "columnWidths": ReplaceColumnWidths(value.Deserialize<List<int>>() ?? []); break;
+            case "rows": ReplaceRows(value.Deserialize<List<List<string>>>() ?? []); break;
             default: throw new ProtocolException($"Unsupported node patch property '{property}'.");
         }
         if (matchingEcho) _pendingEventIds.Remove(property);
@@ -157,6 +177,41 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (Items.SequenceEqual(items, StringComparer.Ordinal)) return;
         Items.Clear();
         foreach (var item in items) Items.Add(item);
+        RaisePropertyChanged(nameof(Items));
+    }
+
+    private void ReplaceSelectedIndices(IEnumerable<int> selectedIndices)
+    {
+        if (SelectedIndices.SequenceEqual(selectedIndices)) return;
+        SelectedIndices.Clear();
+        foreach (var index in selectedIndices) SelectedIndices.Add(index);
+        RaisePropertyChanged(nameof(SelectedIndices));
+    }
+
+    private void ReplaceColumns(IEnumerable<string> columns)
+    {
+        if (Columns.SequenceEqual(columns, StringComparer.Ordinal)) return;
+        Columns.Clear();
+        foreach (var column in columns) Columns.Add(column);
+        RaisePropertyChanged(nameof(Columns));
+    }
+
+    private void ReplaceColumnWidths(IEnumerable<int> widths)
+    {
+        if (ColumnWidths.SequenceEqual(widths)) return;
+        ColumnWidths.Clear();
+        foreach (var width in widths) ColumnWidths.Add(width);
+        RaisePropertyChanged(nameof(ColumnWidths));
+    }
+
+    private void ReplaceRows(IEnumerable<IEnumerable<string>> rows)
+    {
+        var copies = rows.Select(row => (IReadOnlyList<string>)row.ToArray()).ToArray();
+        if (Rows.Count == copies.Length && Rows.Zip(copies).All(pair =>
+                pair.First.SequenceEqual(pair.Second, StringComparer.Ordinal))) return;
+        Rows.Clear();
+        foreach (var row in copies) Rows.Add(row);
+        RaisePropertyChanged(nameof(Rows));
     }
 
     private void ApplyProgressState(int minimum, int maximum, int position)

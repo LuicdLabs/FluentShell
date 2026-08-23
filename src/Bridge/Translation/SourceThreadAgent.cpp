@@ -224,6 +224,31 @@ bool RelevantMessage(UINT message) noexcept {
     case LB_DELETESTRING:
     case LB_RESETCONTENT:
     case LB_SETCURSEL:
+    case LM_SETITEM:
+    case LVM_SETITEMA:
+    case LVM_SETITEMW:
+    case LVM_SETITEMTEXTA:
+    case LVM_SETITEMTEXTW:
+    case LVM_SETITEMSTATE:
+    case LVM_INSERTITEMA:
+    case LVM_INSERTITEMW:
+    case LVM_DELETEITEM:
+    case LVM_DELETEALLITEMS:
+    case LVM_SETCOLUMNA:
+    case LVM_SETCOLUMNW:
+    case LVM_INSERTCOLUMNA:
+    case LVM_INSERTCOLUMNW:
+    case LVM_DELETECOLUMN:
+    case LVM_SETCOLUMNWIDTH:
+    case LVM_SETCOLUMNORDERARRAY:
+    case LVM_SORTITEMS:
+    case LVM_SORTITEMSEX:
+    case LVM_SETEXTENDEDLISTVIEWSTYLE:
+    case LVM_ENABLEGROUPVIEW:
+    case LVM_SETVIEW:
+    case SB_SIMPLE:
+    case SB_SETTEXTW:
+    case SB_SETMINHEIGHT:
     // ProgressBar state is driven entirely by these messages.  Without them a
     // dirty-gated reconcile would never notice a native progress update.
     case PBM_SETPOS:
@@ -387,6 +412,36 @@ void ExecuteCommandImpl(Command* command) {
                     // API normally after this hook returns.
                     if (!AbortIfCancelled(command))
                         command->success = PostMessageW(target, BM_CLICK, 0, 0) != FALSE;
+                } else if (action.action == L"invoke" &&
+                           node.kind == ControlKind::SysLink && interactive) {
+                    // The bounded SysLink adapter accepts exactly one link.
+                    // Let the native control generate its normal NM_RETURN
+                    // notification instead of fabricating a parent callback.
+                    // Queueing avoids holding this dispatcher command across a
+                    // handler that may open another window.
+                    if (!AbortIfCancelled(command)) {
+                        LITEM item{};
+                        item.mask = LIF_ITEMINDEX | LIF_STATE;
+                        item.iLink = 0;
+                        item.stateMask = LIS_FOCUSED;
+                        item.state = LIS_FOCUSED;
+                        const bool focused = SendMessageW(
+                            target, LM_SETITEM, 0, reinterpret_cast<LPARAM>(&item)) != FALSE;
+                        // The native HWND is cloaked and the renderer owns the
+                        // real keyboard focus. Queue a bounded synthetic focus
+                        // lifetime to the SysLink itself so its standard
+                        // WM_KEYDOWN handler emits NM_RETURN without stealing
+                        // the desktop focus from the proxy.
+                        const bool focusEntered = focused && PostMessageW(
+                            target, WM_SETFOCUS, 0, 0) != FALSE;
+                        const bool down = focusEntered && PostMessageW(
+                            target, WM_KEYDOWN, VK_RETURN, 1) != FALSE;
+                        const bool up = down && PostMessageW(
+                            target, WM_KEYUP, VK_RETURN, 1 | (1ll << 30) | (1ll << 31)) != FALSE;
+                        const bool focusLeft = up && PostMessageW(
+                            target, WM_KILLFOCUS, 0, 0) != FALSE;
+                        command->success = focused && focusEntered && down && up && focusLeft;
+                    }
                 } else if (action.action == L"setText" &&
                             (node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
                              (node.kind == ControlKind::ComboBox && node.editable)) &&
@@ -424,6 +479,40 @@ void ExecuteCommandImpl(Command* command) {
                         command->success = static_cast<int>(
                             SendMessageW(target, BM_GETCHECK, 0, 0)) == action.integerValue;
                     }
+                } else if (action.action == L"setSelection" &&
+                           node.kind == ControlKind::ListView && interactive) {
+                    if (AbortIfCancelled(command)) return;
+                    LVITEMW state{};
+                    state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                    state.state = 0;
+                    SendMessageW(target, LVM_SETITEMSTATE, static_cast<WPARAM>(-1),
+                        reinterpret_cast<LPARAM>(&state));
+                    for (size_t index = 0; index < action.integerValues.size(); ++index) {
+                        if (AbortIfCancelled(command)) return;
+                        state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                        state.state = LVIS_SELECTED |
+                            (index == 0 ? LVIS_FOCUSED : 0);
+                        SendMessageW(target, LVM_SETITEMSTATE,
+                            static_cast<WPARAM>(action.integerValues[index]),
+                            reinterpret_cast<LPARAM>(&state));
+                    }
+                    std::vector<int> actual;
+                    int previousSelected = -1;
+                    bool validEnumeration = true;
+                    while (true) {
+                        const int selected = static_cast<int>(SendMessageW(
+                            target, LVM_GETNEXTITEM, previousSelected, LVNI_SELECTED));
+                        if (selected < 0) break;
+                        if (selected <= previousSelected ||
+                            static_cast<size_t>(selected) >= node.rows.size() ||
+                            actual.size() >= node.rows.size()) {
+                            validEnumeration = false;
+                            break;
+                        }
+                        actual.push_back(selected);
+                        previousSelected = selected;
+                    }
+                    command->success = validEnumeration && actual == action.integerValues;
                 } else if (action.action == L"select" &&
                            (node.kind == ControlKind::ComboBox || node.kind == ControlKind::ListBox) &&
                            interactive) {

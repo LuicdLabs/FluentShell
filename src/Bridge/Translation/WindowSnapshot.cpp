@@ -119,6 +119,13 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"automationName", JsonValue::CreateStringValue(node.automationName));
     result.Insert(L"checked", JsonValue::CreateNumberValue(node.checked));
     result.Insert(L"selectedIndex", JsonValue::CreateNumberValue(node.selectedIndex));
+    JsonArray selectedIndices;
+    for (const int index : node.selectedIndices) {
+        selectedIndices.Append(JsonValue::CreateNumberValue(index));
+    }
+    result.Insert(L"selectedIndices", selectedIndices);
+    result.Insert(L"focusedIndex", JsonValue::CreateNumberValue(node.focusedIndex));
+    result.Insert(L"multiSelect", JsonValue::CreateBooleanValue(node.multiSelect));
     result.Insert(L"selectionStart", JsonValue::CreateNumberValue(node.selectionStart));
     result.Insert(L"selectionLength", JsonValue::CreateNumberValue(node.selectionLength));
     result.Insert(L"readOnly", JsonValue::CreateBooleanValue(node.readOnly));
@@ -129,11 +136,42 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"minimum", JsonValue::CreateNumberValue(node.minimum));
     result.Insert(L"maximum", JsonValue::CreateNumberValue(node.maximum));
     result.Insert(L"position", JsonValue::CreateNumberValue(node.position));
+    result.Insert(L"smallChange", JsonValue::CreateNumberValue(node.smallChange));
+    result.Insert(L"largeChange", JsonValue::CreateNumberValue(node.largeChange));
+    result.Insert(L"vertical", JsonValue::CreateBooleanValue(node.vertical));
+    result.Insert(L"reversed", JsonValue::CreateBooleanValue(node.reversed));
     JsonArray items;
     for (const auto& item : node.items) {
         items.Append(JsonValue::CreateStringValue(item));
     }
     result.Insert(L"items", items);
+    JsonArray columns;
+    for (const auto& column : node.columns) {
+        columns.Append(JsonValue::CreateStringValue(column));
+    }
+    result.Insert(L"columns", columns);
+    JsonArray columnWidths;
+    for (const int width : node.columnWidths) {
+        columnWidths.Append(JsonValue::CreateNumberValue(width));
+    }
+    result.Insert(L"columnWidths", columnWidths);
+    JsonArray rows;
+    for (const auto& row : node.rows) {
+        JsonArray cells;
+        for (const auto& cell : row) cells.Append(JsonValue::CreateStringValue(cell));
+        rows.Append(cells);
+    }
+    result.Insert(L"rows", rows);
+    JsonArray itemDepths;
+    for (const int depth : node.itemDepths) {
+        itemDepths.Append(JsonValue::CreateNumberValue(depth));
+    }
+    result.Insert(L"itemDepths", itemDepths);
+    JsonArray itemExpanded;
+    for (const bool expanded : node.itemExpanded) {
+        itemExpanded.Append(JsonValue::CreateBooleanValue(expanded));
+    }
+    result.Insert(L"itemExpanded", itemExpanded);
     return result;
 }
 
@@ -306,6 +344,38 @@ bool ParseActionValue(
         }
         return true;
     }
+    if (action.action == L"setSelection") {
+        if (value.ValueType() != JsonValueType::Array) {
+            error = L"setSelection requires an integer array";
+            return false;
+        }
+        const auto values = value.GetArray();
+        if (values.Size() > Ipc::kMaxListItems) {
+            error = L"setSelection exceeds the item cap";
+            return false;
+        }
+        int previous = -1;
+        for (const auto& entry : values) {
+            if (entry.ValueType() != JsonValueType::Number) {
+                error = L"setSelection requires integer indexes";
+                return false;
+            }
+            const double number = entry.GetNumber();
+            if (!std::isfinite(number) || std::trunc(number) != number ||
+                number < 0 || number > std::numeric_limits<int>::max()) {
+                error = L"setSelection index is outside range";
+                return false;
+            }
+            const int index = static_cast<int>(number);
+            if (index <= previous) {
+                error = L"setSelection indexes must be unique and sorted";
+                return false;
+            }
+            action.integerValues.push_back(index);
+            previous = index;
+        }
+        return true;
+    }
     if (action.action == L"move" || action.action == L"resize") {
         if (value.ValueType() != JsonValueType::Object) {
             error = L"move/resize requires a bounds object";
@@ -342,6 +412,12 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::ListBox: return L"listBox";
     case ControlKind::GroupBox: return L"groupBox";
     case ControlKind::ProgressBar: return L"progressBar";
+    case ControlKind::SysLink: return L"sysLink";
+    case ControlKind::ListView: return L"listView";
+    case ControlKind::TreeView: return L"treeView";
+    case ControlKind::TabControl: return L"tabControl";
+    case ControlKind::Slider: return L"slider";
+    case ControlKind::StatusBar: return L"statusBar";
     }
     return L"static";
 }
@@ -429,13 +505,15 @@ std::string SerializeSurfaceCommit(
     std::wstring_view nonce,
     std::wstring_view surfaceId,
     uint64_t revision,
-    bool show) {
+    bool show,
+    bool interactive) {
     JsonObject root;
     root.Insert(L"messageType", JsonValue::CreateStringValue(L"surface.commit"));
     root.Insert(L"sessionNonce", JsonValue::CreateStringValue(nonce));
     root.Insert(L"surfaceId", JsonValue::CreateStringValue(surfaceId));
     root.Insert(L"revision", JsonValue::CreateStringValue(Ipc::UInt64ToString(revision)));
     root.Insert(L"show", JsonValue::CreateBooleanValue(show));
+    root.Insert(L"interactive", JsonValue::CreateBooleanValue(interactive));
     return Stringify(root);
 }
 
@@ -580,7 +658,8 @@ bool ParseActionInvoke(
         }
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
-            L"activate", L"invoke", L"setText", L"setCheck", L"select", L"menuCommand",
+            L"activate", L"invoke", L"setText", L"setCheck", L"select",
+            L"setSelection", L"menuCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -588,7 +667,8 @@ bool ParseActionInvoke(
             return false;
         }
         const bool requiresNode = action.action == L"invoke" || action.action == L"setText" ||
-            action.action == L"setCheck" || action.action == L"select";
+            action.action == L"setCheck" || action.action == L"select" ||
+            action.action == L"setSelection";
         if (requiresNode != action.nodeId.has_value()) {
             error = L"action.invoke nodeId does not match action semantics";
             return false;
@@ -739,8 +819,8 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"invoke") {
-        if (node.kind == ControlKind::Button) return true;
-        error = L"invoke requires a button node";
+        if (node.kind == ControlKind::Button || node.kind == ControlKind::SysLink) return true;
+        error = L"invoke requires a button or SysLink node";
         return false;
     }
     if (action.action == L"setText") {
@@ -771,6 +851,20 @@ bool ValidateActionForSnapshot(
         if (selectable && inRange) return true;
         error = L"select value is invalid for the node";
         return false;
+    }
+    if (action.action == L"setSelection") {
+        if (node.kind != ControlKind::ListView ||
+            (!node.multiSelect && action.integerValues.size() > 1)) {
+            error = L"setSelection requires a compatible ListView node";
+            return false;
+        }
+        if (std::any_of(action.integerValues.begin(), action.integerValues.end(),
+                [&](int index) { return index < 0 ||
+                    static_cast<size_t>(index) >= node.rows.size(); })) {
+            error = L"setSelection index is outside the ListView";
+            return false;
+        }
+        return true;
     }
     error = L"nodeId is not valid for this action";
     return false;

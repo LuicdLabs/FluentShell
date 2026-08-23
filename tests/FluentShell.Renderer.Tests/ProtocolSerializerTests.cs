@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using FluentShell.Renderer.Protocol;
 
@@ -73,6 +74,29 @@ public sealed class ProtocolSerializerTests
 
         Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
             FrameMessageType.SurfaceCommit, Encoding.UTF8.GetBytes(json.ToJsonString())));
+    }
+
+    [Fact]
+    public void SurfaceCommitInteractiveGateIsExplicitAndBackwardCompatible()
+    {
+        var gatedPayload = ProtocolSerializer.Serialize(new SurfaceCommitMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = TestData.Snapshot().SurfaceId,
+            Revision = "8",
+            Show = true,
+            Interactive = false,
+        });
+        var gated = Assert.IsType<SurfaceCommitMessage>(
+            ProtocolSerializer.Deserialize(FrameMessageType.SurfaceCommit, gatedPayload));
+        Assert.False(gated.Interactive);
+
+        var legacyJson = JsonNode.Parse(gatedPayload)!.AsObject();
+        legacyJson.Remove("interactive");
+        var legacy = Assert.IsType<SurfaceCommitMessage>(
+            ProtocolSerializer.Deserialize(FrameMessageType.SurfaceCommit,
+                Encoding.UTF8.GetBytes(legacyJson.ToJsonString())));
+        Assert.True(legacy.Interactive);
     }
 
     [Fact]
@@ -255,4 +279,269 @@ public sealed class ProtocolSerializerTests
             FrameMessageType.WindowOpen,
             ProtocolSerializer.Serialize(new WindowOpenMessage { SessionNonce = TestData.Nonce, Window = snapshot })));
     }
+
+    [Fact]
+    public void PreservesBoundedSysLinkAndListViewState()
+    {
+        var source = TestData.Snapshot().Nodes[0];
+        var snapshot = TestData.Snapshot() with
+        {
+            Nodes =
+            [
+                source with
+                {
+                    Kind = "sysLink",
+                    Text = "Read the privacy statement.",
+                    Items = ["privacy statement"],
+                },
+                BoundedListView(source) with
+                {
+                    NodeId = "11",
+                    NativeHwnd = "0x5679",
+                    ZIndex = 1,
+                    TabIndex = 1,
+                },
+            ],
+        };
+
+        var decoded = Assert.IsType<WindowOpenMessage>(ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage
+            {
+                SessionNonce = TestData.Nonce,
+                Window = snapshot,
+            })));
+
+        Assert.Equal("privacy statement", decoded.Window.Nodes[0].Items.Single());
+        var listView = decoded.Window.Nodes[1];
+        Assert.Equal(["Name", "Status"], listView.Columns);
+        Assert.Equal([160, 80], listView.ColumnWidths);
+        Assert.Equal(["Drive C", "Ready"], listView.Rows[0]);
+        Assert.Equal([1], listView.SelectedIndices);
+        Assert.Equal(1, listView.FocusedIndex);
+        Assert.False(listView.MultiSelect);
+    }
+
+    [Theory]
+    [InlineData("Read Help, then Help again.", "Help")]
+    [InlineData("No matching label", "Help")]
+    [InlineData("Empty label", "")]
+    public void RejectsNonCanonicalSysLinkLabel(string text, string label)
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "sysLink",
+            Text = text,
+            Items = [label],
+        };
+
+        AssertSnapshotRejected(snapshot);
+    }
+
+    [Fact]
+    public void RejectsSysLinkWithMoreThanOneLink()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "sysLink",
+            Text = "Read Help or Support.",
+            Items = ["Help", "Support"],
+        };
+
+        AssertSnapshotRejected(snapshot);
+    }
+
+    [Fact]
+    public void RejectsNonCanonicalListViewSelection()
+    {
+        var source = TestData.Snapshot().Nodes[0];
+        foreach (var selectedIndices in new[]
+                 {
+                     new List<int> { 1, 0 },
+                     new List<int> { 0, 0 },
+                     new List<int> { 2 },
+                     new List<int> { 0, 1 },
+                 })
+        {
+            var snapshot = TestData.Snapshot();
+            snapshot.Nodes[0] = BoundedListView(source) with { SelectedIndices = selectedIndices };
+            AssertSnapshotRejected(snapshot);
+        }
+    }
+
+    [Fact]
+    public void RejectsMalformedListViewColumnsWidthsAndRows()
+    {
+        var source = TestData.Snapshot().Nodes[0];
+        var malformed = new[]
+        {
+            BoundedListView(source) with { ColumnWidths = [160] },
+            BoundedListView(source) with { ColumnWidths = [160, -1] },
+            BoundedListView(source) with { Rows = [["missing status"]] },
+            BoundedListView(source) with { Columns = [] , ColumnWidths = [], Rows = [] },
+            BoundedListView(source) with { FocusedIndex = 2 },
+        };
+        foreach (var node in malformed)
+        {
+            var snapshot = TestData.Snapshot();
+            snapshot.Nodes[0] = node;
+            AssertSnapshotRejected(snapshot);
+        }
+    }
+
+    [Fact]
+    public void RejectsNullListViewRows()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = BoundedListView(snapshot.Nodes[0]);
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = snapshot,
+        });
+        var json = JsonNode.Parse(payload)!.AsObject();
+        json["window"]!["nodes"]![0]!["rows"] = null;
+
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen, Encoding.UTF8.GetBytes(json.ToJsonString())));
+    }
+
+    [Theory]
+    [InlineData("selectedIndices")]
+    [InlineData("focusedIndex")]
+    [InlineData("multiSelect")]
+    [InlineData("columns")]
+    [InlineData("columnWidths")]
+    [InlineData("rows")]
+    public void RejectsMissingCanonicalListViewField(string property)
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = BoundedListView(snapshot.Nodes[0]);
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = snapshot,
+        });
+        var json = JsonNode.Parse(payload)!.AsObject();
+        json["window"]!["nodes"]![0]!.AsObject().Remove(property);
+
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen, Encoding.UTF8.GetBytes(json.ToJsonString())));
+    }
+
+    [Fact]
+    public void AcceptsCanonicalSetSelectionAction()
+    {
+        var action = new ActionInvokeMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = TestData.Snapshot().SurfaceId,
+            NodeId = "10",
+            EventId = "1",
+            ExpectedRevision = "7",
+            Action = "setSelection",
+            Value = JsonSerializer.SerializeToElement(new[] { 0, 2 }),
+        };
+
+        var decoded = Assert.IsType<ActionInvokeMessage>(ProtocolSerializer.Deserialize(
+            FrameMessageType.ActionInvoke, ProtocolSerializer.Serialize(action)));
+
+        Assert.Equal([0, 2], decoded.Value.EnumerateArray().Select(value => value.GetInt32()));
+    }
+
+    [Theory]
+    [InlineData("[1,1]")]
+    [InlineData("[2,1]")]
+    [InlineData("[-1]")]
+    [InlineData("[4096]")]
+    [InlineData("[\"1\"]")]
+    [InlineData("{}")]
+    public void RejectsNonCanonicalSetSelectionAction(string valueJson)
+    {
+        var action = new ActionInvokeMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = TestData.Snapshot().SurfaceId,
+            NodeId = "10",
+            EventId = "1",
+            ExpectedRevision = "7",
+            Action = "setSelection",
+            Value = JsonDocument.Parse(valueJson).RootElement.Clone(),
+        };
+
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.ActionInvoke, ProtocolSerializer.Serialize(action)));
+    }
+
+    [Fact]
+    public void PreservesBoundedReadOnlyStatusBarParts()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "statusBar",
+            TabStop = false,
+            TabIndex = -1,
+            Text = string.Empty,
+            Items = ["Ready", "Line 1"],
+            ColumnWidths = [240, 80],
+        };
+
+        var decoded = Assert.IsType<WindowOpenMessage>(ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage
+            {
+                SessionNonce = TestData.Nonce,
+                Window = snapshot,
+            })));
+
+        Assert.Equal(["Ready", "Line 1"], decoded.Window.Nodes[0].Items);
+        Assert.Equal([240, 80], decoded.Window.Nodes[0].ColumnWidths);
+    }
+
+    [Fact]
+    public void RejectsStatusBarBeyondPartCapOrWithAmbiguousWidths()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "statusBar",
+            TabStop = false,
+            TabIndex = -1,
+            Items = Enumerable.Range(0, ProtocolConstants.MaxColumns + 1)
+                .Select(index => index.ToString()).ToList(),
+        };
+        AssertSnapshotRejected(snapshot);
+
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Items = ["Ready", "Line 1"],
+            ColumnWidths = [240],
+        };
+        AssertSnapshotRejected(snapshot);
+    }
+
+    private static ControlNode BoundedListView(ControlNode source) => source with
+    {
+        Kind = "listView",
+        Text = string.Empty,
+        Items = ["Drive C", "Drive D"],
+        Columns = ["Name", "Status"],
+        ColumnWidths = [160, 80],
+        Rows = [["Drive C", "Ready"], ["Drive D", "Running"]],
+        SelectedIndices = [1],
+        FocusedIndex = 1,
+        MultiSelect = false,
+    };
+
+    private static void AssertSnapshotRejected(WindowSnapshot snapshot) =>
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage
+            {
+                SessionNonce = TestData.Nonce,
+                Window = snapshot,
+            })));
 }

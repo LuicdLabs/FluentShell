@@ -132,6 +132,19 @@ std::wstring DisplayText(std::wstring_view value) {
     return result;
 }
 
+std::wstring DiagnosticText(std::wstring_view value) {
+    std::wstring result;
+    result.reserve(value.size());
+    for (const wchar_t character : value) {
+        if (character == L'\r') result.append(L"\\r");
+        else if (character == L'\n') result.append(L"\\n");
+        else if (character == L'\t') result.append(L"\\t");
+        else if (character < L' ') result.push_back(L'?');
+        else result.push_back(character);
+    }
+    return result;
+}
+
 bool RectClose(const RECT& left, const RECT& right, LONG tolerance = 18) noexcept {
     return std::abs(left.left - right.left) <= tolerance &&
         std::abs(left.top - right.top) <= tolerance &&
@@ -153,6 +166,9 @@ int ExpectedControlType(ControlKind kind) noexcept {
     case ControlKind::ListBox: return UIA_ListControlTypeId;
     case ControlKind::GroupBox: return UIA_GroupControlTypeId;
     case ControlKind::ProgressBar: return UIA_ProgressBarControlTypeId;
+    case ControlKind::SysLink: return UIA_PaneControlTypeId;
+    case ControlKind::ListView: return UIA_ListControlTypeId;
+    case ControlKind::StatusBar: return UIA_StatusBarControlTypeId;
     default: return 0;
     }
 }
@@ -167,6 +183,7 @@ RequiredPattern PatternFor(ControlKind kind) noexcept {
     case ControlKind::Password: return RequiredPattern::None;
     case ControlKind::ComboBox: return RequiredPattern::Selection;
     case ControlKind::ListBox: return RequiredPattern::Selection;
+    case ControlKind::ListView: return RequiredPattern::Selection;
     case ControlKind::ProgressBar: return RequiredPattern::RangeValue;
     default: return RequiredPattern::None;
     }
@@ -219,6 +236,67 @@ bool HasPattern(
     if (FAILED(patternResult) || !raw)
         return FailHr(error, L"required UIA pattern is unavailable", patternResult);
     static_cast<IUnknown*>(raw)->Release();
+    return true;
+}
+
+bool ValidateSysLinkDescendant(
+    IUIAutomation* automation,
+    IUIAutomationElement* root,
+    const ControlNode& node,
+    DWORD rendererProcessId,
+    std::wstring& error) noexcept {
+    if (!automation || !root || node.items.size() != 1 || node.items.front().empty())
+        return Fail(error, L"SysLink snapshot has no unique link label");
+    VARIANT value{};
+    VariantInit(&value);
+    value.vt = VT_I4;
+    value.lVal = UIA_HyperlinkControlTypeId;
+    ComPtr<IUIAutomationCondition> condition;
+    const HRESULT conditionResult = automation->CreatePropertyCondition(
+        UIA_ControlTypePropertyId, value, &condition);
+    VariantClear(&value);
+    if (FAILED(conditionResult) || !condition)
+        return FailHr(error, L"SysLink hyperlink condition failed", conditionResult);
+    ComPtr<IUIAutomationElementArray> matches;
+    const HRESULT findResult = root->FindAll(
+        TreeScope_Descendants, condition.Get(), &matches);
+    int length = 0;
+    if (FAILED(findResult) || !matches || FAILED(matches->get_Length(&length)))
+        return FailHr(error, L"SysLink hyperlink enumeration failed", findResult);
+    if (length != 1)
+        return Fail(error, L"SysLink projection does not contain exactly one hyperlink");
+    ComPtr<IUIAutomationElement> link;
+    if (FAILED(matches->GetElement(0, &link)) || !link)
+        return Fail(error, L"SysLink hyperlink is unavailable");
+    ElementInfo info;
+    if (!ReadElementInfo(link.Get(), info, error)) return false;
+    if (info.processId != static_cast<int>(rendererProcessId) ||
+        info.framework != L"XAML" || info.controlType != UIA_HyperlinkControlTypeId ||
+        info.name != DisplayText(node.items.front()) || !info.isControl ||
+        info.isEnabled != (node.enabled ? TRUE : FALSE) ||
+        info.isKeyboardFocusable != (node.tabStop && node.enabled ? TRUE : FALSE)) {
+        return Fail(error, L"SysLink hyperlink role, name, process, enabled, or focus state is incorrect");
+    }
+    return HasPattern(link.Get(), RequiredPattern::Invoke, error);
+}
+
+bool ValidateListViewSelectionCapability(
+    IUIAutomationElement* element,
+    const ControlNode& node,
+    std::wstring& error) noexcept {
+    if (!element) return Fail(error, L"ListView UIA element is unavailable");
+    ComPtr<IUIAutomationSelectionPattern> selection;
+    const HRESULT patternResult = element->GetCurrentPatternAs(
+        UIA_SelectionPatternId, IID_IUIAutomationSelectionPattern,
+        reinterpret_cast<void**>(selection.GetAddressOf()));
+    if (FAILED(patternResult) || !selection)
+        return FailHr(error, L"ListView Selection pattern read failed", patternResult);
+    BOOL canSelectMultiple = FALSE;
+    const HRESULT propertyResult = selection->get_CurrentCanSelectMultiple(&canSelectMultiple);
+    if (FAILED(propertyResult))
+        return FailHr(error, L"ListView Selection capability read failed", propertyResult);
+    if (canSelectMultiple != (node.multiSelect ? TRUE : FALSE))
+        return Fail(error, L"ListView multi-select UIA capability does not match native state");
     return true;
 }
 
@@ -528,8 +606,32 @@ bool ValidateOnMta(
             match = index;
             break;
         }
-        if (match == elements.size())
-            return Fail(error, L"expected native control is absent from the proxy UIA tree");
+        if (match == elements.size()) {
+            const auto sameId = std::find_if(elements.begin(), elements.end(),
+                [&](const ElementInfo& candidate) {
+                    return candidate.automationId == expectedId;
+                });
+            error = L"expected native control mismatch: id=" + expectedId +
+                L" kind=" + ControlKindName(node.kind) +
+                L" expectedType=" + std::to_wstring(expectedType) +
+                L" expectedName='" + DiagnosticText(expectedName) + L"' expectedBounds=" +
+                std::to_wstring(expectedBounds.left) + L"," +
+                std::to_wstring(expectedBounds.top) + L"," +
+                std::to_wstring(expectedBounds.right - expectedBounds.left) + L"x" +
+                std::to_wstring(expectedBounds.bottom - expectedBounds.top);
+            if (sameId == elements.end()) {
+                error += L" actual=missing candidates=" + std::to_wstring(elements.size());
+            } else {
+                error += L" actualType=" + std::to_wstring(sameId->controlType) +
+                    L" actualFramework='" + sameId->framework +
+                    L"' actualName='" + DiagnosticText(sameId->name) + L"' actualBounds=" +
+                    std::to_wstring(sameId->bounds.left) + L"," +
+                    std::to_wstring(sameId->bounds.top) + L"," +
+                    std::to_wstring(sameId->bounds.right - sameId->bounds.left) + L"x" +
+                    std::to_wstring(sameId->bounds.bottom - sameId->bounds.top);
+            }
+            return false;
+        }
         const size_t duplicateCount = static_cast<size_t>(std::count_if(
             elements.begin(), elements.end(), [&](const ElementInfo& candidate) {
                 return candidate.automationId == expectedId;
@@ -542,9 +644,15 @@ bool ValidateOnMta(
             return Fail(error, L"proxy UIA node is not a control element");
         if (matched.isEnabled != (node.enabled ? TRUE : FALSE))
             return Fail(error, L"proxy UIA control enabled state does not match native state");
-        if (node.tabStop && node.enabled && !matched.isKeyboardFocusable)
+        if (node.tabStop && node.enabled && node.kind != ControlKind::SysLink &&
+            !matched.isKeyboardFocusable)
             return Fail(error, L"tab-stop native control is not keyboard focusable in XAML");
         if (!HasPattern(matched.element.Get(), PatternFor(node.kind), error)) return false;
+        if (node.kind == ControlKind::SysLink &&
+            !ValidateSysLinkDescendant(automation.Get(), matched.element.Get(), node,
+                options.rendererProcessId, error)) return false;
+        if (node.kind == ControlKind::ListView &&
+            !ValidateListViewSelectionCapability(matched.element.Get(), node, error)) return false;
         if (node.kind == ControlKind::ComboBox &&
             !HasPattern(matched.element.Get(), RequiredPattern::ExpandCollapse, error)) return false;
         if (node.kind == ControlKind::ComboBox && node.editable &&

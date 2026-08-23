@@ -58,4 +58,31 @@ public sealed class WindowStatePolicyTests
         Assert.True(TranslatedWindow.ShouldApplyCanonicalPlacement(
             committed: false, placementChanged: false, placementActionPatch: false,
             localPlacementPending: true));
+
+    [Theory]
+    [InlineData(0x0100)] // WM_KEYDOWN
+    [InlineData(0x00A1)] // WM_NCLBUTTONDOWN
+    [InlineData(0x0201)] // WM_LBUTTONDOWN
+    [InlineData(0x0119)] // WM_GESTURE
+    [InlineData(0x0240)] // WM_TOUCH
+    [InlineData(0x0246)] // WM_POINTERDOWN
+    public void ProvisionalCommitBlocksClientInput(uint message) =>
+        Assert.True(TranslatedWindow.IsGateBlockedInputMessage(message));
+
+    [Theory]
+    [InlineData(0x000F)] // WM_PAINT
+    [InlineData(0x0046)] // WM_WINDOWPOSCHANGING is clamped separately
+    [InlineData(0x0082)] // WM_NCDESTROY
+    public void ProvisionalCommitAllowsLifecycleAndRenderMessages(uint message) =>
+        Assert.False(TranslatedWindow.IsGateBlockedInputMessage(message));
+
+    [Theory]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    public void ProvisionalBoundsClampDoesNotFightCanonicalPlacement(
+        bool interactive, bool applyingCanonical, bool expected) =>
+        Assert.Equal(expected, TranslatedWindow.ShouldClampProvisionalBounds(
+            interactive, applyingCanonical));
 }

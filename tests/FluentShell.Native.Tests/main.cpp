@@ -4,6 +4,7 @@
 
 #include <winrt/base.h>
 #include <objbase.h>
+#include <commctrl.h>
 
 #include <array>
 #include <filesystem>
@@ -209,6 +210,13 @@ void TestScalarContracts() {
         SUCCEEDED(CLSIDFromString(bracedGuid.c_str(), &parsed)),
         "GUID is not canonical lowercase D format");
     Check(Ipc::ProcessCreationTime(GetCurrentProcess()) != 0, "process creation identity is zero");
+
+    const auto gatedCommit = Translation::SerializeSurfaceCommit(
+        L"00112233445566778899aabbccddeeff",
+        L"11111111-2222-3333-4444-555555555555", 7, true, false);
+    Check(gatedCommit.find("\"show\":true") != std::string::npos &&
+          gatedCommit.find("\"interactive\":false") != std::string::npos,
+        "provisional surface commit did not serialize its interaction gate");
 }
 
 void TestSharedFixtures() {
@@ -217,7 +225,9 @@ void TestSharedFixtures() {
     const auto helloPayload = ReadFixture(L"hello.renderer.json");
     Check(!helloPayload.empty() && Translation::ParseHello(helloPayload, hello, error),
         "renderer hello fixture did not parse");
-    Check(hello.role == L"renderer" && hello.processId == 4242 && hello.protocolMajor == 1,
+    Check(hello.role == L"renderer" && hello.processId == 4242 &&
+        hello.protocolMajor == Ipc::kProtocolMajor &&
+        hello.protocolMinor == Ipc::kProtocolMinor,
         "renderer hello fixture changed meaning");
 
     Translation::HelloMessage futureHello;
@@ -287,7 +297,7 @@ void TestStrictMessageValidation() {
         ReplaceOnce(validHello, "\"protocolMajor\": 1", "\"protocolMajor\": 1.5"),
         hello, error), "fractional hello major was accepted");
     Check(Translation::ParseHello(
-        ReplaceOnce(validHello, "\"protocolMinor\": 0", "\"protocolMinor\": 1"),
+        ReplaceOnce(validHello, "\"protocolMinor\": 1", "\"protocolMinor\": 2"),
         hello, error), "future same-major hello minor was rejected");
 
     const std::string actionPrefix =
@@ -497,6 +507,33 @@ void TestExpandedControlSerialization() {
     combo.selectedIndex = 1;
     combo.items = { L"one", L"two" };
     snapshot.nodes.push_back(combo);
+    Translation::ControlNode link;
+    link.nodeId = 4;
+    link.generation = 1;
+    link.kind = Translation::ControlKind::SysLink;
+    link.text = L"Read the license terms";
+    link.automationName = link.text;
+    link.items = { L"license terms" };
+    snapshot.nodes.push_back(link);
+    Translation::ControlNode list;
+    list.nodeId = 5;
+    list.generation = 1;
+    list.kind = Translation::ControlKind::ListView;
+    list.columns = { L"Drive", L"Status" };
+    list.columnWidths = { 120, 180 };
+    list.rows = { { L"C:", L"OK" }, { L"D:", L"Unavailable" } };
+    list.items = { L"C:", L"D:" };
+    list.selectedIndices = { 0 };
+    list.focusedIndex = 0;
+    list.multiSelect = true;
+    snapshot.nodes.push_back(list);
+    Translation::ControlNode status;
+    status.nodeId = 6;
+    status.generation = 1;
+    status.kind = Translation::ControlKind::StatusBar;
+    status.items = { L"Ln 1, Col 1", L"100%" };
+    status.columnWidths = { 140, 80 };
+    snapshot.nodes.push_back(status);
 
     const auto json = Translation::SerializeWindowOpen(
         L"00112233445566778899aabbccddeeff", snapshot);
@@ -511,11 +548,38 @@ void TestExpandedControlSerialization() {
           json.find("\"text\":\"custom\"") != std::string::npos &&
           json.find("\"selectedIndex\":1") != std::string::npos,
         "editable ComboBox state was not serialized");
+    Check(json.find("\"kind\":\"sysLink\"") != std::string::npos &&
+          json.find("\"kind\":\"listView\"") != std::string::npos &&
+          json.find("\"columns\":[\"Drive\",\"Status\"]") != std::string::npos &&
+          json.find("\"selectedIndices\":[0]") != std::string::npos &&
+          json.find("\"kind\":\"statusBar\"") != std::string::npos,
+        "expanded common-control state was not serialized");
 
     const auto editableFingerprint = Translation::SnapshotFingerprint(snapshot);
-    snapshot.nodes.back().editable = false;
+    snapshot.nodes[2].editable = false;
     Check(editableFingerprint != Translation::SnapshotFingerprint(snapshot),
         "editable state was omitted from the snapshot fingerprint");
+
+    const auto listFingerprint = Translation::SnapshotFingerprint(snapshot);
+    snapshot.nodes[4].selectedIndices = { 1 };
+    Check(listFingerprint != Translation::SnapshotFingerprint(snapshot),
+        "ListView selection was omitted from the snapshot fingerprint");
+
+    Translation::ActionRequest invokeLink;
+    invokeLink.action = L"invoke";
+    invokeLink.nodeId = 4;
+    std::wstring error;
+    Check(Translation::ValidateActionForSnapshot(invokeLink, snapshot, error),
+        "bounded SysLink invoke was rejected");
+    Translation::ActionRequest selectRows;
+    selectRows.action = L"setSelection";
+    selectRows.nodeId = 5;
+    selectRows.integerValues = { 1 };
+    Check(Translation::ValidateActionForSnapshot(selectRows, snapshot, error),
+        "bounded ListView selection was rejected");
+    selectRows.integerValues = { 2 };
+    Check(!Translation::ValidateActionForSnapshot(selectRows, snapshot, error),
+        "out-of-range ListView selection was accepted");
 }
 
 bool CaptureSingleCombo(DWORD comboStyle, Translation::WindowSnapshot& snapshot) {
@@ -539,6 +603,113 @@ bool CaptureSingleCombo(DWORD comboStyle, Translation::WindowSnapshot& snapshot)
     const bool captured = combo && Translation::CaptureWindow(window, context, snapshot, error);
     DestroyWindow(window);
     return captured;
+}
+
+void TestStructuredCommonControlCapture() {
+    HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"common-control-capture",
+        WS_OVERLAPPEDWINDOW, 20, 20, 640, 420, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    Check(window != nullptr, "common-control capture root was not created");
+    if (!window) return;
+
+    HWND list = CreateWindowExW(0, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL,
+        10, 10, 600, 260, window, reinterpret_cast<HMENU>(200),
+        GetModuleHandleW(nullptr), nullptr);
+    HWND status = CreateWindowExW(0, STATUSCLASSNAMEW, L"",
+        WS_CHILD | WS_VISIBLE, 0, 340, 620, 24, window,
+        reinterpret_cast<HMENU>(201), GetModuleHandleW(nullptr), nullptr);
+    Check(list != nullptr && status != nullptr,
+        "structured common controls were not created");
+    if (!list || !status) {
+        DestroyWindow(window);
+        return;
+    }
+
+    LVCOLUMNW column{};
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+    column.cx = 180;
+    column.pszText = const_cast<LPWSTR>(L"Drive");
+    SendMessageW(list, LVM_INSERTCOLUMNW, 0, reinterpret_cast<LPARAM>(&column));
+    column.cx = 260;
+    column.pszText = const_cast<LPWSTR>(L"Status");
+    SendMessageW(list, LVM_INSERTCOLUMNW, 1, reinterpret_cast<LPARAM>(&column));
+    LVITEMW item{};
+    item.mask = LVIF_TEXT;
+    item.iItem = 0;
+    item.pszText = const_cast<LPWSTR>(L"C:");
+    SendMessageW(list, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
+    item.iItem = 1;
+    item.pszText = const_cast<LPWSTR>(L"D:");
+    SendMessageW(list, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
+    LVITEMW subItem{};
+    subItem.iSubItem = 1;
+    subItem.pszText = const_cast<LPWSTR>(L"OK");
+    SendMessageW(list, LVM_SETITEMTEXTW, 0, reinterpret_cast<LPARAM>(&subItem));
+    subItem.pszText = const_cast<LPWSTR>(L"Unavailable");
+    SendMessageW(list, LVM_SETITEMTEXTW, 1, reinterpret_cast<LPARAM>(&subItem));
+    LVITEMW selection{};
+    selection.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    selection.state = LVIS_SELECTED | LVIS_FOCUSED;
+    SendMessageW(list, LVM_SETITEMSTATE, 1, reinterpret_cast<LPARAM>(&selection));
+
+    int parts[] = { 260, -1 };
+    SendMessageW(status, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
+    SendMessageW(status, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(L"Ln 1, Col 1"));
+    SendMessageW(status, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(L"100%"));
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"11111111-2222-3333-4444-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    Check(Translation::CaptureWindow(window, context, snapshot, error),
+        "bounded ListView/StatusBar window did not capture");
+    const auto listNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& node) {
+            return node.kind == Translation::ControlKind::ListView;
+        });
+    Check(listNode != snapshot.nodes.end() &&
+          listNode->columns == std::vector<std::wstring>{ L"Drive", L"Status" } &&
+          listNode->rows.size() == 2 && listNode->rows[1][1] == L"Unavailable" &&
+          listNode->selectedIndices == std::vector<int>{ 1 } &&
+          listNode->focusedIndex == 1 && !listNode->multiSelect,
+        "bounded report ListView state was not captured canonically");
+    const auto statusNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& node) {
+            return node.kind == Translation::ControlKind::StatusBar;
+        });
+    Check(statusNode != snapshot.nodes.end() &&
+          statusNode->items == std::vector<std::wstring>{ L"Ln 1, Col 1", L"100%" } &&
+          statusNode->columnWidths.size() == 2,
+        "bounded StatusBar state was not captured canonically");
+
+    SendMessageW(status, SB_SETTEXTW, SBT_OWNERDRAW,
+        reinterpret_cast<LPARAM>(reinterpret_cast<void*>(1)));
+    Translation::WindowSnapshot rejected;
+    context.revision = 2;
+    Check(!Translation::CaptureWindow(window, context, rejected, error),
+        "owner-draw StatusBar part was accepted");
+    DestroyWindow(window);
+
+    HWND virtualWindow = CreateWindowExW(0, L"Static", L"virtual-list",
+        WS_OVERLAPPEDWINDOW, 20, 20, 320, 200, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    HWND virtualList = CreateWindowExW(0, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_OWNERDATA,
+        10, 10, 280, 120, virtualWindow, reinterpret_cast<HMENU>(202),
+        GetModuleHandleW(nullptr), nullptr);
+    ShowWindow(virtualWindow, SW_SHOWNOACTIVATE);
+    Translation::CaptureContext virtualContext;
+    virtualContext.surfaceId = L"22222222-2222-3333-4444-555555555555";
+    virtualContext.generation = 1;
+    virtualContext.revision = 1;
+    Check(virtualList && !Translation::CaptureWindow(
+            virtualWindow, virtualContext, rejected, error),
+        "virtual ListView was accepted by the bounded adapter");
+    DestroyWindow(virtualWindow);
 }
 
 void TestEditableComboCaptureBoundary() {
@@ -657,6 +828,10 @@ void TestMenuActionValidationAndSerialization() {
 
 int wmain() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    INITCOMMONCONTROLSEX controls{ sizeof(controls),
+        ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES };
+    Check(InitCommonControlsEx(&controls) != FALSE,
+        "common-control classes were not initialized");
     TestHeaderValidation();
     TestPipeRoundTrip();
     TestReadFrameUsesOneDeadline();
@@ -669,6 +844,7 @@ int wmain() {
     TestErrorScopeParsing();
     TestExpandedControlSerialization();
     TestEditableComboCaptureBoundary();
+    TestStructuredCommonControlCapture();
     TestStandardMenuCapture();
     TestMenuActionValidationAndSerialization();
     if (g_failures != 0) {

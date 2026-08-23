@@ -40,6 +40,9 @@ public sealed record ControlNode
     public string? AutomationName { get; init; }
     public int? Checked { get; init; }
     public int? SelectedIndex { get; init; }
+    public List<int> SelectedIndices { get; init; } = [];
+    public int? FocusedIndex { get; init; }
+    public bool MultiSelect { get; init; }
     public int? SelectionStart { get; init; }
     public int? SelectionLength { get; init; }
     public bool? ReadOnly { get; init; }
@@ -50,7 +53,16 @@ public sealed record ControlNode
     public int? Minimum { get; init; }
     public int? Maximum { get; init; }
     public int? Position { get; init; }
+    public int? SmallChange { get; init; }
+    public int? LargeChange { get; init; }
+    public bool Vertical { get; init; }
+    public bool Reversed { get; init; }
     public List<string> Items { get; init; } = [];
+    public List<string> Columns { get; init; } = [];
+    public List<int> ColumnWidths { get; init; } = [];
+    public List<List<string>> Rows { get; init; } = [];
+    public List<int> ItemDepths { get; init; } = [];
+    public List<bool> ItemExpanded { get; init; } = [];
 }
 
 public sealed record MenuItemSnapshot
@@ -174,6 +186,10 @@ public sealed record SurfaceCommitMessage : IProtocolMessage
     public Guid SurfaceId { get; init; }
     public string Revision { get; init; } = "0";
     public bool Show { get; init; }
+    // The Bridge first shows a surface while its committed UIA isolation gate
+    // is running, then sends a second commit with Interactive=true.  Keeping
+    // this optional preserves compatibility with older peers.
+    public bool Interactive { get; init; } = true;
 }
 
 public sealed record WindowCloseMessage : IProtocolMessage

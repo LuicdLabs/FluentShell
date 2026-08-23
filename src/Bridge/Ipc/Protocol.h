@@ -18,7 +18,10 @@ namespace FluentShell::Bridge::Ipc {
 inline constexpr uint32_t kFrameMagic = 0x48534C46u; // "FLSH" in little endian.
 inline constexpr uint16_t kProtocolMajor = 1;
 // Writers emit this minor; same-major readers accept any uint16 minor and ignore unknown JSON fields.
-inline constexpr uint16_t kProtocolMinor = 0;
+// Minor 1 requires the renderer-side provisional interaction gate. A Bridge
+// must not pair with a minor-0 renderer because that peer would treat the
+// pre-UIA provisional commit as interactive.
+inline constexpr uint16_t kProtocolMinor = 1;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

@@ -17,6 +17,8 @@ namespace {
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
 constexpr size_t kMaxMenuDepth = 8;
 constexpr size_t kMaxMenuItems = 256;
+constexpr size_t kMaxListViewColumns = 64;
+constexpr size_t kMaxStructuredTextChars = 256 * 1024;
 
 class PhysicalCoordinateScope final {
 public:
@@ -227,6 +229,50 @@ bool ClassifyControl(
         return true;
     }
 
+    if (FluentShell::EqualsIgnoreCase(className, WC_LINK)) {
+        constexpr DWORD unsupportedLinkStyles = LWS_IGNORERETURN |
+            LWS_USECUSTOMTEXT | LWS_RIGHT | LWS_NOPREFIX;
+        if ((style & unsupportedLinkStyles) != 0) {
+            reason = L"SysLink requires unsupported callback, alignment, prefix, or keyboard semantics";
+            return false;
+        }
+        kind = ControlKind::SysLink;
+        return true;
+    }
+
+    if (FluentShell::EqualsIgnoreCase(className, WC_LISTVIEWW)) {
+        const DWORD type = style & LVS_TYPEMASK;
+        if (type != LVS_REPORT || (style & LVS_NOCOLUMNHEADER) != 0 ||
+            (style & (LVS_OWNERDATA | LVS_OWNERDRAWFIXED | LVS_EDITLABELS)) != 0) {
+            reason = L"ListView is virtual, owner-draw, label-editable, headerless, or not in report view";
+            return false;
+        }
+        if (SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0) != FALSE) {
+            reason = L"grouped ListView is not supported";
+            return false;
+        }
+        const DWORD extended = static_cast<DWORD>(
+            SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
+        constexpr DWORD unsupportedExtended = LVS_EX_CHECKBOXES |
+            LVS_EX_HEADERDRAGDROP | LVS_EX_TRACKSELECT | LVS_EX_ONECLICKACTIVATE |
+            LVS_EX_TWOCLICKACTIVATE;
+        if ((extended & unsupportedExtended) != 0) {
+            reason = L"ListView requires unsupported checkbox, header-drag, or activation semantics";
+            return false;
+        }
+        kind = ControlKind::ListView;
+        return true;
+    }
+
+    if (FluentShell::EqualsIgnoreCase(className, STATUSCLASSNAMEW)) {
+        if ((style & WS_TABSTOP) != 0) {
+            reason = L"tab-stop StatusBar is not supported";
+            return false;
+        }
+        kind = ControlKind::StatusBar;
+        return true;
+    }
+
     reason = L"unsupported visible control class: " + className;
     return false;
 }
@@ -264,12 +310,331 @@ bool ReadStringItems(
     return true;
 }
 
-bool IsComboBoxImplementationChild(HWND hwnd) {
+bool CaptureSingleSysLink(
+    HWND hwnd,
+    ControlNode& node,
+    std::wstring& reason) {
+    LITEM item{};
+    item.mask = LIF_ITEMINDEX | LIF_STATE | LIF_ITEMID | LIF_URL;
+    item.iLink = 0;
+    item.stateMask = LIS_ENABLED;
+    if (!SendMessageW(hwnd, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&item))) {
+        reason = L"SysLink has no interrogable link item";
+        return false;
+    }
+    LITEM second{};
+    second.mask = LIF_ITEMINDEX | LIF_STATE;
+    second.iLink = 1;
+    second.stateMask = LIS_ENABLED;
+    if (SendMessageW(hwnd, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&second))) {
+        reason = L"multi-link SysLink is outside the bounded adapter";
+        return false;
+    }
+
+    std::wstring markup = node.text;
+    std::wstring lowered = markup;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+        [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
+    const size_t open = lowered.find(L"<a");
+    const size_t openEnd = open == std::wstring::npos
+        ? std::wstring::npos : lowered.find(L'>', open + 2);
+    const size_t close = openEnd == std::wstring::npos
+        ? std::wstring::npos : lowered.find(L"</a>", openEnd + 1);
+    if (open == std::wstring::npos || openEnd == std::wstring::npos ||
+        close == std::wstring::npos || close == openEnd + 1 ||
+        lowered.find(L"<a", close + 4) != std::wstring::npos) {
+        reason = L"SysLink markup is not a single bounded hyperlink";
+        return false;
+    }
+    const std::wstring prefix = markup.substr(0, open);
+    const std::wstring label = markup.substr(openEnd + 1, close - openEnd - 1);
+    std::wstring suffix = markup.substr(close + 4);
+    while (!suffix.empty() && suffix.back() <= L' ') suffix.pop_back();
+    const auto containsMarkup = [](std::wstring_view value) {
+        return value.find(L'<') != std::wstring_view::npos ||
+            value.find(L'>') != std::wstring_view::npos;
+    };
+    if (containsMarkup(prefix) || containsMarkup(label) || containsMarkup(suffix) ||
+        prefix.find(L'&') != std::wstring::npos ||
+        label.find(L'&') != std::wstring::npos ||
+        suffix.find(L'&') != std::wstring::npos) {
+        reason = L"SysLink contains unsupported nested markup or mnemonic text";
+        return false;
+    }
+    const std::wstring flattened = prefix + label + suffix;
+    const size_t labelAt = flattened.find(label);
+    if (labelAt != prefix.size() ||
+        flattened.find(label, labelAt + label.size()) != std::wstring::npos) {
+        reason = L"SysLink label is ambiguous in its flattened text";
+        return false;
+    }
+    node.text = flattened;
+    node.automationName = node.text;
+    node.items.push_back(label);
+    node.enabled = node.enabled && (item.state & LIS_ENABLED) != 0;
+    return true;
+}
+
+bool ReadListViewCell(
+    HWND hwnd,
+    int row,
+    int column,
+    std::wstring& text,
+    std::wstring& reason) {
+    size_t capacity = 256;
+    while (capacity <= Ipc::kMaxStringChars + 1) {
+        std::wstring buffer(capacity, L'\0');
+        LVITEMW item{};
+        item.iSubItem = column;
+        item.pszText = buffer.data();
+        item.cchTextMax = static_cast<int>(buffer.size());
+        const int copied = static_cast<int>(SendMessageW(
+            hwnd, LVM_GETITEMTEXTW, row, reinterpret_cast<LPARAM>(&item)));
+        if (copied < 0) {
+            reason = L"ListView item text read failed";
+            return false;
+        }
+        if (static_cast<size_t>(copied) + 1 < capacity) {
+            buffer.resize(static_cast<size_t>(copied));
+            text = std::move(buffer);
+            return true;
+        }
+        if (capacity == Ipc::kMaxStringChars + 1) break;
+        capacity = std::min(Ipc::kMaxStringChars + 1, capacity * 2);
+    }
+    reason = L"ListView item text exceeds the protocol string limit";
+    return false;
+}
+
+bool ReadListViewColumn(
+    HWND hwnd,
+    int index,
+    std::wstring& text,
+    int& width,
+    std::wstring& reason) {
+    size_t capacity = 256;
+    while (capacity <= Ipc::kMaxStringChars + 1) {
+        std::wstring buffer(capacity, L'\0');
+        LVCOLUMNW column{};
+        column.mask = LVCF_TEXT | LVCF_WIDTH;
+        column.pszText = buffer.data();
+        column.cchTextMax = static_cast<int>(buffer.size());
+        if (!SendMessageW(hwnd, LVM_GETCOLUMNW, index,
+                reinterpret_cast<LPARAM>(&column))) {
+            reason = L"ListView column read failed";
+            return false;
+        }
+        const size_t length = static_cast<size_t>(
+            std::find(buffer.begin(), buffer.end(), L'\0') - buffer.begin());
+        if (length + 1 < capacity) {
+            buffer.resize(length);
+            text = std::move(buffer);
+            width = std::max(0, column.cx);
+            return true;
+        }
+        if (capacity == Ipc::kMaxStringChars + 1) break;
+        capacity = std::min(Ipc::kMaxStringChars + 1, capacity * 2);
+    }
+    reason = L"ListView column text exceeds the protocol string limit";
+    return false;
+}
+
+bool CaptureListView(
+    HWND hwnd,
+    ControlNode& node,
+    std::wstring& reason) {
+    const LRESULT count = SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0);
+    if (count < 0 || count > static_cast<LRESULT>(Ipc::kMaxListItems)) {
+        reason = L"invalid or excessive ListView item count";
+        return false;
+    }
+    const HWND header = reinterpret_cast<HWND>(
+        SendMessageW(hwnd, LVM_GETHEADER, 0, 0));
+    const int columnCount = header && IsWindow(header)
+        ? Header_GetItemCount(header) : 0;
+    if (columnCount <= 0 ||
+        static_cast<size_t>(columnCount) > kMaxListViewColumns) {
+        reason = L"ListView has no bounded report columns";
+        return false;
+    }
+    std::vector<int> columnOrder(static_cast<size_t>(columnCount), -1);
+    if (!SendMessageW(hwnd, LVM_GETCOLUMNORDERARRAY, columnCount,
+            reinterpret_cast<LPARAM>(columnOrder.data()))) {
+        reason = L"ListView column order read failed";
+        return false;
+    }
+    for (int index = 0; index < columnCount; ++index) {
+        if (columnOrder[static_cast<size_t>(index)] != index) {
+            reason = L"reordered ListView columns are outside the bounded adapter";
+            return false;
+        }
+        HDITEMW headerItem{};
+        headerItem.mask = HDI_FORMAT;
+        if (!Header_GetItem(header, index, &headerItem) ||
+            (headerItem.fmt & (HDF_OWNERDRAW | HDF_BITMAP |
+                HDF_BITMAP_ON_RIGHT | HDF_IMAGE)) != 0) {
+            reason = L"ListView header requires owner-draw, bitmap, or image semantics";
+            return false;
+        }
+    }
+
+    size_t totalText = 0;
+    node.columns.reserve(static_cast<size_t>(columnCount));
+    node.columnWidths.reserve(static_cast<size_t>(columnCount));
+    for (int column = 0; column < columnCount; ++column) {
+        std::wstring label;
+        int width = 0;
+        if (!ReadListViewColumn(hwnd, column, label, width, reason)) return false;
+        totalText += label.size();
+        if (totalText > kMaxStructuredTextChars) {
+            reason = L"ListView text exceeds the bounded adapter payload";
+            return false;
+        }
+        node.columns.push_back(std::move(label));
+        node.columnWidths.push_back(width);
+    }
+
+    node.rows.reserve(static_cast<size_t>(count));
+    node.items.reserve(static_cast<size_t>(count));
+    for (int row = 0; row < count; ++row) {
+        std::vector<std::wstring> cells;
+        cells.reserve(static_cast<size_t>(columnCount));
+        for (int column = 0; column < columnCount; ++column) {
+            std::wstring text;
+            if (!ReadListViewCell(hwnd, row, column, text, reason)) return false;
+            totalText += text.size();
+            if (totalText > kMaxStructuredTextChars) {
+                reason = L"ListView text exceeds the bounded adapter payload";
+                return false;
+            }
+            cells.push_back(std::move(text));
+        }
+        node.items.push_back(cells.empty() ? std::wstring() : cells.front());
+        node.rows.push_back(std::move(cells));
+    }
+
+    int previousSelected = -1;
+    while (true) {
+        const int selected = static_cast<int>(SendMessageW(
+            hwnd, LVM_GETNEXTITEM, previousSelected, LVNI_SELECTED));
+        if (selected < 0) break;
+        if (selected <= previousSelected ||
+            static_cast<size_t>(selected) >= node.rows.size() ||
+            node.selectedIndices.size() >= node.rows.size()) {
+            reason = L"ListView selected index enumeration is invalid";
+            return false;
+        }
+        node.selectedIndices.push_back(selected);
+        previousSelected = selected;
+    }
+    node.focusedIndex = static_cast<int>(SendMessageW(
+        hwnd, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_FOCUSED));
+    if (node.focusedIndex < -1 ||
+        (node.focusedIndex >= 0 &&
+            static_cast<size_t>(node.focusedIndex) >= node.rows.size())) {
+        reason = L"ListView focused index is outside the item range";
+        return false;
+    }
+    node.multiSelect =
+        (static_cast<DWORD>(node.style) & LVS_SINGLESEL) == 0;
+    node.selectedIndex = node.selectedIndices.empty()
+        ? -1 : node.selectedIndices.front();
+    return true;
+}
+
+bool CaptureStatusBar(
+    HWND hwnd,
+    ControlNode& node,
+    std::wstring& reason) {
+    constexpr size_t kMaxStatusParts = 64;
+    node.text.clear();
+    node.automationName.clear();
+    const bool simple = SendMessageW(hwnd, SB_ISSIMPLE, 0, 0) != FALSE;
+    int count = simple ? 1 : static_cast<int>(SendMessageW(hwnd, SB_GETPARTS, 0, 0));
+    if (count <= 0 || static_cast<size_t>(count) > kMaxStatusParts) {
+        reason = L"StatusBar has no bounded part collection";
+        return false;
+    }
+    std::vector<int> rightEdges(static_cast<size_t>(count), -1);
+    if (!simple && SendMessageW(hwnd, SB_GETPARTS, count,
+            reinterpret_cast<LPARAM>(rightEdges.data())) != count) {
+        reason = L"StatusBar part geometry read failed";
+        return false;
+    }
+    RECT client{};
+    if (!GetClientRect(hwnd, &client)) {
+        reason = L"StatusBar client geometry read failed";
+        return false;
+    }
+    const int64_t clientWidth = static_cast<int64_t>(client.right) - client.left;
+    if (clientWidth < 0 || clientWidth > std::numeric_limits<int>::max()) {
+        reason = L"StatusBar client width is outside the bounded adapter";
+        return false;
+    }
+
+    size_t totalText = 0;
+    int64_t previousRight = 0;
+    node.items.reserve(static_cast<size_t>(count));
+    node.columnWidths.reserve(static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        const WPARAM part = simple ? SB_SIMPLEID : static_cast<WPARAM>(index);
+        const LRESULT lengthAndType = SendMessageW(hwnd, SB_GETTEXTLENGTHW, part, 0);
+        const size_t length = LOWORD(lengthAndType);
+        const UINT type = HIWORD(lengthAndType);
+        if ((type & SBT_OWNERDRAW) != 0 || length > Ipc::kMaxStringChars) {
+            reason = L"StatusBar part is owner-draw or exceeds the text limit";
+            return false;
+        }
+        std::wstring text(length + 1, L'\0');
+        const LRESULT copiedAndType = SendMessageW(
+            hwnd, SB_GETTEXTW, part, reinterpret_cast<LPARAM>(text.data()));
+        const size_t copied = LOWORD(copiedAndType);
+        if (copied > length || (HIWORD(copiedAndType) & SBT_OWNERDRAW) != 0) {
+            reason = L"StatusBar part text read failed";
+            return false;
+        }
+        text.resize(copied);
+        totalText += text.size();
+        if (totalText > kMaxStructuredTextChars) {
+            reason = L"StatusBar text exceeds the bounded adapter payload";
+            return false;
+        }
+        node.items.push_back(std::move(text));
+        int64_t right = simple
+            ? clientWidth
+            : rightEdges[static_cast<size_t>(index)];
+        if (right == -1) {
+            if (index + 1 != count) {
+                reason = L"StatusBar stretch part is not the final part";
+                return false;
+            }
+            right = clientWidth;
+        }
+        if (right < previousRight || right > clientWidth || right < 0) {
+            reason = L"StatusBar part edges are not monotonic client coordinates";
+            return false;
+        }
+        const int64_t width = right - previousRight;
+        if (width > std::numeric_limits<int>::max()) {
+            reason = L"StatusBar part width exceeds the protocol range";
+            return false;
+        }
+        node.columnWidths.push_back(static_cast<int>(width));
+        previousRight = right;
+    }
+    return true;
+}
+
+bool IsCompositeImplementationChild(HWND hwnd) {
     const HWND parent = GetParent(hwnd);
-    if (!parent || !FluentShell::EqualsIgnoreCase(WindowClass(parent), L"ComboBox")) return false;
-    COMBOBOXINFO info{sizeof(info)};
-    return GetComboBoxInfo(parent, &info) &&
-        (hwnd == info.hwndItem || hwnd == info.hwndList);
+    if (!parent) return false;
+    if (FluentShell::EqualsIgnoreCase(WindowClass(parent), L"ComboBox")) {
+        COMBOBOXINFO info{sizeof(info)};
+        return GetComboBoxInfo(parent, &info) &&
+            (hwnd == info.hwndItem || hwnd == info.hwndList);
+    }
+    return FluentShell::EqualsIgnoreCase(WindowClass(parent), WC_LISTVIEWW) &&
+        FluentShell::EqualsIgnoreCase(WindowClass(hwnd), WC_HEADERW);
 }
 
 struct Enumeration final {
@@ -289,7 +654,7 @@ bool CaptureNativeTabOrder(
     std::wstring& reason) {
     std::unordered_set<HWND> candidates;
     for (const HWND child : handles) {
-        if (IsComboBoxImplementationChild(child)) continue;
+        if (IsCompositeImplementationChild(child)) continue;
         const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
         if (IsWindowVisible(child) && IsWindowEnabled(child) &&
             (style & WS_TABSTOP) != 0) {
@@ -527,7 +892,7 @@ bool CaptureWindow(
         int zIndex = 0;
         for (const HWND child : enumeration.handles) {
             if (!IsWindowVisible(child)) continue;
-            if (IsComboBoxImplementationChild(child)) continue;
+            if (IsCompositeImplementationChild(child)) continue;
             DWORD childProcess = 0;
             const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
             if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
@@ -583,8 +948,14 @@ bool CaptureWindow(
                 node.tabIndex = tab->second;
             }
             node.dialogCode = static_cast<uint32_t>(SendMessageW(child, WM_GETDLGCODE, 0, 0));
-            if ((node.dialogCode & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE)) != 0) {
-                rejectionReason = L"control requires custom keyboard routing";
+            const bool standardTextKeyboard =
+                (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
+                (static_cast<DWORD>(node.style) & ES_MULTILINE) != 0;
+            if ((node.dialogCode & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE)) != 0 &&
+                !standardTextKeyboard) {
+                rejectionReason = L"control requires custom keyboard routing code=" +
+                    std::to_wstring(node.dialogCode);
+                AppendWindowEvidence(child, rejectionReason);
                 return false;
             }
             if (!WindowText(child, node.text, rejectionReason)) return false;
@@ -595,6 +966,9 @@ bool CaptureWindow(
                 ? L"Password edit"
                 : node.text;
             node.groupStart = (node.style & WS_GROUP) != 0;
+
+            if (node.kind == ControlKind::SysLink &&
+                !CaptureSingleSysLink(child, node, rejectionReason)) return false;
 
             const DWORD controlStyle = static_cast<DWORD>(node.style);
             if (node.kind == ControlKind::Button) {
@@ -628,6 +1002,10 @@ bool CaptureWindow(
                     rejectionReason = L"ProgressBar has an invalid native range or position";
                     return false;
                 }
+            } else if (node.kind == ControlKind::ListView) {
+                if (!CaptureListView(child, node, rejectionReason)) return false;
+            } else if (node.kind == ControlKind::StatusBar) {
+                if (!CaptureStatusBar(child, node, rejectionReason)) return false;
             }
 
             visibleNodeIds.emplace(child, node.nodeId);
@@ -697,6 +1075,10 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashString(hash, node.automationName);
         HashBytes(hash, node.checked);
         HashBytes(hash, node.selectedIndex);
+        HashBytes(hash, node.selectedIndices.size());
+        for (const int index : node.selectedIndices) HashBytes(hash, index);
+        HashBytes(hash, node.focusedIndex);
+        HashBytes(hash, node.multiSelect);
         HashBytes(hash, node.selectionStart);
         HashBytes(hash, node.selectionLength);
         HashBytes(hash, node.readOnly);
@@ -707,8 +1089,25 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.minimum);
         HashBytes(hash, node.maximum);
         HashBytes(hash, node.position);
+        HashBytes(hash, node.smallChange);
+        HashBytes(hash, node.largeChange);
+        HashBytes(hash, node.vertical);
+        HashBytes(hash, node.reversed);
         HashBytes(hash, node.items.size());
         for (const auto& item : node.items) HashString(hash, item);
+        HashBytes(hash, node.columns.size());
+        for (const auto& column : node.columns) HashString(hash, column);
+        HashBytes(hash, node.columnWidths.size());
+        for (const int width : node.columnWidths) HashBytes(hash, width);
+        HashBytes(hash, node.rows.size());
+        for (const auto& row : node.rows) {
+            HashBytes(hash, row.size());
+            for (const auto& cell : row) HashString(hash, cell);
+        }
+        HashBytes(hash, node.itemDepths.size());
+        for (const int depth : node.itemDepths) HashBytes(hash, depth);
+        HashBytes(hash, node.itemExpanded.size());
+        for (const bool expanded : node.itemExpanded) HashBytes(hash, expanded);
     }
     return hash;
 }

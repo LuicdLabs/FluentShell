@@ -55,7 +55,8 @@ $dumpbin = Find-Dumpbin $vsInstall
 $csharpTests = @(Get-ChildItem -Path (Join-Path $Root "tests") -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue)
 foreach ($project in $csharpTests) {
     Write-Host "dotnet test $($project.FullName)"
-    & dotnet test $project.FullName --configuration $Configuration
+    & dotnet test $project.FullName --configuration $Configuration `
+        -p:FluentShellTestBuild=true
     if ($LASTEXITCODE -ne 0) { throw "C# tests failed: $($project.FullName)" }
 }
 if ($csharpTests.Count -eq 0) { Write-Host "No C# test project is currently present." }

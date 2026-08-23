@@ -35,6 +35,8 @@ public sealed class TranslatedWindow : Window
     private bool _applyingCanonical;
     private bool _allowClose;
     private bool _committed;
+    private bool _interactive;
+    private PixelRect? _gateBounds;
     private bool _closePending;
     private bool _retired;
     private bool _interactionBlocked;
@@ -258,15 +260,19 @@ public sealed class TranslatedWindow : Window
         }
     }
 
-    public void Commit(bool show, ulong revision)
+    public void Commit(bool show, ulong revision, bool interactive)
     {
         if (revision != ViewModel.Revision) throw new ProtocolException("surface.commit revision does not match renderer state.");
+        RendererDiagnostics.Log(
+            $"surface.commit surface={ViewModel.SurfaceId} show={show} interactive={interactive} revision={revision}");
         _applyingCanonical = true;
         try
         {
             if (show)
             {
                 _committed = true;
+                _interactive = interactive;
+                _gateBounds = interactive ? null : ViewModel.Bounds;
                 ApplyWindowState();
                 if (ViewModel.Visible)
                 {
@@ -277,6 +283,8 @@ public sealed class TranslatedWindow : Window
             else
             {
                 _committed = false;
+                _interactive = false;
+                _gateBounds = null;
                 _appWindow.Hide();
                 if (!SetCloaked(true)) RendererDiagnostics.Log("proxy cloak failed while hiding surface");
             }
@@ -290,6 +298,8 @@ public sealed class TranslatedWindow : Window
         try
         {
             _committed = false;
+            _interactive = false;
+            _gateBounds = null;
             _retired = true;
             _closePending = false;
             _pending.Clear();
@@ -317,6 +327,8 @@ public sealed class TranslatedWindow : Window
         try
         {
             _committed = false;
+            _interactive = false;
+            _gateBounds = null;
             _retired = true;
             _closePending = false;
             _pending.Clear();
@@ -458,7 +470,7 @@ public sealed class TranslatedWindow : Window
 
     private bool CanEmitActions =>
         !_applyingCanonical && _committed && !_retired &&
-        ViewModel.Visible && ViewModel.Enabled && !_interactionBlocked;
+        _interactive && ViewModel.Visible && ViewModel.Enabled && !_interactionBlocked;
 
     private void ApplyInteractionState() =>
         EnableWindow(Hwnd, ViewModel.Enabled && !_interactionBlocked && !_retired);
@@ -467,8 +479,30 @@ public sealed class TranslatedWindow : Window
     {
         var node = ViewModel.Nodes.FirstOrDefault(candidate =>
             candidate.Kind == "button" && candidate.IsDefault && candidate.Enabled && candidate.Visible);
+        node ??= ViewModel.Nodes
+            .Where(candidate => candidate.TabStop && candidate.Enabled && candidate.Visible)
+            .OrderBy(candidate => candidate.TabIndex)
+            .FirstOrDefault();
+        node ??= ViewModel.Nodes.FirstOrDefault(candidate =>
+            candidate.Enabled && candidate.Visible &&
+            candidate.Kind is "edit" or "password" or "comboBox" or "listBox" or "listView");
         if (node is not null && _controls.TryGetValue(node.NodeId, out var control))
-            control.Focus(FocusState.Programmatic);
+        {
+            // Win32 WS_TABSTOP describes dialog traversal, not whether a main
+            // document control can own keyboard focus. WinUI's IsTabStop also
+            // gates programmatic focus, so enable it only for the focus call
+            // and immediately restore the native traversal contract.
+            var restoreTabStop = !control.IsTabStop;
+            if (restoreTabStop) control.IsTabStop = true;
+            try
+            {
+                control.Focus(FocusState.Programmatic);
+            }
+            finally
+            {
+                if (restoreTabStop) control.IsTabStop = false;
+            }
+        }
     }
 
     private void ApplyPresenterState()
@@ -489,6 +523,7 @@ public sealed class TranslatedWindow : Window
             "setText" => "text",
             "setCheck" => "checked",
             "select" => "selectedIndex",
+            "setSelection" => "selectedIndices",
             _ => action,
         };
         EmitAction(node, property, action, value);
@@ -575,7 +610,7 @@ public sealed class TranslatedWindow : Window
 
     private void OnAppWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
     {
-        if (_applyingCanonical || !_committed) return;
+        if (_applyingCanonical || !_committed || !_interactive) return;
         RefreshRenderDpi();
         if (args.DidPresenterChange && sender.Presenter is OverlappedPresenter presenter)
         {
@@ -620,6 +655,19 @@ public sealed class TranslatedWindow : Window
     private nint OnSubclassMessage(
         nint hwnd, uint message, nint wParam, nint lParam, nuint subclassId, nuint refData)
     {
+        if (!_interactive)
+        {
+            if (ShouldClampProvisionalBounds(_interactive, _applyingCanonical) &&
+                message == WmWindowPosChanging &&
+                _gateBounds is { } gateBounds)
+                ClampWindowPosition(lParam, gateBounds);
+            if (message == WmSysCommand && IsGateBlockedSystemCommand(wParam))
+                return 0;
+            if (message == WmMouseActivate)
+                return MaNoActivateAndEat;
+            if (IsGateBlockedInputMessage(message))
+                return 0;
+        }
         if (message == WmEnterSizeMove)
         {
             _inSizeMove = true;
@@ -643,7 +691,7 @@ public sealed class TranslatedWindow : Window
     {
         var start = _sizeMoveStart;
         _sizeMoveStart = null;
-        if (_applyingCanonical || !_committed) return;
+        if (_applyingCanonical || !_committed || !_interactive) return;
         var bounds = CurrentBounds();
         if (start is null || start == bounds) return;
         if (_appWindow.Presenter is OverlappedPresenter presenter &&
@@ -686,9 +734,79 @@ public sealed class TranslatedWindow : Window
         _boundsActions.Reset();
     }
 
+    private static void ClampWindowPosition(nint lParam, PixelRect bounds)
+    {
+        if (lParam == 0) return;
+        var position = Marshal.PtrToStructure<NativeWindowPos>(lParam);
+        if ((position.Flags & SwpNoMove) == 0)
+        {
+            position.X = bounds.X;
+            position.Y = bounds.Y;
+        }
+        if ((position.Flags & SwpNoSize) == 0)
+        {
+            position.Cx = bounds.Width;
+            position.Cy = bounds.Height;
+        }
+        Marshal.StructureToPtr(position, lParam, false);
+    }
+
+    private static bool IsGateBlockedSystemCommand(nint wParam)
+    {
+        var command = (nuint)wParam & 0xFFF0u;
+        return command is ScSize or ScMove or ScMinimize or ScMaximize or
+            ScRestore or ScClose;
+    }
+
+    internal static bool IsGateBlockedInputMessage(uint message) =>
+        message is >= WmKeyFirst and <= WmKeyLast or
+        >= WmNcMouseFirst and <= WmNcMouseLast or
+        >= WmMouseFirst and <= WmMouseLast or
+        WmGesture or WmGestureNotify or WmTouch or
+        >= WmPointerFirst and <= WmPointerLast;
+
+    internal static bool ShouldClampProvisionalBounds(
+        bool interactive, bool applyingCanonical) =>
+        !interactive && !applyingCanonical;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeWindowPos
+    {
+        public nint HwndInsertAfter;
+        public nint Hwnd;
+        public int X;
+        public int Y;
+        public int Cx;
+        public int Cy;
+        public uint Flags;
+    }
+
     private const uint WmEnterSizeMove = 0x0231;
     private const uint WmExitSizeMove = 0x0232;
+    private const uint WmWindowPosChanging = 0x0046;
+    private const uint WmMouseActivate = 0x0021;
+    private const uint WmSysCommand = 0x0112;
+    private const uint WmGesture = 0x0119;
+    private const uint WmGestureNotify = 0x011A;
+    private const uint WmKeyFirst = 0x0100;
+    private const uint WmKeyLast = 0x0109;
+    private const uint WmNcMouseFirst = 0x00A0;
+    private const uint WmNcMouseLast = 0x00AD;
+    private const uint WmMouseFirst = 0x0200;
+    private const uint WmMouseLast = 0x020E;
+    private const uint WmTouch = 0x0240;
+    private const uint WmPointerFirst = 0x0245;
+    private const uint WmPointerLast = 0x0253;
     private const uint WmNcDestroy = 0x0082;
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint ScSize = 0xF000;
+    private const uint ScMove = 0xF010;
+    private const uint ScMinimize = 0xF020;
+    private const uint ScMaximize = 0xF030;
+    private const uint ScClose = 0xF060;
+    private const uint ScRestore = 0xF120;
+    private const int MaNoActivateAndEat = 4;
     private const nuint SizeMoveSubclassId = 1;
 
     private delegate nint SubclassProc(

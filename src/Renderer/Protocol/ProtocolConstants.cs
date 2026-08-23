@@ -5,13 +5,15 @@ public static class ProtocolConstants
     public const uint Magic = 0x48534C46; // "FLSH" in little-endian byte order.
     public const ushort Major = 1;
     // Writers emit this minor; same-major readers accept any ushort minor and ignore unknown JSON fields.
-    public const ushort Minor = 0;
+    // Minor 1 introduces the two-stage surface interaction gate.
+    public const ushort Minor = 1;
     public const int HeaderSize = 32;
     public const int MaxPayloadBytes = 4 * 1024 * 1024;
     public const int MaxDepth = 32;
     public const int MaxStringChars = 65_536;
     public const int MaxNodes = 512;
     public const int MaxItems = 4_096;
+    public const int MaxColumns = 64;
     public const int MaxPatchOperations = 1_024;
     public const int MaxMenuItems = 256;
     public const int MaxMenuDepth = 8;

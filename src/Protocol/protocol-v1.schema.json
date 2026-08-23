@@ -87,6 +87,10 @@
           "then": { "required": ["minimum", "maximum", "position"] }
         },
         {
+          "if": { "properties": { "kind": { "const": "slider" } }, "required": ["kind"] },
+          "then": { "required": ["minimum", "maximum", "position"] }
+        },
+        {
           "if": { "properties": { "kind": { "const": "comboBox" } }, "required": ["kind"] },
           "then": { "required": ["selectedIndex"] }
         },
@@ -100,7 +104,7 @@
         "generation": { "$ref": "#/$defs/u64String" },
         "nativeHwnd": { "$ref": "#/$defs/hwndString" },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar"] },
+        "kind": { "enum": ["static", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "statusBar"] },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -115,6 +119,9 @@
         "automationName": { "$ref": "#/$defs/text" },
         "checked": { "type": "integer", "minimum": 0, "maximum": 2 },
         "selectedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
+        "selectedIndices": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 4095 } },
+        "focusedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
+        "multiSelect": { "type": "boolean" },
         "selectionStart": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "selectionLength": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "readOnly": { "type": "boolean" },
@@ -125,11 +132,20 @@
         "minimum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "maximum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "position": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "smallChange": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "largeChange": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "vertical": { "type": "boolean" },
+        "reversed": { "type": "boolean" },
         "items": {
           "type": "array",
           "maxItems": 4096,
           "items": { "$ref": "#/$defs/text" }
-        }
+        },
+        "columns": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } },
+        "columnWidths": { "type": "array", "maxItems": 64, "items": { "type": "integer", "minimum": 0, "maximum": 2147483647 } },
+        "rows": { "type": "array", "maxItems": 4096, "items": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } } },
+        "itemDepths": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 31 } },
+        "itemExpanded": { "type": "array", "maxItems": 4096, "items": { "type": "boolean" } }
       }
     },
     "windowSnapshot": {
@@ -227,7 +243,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "menuCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "menuCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },
@@ -267,7 +283,8 @@
         "sessionNonce": { "$ref": "#/$defs/nonce" },
         "surfaceId": { "$ref": "#/$defs/surfaceId" },
         "revision": { "$ref": "#/$defs/u64String" },
-        "show": { "type": "boolean" }
+        "show": { "type": "boolean" },
+        "interactive": { "type": "boolean" }
       }
     },
     "windowClose": {
