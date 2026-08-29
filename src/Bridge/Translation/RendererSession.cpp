@@ -35,6 +35,10 @@ constexpr unsigned kQuietReconcileTicks = 4;
 // A source thread inside a modal loop can miss a bounded capture deadline without
 // being broken.  Tolerate a few misses before discarding a working projection.
 constexpr unsigned kMaxCaptureTimeouts = 3;
+// Classic dialogs commonly destroy one owned top-level and create the next a
+// moment later. Require a quiet owner graph before reprojecting the root so it
+// does not visibly bounce between native and WinUI during that transition.
+constexpr uint64_t kOwnerGraphQuietMs = 2000;
 
 class PhysicalCoordinateScope final {
 public:
@@ -205,6 +209,8 @@ struct RendererSession::Surface final {
     bool restoreRetryScheduled = false;
     bool agentRetained = false;
     unsigned restoreAttempts = 0;
+    uint64_t pendingCloseSequence = 0;
+    std::optional<ActionRequest> pendingCloseAction;
     // Reconcile bookkeeping.  Written only by the supervisor thread.
     unsigned captureTimeouts = 0;
     unsigned reconcileSkips = 0;
@@ -958,6 +964,18 @@ bool RendererSession::OpenSurface(
     return true;
 }
 
+bool IsOwnedBy(HWND window, HWND possibleOwner) noexcept {
+    if (!window || !possibleOwner || window == possibleOwner) return false;
+    HWND owner = GetWindow(window, GW_OWNER);
+    for (size_t depth = 0; owner && depth < 256; ++depth) {
+        if (owner == possibleOwner) return true;
+        const HWND next = GetWindow(owner, GW_OWNER);
+        if (next == owner) break;
+        owner = next;
+    }
+    return false;
+}
+
 void RendererSession::DiscoverTopLevelWindows() {
     struct Context {
         DWORD processId;
@@ -981,15 +999,52 @@ void RendererSession::DiscoverTopLevelWindows() {
         if (!FluentShell::IsShellOrXamlWindowClass(className)) context.windows.push_back(hwnd);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&context));
+    {
+        std::scoped_lock lock(surfacesMutex_);
+        for (auto iterator = discoveryAttempts_.begin();
+             iterator != discoveryAttempts_.end();) {
+            if (!IsWindow(*iterator)) iterator = discoveryAttempts_.erase(iterator);
+            else ++iterator;
+        }
+        for (auto iterator = ownerGraphDeferrals_.begin();
+             iterator != ownerGraphDeferrals_.end();) {
+            if (!IsWindow(iterator->first)) iterator = ownerGraphDeferrals_.erase(iterator);
+            else ++iterator;
+        }
+    }
     for (const HWND window : context.windows) {
         bool attempt = false;
+        bool graphStillVisible = false;
+        bool retryDeferredOwner = false;
+        std::shared_ptr<Surface> projectedOwner;
+        const HWND directOwner = GetWindow(window, GW_OWNER);
+        const bool ownsVisibleTopLevel = !directOwner && std::any_of(
+            context.windows.begin(), context.windows.end(),
+            [window](HWND candidate) { return IsOwnedBy(candidate, window); });
         {
             std::scoped_lock lock(surfacesMutex_);
-            for (auto iterator = discoveryAttempts_.begin();
-                 iterator != discoveryAttempts_.end();) {
-                if (!IsWindow(*iterator)) iterator = discoveryAttempts_.erase(iterator);
-                else ++iterator;
+            if (!directOwner) {
+                const auto deferral = ownerGraphDeferrals_.find(window);
+                if (deferral != ownerGraphDeferrals_.end()) {
+                    if (ownsVisibleTopLevel) {
+                        deferral->second = 0;
+                        graphStillVisible = true;
+                    } else {
+                        const uint64_t now = GetTickCount64();
+                        if (deferral->second == 0) {
+                            deferral->second = now;
+                            graphStillVisible = true;
+                        } else if (now - deferral->second < kOwnerGraphQuietMs) {
+                            graphStillVisible = true;
+                        } else {
+                            ownerGraphDeferrals_.erase(deferral);
+                            discoveryAttempts_.erase(window);
+                            retryDeferredOwner = true;
+                        }
+                    }
+                }
             }
+            if (graphStillVisible) continue;
             attempt = discoveryAttempts_.insert(window).second;
             if (!attempt) continue;
             for (const auto& [_, surface] : surfaces_) {
@@ -997,9 +1052,61 @@ void RendererSession::DiscoverTopLevelWindows() {
                     attempt = false;
                     break;
                 }
+                if (!directOwner || surface->virtualDialog || !surface->agent) continue;
+
+                // Owner graphs are not projected by the bounded v1 adapter. If
+                // a visible owned top-level appears above a projected native
+                // ancestor, keeping that ancestor cloaked can strand the child
+                // behind an unrelated renderer HWND. Resolve the existing
+                // projected ancestor now so the whole native graph can remain
+                // authoritative and interactive.
+                if (IsOwnedBy(window, surface->agent->Root())) {
+                    std::scoped_lock surfaceLock(surface->mutex);
+                    if (surface->state == SurfaceState::Projected) {
+                        projectedOwner = surface;
+                    }
+                }
             }
         }
-        if (attempt) OpenNativeWindow(window);
+        if (!attempt) continue;
+        if (directOwner) {
+            if (projectedOwner) {
+                const HWND ownerRoot = projectedOwner->agent
+                    ? projectedOwner->agent->Root() : nullptr;
+                if (ownerRoot) {
+                    std::scoped_lock lock(surfacesMutex_);
+                    ownerGraphDeferrals_.insert_or_assign(ownerRoot, 0);
+                }
+                FluentShell::Log(
+                    L"Visible owned top-level requires native owner-graph fallback");
+                RestoreSurface(projectedOwner, L"ownedTopLevel");
+            }
+            // An owned surface must never be projected independently from its
+            // owner. It is either covered by the fallback above or already
+            // belongs to an entirely native owner graph.
+            continue;
+        }
+        if (ownsVisibleTopLevel) {
+            // Discovery order follows desktop z-order, so an owned dialog can
+            // be visited before its root during startup. Keep that root native
+            // until every owned top-level closes; otherwise the next iteration
+            // could cloak it underneath the already-skipped dialog.
+            bool firstDeferral = false;
+            {
+                std::scoped_lock lock(surfacesMutex_);
+                firstDeferral = ownerGraphDeferrals_.try_emplace(window, 0).second;
+            }
+            if (firstDeferral) {
+                FluentShell::Log(
+                    L"Native owner graph remains untranslated while an owned top-level is visible");
+            }
+            continue;
+        }
+        if (retryDeferredOwner) {
+            FluentShell::Log(
+                L"Owned top-level closed; retrying native owner projection");
+        }
+        OpenNativeWindow(window);
     }
 }
 
@@ -1164,6 +1271,15 @@ void RendererSession::HandleNativeAction(
     if (surface->state != SurfaceState::Projected || surface->restoreInProgress) {
         return;
     }
+    if (action.action == L"close" && surface->pendingCloseAction) {
+        const uint64_t revision = surface->snapshot.revision;
+        lock.unlock();
+        canonicalLock.unlock();
+        Send(Ipc::MessageType::ActionResult, revision,
+            SerializeActionResult(nonce_, action, L"rejected", revision,
+                L"a native close request is already pending"));
+        return;
+    }
     auto agent = surface->agent;
     const uint64_t sourceGeneration = surface->snapshot.generation;
     if (!agent || agent->Generation() != sourceGeneration) {
@@ -1200,11 +1316,6 @@ void RendererSession::HandleNativeAction(
         RestoreSurface(surface, L"nativeDestroyed");
         return;
     }
-    if (outcome.closeRejected) {
-        Send(Ipc::MessageType::ActionResult, effectiveAction.expectedRevision,
-            SerializeActionResult(nonce_, action, L"closeRejected", effectiveAction.expectedRevision));
-        return;
-    }
     {
         std::unique_lock updateLock(surface->mutex);
         if (surface->state != SurfaceState::Projected ||
@@ -1223,11 +1334,19 @@ void RendererSession::HandleNativeAction(
         }
         surface->snapshot = std::move(outcome.snapshot);
         surface->fingerprint = SnapshotFingerprint(surface->snapshot);
+        if (action.action == L"close" && outcome.closeSequence != 0) {
+            surface->pendingCloseSequence = outcome.closeSequence;
+            surface->pendingCloseAction = action;
+        }
         const uint64_t revision = surface->snapshot.revision;
         const auto resultPayload = SerializeActionResult(
             nonce_, action, L"accepted", revision);
-        const auto patchPayload = SerializeWindowPatch(
-            nonce_, base, surface->snapshot, action.eventId);
+        // WM_CLOSE is merely queued at this point. Keep its renderer pending
+        // entry alive until the root is destroyed or reconcile observes the
+        // completed handler and returns closeRejected.
+        const auto patchPayload = action.action == L"close"
+            ? SerializeWindowPatch(nonce_, base, surface->snapshot)
+            : SerializeWindowPatch(nonce_, base, surface->snapshot, action.eventId);
         updateLock.unlock();
         Send(Ipc::MessageType::ActionResult, revision, resultPayload);
         Send(Ipc::MessageType::WindowPatch, revision, patchPayload);
@@ -1314,14 +1433,34 @@ void RendererSession::ReconcileNativeSurfaces() {
             RestoreSurface(surface, L"nativeStateChanged");
             continue;
         }
-        if (fingerprint == surface->fingerprint) continue;
-        surface->snapshot = std::move(next);
-        surface->fingerprint = fingerprint;
-        const auto payload = SerializeWindowPatch(
-            nonce_, baseRevision, surface->snapshot);
+        const bool changed = fingerprint != surface->fingerprint;
+        std::string payload;
+        if (changed) {
+            surface->snapshot = std::move(next);
+            surface->fingerprint = fingerprint;
+            payload = SerializeWindowPatch(nonce_, baseRevision, surface->snapshot);
+        }
         const uint64_t revision = surface->snapshot.revision;
+        std::optional<ActionRequest> rejectedClose;
+        if (surface->pendingCloseAction && surface->pendingCloseSequence != 0 &&
+            agent->CompletedCloseSequence() >= surface->pendingCloseSequence) {
+            // The queued WM_CLOSE handler has returned and the root survived,
+            // so native code vetoed/cancelled the request. Only now may the
+            // renderer accept another close attempt; this avoids both a stuck
+            // close gate and duplicate prompts during a modal lifetime.
+            rejectedClose = std::move(surface->pendingCloseAction);
+            surface->pendingCloseAction.reset();
+            surface->pendingCloseSequence = 0;
+        }
         lock.unlock();
-        const bool sent = Send(Ipc::MessageType::WindowPatch, revision, payload);
+        bool sent = true;
+        if (changed) {
+            sent = Send(Ipc::MessageType::WindowPatch, revision, std::move(payload));
+        }
+        if (sent && rejectedClose) {
+            sent = Send(Ipc::MessageType::ActionResult, revision,
+                SerializeActionResult(nonce_, *rejectedClose, L"closeRejected", revision));
+        }
         canonicalLock.unlock();
         if (!sent) {
             RestoreSurface(surface, L"restore");

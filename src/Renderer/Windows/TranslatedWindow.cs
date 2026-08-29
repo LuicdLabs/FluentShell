@@ -583,11 +583,14 @@ public sealed class TranslatedWindow : Window
     {
         if (_allowClose) return;
         args.Cancel = true;
-        if (ViewModel.CanCancel && !_closePending)
-        {
-            _closePending = true;
-            EmitAction(null, "close", "close", null);
-        }
+        RequestClose();
+    }
+
+    private void RequestClose()
+    {
+        if (!ViewModel.CanCancel || _closePending) return;
+        _closePending = true;
+        EmitAction(null, "close", "close", null);
     }
 
     private void OnCanvasKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
@@ -603,7 +606,7 @@ public sealed class TranslatedWindow : Window
         }
         else if (args.Key == global::Windows.System.VirtualKey.Escape && ViewModel.CanCancel)
         {
-            EmitAction(null, "close", "close", null);
+            RequestClose();
             args.Handled = true;
         }
     }

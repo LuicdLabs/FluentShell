@@ -11,7 +11,7 @@ namespace FluentShell::Bridge::Translation {
 struct ActionOutcome final {
     bool accepted = false;
     bool destroyed = false;
-    bool closeRejected = false;
+    uint64_t closeSequence = 0;
     uint64_t revision = 0;
     WindowSnapshot snapshot;
     std::wstring error;
@@ -65,6 +65,11 @@ public:
     UINT MessageId() const noexcept { return message_; }
     void MarkDirty() noexcept { dirty_.store(true); }
     void MarkDestroyed() noexcept { destroyed_.store(true); MarkDirty(); }
+    uint64_t RegisterCloseRequest() noexcept;
+    void MarkCloseRequestCompleted() noexcept;
+    uint64_t CompletedCloseSequence() const noexcept {
+        return closeCompleted_.load(std::memory_order_acquire);
+    }
     bool CaptureOnSourceThread(
         std::wstring_view surfaceId,
         uint64_t revision,
@@ -87,6 +92,8 @@ private:
     std::atomic<bool> dirty_{ true };
     std::atomic<bool> destroyed_{ false };
     std::atomic<bool> shuttingDown_{ false };
+    std::atomic<uint64_t> closeIssued_{ 0 };
+    std::atomic<uint64_t> closeCompleted_{ 0 };
     CaptureContext captureContext_;
 };
 

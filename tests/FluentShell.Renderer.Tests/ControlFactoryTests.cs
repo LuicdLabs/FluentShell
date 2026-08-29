@@ -71,6 +71,7 @@ public sealed class ControlFactoryTests
     [Fact]
     public void SemanticWrapperPeersExposeBoundedNativeControlTypes()
     {
+        Assert.Equal(AutomationControlType.Text, ControlFactory.AutomationControlTypeFor("static"));
         Assert.Equal(AutomationControlType.Pane, ControlFactory.AutomationControlTypeFor("sysLink"));
         Assert.Equal(AutomationControlType.StatusBar, ControlFactory.AutomationControlTypeFor("statusBar"));
     }

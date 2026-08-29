@@ -199,6 +199,23 @@ void MarkCurrentThreadAgentsDirty() noexcept {
     } catch (...) {}
 }
 
+void MarkWindowCloseCompleted(HWND window) noexcept {
+    if (!window) return;
+    try {
+        // Resolve through the lifetime-protected registry after the native
+        // WndProc returns. A nested fallback may have removed and destroyed the
+        // agent while WM_CLOSE was inside a modal loop, so the subclass's raw
+        // refData must not be dereferenced for this completion notification.
+        std::scoped_lock lock(g_agentsMutex);
+        for (const auto& [_, agent] : g_agents) {
+            if (agent && agent->Root() == window) {
+                agent->MarkCloseRequestCompleted();
+                break;
+            }
+        }
+    } catch (...) {}
+}
+
 bool RelevantMessage(UINT message) noexcept {
     switch (message) {
     case WM_SETTEXT:
@@ -281,6 +298,7 @@ LRESULT CALLBACK RootSubclassProc(
     UINT_PTR subclassId, DWORD_PTR refData) {
     auto* owner = reinterpret_cast<SourceThreadAgent*>(refData);
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    if (message == WM_CLOSE) MarkWindowCloseCompleted(window);
     if (owner && RelevantMessage(message)) owner->MarkDirty();
     if (message == WM_NCDESTROY && owner) {
         owner->MarkDestroyed();
@@ -386,10 +404,22 @@ void ExecuteCommandImpl(Command* command) {
             command->success = !IsIconic(agent->Root()) && !IsZoomed(agent->Root());
         } else if (action.action == L"close") {
             if (AbortIfCancelled(command)) return;
-            SendMessageW(agent->Root(), WM_CLOSE, 0, 0);
-            command->outcome.destroyed = !IsWindow(agent->Root());
-            command->outcome.closeRejected = !command->outcome.destroyed;
-            command->success = true;
+            // WM_CLOSE is allowed to enter an application-owned modal loop (for
+            // example Notepad's unsaved-document prompt).  Sending it from this
+            // bounded command would keep Invoke blocked until the user answers
+            // and make the Bridge tear down a healthy projection at its 2 s
+            // deadline.  Queue the request for the native message loop just as
+            // we do for buttons and menu commands.  Destruction is observed by
+            // the root subclass/reconcile path. If the handler returns without
+            // destroying the root, reconcile reports closeRejected only after
+            // that complete modal/veto lifetime.
+            command->success = PostMessageW(agent->Root(), WM_CLOSE, 0, 0) != FALSE;
+            if (command->success) {
+                // This hook is executing on the source UI thread, so the posted
+                // message cannot reach RootSubclassProc until this command
+                // returns. Registering after a successful post is race-free.
+                command->outcome.closeSequence = agent->RegisterCloseRequest();
+            }
         } else if (action.action == L"menuCommand") {
             if (AbortIfCancelled(command)) return;
             // Menu handlers may enter a modal loop. Queue the validated
@@ -710,6 +740,25 @@ SourceThreadAgent::SourceThreadAgent(
     HWND root, HMODULE module, DWORD threadId, UINT message) noexcept
     : root_(root), module_(module), threadId_(threadId), message_(message),
       generation_(g_nextGeneration.fetch_add(1)) {}
+
+uint64_t SourceThreadAgent::RegisterCloseRequest() noexcept {
+    const uint64_t sequence = closeIssued_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    try {
+        FluentShell::Log(L"Queued native WM_CLOSE sequence=" + std::to_wstring(sequence));
+    } catch (...) {}
+    return sequence;
+}
+
+void SourceThreadAgent::MarkCloseRequestCompleted() noexcept {
+    const uint64_t sequence = closeIssued_.load(std::memory_order_acquire);
+    if (sequence == 0 || sequence <= closeCompleted_.load(std::memory_order_acquire)) return;
+    closeCompleted_.store(sequence, std::memory_order_release);
+    MarkDirty();
+    try {
+        FluentShell::Log(L"Native WM_CLOSE handler completed sequence=" +
+            std::to_wstring(sequence));
+    } catch (...) {}
+}
 
 bool SourceThreadAgent::CaptureOnSourceThread(
     std::wstring_view surfaceId,

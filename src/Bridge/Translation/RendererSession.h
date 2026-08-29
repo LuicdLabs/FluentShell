@@ -129,6 +129,9 @@ private:
     std::unordered_set<std::wstring> retiredSurfaceIds_;
     std::deque<std::wstring> retiredSurfaceOrder_;
     std::unordered_set<HWND> discoveryAttempts_;
+    // Zero means an owned top-level is still visible. A nonzero tick starts the
+    // quiet period that must elapse before the native owner is projected again.
+    std::unordered_map<HWND, uint64_t> ownerGraphDeferrals_;
     std::mutex actionMutex_;
     std::condition_variable actionCondition_;
     std::deque<std::pair<ActionRequest, std::shared_ptr<Surface>>> actionQueue_;

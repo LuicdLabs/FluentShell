@@ -85,16 +85,26 @@ internal sealed class ControlFactory
         return element;
     }
 
-    private static TextBlock CreateStatic(ControlNodeViewModel viewModel)
+    private static ContentControl CreateStatic(ControlNodeViewModel viewModel)
     {
-        var control = new TextBlock
+        var text = new TextBlock
         {
             FontSize = NativeFontSize,
             TextWrapping = TextWrapping.Wrap,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        Bind(control, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay);
-        return control;
+        Bind(text, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay);
+        AutomationProperties.SetAccessibilityView(text, AccessibilityView.Raw);
+        return new SemanticStaticTextControl
+        {
+            Content = text,
+            MinWidth = 0,
+            MinHeight = 0,
+            Padding = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+            IsHitTestVisible = false,
+        };
     }
 
     private static ContentControl CreateGroupBox(ControlNodeViewModel viewModel)
@@ -200,6 +210,7 @@ internal sealed class ControlFactory
         var control = new RadioButton
         {
             FontSize = NativeFontSize,
+            MinWidth = 0,
             MinHeight = 0,
             IsChecked = viewModel.Checked == 1,
             GroupName = _radioGroups[viewModel.NodeId],
@@ -622,6 +633,7 @@ internal sealed class ControlFactory
 
     internal static AutomationControlType AutomationControlTypeFor(string kind) => kind switch
     {
+        "static" => AutomationControlType.Text,
         "sysLink" => AutomationControlType.Pane,
         "listView" => AutomationControlType.List,
         "statusBar" => AutomationControlType.StatusBar,
@@ -676,6 +688,22 @@ internal sealed class ControlFactory
 
     private static void Bind(FrameworkElement target, DependencyProperty property, string path, BindingMode mode, IValueConverter? converter = null) =>
         target.SetBinding(property, new Binding { Path = new PropertyPath(path), Mode = mode, Converter = converter });
+}
+
+internal sealed class SemanticStaticTextControl : ContentControl
+{
+    protected override AutomationPeer OnCreateAutomationPeer() => new SemanticStaticTextAutomationPeer(this);
+}
+
+internal sealed class SemanticStaticTextAutomationPeer(SemanticStaticTextControl owner) : FrameworkElementAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        ControlFactory.AutomationControlTypeFor("static");
+
+    protected override string GetClassNameCore() => "TextBlock";
+    protected override string GetNameCore() => AutomationProperties.GetName(owner);
+    protected override bool IsControlElementCore() => true;
+    protected override bool IsContentElementCore() => true;
 }
 
 internal sealed class SemanticGroupControl : ContentControl
