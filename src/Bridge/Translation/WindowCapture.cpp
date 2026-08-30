@@ -1,13 +1,11 @@
 #include "WindowCapture.h"
 
 #include "../../Common/FluentShell.h"
+#include "ControlAdapters.h"
 
 #include <commctrl.h>
 
-#include <algorithm>
 #include <array>
-#include <cwctype>
-#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -17,8 +15,6 @@ namespace {
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
 constexpr size_t kMaxMenuDepth = 8;
 constexpr size_t kMaxMenuItems = 256;
-constexpr size_t kMaxListViewColumns = 64;
-constexpr size_t kMaxStructuredTextChars = 256 * 1024;
 
 class PhysicalCoordinateScope final {
 public:
@@ -61,17 +57,14 @@ bool CaptureTopLevelBounds(HWND root, bool minimized, bool maximized, RECT& boun
     return true;
 }
 
-std::wstring WindowClass(HWND hwnd) {
-    wchar_t value[256]{};
-    const int length = GetClassNameW(hwnd, value, static_cast<int>(std::size(value)));
-    return length > 0 ? std::wstring(value, static_cast<size_t>(length)) : std::wstring();
-}
-
+// Appended to every rejection so the log names the concrete HWND that failed
+// its adapter contract, not just the stage that rejected it.
 void AppendWindowEvidence(HWND hwnd, std::wstring& reason) {
+    wchar_t classBuffer[kMaxClassNameChars]{};
     reason.append(L" [hwnd=");
     reason.append(std::to_wstring(reinterpret_cast<uintptr_t>(hwnd)));
     reason.append(L" class=");
-    reason.append(WindowClass(hwnd));
+    reason.append(ClassNameOf(hwnd, classBuffer));
     reason.append(L" style=");
     reason.append(std::to_wstring(
         static_cast<uint64_t>(GetWindowLongPtrW(hwnd, GWL_STYLE))));
@@ -133,510 +126,6 @@ bool IsStandardTopLevel(HWND root, std::wstring& reason) {
     return true;
 }
 
-bool ClassifyControl(
-    HWND hwnd,
-    ControlKind& kind,
-    std::wstring& reason) {
-    const auto className = WindowClass(hwnd);
-    const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
-
-    if (FluentShell::EqualsIgnoreCase(className, L"Static")) {
-        const DWORD type = style & SS_TYPEMASK;
-        if (type != SS_LEFT && type != SS_CENTER && type != SS_RIGHT &&
-            type != SS_SIMPLE && type != SS_LEFTNOWORDWRAP &&
-            type != SS_ETCHEDHORZ && type != SS_ETCHEDVERT) {
-            reason = L"unsupported Static draw style";
-            return false;
-        }
-        kind = (type == SS_ETCHEDHORZ || type == SS_ETCHEDVERT)
-            ? ControlKind::Separator
-            : ControlKind::StaticText;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, L"Button")) {
-        const DWORD type = style & BS_TYPEMASK;
-        if (type == BS_OWNERDRAW || (style & (BS_BITMAP | BS_ICON)) != 0) {
-            reason = L"unsupported Button draw style";
-            return false;
-        }
-        switch (type) {
-        case BS_PUSHBUTTON:
-        case BS_DEFPUSHBUTTON:
-            kind = ControlKind::Button;
-            return true;
-        case BS_CHECKBOX:
-        case BS_AUTOCHECKBOX:
-            kind = ControlKind::CheckBox;
-            return true;
-        case BS_3STATE:
-        case BS_AUTO3STATE:
-            kind = ControlKind::ThreeState;
-            return true;
-        case BS_RADIOBUTTON:
-        case BS_AUTORADIOBUTTON:
-            kind = ControlKind::RadioButton;
-            return true;
-        case BS_GROUPBOX:
-            if ((style & WS_TABSTOP) != 0) {
-                reason = L"tab-stop GroupBox is not supported";
-                return false;
-            }
-            kind = ControlKind::GroupBox;
-            return true;
-        default:
-            reason = L"unsupported Button type";
-            return false;
-        }
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, L"Edit")) {
-        kind = (style & ES_PASSWORD) != 0 ? ControlKind::Password : ControlKind::Edit;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, L"ComboBox")) {
-        if ((style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE)) != 0) {
-            reason = L"owner-draw ComboBox";
-            return false;
-        }
-        const DWORD type = style & 0x0003u;
-        if (type != CBS_DROPDOWNLIST &&
-            (type != CBS_DROPDOWN || (style & CBS_HASSTRINGS) == 0)) {
-            reason = L"ComboBox is simple, non-string-backed, or has an unsupported type";
-            return false;
-        }
-        kind = ControlKind::ComboBox;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, L"ListBox")) {
-        if ((style & (LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE | LBS_NODATA |
-                      LBS_MULTIPLESEL | LBS_EXTENDEDSEL | LBS_MULTICOLUMN | LBS_NOSEL)) != 0) {
-            reason = L"owner-draw, virtual, multi-select, or multi-column ListBox";
-            return false;
-        }
-        kind = ControlKind::ListBox;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, PROGRESS_CLASSW)) {
-        if ((style & (PBS_MARQUEE | PBS_VERTICAL | WS_TABSTOP)) != 0) {
-            reason = L"marquee, vertical, or tab-stop ProgressBar is not supported";
-            return false;
-        }
-        kind = ControlKind::ProgressBar;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, WC_LINK)) {
-        constexpr DWORD unsupportedLinkStyles = LWS_IGNORERETURN |
-            LWS_USECUSTOMTEXT | LWS_RIGHT | LWS_NOPREFIX;
-        if ((style & unsupportedLinkStyles) != 0) {
-            reason = L"SysLink requires unsupported callback, alignment, prefix, or keyboard semantics";
-            return false;
-        }
-        kind = ControlKind::SysLink;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, WC_LISTVIEWW)) {
-        const DWORD type = style & LVS_TYPEMASK;
-        if (type != LVS_REPORT || (style & LVS_NOCOLUMNHEADER) != 0 ||
-            (style & (LVS_OWNERDATA | LVS_OWNERDRAWFIXED | LVS_EDITLABELS)) != 0) {
-            reason = L"ListView is virtual, owner-draw, label-editable, headerless, or not in report view";
-            return false;
-        }
-        if (SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0) != FALSE) {
-            reason = L"grouped ListView is not supported";
-            return false;
-        }
-        const DWORD extended = static_cast<DWORD>(
-            SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
-        constexpr DWORD unsupportedExtended = LVS_EX_CHECKBOXES |
-            LVS_EX_HEADERDRAGDROP | LVS_EX_TRACKSELECT | LVS_EX_ONECLICKACTIVATE |
-            LVS_EX_TWOCLICKACTIVATE;
-        if ((extended & unsupportedExtended) != 0) {
-            reason = L"ListView requires unsupported checkbox, header-drag, or activation semantics";
-            return false;
-        }
-        kind = ControlKind::ListView;
-        return true;
-    }
-
-    if (FluentShell::EqualsIgnoreCase(className, STATUSCLASSNAMEW)) {
-        if ((style & WS_TABSTOP) != 0) {
-            reason = L"tab-stop StatusBar is not supported";
-            return false;
-        }
-        kind = ControlKind::StatusBar;
-        return true;
-    }
-
-    reason = L"unsupported visible control class: " + className;
-    return false;
-}
-
-bool ReadStringItems(
-    HWND hwnd,
-    bool combo,
-    std::vector<std::wstring>& items,
-    std::wstring& reason) {
-    const UINT countMessage = combo ? CB_GETCOUNT : LB_GETCOUNT;
-    const UINT lengthMessage = combo ? CB_GETLBTEXTLEN : LB_GETTEXTLEN;
-    const UINT textMessage = combo ? CB_GETLBTEXT : LB_GETTEXT;
-    const LRESULT rawCount = SendMessageW(hwnd, countMessage, 0, 0);
-    if (rawCount < 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxListItems)) {
-        reason = L"invalid or excessive string item count";
-        return false;
-    }
-    items.reserve(static_cast<size_t>(rawCount));
-    for (LRESULT index = 0; index < rawCount; ++index) {
-        const LRESULT length = SendMessageW(hwnd, lengthMessage, index, 0);
-        if (length < 0 || length > static_cast<LRESULT>(Ipc::kMaxStringChars)) {
-            reason = L"invalid string item length";
-            return false;
-        }
-        std::wstring text(static_cast<size_t>(length) + 1, L'\0');
-        const LRESULT copied = SendMessageW(
-            hwnd, textMessage, index, reinterpret_cast<LPARAM>(text.data()));
-        if (copied < 0) {
-            reason = L"failed to read string item";
-            return false;
-        }
-        text.resize(static_cast<size_t>(copied));
-        items.push_back(std::move(text));
-    }
-    return true;
-}
-
-bool CaptureSingleSysLink(
-    HWND hwnd,
-    ControlNode& node,
-    std::wstring& reason) {
-    LITEM item{};
-    item.mask = LIF_ITEMINDEX | LIF_STATE | LIF_ITEMID | LIF_URL;
-    item.iLink = 0;
-    item.stateMask = LIS_ENABLED;
-    if (!SendMessageW(hwnd, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&item))) {
-        reason = L"SysLink has no interrogable link item";
-        return false;
-    }
-    LITEM second{};
-    second.mask = LIF_ITEMINDEX | LIF_STATE;
-    second.iLink = 1;
-    second.stateMask = LIS_ENABLED;
-    if (SendMessageW(hwnd, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&second))) {
-        reason = L"multi-link SysLink is outside the bounded adapter";
-        return false;
-    }
-
-    std::wstring markup = node.text;
-    std::wstring lowered = markup;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-        [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
-    const size_t open = lowered.find(L"<a");
-    const size_t openEnd = open == std::wstring::npos
-        ? std::wstring::npos : lowered.find(L'>', open + 2);
-    const size_t close = openEnd == std::wstring::npos
-        ? std::wstring::npos : lowered.find(L"</a>", openEnd + 1);
-    if (open == std::wstring::npos || openEnd == std::wstring::npos ||
-        close == std::wstring::npos || close == openEnd + 1 ||
-        lowered.find(L"<a", close + 4) != std::wstring::npos) {
-        reason = L"SysLink markup is not a single bounded hyperlink";
-        return false;
-    }
-    const std::wstring prefix = markup.substr(0, open);
-    const std::wstring label = markup.substr(openEnd + 1, close - openEnd - 1);
-    std::wstring suffix = markup.substr(close + 4);
-    while (!suffix.empty() && suffix.back() <= L' ') suffix.pop_back();
-    const auto containsMarkup = [](std::wstring_view value) {
-        return value.find(L'<') != std::wstring_view::npos ||
-            value.find(L'>') != std::wstring_view::npos;
-    };
-    if (containsMarkup(prefix) || containsMarkup(label) || containsMarkup(suffix) ||
-        prefix.find(L'&') != std::wstring::npos ||
-        label.find(L'&') != std::wstring::npos ||
-        suffix.find(L'&') != std::wstring::npos) {
-        reason = L"SysLink contains unsupported nested markup or mnemonic text";
-        return false;
-    }
-    const std::wstring flattened = prefix + label + suffix;
-    const size_t labelAt = flattened.find(label);
-    if (labelAt != prefix.size() ||
-        flattened.find(label, labelAt + label.size()) != std::wstring::npos) {
-        reason = L"SysLink label is ambiguous in its flattened text";
-        return false;
-    }
-    node.text = flattened;
-    node.automationName = node.text;
-    node.items.push_back(label);
-    node.enabled = node.enabled && (item.state & LIS_ENABLED) != 0;
-    return true;
-}
-
-bool ReadListViewCell(
-    HWND hwnd,
-    int row,
-    int column,
-    std::wstring& text,
-    std::wstring& reason) {
-    size_t capacity = 256;
-    while (capacity <= Ipc::kMaxStringChars + 1) {
-        std::wstring buffer(capacity, L'\0');
-        LVITEMW item{};
-        item.iSubItem = column;
-        item.pszText = buffer.data();
-        item.cchTextMax = static_cast<int>(buffer.size());
-        const int copied = static_cast<int>(SendMessageW(
-            hwnd, LVM_GETITEMTEXTW, row, reinterpret_cast<LPARAM>(&item)));
-        if (copied < 0) {
-            reason = L"ListView item text read failed";
-            return false;
-        }
-        if (static_cast<size_t>(copied) + 1 < capacity) {
-            buffer.resize(static_cast<size_t>(copied));
-            text = std::move(buffer);
-            return true;
-        }
-        if (capacity == Ipc::kMaxStringChars + 1) break;
-        capacity = std::min(Ipc::kMaxStringChars + 1, capacity * 2);
-    }
-    reason = L"ListView item text exceeds the protocol string limit";
-    return false;
-}
-
-bool ReadListViewColumn(
-    HWND hwnd,
-    int index,
-    std::wstring& text,
-    int& width,
-    std::wstring& reason) {
-    size_t capacity = 256;
-    while (capacity <= Ipc::kMaxStringChars + 1) {
-        std::wstring buffer(capacity, L'\0');
-        LVCOLUMNW column{};
-        column.mask = LVCF_TEXT | LVCF_WIDTH;
-        column.pszText = buffer.data();
-        column.cchTextMax = static_cast<int>(buffer.size());
-        if (!SendMessageW(hwnd, LVM_GETCOLUMNW, index,
-                reinterpret_cast<LPARAM>(&column))) {
-            reason = L"ListView column read failed";
-            return false;
-        }
-        const size_t length = static_cast<size_t>(
-            std::find(buffer.begin(), buffer.end(), L'\0') - buffer.begin());
-        if (length + 1 < capacity) {
-            buffer.resize(length);
-            text = std::move(buffer);
-            width = std::max(0, column.cx);
-            return true;
-        }
-        if (capacity == Ipc::kMaxStringChars + 1) break;
-        capacity = std::min(Ipc::kMaxStringChars + 1, capacity * 2);
-    }
-    reason = L"ListView column text exceeds the protocol string limit";
-    return false;
-}
-
-bool CaptureListView(
-    HWND hwnd,
-    ControlNode& node,
-    std::wstring& reason) {
-    const LRESULT count = SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0);
-    if (count < 0 || count > static_cast<LRESULT>(Ipc::kMaxListItems)) {
-        reason = L"invalid or excessive ListView item count";
-        return false;
-    }
-    const HWND header = reinterpret_cast<HWND>(
-        SendMessageW(hwnd, LVM_GETHEADER, 0, 0));
-    const int columnCount = header && IsWindow(header)
-        ? Header_GetItemCount(header) : 0;
-    if (columnCount <= 0 ||
-        static_cast<size_t>(columnCount) > kMaxListViewColumns) {
-        reason = L"ListView has no bounded report columns";
-        return false;
-    }
-    std::vector<int> columnOrder(static_cast<size_t>(columnCount), -1);
-    if (!SendMessageW(hwnd, LVM_GETCOLUMNORDERARRAY, columnCount,
-            reinterpret_cast<LPARAM>(columnOrder.data()))) {
-        reason = L"ListView column order read failed";
-        return false;
-    }
-    for (int index = 0; index < columnCount; ++index) {
-        if (columnOrder[static_cast<size_t>(index)] != index) {
-            reason = L"reordered ListView columns are outside the bounded adapter";
-            return false;
-        }
-        HDITEMW headerItem{};
-        headerItem.mask = HDI_FORMAT;
-        if (!Header_GetItem(header, index, &headerItem) ||
-            (headerItem.fmt & (HDF_OWNERDRAW | HDF_BITMAP |
-                HDF_BITMAP_ON_RIGHT | HDF_IMAGE)) != 0) {
-            reason = L"ListView header requires owner-draw, bitmap, or image semantics";
-            return false;
-        }
-    }
-
-    size_t totalText = 0;
-    node.columns.reserve(static_cast<size_t>(columnCount));
-    node.columnWidths.reserve(static_cast<size_t>(columnCount));
-    for (int column = 0; column < columnCount; ++column) {
-        std::wstring label;
-        int width = 0;
-        if (!ReadListViewColumn(hwnd, column, label, width, reason)) return false;
-        totalText += label.size();
-        if (totalText > kMaxStructuredTextChars) {
-            reason = L"ListView text exceeds the bounded adapter payload";
-            return false;
-        }
-        node.columns.push_back(std::move(label));
-        node.columnWidths.push_back(width);
-    }
-
-    node.rows.reserve(static_cast<size_t>(count));
-    node.items.reserve(static_cast<size_t>(count));
-    for (int row = 0; row < count; ++row) {
-        std::vector<std::wstring> cells;
-        cells.reserve(static_cast<size_t>(columnCount));
-        for (int column = 0; column < columnCount; ++column) {
-            std::wstring text;
-            if (!ReadListViewCell(hwnd, row, column, text, reason)) return false;
-            totalText += text.size();
-            if (totalText > kMaxStructuredTextChars) {
-                reason = L"ListView text exceeds the bounded adapter payload";
-                return false;
-            }
-            cells.push_back(std::move(text));
-        }
-        node.items.push_back(cells.empty() ? std::wstring() : cells.front());
-        node.rows.push_back(std::move(cells));
-    }
-
-    int previousSelected = -1;
-    while (true) {
-        const int selected = static_cast<int>(SendMessageW(
-            hwnd, LVM_GETNEXTITEM, previousSelected, LVNI_SELECTED));
-        if (selected < 0) break;
-        if (selected <= previousSelected ||
-            static_cast<size_t>(selected) >= node.rows.size() ||
-            node.selectedIndices.size() >= node.rows.size()) {
-            reason = L"ListView selected index enumeration is invalid";
-            return false;
-        }
-        node.selectedIndices.push_back(selected);
-        previousSelected = selected;
-    }
-    node.focusedIndex = static_cast<int>(SendMessageW(
-        hwnd, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_FOCUSED));
-    if (node.focusedIndex < -1 ||
-        (node.focusedIndex >= 0 &&
-            static_cast<size_t>(node.focusedIndex) >= node.rows.size())) {
-        reason = L"ListView focused index is outside the item range";
-        return false;
-    }
-    node.multiSelect =
-        (static_cast<DWORD>(node.style) & LVS_SINGLESEL) == 0;
-    node.selectedIndex = node.selectedIndices.empty()
-        ? -1 : node.selectedIndices.front();
-    return true;
-}
-
-bool CaptureStatusBar(
-    HWND hwnd,
-    ControlNode& node,
-    std::wstring& reason) {
-    constexpr size_t kMaxStatusParts = 64;
-    node.text.clear();
-    node.automationName.clear();
-    const bool simple = SendMessageW(hwnd, SB_ISSIMPLE, 0, 0) != FALSE;
-    int count = simple ? 1 : static_cast<int>(SendMessageW(hwnd, SB_GETPARTS, 0, 0));
-    if (count <= 0 || static_cast<size_t>(count) > kMaxStatusParts) {
-        reason = L"StatusBar has no bounded part collection";
-        return false;
-    }
-    std::vector<int> rightEdges(static_cast<size_t>(count), -1);
-    if (!simple && SendMessageW(hwnd, SB_GETPARTS, count,
-            reinterpret_cast<LPARAM>(rightEdges.data())) != count) {
-        reason = L"StatusBar part geometry read failed";
-        return false;
-    }
-    RECT client{};
-    if (!GetClientRect(hwnd, &client)) {
-        reason = L"StatusBar client geometry read failed";
-        return false;
-    }
-    const int64_t clientWidth = static_cast<int64_t>(client.right) - client.left;
-    if (clientWidth < 0 || clientWidth > std::numeric_limits<int>::max()) {
-        reason = L"StatusBar client width is outside the bounded adapter";
-        return false;
-    }
-
-    size_t totalText = 0;
-    int64_t previousRight = 0;
-    node.items.reserve(static_cast<size_t>(count));
-    node.columnWidths.reserve(static_cast<size_t>(count));
-    for (int index = 0; index < count; ++index) {
-        const WPARAM part = simple ? SB_SIMPLEID : static_cast<WPARAM>(index);
-        const LRESULT lengthAndType = SendMessageW(hwnd, SB_GETTEXTLENGTHW, part, 0);
-        const size_t length = LOWORD(lengthAndType);
-        const UINT type = HIWORD(lengthAndType);
-        if ((type & SBT_OWNERDRAW) != 0 || length > Ipc::kMaxStringChars) {
-            reason = L"StatusBar part is owner-draw or exceeds the text limit";
-            return false;
-        }
-        std::wstring text(length + 1, L'\0');
-        const LRESULT copiedAndType = SendMessageW(
-            hwnd, SB_GETTEXTW, part, reinterpret_cast<LPARAM>(text.data()));
-        const size_t copied = LOWORD(copiedAndType);
-        if (copied > length || (HIWORD(copiedAndType) & SBT_OWNERDRAW) != 0) {
-            reason = L"StatusBar part text read failed";
-            return false;
-        }
-        text.resize(copied);
-        totalText += text.size();
-        if (totalText > kMaxStructuredTextChars) {
-            reason = L"StatusBar text exceeds the bounded adapter payload";
-            return false;
-        }
-        node.items.push_back(std::move(text));
-        int64_t right = simple
-            ? clientWidth
-            : rightEdges[static_cast<size_t>(index)];
-        if (right == -1) {
-            if (index + 1 != count) {
-                reason = L"StatusBar stretch part is not the final part";
-                return false;
-            }
-            right = clientWidth;
-        }
-        if (right < previousRight || right > clientWidth || right < 0) {
-            reason = L"StatusBar part edges are not monotonic client coordinates";
-            return false;
-        }
-        const int64_t width = right - previousRight;
-        if (width > std::numeric_limits<int>::max()) {
-            reason = L"StatusBar part width exceeds the protocol range";
-            return false;
-        }
-        node.columnWidths.push_back(static_cast<int>(width));
-        previousRight = right;
-    }
-    return true;
-}
-
-bool IsCompositeImplementationChild(HWND hwnd) {
-    const HWND parent = GetParent(hwnd);
-    if (!parent) return false;
-    if (FluentShell::EqualsIgnoreCase(WindowClass(parent), L"ComboBox")) {
-        COMBOBOXINFO info{sizeof(info)};
-        return GetComboBoxInfo(parent, &info) &&
-            (hwnd == info.hwndItem || hwnd == info.hwndList);
-    }
-    return FluentShell::EqualsIgnoreCase(WindowClass(parent), WC_LISTVIEWW) &&
-        FluentShell::EqualsIgnoreCase(WindowClass(hwnd), WC_HEADERW);
-}
-
 struct Enumeration final {
     std::vector<HWND> handles;
 };
@@ -688,17 +177,25 @@ bool CaptureNativeTabOrder(
     return true;
 }
 
-template <typename T>
-void HashBytes(uint64_t& hash, const T& value) noexcept {
-    const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
-    for (size_t index = 0; index < sizeof(T); ++index) {
+void HashRange(uint64_t& hash, const void* data, size_t size) noexcept {
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    for (size_t index = 0; index < size; ++index) {
         hash ^= bytes[index];
         hash *= 1099511628211ull;
     }
 }
 
+template <typename T>
+void HashBytes(uint64_t& hash, const T& value) noexcept {
+    HashRange(hash, &value, sizeof(T));
+}
+
+// A ListView can carry 256 KiB of text and the fingerprint runs on every
+// reconcile tick, so string content is folded in one contiguous pass rather
+// than one call per character.  The byte order, and therefore the hash, is
+// identical to the per-character walk.
 void HashString(uint64_t& hash, std::wstring_view value) noexcept {
-    for (const wchar_t character : value) HashBytes(hash, character);
+    HashRange(hash, value.data(), value.size() * sizeof(wchar_t));
 }
 
 bool HasMdiClient(HWND root) {
@@ -806,6 +303,186 @@ bool CaptureMenuLevel(
     return true;
 }
 
+// Per-window state the child loop threads through node capture.  Passing it as
+// one value keeps the child capture stages independent of the loop itself.
+struct ChildCaptureScope final {
+    HWND root = nullptr;
+    DWORD rootThread = 0;
+    const std::unordered_map<HWND, int>* tabIndexes = nullptr;
+    const std::unordered_map<HWND, uint64_t>* visibleNodeIds = nullptr;
+    int zIndex = 0;
+};
+
+bool CaptureTopLevelFacets(
+    HWND root,
+    const CaptureContext& context,
+    WindowSnapshot& next,
+    std::wstring& reason) {
+    next.surfaceId = context.surfaceId;
+    next.surfaceKind = SurfaceKind::Window;
+    next.modal = false;
+    next.canCancel = true;
+    next.generation = context.generation;
+    next.revision = context.revision;
+    next.nativeHwnd = root;
+    next.ownerHwnd = GetWindow(root, GW_OWNER);
+    if (!WindowText(root, next.title, reason)) return false;
+    next.dpi = GetDpiForWindow(root);
+    if (next.dpi == 0) next.dpi = 96;
+    const bool minimized = IsIconic(root) != FALSE;
+    const bool maximized = IsZoomed(root) != FALSE;
+    if (!CaptureTopLevelBounds(root, minimized, maximized, next.bounds)) {
+        reason = L"native window has no valid restore bounds";
+        return false;
+    }
+    GetClientRect(root, &next.clientBounds);
+    next.windowStyle = static_cast<uint64_t>(GetWindowLongPtrW(root, GWL_STYLE));
+    next.windowExStyle = static_cast<uint64_t>(GetWindowLongPtrW(root, GWL_EXSTYLE));
+    next.visible = IsWindowVisible(root) != FALSE;
+    next.enabled = IsWindowEnabled(root) != FALSE;
+    next.state = minimized ? L"minimized" : (maximized ? L"maximized" : L"normal");
+    next.showInTaskbar =
+        next.ownerHwnd == nullptr || (next.windowExStyle & WS_EX_APPWINDOW) != 0;
+    next.rtl = (next.windowExStyle & WS_EX_LAYOUTRTL) != 0;
+    return CaptureTopLevelMenu(root, next.menu, reason);
+}
+
+// Node IDs must survive a reconcile pass but never outlive the HWND they name.
+// A bridge-owned window property carries the lifecycle generation, so a
+// recreated control at the same address is issued a fresh node ID.
+bool AssignNodeIdentity(
+    HWND child,
+    CaptureContext& context,
+    ControlNode& node,
+    std::wstring& reason) {
+    auto generation = reinterpret_cast<uintptr_t>(
+        GetPropW(child, kNodeGenerationProperty));
+    if (generation == 0) {
+        generation = static_cast<uintptr_t>(context.nextNodeGeneration++);
+        if (!SetPropW(child, kNodeGenerationProperty,
+                reinterpret_cast<HANDLE>(generation))) {
+            reason = L"cannot assign bridge-owned child generation";
+            return false;
+        }
+    }
+    auto identity = context.nodeIds.find(child);
+    if (identity == context.nodeIds.end() || identity->second.generation != generation) {
+        identity = context.nodeIds.insert_or_assign(
+            child, CaptureContext::NodeIdentity{ generation, context.nextNodeId++ }).first;
+    }
+    node.nodeId = identity->second.nodeId;
+    node.generation = generation;
+    node.hwnd = child;
+    return true;
+}
+
+// Geometry, styles, focusability, and text: the facets every projected control
+// shares regardless of which adapter owns it.
+bool CaptureCommonNodeFacets(
+    HWND child,
+    const ChildCaptureScope& scope,
+    ControlNode& node,
+    std::wstring& reason) {
+    const HWND parent = GetParent(child);
+    if (parent != scope.root) {
+        const auto parentId = scope.visibleNodeIds->find(parent);
+        if (parentId == scope.visibleNodeIds->end()) {
+            reason = L"unsupported or hidden intermediate parent";
+            return false;
+        }
+        node.parentNodeId = parentId->second;
+    }
+    node.controlId = GetDlgCtrlID(child);
+    node.zIndex = scope.zIndex;
+    RECT childRect{};
+    GetWindowRect(child, &childRect);
+    MapWindowPoints(nullptr, scope.root, reinterpret_cast<POINT*>(&childRect), 2);
+    node.rect = childRect;
+    node.style = static_cast<uint64_t>(GetWindowLongPtrW(child, GWL_STYLE));
+    node.exStyle = static_cast<uint64_t>(GetWindowLongPtrW(child, GWL_EXSTYLE));
+    node.visible = true;
+    node.enabled = IsWindowEnabled(child) != FALSE;
+    node.tabStop = (node.style & WS_TABSTOP) != 0;
+    if (const auto tab = scope.tabIndexes->find(child); tab != scope.tabIndexes->end()) {
+        node.tabIndex = tab->second;
+    }
+    node.dialogCode = static_cast<uint32_t>(SendMessageW(child, WM_GETDLGCODE, 0, 0));
+    // A multiline Edit legitimately wants all keys; anything else asking for raw
+    // key routing implements private keyboard behavior we cannot project.
+    const bool standardTextKeyboard =
+        (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
+        (static_cast<DWORD>(node.style) & ES_MULTILINE) != 0;
+    if ((node.dialogCode & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE)) != 0 &&
+        !standardTextKeyboard) {
+        reason = L"control requires custom keyboard routing code=" +
+            std::to_wstring(node.dialogCode);
+        return false;
+    }
+    if (!WindowText(child, node.text, reason)) return false;
+    // Never place a clear-text password in the UIA Name property.  The
+    // PasswordBox still receives the canonical value through its typed view
+    // model, while accessibility exposes only its role.
+    node.automationName = node.kind == ControlKind::Password
+        ? L"Password edit"
+        : node.text;
+    node.groupStart = (node.style & WS_GROUP) != 0;
+    return true;
+}
+
+// Classify, identify, common facets, adapter-specific state.  Every stage
+// rejects with its own reason and the caller appends the HWND evidence once.
+bool CaptureChildNode(
+    HWND child,
+    CaptureContext& context,
+    const ChildCaptureScope& scope,
+    ControlNode& node,
+    std::wstring& reason) {
+    DWORD childProcess = 0;
+    const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
+    if (childProcess != GetCurrentProcessId() || childThread != scope.rootThread) {
+        reason = L"foreign-process or foreign-thread child HWND";
+        return false;
+    }
+    return ClassifyControl(child, node.kind, reason) &&
+        AssignNodeIdentity(child, context, node, reason) &&
+        CaptureCommonNodeFacets(child, scope, node, reason) &&
+        CaptureControlDetail(child, node, reason);
+}
+
+bool CaptureChildNodes(
+    HWND root,
+    CaptureContext& context,
+    WindowSnapshot& next,
+    std::wstring& reason) {
+    Enumeration enumeration;
+    EnumChildWindows(root, CollectChild, reinterpret_cast<LPARAM>(&enumeration));
+    if (enumeration.handles.size() > Ipc::kMaxNodes) {
+        reason = L"window exceeds the 512 node limit";
+        return false;
+    }
+    std::unordered_map<HWND, int> tabIndexes;
+    if (!CaptureNativeTabOrder(root, enumeration.handles, tabIndexes, reason)) return false;
+
+    std::unordered_map<HWND, uint64_t> visibleNodeIds;
+    ChildCaptureScope scope;
+    scope.root = root;
+    scope.rootThread = GetWindowThreadProcessId(root, nullptr);
+    scope.tabIndexes = &tabIndexes;
+    scope.visibleNodeIds = &visibleNodeIds;
+    for (const HWND child : enumeration.handles) {
+        if (!IsWindowVisible(child) || IsCompositeImplementationChild(child)) continue;
+        ControlNode node;
+        if (!CaptureChildNode(child, context, scope, node, reason)) {
+            AppendWindowEvidence(child, reason);
+            return false;
+        }
+        ++scope.zIndex;
+        visibleNodeIds.emplace(child, node.nodeId);
+        next.nodes.push_back(std::move(node));
+    }
+    return true;
+}
+
 } // namespace
 
 bool CaptureTopLevelMenu(
@@ -836,6 +513,8 @@ bool CaptureWindow(
     WindowSnapshot& snapshot,
     std::wstring& rejectionReason) noexcept {
     try {
+        // WindowCapture and the renderer exchange physical pixel bounds, so the
+        // whole pass runs in one explicit DPI context.
         PhysicalCoordinateScope dpiScope;
         if (!dpiScope.IsValid()) {
             rejectionReason = L"cannot establish physical-coordinate DPI context";
@@ -845,173 +524,13 @@ bool CaptureWindow(
             AppendWindowEvidence(root, rejectionReason);
             return false;
         }
-
         WindowSnapshot next;
-        next.surfaceId = context.surfaceId;
-        next.surfaceKind = SurfaceKind::Window;
-        next.modal = false;
-        next.canCancel = true;
-        next.generation = context.generation;
-        next.revision = context.revision;
-        next.nativeHwnd = root;
-        next.ownerHwnd = GetWindow(root, GW_OWNER);
-        if (!WindowText(root, next.title, rejectionReason)) return false;
-        next.dpi = GetDpiForWindow(root);
-        if (next.dpi == 0) next.dpi = 96;
-        const bool minimized = IsIconic(root) != FALSE;
-        const bool maximized = IsZoomed(root) != FALSE;
-        if (!CaptureTopLevelBounds(root, minimized, maximized, next.bounds)) {
-            rejectionReason = L"native window has no valid restore bounds";
+        if (!CaptureTopLevelFacets(root, context, next, rejectionReason) ||
+            !CaptureChildNodes(root, context, next, rejectionReason)) {
             return false;
         }
-        RECT client{};
-        GetClientRect(root, &client);
-        next.clientBounds = client;
-        next.windowStyle = static_cast<uint64_t>(GetWindowLongPtrW(root, GWL_STYLE));
-        next.windowExStyle = static_cast<uint64_t>(GetWindowLongPtrW(root, GWL_EXSTYLE));
-        next.visible = IsWindowVisible(root) != FALSE;
-        next.enabled = IsWindowEnabled(root) != FALSE;
-        next.state = minimized ? L"minimized" : (maximized ? L"maximized" : L"normal");
-        next.showInTaskbar = next.ownerHwnd == nullptr || (next.windowExStyle & WS_EX_APPWINDOW) != 0;
-        next.rtl = (next.windowExStyle & WS_EX_LAYOUTRTL) != 0;
-        if (!CaptureTopLevelMenu(root, next.menu, rejectionReason)) return false;
-
-        Enumeration enumeration;
-        EnumChildWindows(root, CollectChild, reinterpret_cast<LPARAM>(&enumeration));
-        if (enumeration.handles.size() > Ipc::kMaxNodes) {
-            rejectionReason = L"window exceeds the 512 node limit";
-            return false;
-        }
-
-        std::unordered_map<HWND, uint64_t> visibleNodeIds;
-        std::unordered_map<HWND, int> nativeTabIndexes;
-        if (!CaptureNativeTabOrder(root, enumeration.handles, nativeTabIndexes, rejectionReason)) {
-            return false;
-        }
-        const DWORD rootThread = GetWindowThreadProcessId(root, nullptr);
-        int zIndex = 0;
-        for (const HWND child : enumeration.handles) {
-            if (!IsWindowVisible(child)) continue;
-            if (IsCompositeImplementationChild(child)) continue;
-            DWORD childProcess = 0;
-            const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
-            if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
-                rejectionReason = L"foreign-process or foreign-thread child HWND";
-                return false;
-            }
-
-            ControlNode node;
-            if (!ClassifyControl(child, node.kind, rejectionReason)) {
-                AppendWindowEvidence(child, rejectionReason);
-                return false;
-            }
-            uint64_t lifecycleGeneration = reinterpret_cast<uintptr_t>(
-                GetPropW(child, kNodeGenerationProperty));
-            if (lifecycleGeneration == 0) {
-                lifecycleGeneration = context.nextNodeGeneration++;
-                if (!SetPropW(child, kNodeGenerationProperty,
-                        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(lifecycleGeneration)))) {
-                    rejectionReason = L"cannot assign bridge-owned child generation";
-                    return false;
-                }
-            }
-            auto id = context.nodeIds.find(child);
-            if (id == context.nodeIds.end() || id->second.generation != lifecycleGeneration) {
-                CaptureContext::NodeIdentity identity{
-                    lifecycleGeneration, context.nextNodeId++ };
-                id = context.nodeIds.insert_or_assign(child, identity).first;
-            }
-            node.nodeId = id->second.nodeId;
-            node.generation = lifecycleGeneration;
-            node.hwnd = child;
-            const HWND parent = GetParent(child);
-            if (parent != root) {
-                const auto parentId = visibleNodeIds.find(parent);
-                if (parentId == visibleNodeIds.end()) {
-                    rejectionReason = L"unsupported or hidden intermediate parent";
-                    return false;
-                }
-                node.parentNodeId = parentId->second;
-            }
-            node.controlId = GetDlgCtrlID(child);
-            node.zIndex = zIndex++;
-            RECT childRect{};
-            GetWindowRect(child, &childRect);
-            MapWindowPoints(nullptr, root, reinterpret_cast<POINT*>(&childRect), 2);
-            node.rect = childRect;
-            node.style = static_cast<uint64_t>(GetWindowLongPtrW(child, GWL_STYLE));
-            node.exStyle = static_cast<uint64_t>(GetWindowLongPtrW(child, GWL_EXSTYLE));
-            node.visible = true;
-            node.enabled = IsWindowEnabled(child) != FALSE;
-            node.tabStop = (node.style & WS_TABSTOP) != 0;
-            if (const auto tab = nativeTabIndexes.find(child); tab != nativeTabIndexes.end()) {
-                node.tabIndex = tab->second;
-            }
-            node.dialogCode = static_cast<uint32_t>(SendMessageW(child, WM_GETDLGCODE, 0, 0));
-            const bool standardTextKeyboard =
-                (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
-                (static_cast<DWORD>(node.style) & ES_MULTILINE) != 0;
-            if ((node.dialogCode & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE)) != 0 &&
-                !standardTextKeyboard) {
-                rejectionReason = L"control requires custom keyboard routing code=" +
-                    std::to_wstring(node.dialogCode);
-                AppendWindowEvidence(child, rejectionReason);
-                return false;
-            }
-            if (!WindowText(child, node.text, rejectionReason)) return false;
-            // Never place a password's clear text in the UIA Name property.
-            // The PasswordBox still receives the canonical value through its
-            // typed view model, while accessibility exposes only its role.
-            node.automationName = node.kind == ControlKind::Password
-                ? L"Password edit"
-                : node.text;
-            node.groupStart = (node.style & WS_GROUP) != 0;
-
-            if (node.kind == ControlKind::SysLink &&
-                !CaptureSingleSysLink(child, node, rejectionReason)) return false;
-
-            const DWORD controlStyle = static_cast<DWORD>(node.style);
-            if (node.kind == ControlKind::Button) {
-                node.isDefault = (controlStyle & BS_TYPEMASK) == BS_DEFPUSHBUTTON;
-            } else if (node.kind == ControlKind::CheckBox ||
-                       node.kind == ControlKind::ThreeState ||
-                       node.kind == ControlKind::RadioButton) {
-                node.checked = static_cast<int>(SendMessageW(child, BM_GETCHECK, 0, 0));
-            } else if (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) {
-                node.readOnly = (controlStyle & ES_READONLY) != 0;
-                node.multiline = (controlStyle & ES_MULTILINE) != 0;
-                DWORD start = 0;
-                DWORD end = 0;
-                SendMessageW(child, EM_GETSEL, reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
-                node.selectionStart = static_cast<int>(start);
-                node.selectionLength = static_cast<int>(end >= start ? end - start : 0);
-            } else if (node.kind == ControlKind::ComboBox || node.kind == ControlKind::ListBox) {
-                const bool combo = node.kind == ControlKind::ComboBox;
-                node.editable = combo && (controlStyle & 0x0003u) == CBS_DROPDOWN;
-                if (!ReadStringItems(child, combo, node.items, rejectionReason)) return false;
-                node.selectedIndex = static_cast<int>(SendMessageW(
-                    child, combo ? CB_GETCURSEL : LB_GETCURSEL, 0, 0));
-            } else if (node.kind == ControlKind::ProgressBar) {
-                PBRANGE range{};
-                SendMessageW(child, PBM_GETRANGE, FALSE, reinterpret_cast<LPARAM>(&range));
-                node.minimum = range.iLow;
-                node.maximum = range.iHigh;
-                node.position = static_cast<int>(SendMessageW(child, PBM_GETPOS, 0, 0));
-                if (node.maximum <= node.minimum || node.position < node.minimum ||
-                    node.position > node.maximum) {
-                    rejectionReason = L"ProgressBar has an invalid native range or position";
-                    return false;
-                }
-            } else if (node.kind == ControlKind::ListView) {
-                if (!CaptureListView(child, node, rejectionReason)) return false;
-            } else if (node.kind == ControlKind::StatusBar) {
-                if (!CaptureStatusBar(child, node, rejectionReason)) return false;
-            }
-
-            visibleNodeIds.emplace(child, node.nodeId);
-            next.nodes.push_back(std::move(node));
-        }
-
+        // The snapshot is published only once every stage has accepted, so a
+        // rejected capture can never leave a partial tree behind.
         snapshot = std::move(next);
         return true;
     } catch (...) {

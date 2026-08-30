@@ -5,6 +5,7 @@
 #include <commctrl.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -53,6 +54,28 @@ public:
 
 private:
     struct Surface;
+    // One projection attempt.  Groups the values every gate stage reads so the
+    // gate can be a sequence of named stages instead of one long function.
+    struct ProjectionAttempt;
+
+    // What discovery decided about one visible top-level window.  Classification
+    // runs under the surface barrier; acting on the decision must not, because
+    // rollback and projection both take that barrier themselves.
+    enum class DiscoveryAction {
+        Skip,
+        RestoreOwnerGraph,
+        DeferOwnerGraph,
+        Project,
+        ProjectAfterDeferral,
+    };
+    struct DiscoveryDecision final {
+        DiscoveryAction action = DiscoveryAction::Skip;
+        // Set for RestoreOwnerGraph: the projected ancestor to roll back.
+        std::shared_ptr<Surface> projectedOwner;
+        // Set for DeferOwnerGraph: true the first time this root is deferred, so
+        // a steady state does not repeat the log line every pass.
+        bool firstDeferral = false;
+    };
 
     bool CreatePipeAndRenderer(uint64_t handshakeDeadline);
     bool Handshake(DWORD timeoutMs);
@@ -67,14 +90,79 @@ private:
     void HandleFrame(const Ipc::Frame& frame);
     void HandleReady(const SurfaceReady& ready);
     void HandleAction(const ActionRequest& action);
+    // Rejects an action and resynchronizes the renderer with the canonical
+    // revision.  Requires `lock` to own surface->mutex and releases it before
+    // the frames are sent, because Send can block on pipe backpressure.
+    void RejectAction(
+        const std::shared_ptr<Surface>& surface,
+        std::unique_lock<std::mutex>& lock,
+        const ActionRequest& action,
+        std::wstring_view status,
+        std::wstring_view reason);
+    // A virtual dialog has no native HWND, so the Bridge answers MessageBox and
+    // TaskDialog semantics directly from the snapshot it synthesized.  Same lock
+    // contract as RejectAction.
+    void ApplyVirtualDialogAction(
+        const std::shared_ptr<Surface>& surface,
+        std::unique_lock<std::mutex>& lock,
+        const ActionRequest& action);
     void HandleNativeAction(const ActionRequest& action, const std::shared_ptr<Surface>& surface);
     void ActionMain() noexcept;
     void DiscoverTopLevelWindows();
+    void PruneDiscoveryState();
+    DiscoveryDecision ClassifyTopLevel(HWND window, bool ownsVisibleTopLevel);
     bool OpenNativeWindow(HWND root);
     bool IsProjectedOwner(HWND owner);
     bool OpenSurface(const std::shared_ptr<Surface>& surface, bool cloakNative);
+    // Projection gate stages, in the order OpenSurface runs them.  Each logs its
+    // own rejection reason and returns false; the caller owns rollback.  All of
+    // them run with the surface canonical barrier held.
+    bool ResolveOwnerProxy(ProjectionAttempt& attempt);
+    bool PublishAndAwaitReady(ProjectionAttempt& attempt);
+    bool SynchronizeNativeRevision(ProjectionAttempt& attempt);
+    // One resync round: republish the recaptured native revision and wait for
+    // the renderer to re-report a matching hidden proxy.
+    bool RepublishResyncRevision(
+        ProjectionAttempt& attempt,
+        WindowSnapshot& barrier,
+        uint64_t baseRevision,
+        uint64_t expectedGeneration,
+        std::chrono::steady_clock::time_point deadline);
+    bool CommitProvisional(ProjectionAttempt& attempt);
+    bool AwaitProxyVisible(ProjectionAttempt& attempt);
+    bool EstablishProxyZOrder(const ProjectionAttempt& attempt);
+    bool VerifyNativeCloaked(const ProjectionAttempt& attempt);
+    bool CommitInteractive(ProjectionAttempt& attempt);
+    bool RunUiaGate(
+        const ProjectionAttempt& attempt,
+        const WindowSnapshot& snapshot,
+        const wchar_t* stage);
+    bool RunCommittedUiaGate(const ProjectionAttempt& attempt);
+    // Rolls the native window back before rejecting.  Used only after the
+    // provisional commit has already made the proxy visible.
+    bool RejectAfterCommit(const ProjectionAttempt& attempt, std::wstring_view reason);
+    // One reconcile pass over one surface.
+    struct ReconcilePass;
     void ReconcileNativeSurfaces();
+    // Both return the rollback reason the surface needs, or nullptr to keep the
+    // projection.  Returning instead of rolling back inline is what keeps the
+    // lock choreography out of the reconcile logic: the caller restores only
+    // after every lock this pass took has been released.
+    const wchar_t* ReconcileSurface(const std::shared_ptr<Surface>& surface);
+    const wchar_t* PublishReconciledSnapshot(ReconcilePass& pass);
+    // Everything the rollback path needs, captured once under the barrier so no
+    // stage can read a surface another thread is concurrently changing.
+    struct RestoreAttempt;
     void RestoreSurface(const std::shared_ptr<Surface>& surface, std::wstring_view reason) noexcept;
+    // Rollback stages, in the order RestoreSurface runs them.  The first four run
+    // with the surface canonical barrier held; the last two must not.
+    bool BeginRestore(RestoreAttempt& attempt);
+    void IsolateProxyForRestore(const RestoreAttempt& attempt) noexcept;
+    bool RestoreNativeWindow(const RestoreAttempt& attempt);
+    bool PublishRestoredState(const RestoreAttempt& attempt, bool nativeRestored);
+    void NotifyRendererOfRollback(
+        const RestoreAttempt& attempt, std::wstring_view protocolReason) noexcept;
+    void ScheduleEmergencyUncloakRetry(const RestoreAttempt& attempt) noexcept;
     void RestoreAll(std::wstring_view reason) noexcept;
     bool IsRetiredSurface(std::wstring_view surfaceId) noexcept;
     void RememberRetiredSurfaceLocked(std::wstring_view surfaceId) noexcept;

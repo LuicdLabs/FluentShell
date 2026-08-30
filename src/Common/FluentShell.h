@@ -12,6 +12,7 @@
 #include <shellapi.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -48,36 +49,56 @@ struct MatchRule {
     DwmStyle dwm{};
 };
 
+// Diagnostics are the only view into a projection that failed inside an injected
+// process, so this must never lose or truncate a record: rejection reasons carry
+// several hundred characters of HWND/style evidence.
 inline void Log(std::wstring_view msg) {
-    OutputDebugStringW(kLogPrefix);
-    OutputDebugStringW(msg.data());
-    OutputDebugStringW(L"\n");
+    std::wstring line;
+    try {
+        line.reserve(msg.size() + 32);
+        line.append(kLogPrefix);
+        line.append(msg);
+        line.push_back(L'\n');
+    } catch (...) {
+        OutputDebugStringW(L"[FluentShell] log allocation failed\n");
+        return;
+    }
+    // std::wstring_view is not guaranteed to be null-terminated, so the debugger
+    // string is always built here instead of passing msg.data() through.
+    OutputDebugStringW(line.c_str());
 
     // Also append to %TEMP%\FluentShell.log for field diagnosis without a debugger.
     wchar_t temp[MAX_PATH]{};
-    if (GetTempPathW(static_cast<DWORD>(std::size(temp)), temp) > 0) {
-        std::wstring path = temp;
-        path += L"FluentShell.log";
-        HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            SYSTEMTIME st{};
-            GetLocalTime(&st);
-            wchar_t line[1024]{};
-            swprintf_s(line, L"%02u:%02u:%02u.%03u %s%.*s\r\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                kLogPrefix,
-                static_cast<int>(msg.size()), msg.data());
+    if (GetTempPathW(static_cast<DWORD>(std::size(temp)), temp) == 0) return;
+    std::wstring path = temp;
+    path += L"FluentShell.log";
+    const HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[24]{};
+    swprintf_s(stamp, L"%02u:%02u:%02u.%03u ",
+        now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    std::wstring record = stamp;
+    record.append(line, 0, line.size() - 1);
+    record.append(L"\r\n");
+
+    // UTF-8 for notepad-friendly logs.  Size the conversion from the record
+    // rather than a fixed buffer so a long reason cannot be cut in half.
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, record.c_str(),
+        static_cast<int>(record.size()), nullptr, 0, nullptr, nullptr);
+    if (bytes > 0) {
+        std::string utf8(static_cast<size_t>(bytes), '\0');
+        if (WideCharToMultiByte(CP_UTF8, 0, record.c_str(),
+                static_cast<int>(record.size()), utf8.data(), bytes,
+                nullptr, nullptr) == bytes) {
             DWORD written = 0;
-            // UTF-8 for notepad-friendly logs.
-            char utf8[2048]{};
-            const int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, static_cast<int>(sizeof(utf8)), nullptr, nullptr);
-            if (n > 1) {
-                WriteFile(h, utf8, static_cast<DWORD>(n - 1), &written, nullptr);
-            }
-            CloseHandle(h);
+            WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
         }
     }
+    CloseHandle(file);
 }
 
 inline std::wstring GetProcessImagePath(DWORD pid) {

@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using FluentShell.Renderer.Protocol;
 using FluentShell.Renderer.Runtime;
@@ -29,7 +28,7 @@ public sealed class TranslatedWindow : Window
     private readonly HashSet<string> _placementEventIds = new(StringComparer.Ordinal);
     private readonly PresenterActionCoordinator _presenterActions = new();
     private readonly BoundsActionCoordinator _boundsActions = new();
-    private readonly SubclassProc _subclassProc;
+    private readonly NativeWindowInterop.SubclassProc _subclassProc;
     private bool _inSizeMove;
     private PixelRect? _sizeMoveStart;
     private bool _applyingCanonical;
@@ -77,7 +76,7 @@ public sealed class TranslatedWindow : Window
         // move/size loop directly.  The delegate is held in a field because the
         // subclass keeps an unmanaged pointer to it.
         _subclassProc = OnSubclassMessage;
-        if (!SetWindowSubclass(Hwnd, _subclassProc, SizeMoveSubclassId, 0))
+        if (!NativeWindowInterop.SetWindowSubclass(Hwnd, _subclassProc, SizeMoveSubclassId, 0))
             throw new InvalidOperationException("Unable to observe the renderer proxy move/size loop.");
         Closed += (_, _) => RendererDiagnostics.Log($"window closed hwnd=0x{(ulong)(nuint)Hwnd:X} surface={ViewModel.SurfaceId}");
         RebuildControls();
@@ -89,7 +88,7 @@ public sealed class TranslatedWindow : Window
     {
         if (ViewModel.Modal && ownerHwnd != 0)
         {
-            SetWindowLongPtr(Hwnd, -8, ownerHwnd);
+            NativeWindowInterop.SetOwner(Hwnd, ownerHwnd);
             if (_appWindow.Presenter is OverlappedPresenter presenter) presenter.IsModal = true;
         }
     }
@@ -473,7 +472,8 @@ public sealed class TranslatedWindow : Window
         _interactive && ViewModel.Visible && ViewModel.Enabled && !_interactionBlocked;
 
     private void ApplyInteractionState() =>
-        EnableWindow(Hwnd, ViewModel.Enabled && !_interactionBlocked && !_retired);
+        NativeWindowInterop.SetEnabled(
+            Hwnd, ViewModel.Enabled && !_interactionBlocked && !_retired);
 
     private void FocusDefaultButton()
     {
@@ -658,36 +658,48 @@ public sealed class TranslatedWindow : Window
     private nint OnSubclassMessage(
         nint hwnd, uint message, nint wParam, nint lParam, nuint subclassId, nuint refData)
     {
-        if (!_interactive)
+        // Committed but not interactive: the proxy is on screen so the committed
+        // UIA gate can see it, yet it must behave as if it were not there.
+        if (!_interactive && ApplyPreInteractiveGate(message, wParam, lParam) is { } gated)
         {
-            if (ShouldClampProvisionalBounds(_interactive, _applyingCanonical) &&
-                message == WmWindowPosChanging &&
-                _gateBounds is { } gateBounds)
-                ClampWindowPosition(lParam, gateBounds);
-            if (message == WmSysCommand && IsGateBlockedSystemCommand(wParam))
-                return 0;
-            if (message == WmMouseActivate)
-                return MaNoActivateAndEat;
-            if (IsGateBlockedInputMessage(message))
-                return 0;
+            return gated;
         }
-        if (message == WmEnterSizeMove)
+        if (message == WindowMessages.EnterSizeMove)
         {
             _inSizeMove = true;
             _sizeMoveStart = CurrentBounds();
         }
-        var result = DefSubclassProc(hwnd, message, wParam, lParam);
+        var result = NativeWindowInterop.DefSubclassProc(hwnd, message, wParam, lParam);
         switch (message)
         {
-            case WmExitSizeMove:
+            case WindowMessages.ExitSizeMove:
                 _inSizeMove = false;
                 CommitSizeMove();
                 break;
-            case WmNcDestroy:
-                RemoveWindowSubclass(hwnd, _subclassProc, SizeMoveSubclassId);
+            case WindowMessages.NcDestroy:
+                NativeWindowInterop.RemoveWindowSubclass(hwnd, _subclassProc, SizeMoveSubclassId);
                 break;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Returns the result to answer a message with while input is still gated, or
+    /// null to let it reach the default handler.
+    /// </summary>
+    private nint? ApplyPreInteractiveGate(uint message, nint wParam, nint lParam)
+    {
+        if (ShouldClampProvisionalBounds(_interactive, _applyingCanonical) &&
+            message == WindowMessages.WindowPosChanging &&
+            _gateBounds is { } gateBounds)
+        {
+            NativeWindowInterop.ClampWindowPosition(lParam, gateBounds);
+        }
+        if (message == WindowMessages.SysCommand &&
+            WindowMessages.IsPlacementSystemCommand(wParam)) return 0;
+        if (message == WindowMessages.MouseActivate) return WindowMessages.NoActivateAndEat;
+        if (WindowMessages.IsInputMessage(message)) return 0;
+        return null;
     }
 
     private void CommitSizeMove()
@@ -737,146 +749,15 @@ public sealed class TranslatedWindow : Window
         _boundsActions.Reset();
     }
 
-    private static void ClampWindowPosition(nint lParam, PixelRect bounds)
-    {
-        if (lParam == 0) return;
-        var position = Marshal.PtrToStructure<NativeWindowPos>(lParam);
-        if ((position.Flags & SwpNoMove) == 0)
-        {
-            position.X = bounds.X;
-            position.Y = bounds.Y;
-        }
-        if ((position.Flags & SwpNoSize) == 0)
-        {
-            position.Cx = bounds.Width;
-            position.Cy = bounds.Height;
-        }
-        Marshal.StructureToPtr(position, lParam, false);
-    }
-
-    private static bool IsGateBlockedSystemCommand(nint wParam)
-    {
-        var command = (nuint)wParam & 0xFFF0u;
-        return command is ScSize or ScMove or ScMinimize or ScMaximize or
-            ScRestore or ScClose;
-    }
-
-    internal static bool IsGateBlockedInputMessage(uint message) =>
-        message is >= WmKeyFirst and <= WmKeyLast or
-        >= WmNcMouseFirst and <= WmNcMouseLast or
-        >= WmMouseFirst and <= WmMouseLast or
-        WmGesture or WmGestureNotify or WmTouch or
-        >= WmPointerFirst and <= WmPointerLast;
-
     internal static bool ShouldClampProvisionalBounds(
         bool interactive, bool applyingCanonical) =>
         !interactive && !applyingCanonical;
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct NativeWindowPos
-    {
-        public nint HwndInsertAfter;
-        public nint Hwnd;
-        public int X;
-        public int Y;
-        public int Cx;
-        public int Cy;
-        public uint Flags;
-    }
-
-    private const uint WmEnterSizeMove = 0x0231;
-    private const uint WmExitSizeMove = 0x0232;
-    private const uint WmWindowPosChanging = 0x0046;
-    private const uint WmMouseActivate = 0x0021;
-    private const uint WmSysCommand = 0x0112;
-    private const uint WmGesture = 0x0119;
-    private const uint WmGestureNotify = 0x011A;
-    private const uint WmKeyFirst = 0x0100;
-    private const uint WmKeyLast = 0x0109;
-    private const uint WmNcMouseFirst = 0x00A0;
-    private const uint WmNcMouseLast = 0x00AD;
-    private const uint WmMouseFirst = 0x0200;
-    private const uint WmMouseLast = 0x020E;
-    private const uint WmTouch = 0x0240;
-    private const uint WmPointerFirst = 0x0245;
-    private const uint WmPointerLast = 0x0253;
-    private const uint WmNcDestroy = 0x0082;
-    private const uint SwpNoSize = 0x0001;
-    private const uint SwpNoMove = 0x0002;
-    private const uint ScSize = 0xF000;
-    private const uint ScMove = 0xF010;
-    private const uint ScMinimize = 0xF020;
-    private const uint ScMaximize = 0xF030;
-    private const uint ScClose = 0xF060;
-    private const uint ScRestore = 0xF120;
-    private const int MaNoActivateAndEat = 4;
     private const nuint SizeMoveSubclassId = 1;
 
-    private delegate nint SubclassProc(
-        nint hwnd, uint message, nint wParam, nint lParam, nuint subclassId, nuint refData);
+    private bool SetCloaked(bool cloaked) => NativeWindowInterop.SetCloaked(Hwnd, cloaked);
 
-    [DllImport("comctl32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetWindowSubclass(
-        nint hwnd, SubclassProc callback, nuint subclassId, nuint refData);
-
-    [DllImport("comctl32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool RemoveWindowSubclass(
-        nint hwnd, SubclassProc callback, nuint subclassId);
-
-    [DllImport("comctl32.dll")]
-    private static extern nint DefSubclassProc(
-        nint hwnd, uint message, nint wParam, nint lParam);
-
-    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
-    private static extern nint SetWindowLongPtr(nint hwnd, int index, nint newValue);
-
-    [DllImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool EnableWindow(nint hwnd, bool enabled);
-
-    [DllImport("user32.dll")]
-    private static extern uint GetDpiForWindow(nint hwnd);
-
-    [DllImport("dwmapi.dll")]
-    private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
-
-    [DllImport("imm32.dll")]
-    private static extern nint ImmGetContext(nint hwnd);
-
-    [DllImport("imm32.dll")]
-    private static extern int ImmGetCompositionStringW(
-        nint inputContext,
-        uint index,
-        nint buffer,
-        uint bufferLength);
-
-    [DllImport("imm32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ImmReleaseContext(nint hwnd, nint inputContext);
-
-    private bool IsImeComposing()
-    {
-        const uint GcsCompositionString = 0x0008;
-        var context = ImmGetContext(Hwnd);
-        if (context == 0) return false;
-        try
-        {
-            return ImmGetCompositionStringW(
-                context, GcsCompositionString, 0, 0) > 0;
-        }
-        finally
-        {
-            ImmReleaseContext(Hwnd, context);
-        }
-    }
-
-    private bool SetCloaked(bool cloaked)
-    {
-        var value = cloaked ? 1 : 0;
-        return DwmSetWindowAttribute(Hwnd, 13, ref value, sizeof(int)) >= 0;
-    }
+    private bool IsImeComposing() => NativeWindowInterop.IsImeComposing(Hwnd);
 
     private double RenderDpi => _renderDpi == 0
         ? Math.Max(1u, ViewModel.Dpi)
@@ -884,7 +765,7 @@ public sealed class TranslatedWindow : Window
 
     private uint ReadWindowDpi()
     {
-        var dpi = GetDpiForWindow(Hwnd);
+        var dpi = NativeWindowInterop.GetWindowDpi(Hwnd);
         return dpi == 0 ? (uint)Math.Max(1, ViewModel.Dpi) : dpi;
     }
 

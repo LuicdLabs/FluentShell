@@ -646,15 +646,375 @@ void RendererSession::HandleReady(const SurfaceReady& ready) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Projection gate
+//
+// A window becomes a WinUI surface only if every stage below accepts it.  The
+// order matters: the proxy is validated while hidden, the native window is
+// cloaked against a verified revision, and renderer input is released last.
+// ---------------------------------------------------------------------------
+
+struct RendererSession::ProjectionAttempt final {
+    std::shared_ptr<Surface> surface;
+    // Null for a virtual dialog, which has no native HWND to cloak.
+    std::shared_ptr<SourceThreadAgent> agent;
+    HWND nativeRoot = nullptr;
+    HWND expectedOwnerProxy = nullptr;
+    bool cloakNative = false;
+    bool nativeWasForeground = false;
+    SurfaceReady ready;
+};
+
+namespace {
+
+bool RejectProjection(std::wstring_view reason) {
+    try {
+        FluentShell::Log(
+            std::wstring(L"Projection gate rejected surface: ") + std::wstring(reason));
+    } catch (...) {}
+    return false;
+}
+
+// surface.ready must describe exactly the snapshot the Bridge published.
+bool ReadyMatchesSnapshot(const SurfaceReady& ready, const WindowSnapshot& expected) {
+    return ready.uiaReady && ready.revision == expected.revision &&
+        ready.nodeCount == expected.nodes.size() &&
+        RectClose(ready.bounds, expected.bounds);
+}
+
+std::wstring DescribeRect(const RECT& rect) {
+    return std::to_wstring(rect.left) + L"," + std::to_wstring(rect.top) + L"," +
+        std::to_wstring(rect.right - rect.left) + L"x" +
+        std::to_wstring(rect.bottom - rect.top);
+}
+
+void LogReadyMismatch(const SurfaceReady& ready, const WindowSnapshot& expected) {
+    FluentShell::Log(L"surface.ready values: uia=" + std::to_wstring(ready.uiaReady) +
+        L" revision=" + std::to_wstring(ready.revision) +
+        L" nodes=" + std::to_wstring(ready.nodeCount) +
+        L" expectedNodes=" + std::to_wstring(expected.nodes.size()) +
+        L" bounds=" + DescribeRect(ready.bounds));
+}
+
+} // namespace
+
+// An owned surface may only be projected while its owner is itself a live
+// projection, so the proxy can inherit the real modal owner relationship.
+bool RendererSession::ResolveOwnerProxy(ProjectionAttempt& attempt) {
+    const auto& surface = attempt.surface;
+    if (!surface->snapshot.ownerHwnd) return true;
+    {
+        std::scoped_lock surfacesLock(surfacesMutex_);
+        for (const auto& [_, candidate] : surfaces_) {
+            std::scoped_lock candidateLock(candidate->mutex);
+            if (!candidate->virtualDialog && candidate->agent &&
+                candidate->agent->Root() == surface->snapshot.ownerHwnd &&
+                candidate->state == SurfaceState::Projected) {
+                attempt.expectedOwnerProxy = candidate->ready.proxyHwnd;
+                break;
+            }
+        }
+    }
+    return attempt.expectedOwnerProxy != nullptr ||
+        RejectProjection(L"projected owner proxy is unavailable");
+}
+
+// Publishes window.open and waits for the renderer to report a hidden, fully
+// realized proxy that matches the snapshot exactly.
+bool RendererSession::PublishAndAwaitReady(ProjectionAttempt& attempt) {
+    const auto& surface = attempt.surface;
+    {
+        std::scoped_lock lock(surface->mutex);
+        surface->state = SurfaceState::Scanning;
+    }
+    if (!Send(Ipc::MessageType::WindowOpen, surface->snapshot.revision,
+            SerializeWindowOpen(nonce_, surface->snapshot))) {
+        return RejectProjection(L"window.open send failed");
+    }
+
+    std::unique_lock lock(surface->mutex);
+    if (!surface->readyCondition.wait_for(lock, std::chrono::seconds(5), [&] {
+            return surface->readyReceived || failed_.load();
+        }) || failed_.load()) {
+        return RejectProjection(L"surface.ready timeout or renderer fault");
+    }
+    attempt.ready = surface->ready;
+    if (!ReadyMatchesSnapshot(attempt.ready, surface->snapshot)) {
+        LogReadyMismatch(attempt.ready, surface->snapshot);
+        return RejectProjection(L"surface.ready validation failed");
+    }
+    DWORD proxyPid = 0;
+    GetWindowThreadProcessId(attempt.ready.proxyHwnd, &proxyPid);
+    if (!IsWindow(attempt.ready.proxyHwnd) || proxyPid != rendererProcessId_) {
+        return RejectProjection(L"proxy HWND identity failed");
+    }
+
+    // The proxy must already be at its final geometry while still cloaked, so
+    // the commit below can only change visibility and never move the window.
+    RECT actualBounds{};
+    DWORD cloakReasons = 0;
+    const BOOL boundsRead = GetWindowRect(attempt.ready.proxyHwnd, &actualBounds);
+    const BOOL proxyVisible = IsWindowVisible(attempt.ready.proxyHwnd);
+    const HRESULT cloakRead = DwmGetWindowAttribute(
+        attempt.ready.proxyHwnd, DWMWA_CLOAKED, &cloakReasons, sizeof(cloakReasons));
+    if (!boundsRead || !RectClose(actualBounds, surface->snapshot.bounds) ||
+        !proxyVisible || FAILED(cloakRead) || (cloakReasons & DWM_CLOAKED_APP) == 0) {
+        FluentShell::Log(L"Hidden proxy gate values: rectRead=" +
+            std::to_wstring(boundsRead != FALSE) +
+            L" visible=" + std::to_wstring(proxyVisible != FALSE) +
+            L" cloakHr=" + std::to_wstring(static_cast<long>(cloakRead)) +
+            L" cloakBits=" + std::to_wstring(cloakReasons) +
+            L" actual=" + DescribeRect(actualBounds) +
+            L" expected=" + DescribeRect(surface->snapshot.bounds));
+        return RejectProjection(L"hidden proxy geometry or visibility failed");
+    }
+    surface->state = SurfaceState::SurfaceReady;
+    return true;
+}
+
+bool RendererSession::RunUiaGate(
+    const ProjectionAttempt& attempt,
+    const WindowSnapshot& snapshot,
+    const wchar_t* stage) {
+    UiAutomationValidationOptions options;
+    options.proxy = attempt.ready.proxyHwnd;
+    options.expectedOwner = attempt.expectedOwnerProxy;
+    options.rendererProcessId = rendererProcessId_;
+    options.rendererCreated = rendererCreated_;
+    std::wstring error;
+    if (ValidateProjectedSurface(options, snapshot, error)) return true;
+    FluentShell::Log(std::wstring(stage) + L" UIA gate failed: " + error);
+    return RejectProjection(std::wstring(stage) + L" UIA validation failed");
+}
+
+bool RendererSession::RunCommittedUiaGate(const ProjectionAttempt& attempt) {
+    const auto& snapshot = attempt.surface->snapshot;
+    UiAutomationValidationOptions options;
+    options.proxy = attempt.ready.proxyHwnd;
+    options.nativeRoot = attempt.nativeRoot;
+    options.expectedOwner = attempt.expectedOwnerProxy;
+    options.rendererProcessId = rendererProcessId_;
+    options.rendererCreated = rendererCreated_;
+    options.committed = true;
+    options.requireVisible = snapshot.visible && snapshot.state != L"minimized";
+    options.requireFocus = options.requireVisible &&
+        (attempt.nativeWasForeground || snapshot.modal);
+
+    // DWM visibility and the desktop UIA hit-test are published on different
+    // asynchronous paths.  A proxy can be visible and uncloaked while
+    // ElementFromPoint still returns the old provider for one or two compositor
+    // turns.  Do not restore the native window for that transient state; keep
+    // the gate strict and retry it briefly.
+    constexpr unsigned kAttempts = 8;
+    std::wstring error;
+    for (unsigned attemptIndex = 1; attemptIndex <= kAttempts; ++attemptIndex) {
+        if (ValidateProjectedSurface(options, snapshot, error)) return true;
+        FluentShell::Log(L"Committed UIA gate attempt " + std::to_wstring(attemptIndex) +
+            L" failed: " + error);
+        if (attemptIndex == kAttempts) {
+            return RejectProjection(L"committed UIA validation failed");
+        }
+        Sleep(50 * attemptIndex);
+    }
+    return RejectProjection(L"committed UIA validation failed");
+}
+
+bool RendererSession::RejectAfterCommit(
+    const ProjectionAttempt& attempt, std::wstring_view reason) {
+    if (attempt.cloakNative && attempt.surface->agent) {
+        std::wstring ignored;
+        attempt.surface->agent->Restore(ignored, 2000, shutdownEvent_);
+    }
+    return RejectProjection(reason);
+}
+
+// The native window is cloaked only against the exact revision the renderer has
+// already validated.  If native state moved between the two, the surface is
+// republished and revalidated -- a bounded number of times -- before giving up.
+bool RendererSession::SynchronizeNativeRevision(ProjectionAttempt& attempt) {
+    if (!attempt.cloakNative || !attempt.agent) return true;
+    const auto& surface = attempt.surface;
+    const auto& agent = attempt.agent;
+
+    constexpr unsigned kMaxResyncs = 4;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    unsigned resyncs = 0;
+    for (;;) {
+        WindowSnapshot barrier;
+        uint64_t baseRevision = 0;
+        uint64_t expectedGeneration = 0;
+        uint64_t expectedFingerprint = 0;
+        {
+            std::scoped_lock lock(surface->mutex);
+            if (surface->state != SurfaceState::SurfaceReady || surface->agent != agent) {
+                return RejectProjection(L"surface changed during initial revision resync");
+            }
+            barrier = surface->snapshot;
+            baseRevision = barrier.revision;
+            expectedGeneration = barrier.generation;
+            expectedFingerprint = surface->fingerprint;
+        }
+
+        std::wstring error;
+        if (agent->CaptureAndCloak(
+                barrier, expectedFingerprint, error, 2000, shutdownEvent_)) {
+            std::scoped_lock lock(surface->mutex);
+            const bool barrierValid = surface->state == SurfaceState::SurfaceReady &&
+                surface->agent == agent &&
+                agent->Generation() == expectedGeneration &&
+                barrier.revision == surface->snapshot.revision;
+            return barrierValid ||
+                RejectProjection(L"native revision barrier returned an invalid revision");
+        }
+        // Only a losing race against a native change is retryable.  Anything
+        // else means the cloak itself, or the surface identity, is broken.
+        if (error != L"native revision changed before cloak" ||
+            barrier.surfaceId != surface->snapshot.surfaceId) {
+            return RejectProjection(L"native revision barrier or cloak failed");
+        }
+        if (++resyncs > kMaxResyncs || std::chrono::steady_clock::now() >= deadline) {
+            return RejectProjection(
+                L"native did not stabilize during initial revision resync");
+        }
+        if (!RepublishResyncRevision(
+                attempt, barrier, baseRevision, expectedGeneration, deadline)) {
+            return false;
+        }
+    }
+}
+
+bool RendererSession::RepublishResyncRevision(
+    ProjectionAttempt& attempt,
+    WindowSnapshot& barrier,
+    uint64_t baseRevision,
+    uint64_t expectedGeneration,
+    std::chrono::steady_clock::time_point deadline) {
+    const auto& surface = attempt.surface;
+    const auto& agent = attempt.agent;
+    barrier.revision = baseRevision + 1;
+    {
+        std::scoped_lock lock(surface->mutex);
+        if (surface->state != SurfaceState::SurfaceReady || surface->agent != agent ||
+            agent->Generation() != expectedGeneration ||
+            surface->snapshot.revision != baseRevision) {
+            return RejectProjection(L"surface changed during initial revision resync");
+        }
+        surface->snapshot = barrier;
+        surface->fingerprint = SnapshotFingerprint(surface->snapshot);
+        surface->readyReceived = false;
+        surface->state = SurfaceState::Scanning;
+    }
+    if (!Send(Ipc::MessageType::WindowPatch, surface->snapshot.revision,
+            SerializeWindowPatch(nonce_, baseRevision, surface->snapshot))) {
+        return RejectProjection(L"initial revision resync send failed");
+    }
+
+    WindowSnapshot refreshedSnapshot;
+    {
+        std::unique_lock lock(surface->mutex);
+        if (!surface->readyCondition.wait_until(lock, deadline, [&] {
+                return surface->readyReceived || failed_.load();
+            }) || failed_.load()) {
+            return RejectProjection(L"initial revision resync surface.ready timeout");
+        }
+        const auto refreshedReady = surface->ready;
+        refreshedSnapshot = surface->snapshot;
+        if (!ReadyMatchesSnapshot(refreshedReady, refreshedSnapshot) ||
+            refreshedReady.proxyHwnd != attempt.ready.proxyHwnd) {
+            return RejectProjection(
+                L"initial revision resync surface.ready validation failed");
+        }
+        attempt.ready = refreshedReady;
+    }
+    if (!RunUiaGate(attempt, refreshedSnapshot, L"Resync")) return false;
+
+    std::scoped_lock lock(surface->mutex);
+    if (surface->state != SurfaceState::Scanning || surface->agent != agent ||
+        agent->Generation() != expectedGeneration) {
+        return RejectProjection(L"surface changed before resync commit");
+    }
+    surface->state = SurfaceState::SurfaceReady;
+    return true;
+}
+
+// Provisional commit: show the proxy so the committed UIA gate can run, but keep
+// renderer input gated until the whole contract has passed.
+bool RendererSession::CommitProvisional(ProjectionAttempt& attempt) {
+    const auto& snapshot = attempt.surface->snapshot;
+    if (Send(Ipc::MessageType::SurfaceCommit, snapshot.revision,
+            SerializeSurfaceCommit(
+                nonce_, snapshot.surfaceId, snapshot.revision, true, false))) {
+        return true;
+    }
+    return RejectAfterCommit(attempt, L"surface.commit send failed");
+}
+
+bool RendererSession::AwaitProxyVisible(ProjectionAttempt& attempt) {
+    const HWND proxy = attempt.ready.proxyHwnd;
+    const uint64_t deadline = GetTickCount64() + 1000;
+    DWORD cloakReasons = DWM_CLOAKED_APP;
+    while (GetTickCount64() < deadline) {
+        cloakReasons = DWM_CLOAKED_APP;
+        DwmGetWindowAttribute(proxy, DWMWA_CLOAKED, &cloakReasons, sizeof(cloakReasons));
+        if (IsWindowVisible(proxy) && (cloakReasons & DWM_CLOAKED_APP) == 0) break;
+        Sleep(25);
+    }
+    if (!IsWindowVisible(proxy) || (cloakReasons & DWM_CLOAKED_APP) != 0) {
+        return RejectAfterCommit(attempt, L"proxy did not become visible and uncloaked");
+    }
+    return true;
+}
+
+bool RendererSession::EstablishProxyZOrder(const ProjectionAttempt& attempt) {
+    // WinUI activation does not guarantee sibling z-order against a cloaked
+    // native HWND.  Establish the proxy position explicitly before the isolation
+    // gate; NOACTIVATE retains the current activation state.
+    if (!SetWindowPos(attempt.ready.proxyHwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+        return RejectProjection(L"proxy z-order placement failed");
+    }
+    if (attempt.nativeRoot &&
+        !SetWindowPos(attempt.nativeRoot, attempt.ready.proxyHwnd, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)) {
+        return RejectProjection(L"native/proxy relative z-order placement failed");
+    }
+    return true;
+}
+
+// Isolation: exactly one of the two windows may be composited.
+bool RendererSession::VerifyNativeCloaked(const ProjectionAttempt& attempt) {
+    if (!attempt.cloakNative || !attempt.surface->agent) return true;
+    DWORD reasons = 0;
+    if (FAILED(DwmGetWindowAttribute(attempt.surface->agent->Root(), DWMWA_CLOAKED,
+            &reasons, sizeof(reasons))) ||
+        (reasons & DWM_CLOAKED_APP) == 0) {
+        return RejectProjection(L"native HWND was not application-cloaked after commit");
+    }
+    return true;
+}
+
+// Releases the renderer input gate.  The Bridge state moves to Projected first,
+// so an action emitted the moment the renderer consumes this frame cannot race
+// the local transition.
+bool RendererSession::CommitInteractive(ProjectionAttempt& attempt) {
+    const auto& surface = attempt.surface;
+    {
+        std::scoped_lock lock(surface->mutex);
+        surface->state = SurfaceState::Projected;
+    }
+    const auto& snapshot = surface->snapshot;
+    if (Send(Ipc::MessageType::SurfaceCommit, snapshot.revision,
+            SerializeSurfaceCommit(
+                nonce_, snapshot.surfaceId, snapshot.revision, true, true))) {
+        return true;
+    }
+    return RejectAfterCommit(attempt, L"surface.interactive commit send failed");
+}
+
 bool RendererSession::OpenSurface(
     const std::shared_ptr<Surface>& surface,
     bool cloakNative) {
-    const auto reject = [&](std::wstring_view reason) {
-        FluentShell::Log(std::wstring(L"Projection gate rejected surface: ") +
-            std::wstring(reason));
-        return false;
-    };
-    if (!surface) return reject(L"null surface");
+    if (!surface) return RejectProjection(L"null surface");
     // WindowCapture and the renderer exchange physical pixel bounds.  The
     // injected process can be system-DPI-aware or DPI-unaware, so querying the
     // proxy from its inherited thread context would virtualize GetWindowRect
@@ -662,306 +1022,31 @@ bool RendererSession::OpenSurface(
     // strict pre-commit geometry gate.
     PhysicalCoordinateScope dpiScope;
     if (!dpiScope.IsValid()) {
-        return reject(L"cannot establish physical-coordinate DPI context");
+        return RejectProjection(L"cannot establish physical-coordinate DPI context");
     }
     // Projection, initial revision resync, and native rollback all share this
-    // barrier.  It prevents a source-thread capture from being published after
-    // a concurrent restore has started.
+    // barrier.  It prevents a source-thread capture from being published after a
+    // concurrent restore has started.
     std::unique_lock canonicalLock(surface->canonicalMutex);
-    const auto sourceAgent = surface->agent;
-    const HWND nativeRoot = cloakNative && sourceAgent ? sourceAgent->Root() : nullptr;
-    const bool nativeWasForeground = nativeRoot &&
-        GetAncestor(GetForegroundWindow(), GA_ROOT) == nativeRoot;
-    HWND expectedOwnerProxy = nullptr;
-    if (surface->snapshot.ownerHwnd) {
-        std::scoped_lock surfacesLock(surfacesMutex_);
-        for (const auto& [_, candidate] : surfaces_) {
-            std::scoped_lock candidateLock(candidate->mutex);
-            if (!candidate->virtualDialog && candidate->agent &&
-                candidate->agent->Root() == surface->snapshot.ownerHwnd &&
-                candidate->state == SurfaceState::Projected) {
-                expectedOwnerProxy = candidate->ready.proxyHwnd;
-                break;
-            }
-        }
-        if (!expectedOwnerProxy) return reject(L"projected owner proxy is unavailable");
-    }
-    {
-        std::scoped_lock lock(surface->mutex);
-        surface->state = SurfaceState::Scanning;
-    }
-    if (!Send(Ipc::MessageType::WindowOpen, surface->snapshot.revision,
-            SerializeWindowOpen(nonce_, surface->snapshot))) {
-        return reject(L"window.open send failed");
-    }
 
-    std::unique_lock lock(surface->mutex);
-    if (!surface->readyCondition.wait_for(lock, std::chrono::seconds(5), [&] {
-            return surface->readyReceived || failed_.load();
-        }) || failed_.load()) {
-        return reject(L"surface.ready timeout or renderer fault");
-    }
-    auto ready = surface->ready;
-    const auto validateReady = [](const SurfaceReady& candidate,
-                                  const WindowSnapshot& expected) {
-        return candidate.uiaReady && candidate.revision == expected.revision &&
-            candidate.nodeCount == expected.nodes.size() &&
-            RectClose(candidate.bounds, expected.bounds);
-    };
-    if (!validateReady(ready, surface->snapshot)) {
-        FluentShell::Log(L"surface.ready values: uia=" + std::to_wstring(ready.uiaReady) +
-            L" revision=" + std::to_wstring(ready.revision) +
-            L" nodes=" + std::to_wstring(ready.nodeCount) +
-            L" expectedNodes=" + std::to_wstring(surface->snapshot.nodes.size()) +
-            L" bounds=" + std::to_wstring(ready.bounds.left) + L"," +
-            std::to_wstring(ready.bounds.top) + L"," +
-            std::to_wstring(ready.bounds.right - ready.bounds.left) + L"x" +
-            std::to_wstring(ready.bounds.bottom - ready.bounds.top));
-        return reject(L"surface.ready validation failed");
-    }
-    DWORD proxyPid = 0;
-    GetWindowThreadProcessId(ready.proxyHwnd, &proxyPid);
-    if (!IsWindow(ready.proxyHwnd) || proxyPid != rendererProcessId_) {
-        return reject(L"proxy HWND identity failed");
-    }
-    RECT actualProxyBounds{};
-    DWORD readyProxyCloak = 0;
-    const BOOL boundsRead = GetWindowRect(ready.proxyHwnd, &actualProxyBounds);
-    const BOOL proxyVisible = IsWindowVisible(ready.proxyHwnd);
-    const HRESULT cloakRead = DwmGetWindowAttribute(
-        ready.proxyHwnd, DWMWA_CLOAKED, &readyProxyCloak, sizeof(readyProxyCloak));
-    const bool boundsMatch = boundsRead &&
-        RectClose(actualProxyBounds, surface->snapshot.bounds);
-    if (!boundsMatch || !proxyVisible || FAILED(cloakRead) ||
-        (readyProxyCloak & DWM_CLOAKED_APP) == 0) {
-        FluentShell::Log(L"Hidden proxy gate values: rectRead=" +
-            std::to_wstring(boundsRead != FALSE) + L" visible=" +
-            std::to_wstring(proxyVisible != FALSE) + L" cloakHr=" +
-            std::to_wstring(static_cast<long>(cloakRead)) + L" cloakBits=" +
-            std::to_wstring(readyProxyCloak) + L" actual=" +
-            std::to_wstring(actualProxyBounds.left) + L"," +
-            std::to_wstring(actualProxyBounds.top) + L"," +
-            std::to_wstring(actualProxyBounds.right - actualProxyBounds.left) + L"x" +
-            std::to_wstring(actualProxyBounds.bottom - actualProxyBounds.top) +
-            L" expected=" + std::to_wstring(surface->snapshot.bounds.left) + L"," +
-            std::to_wstring(surface->snapshot.bounds.top) + L"," +
-            std::to_wstring(surface->snapshot.bounds.right - surface->snapshot.bounds.left) + L"x" +
-            std::to_wstring(surface->snapshot.bounds.bottom - surface->snapshot.bounds.top));
-        return reject(L"hidden proxy geometry or visibility failed");
-    }
-    surface->state = SurfaceState::SurfaceReady;
-    lock.unlock();
+    ProjectionAttempt attempt;
+    attempt.surface = surface;
+    attempt.cloakNative = cloakNative;
+    attempt.agent = surface->agent;
+    attempt.nativeRoot = cloakNative && attempt.agent ? attempt.agent->Root() : nullptr;
+    attempt.nativeWasForeground = attempt.nativeRoot &&
+        GetAncestor(GetForegroundWindow(), GA_ROOT) == attempt.nativeRoot;
 
-    {
-        UiAutomationValidationOptions options;
-        options.proxy = ready.proxyHwnd;
-        options.expectedOwner = expectedOwnerProxy;
-        options.rendererProcessId = rendererProcessId_;
-        options.rendererCreated = rendererCreated_;
-        std::wstring error;
-        if (!ValidateProjectedSurface(options, surface->snapshot, error)) {
-            FluentShell::Log(L"Prepared UIA gate failed: " + error);
-            return reject(L"prepared UIA validation failed");
-        }
-    }
-
-    if (cloakNative && sourceAgent) {
-        constexpr unsigned kMaxInitialResyncs = 4;
-        const auto resyncDeadline = std::chrono::steady_clock::now() +
-            std::chrono::seconds(5);
-        unsigned resyncCount = 0;
-        while (true) {
-            WindowSnapshot barrier;
-            uint64_t baseRevision = 0;
-            uint64_t expectedGeneration = 0;
-            uint64_t expectedFingerprint = 0;
-            {
-                std::scoped_lock snapshotLock(surface->mutex);
-                if (surface->state != SurfaceState::SurfaceReady ||
-                    surface->agent != sourceAgent) {
-                    return reject(L"surface changed during initial revision resync");
-                }
-                barrier = surface->snapshot;
-                baseRevision = barrier.revision;
-                expectedGeneration = barrier.generation;
-                expectedFingerprint = surface->fingerprint;
-            }
-            std::wstring error;
-            if (sourceAgent->CaptureAndCloak(
-                    barrier, expectedFingerprint, error, 2000, shutdownEvent_)) {
-                bool barrierValid = false;
-                {
-                    std::scoped_lock snapshotLock(surface->mutex);
-                    barrierValid = surface->state == SurfaceState::SurfaceReady &&
-                        surface->agent == sourceAgent &&
-                        sourceAgent->Generation() == expectedGeneration &&
-                        barrier.revision == surface->snapshot.revision;
-                }
-                if (!barrierValid) {
-                    return reject(L"native revision barrier returned an invalid revision");
-                }
-                break;
-            }
-            if (error != L"native revision changed before cloak" ||
-                barrier.surfaceId != surface->snapshot.surfaceId) {
-                return reject(L"native revision barrier or cloak failed");
-            }
-            if (++resyncCount > kMaxInitialResyncs ||
-                std::chrono::steady_clock::now() >= resyncDeadline) {
-                return reject(L"native did not stabilize during initial revision resync");
-            }
-
-            barrier.revision = baseRevision + 1;
-            {
-                std::scoped_lock stateLock(surface->mutex);
-                if (surface->state != SurfaceState::SurfaceReady ||
-                    surface->agent != sourceAgent ||
-                    sourceAgent->Generation() != expectedGeneration ||
-                    surface->snapshot.revision != baseRevision) {
-                    return reject(L"surface changed during initial revision resync");
-                }
-                surface->snapshot = barrier;
-                surface->fingerprint = SnapshotFingerprint(surface->snapshot);
-                surface->readyReceived = false;
-                surface->state = SurfaceState::Scanning;
-            }
-            if (!Send(Ipc::MessageType::WindowPatch, surface->snapshot.revision,
-                    SerializeWindowPatch(nonce_, baseRevision, surface->snapshot))) {
-                return reject(L"initial revision resync send failed");
-            }
-
-            std::unique_lock readyLock(surface->mutex);
-            if (!surface->readyCondition.wait_until(readyLock, resyncDeadline, [&] {
-                    return surface->readyReceived || failed_.load();
-            }) || failed_.load()) {
-                return reject(L"initial revision resync surface.ready timeout");
-            }
-            const auto refreshedReady = surface->ready;
-            const auto refreshedSnapshot = surface->snapshot;
-            if (!validateReady(refreshedReady, refreshedSnapshot) ||
-                refreshedReady.proxyHwnd != ready.proxyHwnd) {
-                return reject(L"initial revision resync surface.ready validation failed");
-            }
-            readyLock.unlock();
-            {
-                UiAutomationValidationOptions options;
-                options.proxy = refreshedReady.proxyHwnd;
-                options.expectedOwner = expectedOwnerProxy;
-                options.rendererProcessId = rendererProcessId_;
-                options.rendererCreated = rendererCreated_;
-                std::wstring error;
-                if (!ValidateProjectedSurface(options, refreshedSnapshot, error)) {
-                    FluentShell::Log(L"Resync UIA gate failed: " + error);
-                    return reject(L"resync UIA validation failed");
-                }
-            }
-            ready = refreshedReady;
-            {
-                std::scoped_lock stateLock(surface->mutex);
-                if (surface->state != SurfaceState::Scanning ||
-                    surface->agent != sourceAgent ||
-                    sourceAgent->Generation() != expectedGeneration) {
-                    return reject(L"surface changed before resync commit");
-                }
-                surface->state = SurfaceState::SurfaceReady;
-            }
-        }
-    }
-    if (!Send(Ipc::MessageType::SurfaceCommit, surface->snapshot.revision,
-            SerializeSurfaceCommit(nonce_, surface->snapshot.surfaceId,
-                surface->snapshot.revision, true, false))) {
-        if (cloakNative && surface->agent) {
-            std::wstring ignored;
-            surface->agent->Restore(ignored, 2000, shutdownEvent_);
-        }
-        return reject(L"surface.commit send failed");
-    }
-    const uint64_t visibleDeadline = GetTickCount64() + 1000;
-    DWORD proxyCloakReasons = DWM_CLOAKED_APP;
-    while (GetTickCount64() < visibleDeadline) {
-        proxyCloakReasons = DWM_CLOAKED_APP;
-        DwmGetWindowAttribute(
-            ready.proxyHwnd, DWMWA_CLOAKED, &proxyCloakReasons, sizeof(proxyCloakReasons));
-        if (IsWindowVisible(ready.proxyHwnd) &&
-            (proxyCloakReasons & DWM_CLOAKED_APP) == 0) break;
-        Sleep(25);
-    }
-    if (!IsWindowVisible(ready.proxyHwnd) ||
-        (proxyCloakReasons & DWM_CLOAKED_APP) != 0) {
-        if (cloakNative && surface->agent) {
-            std::wstring ignored;
-            surface->agent->Restore(ignored, 2000, shutdownEvent_);
-        }
-        return reject(L"proxy did not become visible and uncloaked");
-    }
-    // WinUI activation does not guarantee sibling z-order against a cloaked
-    // native HWND.  Establish the proxy's position explicitly before the
-    // isolation gate; retain the current activation state with NOACTIVATE.
-    if (!SetWindowPos(ready.proxyHwnd, HWND_TOP, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        return reject(L"proxy z-order placement failed");
-    }
-    if (nativeRoot && !SetWindowPos(nativeRoot, ready.proxyHwnd, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)) {
-        return reject(L"native/proxy relative z-order placement failed");
-    }
-    if (cloakNative && surface->agent) {
-        DWORD nativeCloakReasons = 0;
-        if (FAILED(DwmGetWindowAttribute(
-                surface->agent->Root(), DWMWA_CLOAKED,
-                &nativeCloakReasons, sizeof(nativeCloakReasons))) ||
-            (nativeCloakReasons & DWM_CLOAKED_APP) == 0) {
-            return reject(L"native HWND was not application-cloaked after commit");
-        }
-    }
-    {
-        UiAutomationValidationOptions options;
-        options.proxy = ready.proxyHwnd;
-        options.nativeRoot = nativeRoot;
-        options.expectedOwner = expectedOwnerProxy;
-        options.rendererProcessId = rendererProcessId_;
-        options.rendererCreated = rendererCreated_;
-        options.committed = true;
-        options.requireVisible = surface->snapshot.visible && surface->snapshot.state != L"minimized";
-        options.requireFocus = options.requireVisible &&
-            (nativeWasForeground || surface->snapshot.modal);
-
-        // DWM visibility and the desktop UIA hit-test are published on
-        // different asynchronous paths.  A proxy can be visible and
-        // uncloaked while ElementFromPoint still returns the old provider for
-        // one or two compositor turns.  Do not restore the native window for
-        // that transient state; keep the gate strict and retry it briefly.
-        constexpr unsigned kCommittedValidationAttempts = 8;
-        std::wstring error;
-        for (unsigned attempt = 1; attempt <= kCommittedValidationAttempts; ++attempt) {
-            if (ValidateProjectedSurface(options, surface->snapshot, error)) break;
-            FluentShell::Log(L"Committed UIA gate attempt " + std::to_wstring(attempt) +
-                L" failed: " + error);
-            if (attempt == kCommittedValidationAttempts) {
-                return reject(L"committed UIA validation failed");
-            }
-            Sleep(50 * attempt);
-        }
-    }
-    // The provisional commit above makes the proxy visible for committed UIA
-    // validation but deliberately leaves renderer input gated.  Release that
-    // gate only after the complete proxy/isolation contract has passed.  Mark
-    // the Bridge side projected first so an action emitted immediately after
-    // the renderer consumes this frame cannot race the local state transition.
-    {
-        std::scoped_lock stateLock(surface->mutex);
-        surface->state = SurfaceState::Projected;
-    }
-    if (!Send(Ipc::MessageType::SurfaceCommit, surface->snapshot.revision,
-            SerializeSurfaceCommit(nonce_, surface->snapshot.surfaceId,
-                surface->snapshot.revision, true, true))) {
-        if (cloakNative && surface->agent) {
-            std::wstring ignored;
-            surface->agent->Restore(ignored, 2000, shutdownEvent_);
-        }
-        return reject(L"surface.interactive commit send failed");
-    }
-    return true;
+    return ResolveOwnerProxy(attempt) &&
+        PublishAndAwaitReady(attempt) &&
+        RunUiaGate(attempt, surface->snapshot, L"Prepared") &&
+        SynchronizeNativeRevision(attempt) &&
+        CommitProvisional(attempt) &&
+        AwaitProxyVisible(attempt) &&
+        EstablishProxyZOrder(attempt) &&
+        VerifyNativeCloaked(attempt) &&
+        RunCommittedUiaGate(attempt) &&
+        CommitInteractive(attempt);
 }
 
 bool IsOwnedBy(HWND window, HWND possibleOwner) noexcept {
@@ -976,8 +1061,14 @@ bool IsOwnedBy(HWND window, HWND possibleOwner) noexcept {
     return false;
 }
 
-void RendererSession::DiscoverTopLevelWindows() {
-    struct Context {
+namespace {
+
+// Visible, unowned-or-owned application top-levels in this process.  Shell,
+// XAML host, and the transient HMENU popup surface are never candidates: the
+// projected MenuBar owns that command surface, and attaching a source agent to
+// the popup only produces a false owner-graph rejection.
+std::vector<HWND> EnumerateCandidateTopLevels() {
+    struct Context final {
         DWORD processId;
         std::vector<HWND> windows;
     } context{ GetCurrentProcessId(), {} };
@@ -991,122 +1082,137 @@ void RendererSession::DiscoverTopLevelWindows() {
         }
         wchar_t className[256]{};
         GetClassNameW(hwnd, className, static_cast<int>(std::size(className)));
-        // A visible #32768 is the system-owned popup surface for an HMENU, not
-        // an application top-level contract.  The projected MenuBar owns that
-        // command surface; trying to attach a source agent to the transient
-        // popup only produces a false owner-graph rejection.
         if (FluentShell::EqualsIgnoreCase(className, L"#32768")) return TRUE;
-        if (!FluentShell::IsShellOrXamlWindowClass(className)) context.windows.push_back(hwnd);
+        if (!FluentShell::IsShellOrXamlWindowClass(className)) {
+            context.windows.push_back(hwnd);
+        }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&context));
-    {
-        std::scoped_lock lock(surfacesMutex_);
-        for (auto iterator = discoveryAttempts_.begin();
-             iterator != discoveryAttempts_.end();) {
-            if (!IsWindow(*iterator)) iterator = discoveryAttempts_.erase(iterator);
-            else ++iterator;
-        }
-        for (auto iterator = ownerGraphDeferrals_.begin();
-             iterator != ownerGraphDeferrals_.end();) {
-            if (!IsWindow(iterator->first)) iterator = ownerGraphDeferrals_.erase(iterator);
-            else ++iterator;
+    return context.windows;
+}
+
+} // namespace
+
+// Discovery bookkeeping is keyed by HWND, so entries for destroyed windows must
+// go before an address is reused by a new window.
+void RendererSession::PruneDiscoveryState() {
+    std::scoped_lock lock(surfacesMutex_);
+    for (auto iterator = discoveryAttempts_.begin(); iterator != discoveryAttempts_.end();) {
+        if (!IsWindow(*iterator)) iterator = discoveryAttempts_.erase(iterator);
+        else ++iterator;
+    }
+    for (auto iterator = ownerGraphDeferrals_.begin();
+         iterator != ownerGraphDeferrals_.end();) {
+        if (!IsWindow(iterator->first)) iterator = ownerGraphDeferrals_.erase(iterator);
+        else ++iterator;
+    }
+}
+
+RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
+    HWND window,
+    bool ownsVisibleTopLevel) {
+    const HWND directOwner = GetWindow(window, GW_OWNER);
+    DiscoveryDecision decision;
+    std::scoped_lock lock(surfacesMutex_);
+
+    // A root that recently owned a visible top-level stays native until the owner
+    // graph has been quiet for kOwnerGraphQuietMs.  Classic dialog sequences
+    // destroy one owned window and create the next a moment later, and without
+    // this the root would visibly bounce between native and WinUI.
+    bool retryDeferredOwner = false;
+    if (!directOwner) {
+        const auto deferral = ownerGraphDeferrals_.find(window);
+        if (deferral != ownerGraphDeferrals_.end()) {
+            if (ownsVisibleTopLevel) {
+                deferral->second = 0;
+                return decision;
+            }
+            const uint64_t now = GetTickCount64();
+            if (deferral->second == 0) {
+                deferral->second = now;
+                return decision;
+            }
+            if (now - deferral->second < kOwnerGraphQuietMs) return decision;
+            ownerGraphDeferrals_.erase(deferral);
+            discoveryAttempts_.erase(window);
+            retryDeferredOwner = true;
         }
     }
-    for (const HWND window : context.windows) {
-        bool attempt = false;
-        bool graphStillVisible = false;
-        bool retryDeferredOwner = false;
-        std::shared_ptr<Surface> projectedOwner;
-        const HWND directOwner = GetWindow(window, GW_OWNER);
-        const bool ownsVisibleTopLevel = !directOwner && std::any_of(
-            context.windows.begin(), context.windows.end(),
-            [window](HWND candidate) { return IsOwnedBy(candidate, window); });
-        {
-            std::scoped_lock lock(surfacesMutex_);
-            if (!directOwner) {
-                const auto deferral = ownerGraphDeferrals_.find(window);
-                if (deferral != ownerGraphDeferrals_.end()) {
-                    if (ownsVisibleTopLevel) {
-                        deferral->second = 0;
-                        graphStillVisible = true;
-                    } else {
-                        const uint64_t now = GetTickCount64();
-                        if (deferral->second == 0) {
-                            deferral->second = now;
-                            graphStillVisible = true;
-                        } else if (now - deferral->second < kOwnerGraphQuietMs) {
-                            graphStillVisible = true;
-                        } else {
-                            ownerGraphDeferrals_.erase(deferral);
-                            discoveryAttempts_.erase(window);
-                            retryDeferredOwner = true;
-                        }
-                    }
-                }
-            }
-            if (graphStillVisible) continue;
-            attempt = discoveryAttempts_.insert(window).second;
-            if (!attempt) continue;
-            for (const auto& [_, surface] : surfaces_) {
-                if (surface->agent && surface->agent->Root() == window) {
-                    attempt = false;
-                    break;
-                }
-                if (!directOwner || surface->virtualDialog || !surface->agent) continue;
+    // One attempt per window until it is destroyed or explicitly retried, so a
+    // rejected window does not reappear in the log every second.
+    if (!discoveryAttempts_.insert(window).second) return decision;
 
-                // Owner graphs are not projected by the bounded v1 adapter. If
-                // a visible owned top-level appears above a projected native
-                // ancestor, keeping that ancestor cloaked can strand the child
-                // behind an unrelated renderer HWND. Resolve the existing
-                // projected ancestor now so the whole native graph can remain
-                // authoritative and interactive.
-                if (IsOwnedBy(window, surface->agent->Root())) {
-                    std::scoped_lock surfaceLock(surface->mutex);
-                    if (surface->state == SurfaceState::Projected) {
-                        projectedOwner = surface;
-                    }
-                }
-            }
+    std::shared_ptr<Surface> projectedOwner;
+    for (const auto& [_, surface] : surfaces_) {
+        if (surface->agent && surface->agent->Root() == window) return decision;
+        if (!directOwner || surface->virtualDialog || !surface->agent) continue;
+        // Owner graphs are not projected by the bounded v1 adapter.  If a visible
+        // owned top-level appears above a projected native ancestor, keeping that
+        // ancestor cloaked can strand the child behind an unrelated renderer
+        // HWND, so the ancestor is resolved back to native instead.
+        if (IsOwnedBy(window, surface->agent->Root())) {
+            std::scoped_lock surfaceLock(surface->mutex);
+            if (surface->state == SurfaceState::Projected) projectedOwner = surface;
         }
-        if (!attempt) continue;
-        if (directOwner) {
-            if (projectedOwner) {
-                const HWND ownerRoot = projectedOwner->agent
-                    ? projectedOwner->agent->Root() : nullptr;
-                if (ownerRoot) {
-                    std::scoped_lock lock(surfacesMutex_);
-                    ownerGraphDeferrals_.insert_or_assign(ownerRoot, 0);
-                }
-                FluentShell::Log(
-                    L"Visible owned top-level requires native owner-graph fallback");
-                RestoreSurface(projectedOwner, L"ownedTopLevel");
-            }
-            // An owned surface must never be projected independently from its
-            // owner. It is either covered by the fallback above or already
-            // belongs to an entirely native owner graph.
-            continue;
-        }
-        if (ownsVisibleTopLevel) {
-            // Discovery order follows desktop z-order, so an owned dialog can
-            // be visited before its root during startup. Keep that root native
-            // until every owned top-level closes; otherwise the next iteration
-            // could cloak it underneath the already-skipped dialog.
-            bool firstDeferral = false;
-            {
-                std::scoped_lock lock(surfacesMutex_);
-                firstDeferral = ownerGraphDeferrals_.try_emplace(window, 0).second;
-            }
-            if (firstDeferral) {
+    }
+
+    if (directOwner) {
+        // An owned surface is never projected independently from its owner: it is
+        // either covered by the fallback below or already fully native.
+        if (!projectedOwner) return decision;
+        decision.action = DiscoveryAction::RestoreOwnerGraph;
+        decision.projectedOwner = std::move(projectedOwner);
+        const HWND ownerRoot = decision.projectedOwner->agent
+            ? decision.projectedOwner->agent->Root()
+            : nullptr;
+        if (ownerRoot) ownerGraphDeferrals_.insert_or_assign(ownerRoot, 0);
+        return decision;
+    }
+    if (ownsVisibleTopLevel) {
+        // Discovery order follows desktop z-order, so an owned dialog can be
+        // visited before its root during startup.  Keep the root native until
+        // every owned top-level closes; otherwise the next pass could cloak it
+        // underneath the dialog that was already skipped.
+        decision.action = DiscoveryAction::DeferOwnerGraph;
+        decision.firstDeferral = ownerGraphDeferrals_.try_emplace(window, 0).second;
+        return decision;
+    }
+    decision.action = retryDeferredOwner
+        ? DiscoveryAction::ProjectAfterDeferral
+        : DiscoveryAction::Project;
+    return decision;
+}
+
+void RendererSession::DiscoverTopLevelWindows() {
+    const auto candidates = EnumerateCandidateTopLevels();
+    PruneDiscoveryState();
+    for (const HWND window : candidates) {
+        const bool ownsVisibleTopLevel = !GetWindow(window, GW_OWNER) &&
+            std::any_of(candidates.begin(), candidates.end(),
+                [window](HWND candidate) { return IsOwnedBy(candidate, window); });
+        auto decision = ClassifyTopLevel(window, ownsVisibleTopLevel);
+        switch (decision.action) {
+        case DiscoveryAction::Skip:
+            break;
+        case DiscoveryAction::RestoreOwnerGraph:
+            FluentShell::Log(
+                L"Visible owned top-level requires native owner-graph fallback");
+            RestoreSurface(decision.projectedOwner, L"ownedTopLevel");
+            break;
+        case DiscoveryAction::DeferOwnerGraph:
+            if (decision.firstDeferral) {
                 FluentShell::Log(
                     L"Native owner graph remains untranslated while an owned top-level is visible");
             }
-            continue;
+            break;
+        case DiscoveryAction::ProjectAfterDeferral:
+            FluentShell::Log(L"Owned top-level closed; retrying native owner projection");
+            OpenNativeWindow(window);
+            break;
+        case DiscoveryAction::Project:
+            OpenNativeWindow(window);
+            break;
         }
-        if (retryDeferredOwner) {
-            FluentShell::Log(
-                L"Owned top-level closed; retrying native owner projection");
-        }
-        OpenNativeWindow(window);
     }
 }
 
@@ -1162,6 +1268,66 @@ bool RendererSession::IsProjectedOwner(HWND owner) {
     return false;
 }
 
+void RendererSession::RejectAction(
+    const std::shared_ptr<Surface>& surface,
+    std::unique_lock<std::mutex>& lock,
+    const ActionRequest& action,
+    std::wstring_view status,
+    std::wstring_view reason) {
+    const uint64_t revision = surface->snapshot.revision;
+    auto patch = SerializeWindowPatch(nonce_, revision, surface->snapshot, action.eventId);
+    lock.unlock();
+    Send(Ipc::MessageType::ActionResult, revision,
+        SerializeActionResult(nonce_, action, status, revision, reason));
+    Send(Ipc::MessageType::WindowPatch, revision, std::move(patch));
+}
+
+void RendererSession::ApplyVirtualDialogAction(
+    const std::shared_ptr<Surface>& surface,
+    std::unique_lock<std::mutex>& lock,
+    const ActionRequest& action) {
+    std::wstring_view status = L"rejected";
+    bool completesDialog = false;
+    bool patchRenderer = false;
+    if (action.action == L"invoke" && action.nodeId) {
+        // Only a button the synthesized dialog actually published can complete it.
+        const auto button = surface->buttonResults.find(*action.nodeId);
+        if (button != surface->buttonResults.end()) {
+            surface->dialogResult = button->second;
+            status = L"accepted";
+            completesDialog = true;
+        }
+    } else if (action.action == L"setCheck" && action.nodeId &&
+               surface->verificationNode == action.nodeId) {
+        surface->verificationChecked = action.integerValue != 0;
+        ++surface->snapshot.revision;
+        for (auto& node : surface->snapshot.nodes) {
+            if (node.nodeId == *action.nodeId) node.checked = action.integerValue;
+        }
+        status = L"accepted";
+        patchRenderer = true;
+    } else if (action.action == L"close") {
+        // A dialog without a cancel result has no close semantics to honor.
+        if (surface->cancelResult) {
+            surface->dialogResult = *surface->cancelResult;
+            status = L"accepted";
+            completesDialog = true;
+        } else {
+            status = L"closeRejected";
+        }
+    }
+    const uint64_t revision = surface->snapshot.revision;
+    auto patch = SerializeWindowPatch(
+        nonce_, action.expectedRevision, surface->snapshot, action.eventId);
+    lock.unlock();
+    Send(Ipc::MessageType::ActionResult, revision,
+        SerializeActionResult(nonce_, action, status, revision));
+    if (patchRenderer) {
+        Send(Ipc::MessageType::WindowPatch, revision, std::move(patch));
+    }
+    if (completesDialog) SetEvent(surface->resultEvent);
+}
+
 void RendererSession::HandleAction(const ActionRequest& action) {
     std::shared_ptr<Surface> surface;
     {
@@ -1170,6 +1336,8 @@ void RendererSession::HandleAction(const ActionRequest& action) {
         if (found != surfaces_.end()) surface = found->second;
     }
     if (!surface) {
+        // A retired surface is a benign late frame; anything else is a protocol
+        // violation, because the renderer named a surface it was never given.
         if (IsRetiredSurface(action.surfaceId)) return;
         Fail(L"action references an unknown surface");
         return;
@@ -1180,8 +1348,8 @@ void RendererSession::HandleAction(const ActionRequest& action) {
     if (surface->state != SurfaceState::Projected) {
         const auto state = surface->state;
         lock.unlock();
-        // A renderer action can race the bridge's restore/close commit.  The
-        // native window is already authoritative in these states, so dropping
+        // A renderer action can race the bridge restore/close commit.  The native
+        // window is already authoritative in Restoring and Closed, so dropping
         // the authenticated late action is safer than faulting the session.
         if (state == SurfaceState::Native || state == SurfaceState::Scanning ||
             state == SurfaceState::SurfaceReady) {
@@ -1190,69 +1358,25 @@ void RendererSession::HandleAction(const ActionRequest& action) {
         }
         return;
     }
-    const bool requestSemantic = IsRequestSemanticAction(action.action);
-    if (!requestSemantic && action.expectedRevision != surface->snapshot.revision) {
-        const uint64_t revision = surface->snapshot.revision;
-        const auto patch = SerializeWindowPatch(
-            nonce_, revision, surface->snapshot, action.eventId);
-        lock.unlock();
-        Send(Ipc::MessageType::ActionResult, revision,
-            SerializeActionResult(nonce_, action, L"stale", revision, L"revision mismatch"));
-        Send(Ipc::MessageType::WindowPatch, revision, patch);
+    // Geometry actions are latest-wins and carry request semantics, so they are
+    // rebased onto the current revision instead of being revision-gated.
+    if (!IsRequestSemanticAction(action.action) &&
+        action.expectedRevision != surface->snapshot.revision) {
+        RejectAction(surface, lock, action, L"stale", L"revision mismatch");
         return;
     }
     std::wstring semanticError;
     if (!ValidateActionForSnapshot(action, surface->snapshot, semanticError)) {
-        const uint64_t revision = surface->snapshot.revision;
-        const auto patch = SerializeWindowPatch(
-            nonce_, revision, surface->snapshot, action.eventId);
-        lock.unlock();
-        Send(Ipc::MessageType::ActionResult, revision,
-            SerializeActionResult(nonce_, action, L"rejected", revision, semanticError));
-        Send(Ipc::MessageType::WindowPatch, revision, patch);
+        RejectAction(surface, lock, action, L"rejected", semanticError);
         return;
     }
-
     if (surface->virtualDialog) {
-        std::wstring status = L"rejected";
-        bool completesDialog = false;
-        if (action.action == L"invoke" && action.nodeId) {
-            const auto found = surface->buttonResults.find(*action.nodeId);
-            if (found != surface->buttonResults.end()) {
-                surface->dialogResult = found->second;
-                status = L"accepted";
-                completesDialog = true;
-            }
-        } else if (action.action == L"setCheck" && action.nodeId &&
-                   surface->verificationNode == action.nodeId) {
-            surface->verificationChecked = action.integerValue != 0;
-            ++surface->snapshot.revision;
-            for (auto& node : surface->snapshot.nodes) {
-                if (node.nodeId == *action.nodeId) node.checked = action.integerValue;
-            }
-            status = L"accepted";
-        } else if (action.action == L"close") {
-            if (surface->cancelResult) {
-                surface->dialogResult = *surface->cancelResult;
-                status = L"accepted";
-                completesDialog = true;
-            } else {
-                status = L"closeRejected";
-            }
-        }
-        const uint64_t revision = surface->snapshot.revision;
-        const auto patch = SerializeWindowPatch(
-            nonce_, action.expectedRevision, surface->snapshot, action.eventId);
-        lock.unlock();
-        Send(Ipc::MessageType::ActionResult, revision,
-            SerializeActionResult(nonce_, action, status, revision));
-        if (status == L"accepted" && action.action == L"setCheck") {
-            Send(Ipc::MessageType::WindowPatch, revision, patch);
-        }
-        if (completesDialog) SetEvent(surface->resultEvent);
+        ApplyVirtualDialogAction(surface, lock, action);
         return;
     }
 
+    // Native work needs the source UI thread, so it is queued for the action
+    // worker rather than run on the pipe reader.
     lock.unlock();
     canonicalLock.unlock();
     {
@@ -1292,13 +1416,7 @@ void RendererSession::HandleNativeAction(
     const bool requestSemantic = IsRequestSemanticAction(action.action);
     if (requestSemantic) effectiveAction.expectedRevision = surface->snapshot.revision;
     if (!requestSemantic && action.expectedRevision != surface->snapshot.revision) {
-        const uint64_t revision = surface->snapshot.revision;
-        const auto patch = SerializeWindowPatch(
-            nonce_, revision, surface->snapshot, action.eventId);
-        lock.unlock();
-        Send(Ipc::MessageType::ActionResult, revision,
-            SerializeActionResult(nonce_, action, L"stale", revision, L"revision mismatch"));
-        Send(Ipc::MessageType::WindowPatch, revision, patch);
+        RejectAction(surface, lock, action, L"stale", L"revision mismatch");
         return;
     }
 
@@ -1373,6 +1491,14 @@ void RendererSession::ActionMain() noexcept {
     }
 }
 
+struct RendererSession::ReconcilePass final {
+    std::shared_ptr<Surface> surface;
+    std::shared_ptr<SourceThreadAgent> agent;
+    uint64_t sourceGeneration = 0;
+    uint64_t baseRevision = 0;
+    WindowSnapshot next;
+};
+
 void RendererSession::ReconcileNativeSurfaces() {
     std::vector<std::shared_ptr<Surface>> surfaces;
     {
@@ -1380,98 +1506,119 @@ void RendererSession::ReconcileNativeSurfaces() {
         for (const auto& [_, surface] : surfaces_) surfaces.push_back(surface);
     }
     for (const auto& surface : surfaces) {
-        std::unique_lock canonicalLock(surface->canonicalMutex, std::try_to_lock);
-        if (!canonicalLock.owns_lock()) continue;
-        std::unique_lock lock(surface->mutex);
-        if (surface->virtualDialog || surface->state != SurfaceState::Projected) continue;
-        auto agent = surface->agent;
-        const uint64_t sourceGeneration = surface->snapshot.generation;
-        if (!agent || agent->Generation() != sourceGeneration || agent->IsDestroyed()) {
-            lock.unlock();
-            canonicalLock.unlock();
-            RestoreSurface(surface, L"nativeDestroyed");
-            continue;
+        if (const wchar_t* reason = ReconcileSurface(surface)) {
+            RestoreSurface(surface, reason);
         }
-        WindowSnapshot next = surface->snapshot;
-        const uint64_t baseRevision = next.revision;
-        next.revision = baseRevision + 1;
-        lock.unlock();
-        // A quiet source thread does not need a full capture on every tick.  This is
-        // what keeps a drag or an open menu from being hammered with 2 s-deadline
-        // source-thread work that it cannot service in time.
-        if (!agent->IsDirty() && ++surface->reconcileSkips < kQuietReconcileTicks) {
-            continue;
+    }
+}
+
+const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>& surface) {
+    // A surface another thread is already operating on is skipped, never waited
+    // on: reconcile must not hold up an action or a rollback.
+    std::unique_lock canonicalLock(surface->canonicalMutex, std::try_to_lock);
+    if (!canonicalLock.owns_lock()) return nullptr;
+
+    ReconcilePass pass;
+    pass.surface = surface;
+    {
+        std::scoped_lock lock(surface->mutex);
+        if (surface->virtualDialog || surface->state != SurfaceState::Projected) return nullptr;
+        pass.agent = surface->agent;
+        pass.sourceGeneration = surface->snapshot.generation;
+        if (!pass.agent || pass.agent->Generation() != pass.sourceGeneration ||
+            pass.agent->IsDestroyed()) {
+            return L"nativeDestroyed";
         }
-        surface->reconcileSkips = 0;
-        std::wstring error;
-        bool timedOut = false;
-        if (!agent->Capture(next, error, 2000, shutdownEvent_, &timedOut)) {
-            if (timedOut && !stopping_.load() && !failed_.load() &&
-                ++surface->captureTimeouts < kMaxCaptureTimeouts) {
-                try {
-                    FluentShell::Log(L"Reconcile capture missed its deadline (" +
-                        std::to_wstring(surface->captureTimeouts) + L" of " +
-                        std::to_wstring(kMaxCaptureTimeouts) + L"); keeping the projection");
-                } catch (...) {}
-                continue;
-            }
-            canonicalLock.unlock();
-            RestoreSurface(surface, timedOut ? L"timeout" : L"unsupported");
-            continue;
+        pass.next = surface->snapshot;
+        pass.baseRevision = pass.next.revision;
+        pass.next.revision = pass.baseRevision + 1;
+    }
+
+    // A quiet source thread does not need a full capture on every tick.  This is
+    // what keeps a drag or an open menu from being hammered with 2 s-deadline
+    // source-thread work it cannot service in time.  The slow poll stays as the
+    // backstop because the dirty whitelist cannot prove it observes every way
+    // native state can change.
+    if (!pass.agent->IsDirty() && ++surface->reconcileSkips < kQuietReconcileTicks) {
+        return nullptr;
+    }
+    surface->reconcileSkips = 0;
+
+    std::wstring error;
+    bool timedOut = false;
+    if (!pass.agent->Capture(pass.next, error, 2000, shutdownEvent_, &timedOut)) {
+        // A source thread inside a modal loop can miss a bounded deadline without
+        // being broken, so a few misses keep the projection.
+        if (timedOut && !stopping_.load() && !failed_.load() &&
+            ++surface->captureTimeouts < kMaxCaptureTimeouts) {
+            try {
+                FluentShell::Log(L"Reconcile capture missed its deadline (" +
+                    std::to_wstring(surface->captureTimeouts) + L" of " +
+                    std::to_wstring(kMaxCaptureTimeouts) + L"); keeping the projection");
+            } catch (...) {}
+            return nullptr;
         }
-        surface->captureTimeouts = 0;
-        const uint64_t fingerprint = SnapshotFingerprint(next);
-        lock.lock();
-        if (surface->state != SurfaceState::Projected ||
-            surface->restoreInProgress || surface->agent != agent ||
-            agent->Generation() != sourceGeneration ||
-            surface->snapshot.revision != baseRevision ||
-            next.surfaceId != surface->snapshot.surfaceId ||
-            next.generation != sourceGeneration) {
-            lock.unlock();
-            canonicalLock.unlock();
-            RestoreSurface(surface, L"nativeStateChanged");
-            continue;
+        return timedOut ? L"timeout" : L"unsupported";
+    }
+    surface->captureTimeouts = 0;
+    return PublishReconciledSnapshot(pass);
+}
+
+// Runs with the surface canonical barrier held by ReconcileSurface.  The capture
+// above ran without surface->mutex, so every identity fact is rechecked before
+// the snapshot is allowed to become canonical.
+const wchar_t* RendererSession::PublishReconciledSnapshot(ReconcilePass& pass) {
+    const auto& surface = pass.surface;
+    const auto& agent = pass.agent;
+    const uint64_t fingerprint = SnapshotFingerprint(pass.next);
+
+    bool changed = false;
+    uint64_t revision = 0;
+    std::string payload;
+    std::optional<ActionRequest> rejectedClose;
+    {
+        std::scoped_lock lock(surface->mutex);
+        if (surface->state != SurfaceState::Projected || surface->restoreInProgress ||
+            surface->agent != agent ||
+            agent->Generation() != pass.sourceGeneration ||
+            surface->snapshot.revision != pass.baseRevision ||
+            pass.next.surfaceId != surface->snapshot.surfaceId ||
+            pass.next.generation != pass.sourceGeneration) {
+            return L"nativeStateChanged";
         }
-        const bool changed = fingerprint != surface->fingerprint;
-        std::string payload;
+        changed = fingerprint != surface->fingerprint;
         if (changed) {
-            surface->snapshot = std::move(next);
+            surface->snapshot = std::move(pass.next);
             surface->fingerprint = fingerprint;
-            payload = SerializeWindowPatch(nonce_, baseRevision, surface->snapshot);
+            payload = SerializeWindowPatch(nonce_, pass.baseRevision, surface->snapshot);
         }
-        const uint64_t revision = surface->snapshot.revision;
-        std::optional<ActionRequest> rejectedClose;
+        revision = surface->snapshot.revision;
         if (surface->pendingCloseAction && surface->pendingCloseSequence != 0 &&
             agent->CompletedCloseSequence() >= surface->pendingCloseSequence) {
-            // The queued WM_CLOSE handler has returned and the root survived,
-            // so native code vetoed/cancelled the request. Only now may the
+            // The queued WM_CLOSE handler has returned and the root survived, so
+            // native code vetoed or cancelled the request.  Only now may the
             // renderer accept another close attempt; this avoids both a stuck
             // close gate and duplicate prompts during a modal lifetime.
             rejectedClose = std::move(surface->pendingCloseAction);
             surface->pendingCloseAction.reset();
             surface->pendingCloseSequence = 0;
         }
-        lock.unlock();
-        bool sent = true;
-        if (changed) {
-            sent = Send(Ipc::MessageType::WindowPatch, revision, std::move(payload));
-        }
-        if (sent && rejectedClose) {
-            sent = Send(Ipc::MessageType::ActionResult, revision,
-                SerializeActionResult(nonce_, *rejectedClose, L"closeRejected", revision));
-        }
-        canonicalLock.unlock();
-        if (!sent) {
-            RestoreSurface(surface, L"restore");
-        }
     }
+
+    bool sent = true;
+    if (changed) {
+        sent = Send(Ipc::MessageType::WindowPatch, revision, std::move(payload));
+    }
+    if (sent && rejectedClose) {
+        sent = Send(Ipc::MessageType::ActionResult, revision,
+            SerializeActionResult(nonce_, *rejectedClose, L"closeRejected", revision));
+    }
+    return sent ? nullptr : L"restore";
 }
 
-void RendererSession::RestoreSurface(
-    const std::shared_ptr<Surface>& surface,
-    std::wstring_view reason) noexcept {
-    if (!surface) return;
+struct RendererSession::RestoreAttempt final {
+    std::shared_ptr<Surface> surface;
+    // Null for a virtual dialog, or once the native window is already gone.
     std::shared_ptr<SourceThreadAgent> agent;
     std::wstring surfaceId;
     uint64_t revision = 0;
@@ -1480,166 +1627,217 @@ void RendererSession::RestoreSurface(
     DWORD sourceThread = 0;
     uint64_t sourceGeneration = 0;
     bool virtualDialog = false;
-    bool nativeRestored = false;
-    bool scheduleRetry = false;
+};
+
+namespace {
+
+// window.close carries a closed enum, so a specific cause has to be logged
+// separately or a fallback leaves no trace of why it happened.
+std::wstring_view WireRestoreReason(std::wstring_view reason) noexcept {
+    return reason == L"nativeDestroyed" || reason == L"unsupported" ||
+        reason == L"restore" || reason == L"shutdown"
+        ? reason
+        : std::wstring_view(L"restore");
+}
+
+} // namespace
+
+// Claims the rollback.  Returns false when the surface is already closed or
+// another thread owns its rollback, which makes RestoreSurface idempotent.
+bool RendererSession::BeginRestore(RestoreAttempt& attempt) {
+    const auto& surface = attempt.surface;
+    std::scoped_lock lock(surface->mutex);
+    if (surface->state == SurfaceState::Closed || surface->restoreInProgress) return false;
+    surface->restoreInProgress = true;
+    ++surface->restoreAttempts;
+    surface->state = SurfaceState::Restoring;
+    attempt.agent = surface->agent;
+    attempt.proxy = surface->ready.proxyHwnd;
+    attempt.virtualDialog = surface->virtualDialog;
+    attempt.revision = surface->snapshot.revision;
+    attempt.surfaceId = surface->snapshot.surfaceId;
+    if (attempt.agent) {
+        attempt.nativeRoot = attempt.agent->Root();
+        attempt.sourceThread = attempt.agent->ThreadId();
+        attempt.sourceGeneration = attempt.agent->Generation();
+    }
+    // A caller blocked in ShowMessageBox/ShowTaskDialog is waiting on this event
+    // and would otherwise hang for the whole dialog deadline.
+    if (attempt.virtualDialog && surface->resultEvent) SetEvent(surface->resultEvent);
+    return true;
+}
+
+// The proxy goes away before native visibility changes.  If DWM cannot establish
+// that isolation, kill the renderer rather than show the user two of the window.
+void RendererSession::IsolateProxyForRestore(const RestoreAttempt& attempt) noexcept {
+    if (HideProxyForRestore(attempt.proxy)) return;
     try {
-        const std::wstring_view protocolReason =
-            reason == L"nativeDestroyed" || reason == L"unsupported" ||
-            reason == L"restore" || reason == L"shutdown"
-            ? reason
-            : std::wstring_view(L"restore");
-        // The wire reason is a closed enum, so record the specific cause here.
-        // Without this a fallback leaves no trace of why it happened.
+        FluentShell::Log(L"Proxy isolation failed during restore; terminating renderer");
+    } catch (...) {}
+    TerminateRenderer(ERROR_CANCELLED);
+}
+
+// Hands the native window back to the user.  A virtual dialog and an already
+// destroyed window need nothing, so both count as restored.
+bool RendererSession::RestoreNativeWindow(const RestoreAttempt& attempt) {
+    const auto& agent = attempt.agent;
+    if (attempt.virtualDialog) return true;
+    if (!agent || agent->IsDestroyed() || !IsWindow(attempt.nativeRoot)) return true;
+
+    std::wstring error;
+    bool restored = agent->Restore(error, 2000, shutdownEvent_);
+    if (!restored) {
+        // The source thread may be stalled.  DWM uncloak is the bounded emergency
+        // path that keeps the target usable without it.
+        restored = ClearApplicationCloak(attempt.nativeRoot);
+        if (!restored) {
+            try { FluentShell::Log(L"Emergency native uncloak failed: " + error); }
+            catch (...) {}
+        }
+    }
+    if (!agent->Shutdown()) {
+        // The hooks could not be removed, so the agent must outlive this surface:
+        // a later callback would otherwise dereference freed memory.  Retain it
+        // exactly once, however many rollback attempts this surface sees.
+        bool retain = false;
+        {
+            std::scoped_lock lock(attempt.surface->mutex);
+            if (!attempt.surface->agentRetained) {
+                attempt.surface->agentRetained = true;
+                retain = true;
+            }
+        }
+        if (retain) RetainSourceThreadAgent(agent);
+    }
+    return restored;
+}
+
+// Publishes the terminal state.  Returns true when a still-cloaked native window
+// needs the detached uncloak retry.
+bool RendererSession::PublishRestoredState(
+    const RestoreAttempt& attempt, bool nativeRestored) {
+    const auto& surface = attempt.surface;
+    std::scoped_lock lock(surface->mutex);
+    surface->restoreInProgress = false;
+    if (nativeRestored) {
+        surface->state = SurfaceState::Closed;
+        return false;
+    }
+    surface->state = SurfaceState::Restoring;
+    if (!attempt.nativeRoot || surface->restoreRetryScheduled) return false;
+    surface->restoreRetryScheduled = true;
+    return true;
+}
+
+// Advisory only: native visibility is already restored, so these frames are sent
+// with a short deadline and are not allowed to fault the session.
+void RendererSession::NotifyRendererOfRollback(
+    const RestoreAttempt& attempt, std::wstring_view protocolReason) noexcept {
+    if (attempt.surfaceId.empty()) return;
+    try {
+        Send(Ipc::MessageType::SurfaceCommit, attempt.revision,
+            SerializeSurfaceCommit(nonce_, attempt.surfaceId, attempt.revision, false),
+            250, false);
+        Send(Ipc::MessageType::WindowClose, attempt.revision,
+            SerializeWindowClose(nonce_, attempt.surfaceId, protocolReason), 250, false);
+    } catch (...) {
+        // Keep the native fallback even when serialization or allocation fails
+        // while the pipe is already faulted.
+    }
+}
+
+// Last resort: the source thread never acknowledged the restore, so a detached
+// thread keeps trying the bounded DWM uncloak until the window is visible again
+// or its identity changes.  It must never terminate the injected process, so
+// every path ends with the surface marked closed.
+void RendererSession::ScheduleEmergencyUncloakRetry(const RestoreAttempt& attempt) noexcept {
+    const auto surface = attempt.surface;
+    const auto agent = attempt.agent;
+    if (!agent) return;
+    const HWND nativeRoot = attempt.nativeRoot;
+    const DWORD sourceThread = attempt.sourceThread;
+    const uint64_t sourceGeneration = attempt.sourceGeneration;
+    try {
+        std::thread([weakSession = weak_from_this(), surface, agent,
+                     nativeRoot, sourceThread, sourceGeneration] {
+            const auto markClosed = [&surface] {
+                try {
+                    std::scoped_lock lock(surface->mutex);
+                    surface->state = SurfaceState::Closed;
+                    surface->restoreRetryScheduled = false;
+                } catch (...) {}
+            };
+            try {
+                while (!agent->IsDestroyed() &&
+                       agent->Generation() == sourceGeneration &&
+                       agent->ThreadId() == sourceThread &&
+                       agent->Root() == nativeRoot && IsWindow(nativeRoot)) {
+                    if (ClearApplicationCloak(nativeRoot)) {
+                        SetWindowPos(nativeRoot, nullptr, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                            SWP_NOACTIVATE | SWP_FRAMECHANGED);
+                        markClosed();
+                        try { FluentShell::Log(L"Emergency native uncloak retry succeeded"); }
+                        catch (...) {}
+                        if (const auto session = weakSession.lock())
+                            session->RetireSurfaceIfClosed(surface);
+                        return;
+                    }
+                    Sleep(250);
+                }
+            } catch (...) {
+                // Never let a detached recovery thread take down the target.
+            }
+            markClosed();
+            if (const auto session = weakSession.lock())
+                session->RetireSurfaceIfClosed(surface);
+        }).detach();
+    } catch (...) {
+        std::scoped_lock lock(surface->mutex);
+        surface->restoreRetryScheduled = false;
+    }
+}
+
+void RendererSession::RestoreSurface(
+    const std::shared_ptr<Surface>& surface,
+    std::wstring_view reason) noexcept {
+    if (!surface) return;
+    RestoreAttempt attempt;
+    attempt.surface = surface;
+    bool nativeRestored = false;
+    try {
+        const std::wstring_view protocolReason = WireRestoreReason(reason);
         try {
             FluentShell::Log(L"Restoring native window: reason=" + std::wstring(reason) +
                 L" wire=" + std::wstring(protocolReason));
         } catch (...) {}
-        // This is the single native-operation barrier.  Action and reconcile
-        // workers take the same lock, so neither can issue a source-thread call
-        // after rollback has begun.
+
+        // The single native-operation barrier.  Action and reconcile workers take
+        // the same lock, so neither can issue a source-thread call once rollback
+        // has begun.
         std::unique_lock canonicalLock(surface->canonicalMutex);
-        {
-            std::scoped_lock lock(surface->mutex);
-            if (surface->state == SurfaceState::Closed || surface->restoreInProgress) return;
-            surface->restoreInProgress = true;
-            ++surface->restoreAttempts;
-            surface->state = SurfaceState::Restoring;
-            agent = surface->agent;
-            proxy = surface->ready.proxyHwnd;
-            virtualDialog = surface->virtualDialog;
-            revision = surface->snapshot.revision;
-            surfaceId = surface->snapshot.surfaceId;
-            if (agent) {
-                nativeRoot = agent->Root();
-                sourceThread = agent->ThreadId();
-                sourceGeneration = agent->Generation();
-            }
-            if (virtualDialog && surface->resultEvent) SetEvent(surface->resultEvent);
-        }
-
-        // Hide the proxy before touching native visibility.  If DWM cannot
-        // establish isolation, kill the renderer rather than exposing two UI
-        // surfaces during rollback.
-        if (!HideProxyForRestore(proxy)) {
-            try { FluentShell::Log(L"Proxy isolation failed during restore; terminating renderer"); }
-            catch (...) {}
-            TerminateRenderer(ERROR_CANCELLED);
-        }
-
-        if (virtualDialog) {
-            nativeRestored = true;
-        } else if (!agent || agent->IsDestroyed() || !IsWindow(nativeRoot)) {
-            nativeRestored = true;
-        } else {
-            std::wstring error;
-            nativeRestored = agent->Restore(error, 2000, shutdownEvent_);
-            if (!nativeRestored) {
-                // The source thread may be stalled.  DWM uncloak is the
-                // bounded emergency path that keeps the target usable.
-                nativeRestored = ClearApplicationCloak(nativeRoot);
-                if (!nativeRestored) {
-                    try { FluentShell::Log(L"Emergency native uncloak failed: " + error); }
-                    catch (...) {}
-                }
-            }
-            const bool hookRemoved = agent->Shutdown();
-            if (!hookRemoved) {
-                bool retain = false;
-                {
-                    std::scoped_lock lock(surface->mutex);
-                    if (!surface->agentRetained) {
-                        surface->agentRetained = true;
-                        retain = true;
-                    }
-                }
-                if (retain) RetainSourceThreadAgent(agent);
-            }
-        }
-
-        {
-            std::scoped_lock lock(surface->mutex);
-            surface->restoreInProgress = false;
-            if (nativeRestored) {
-                surface->state = SurfaceState::Closed;
-            } else {
-                surface->state = SurfaceState::Restoring;
-                if (nativeRoot && !surface->restoreRetryScheduled) {
-                    surface->restoreRetryScheduled = true;
-                    scheduleRetry = true;
-                }
-            }
-        }
+        if (!BeginRestore(attempt)) return;
+        IsolateProxyForRestore(attempt);
+        nativeRestored = RestoreNativeWindow(attempt);
+        const bool scheduleRetry = PublishRestoredState(attempt, nativeRestored);
         canonicalLock.unlock();
 
-        // Native visibility is restored before any potentially backpressured
-        // pipe operation.  These notifications are advisory after rollback.
-        if (!surfaceId.empty()) {
-            try {
-                Send(Ipc::MessageType::SurfaceCommit, revision,
-                    SerializeSurfaceCommit(nonce_, surfaceId, revision, false),
-                    250, false);
-                Send(Ipc::MessageType::WindowClose, revision,
-                    SerializeWindowClose(nonce_, surfaceId, protocolReason), 250, false);
-            } catch (...) {
-                // Keep the native fallback even when serialization/allocation
-                // fails while the pipe is already faulted.
-            }
-        }
+        // Native visibility is restored before any potentially backpressured pipe
+        // operation, so a stalled renderer cannot delay the fallback.
+        NotifyRendererOfRollback(attempt, protocolReason);
         if (nativeRestored) RetireSurfaceIfClosed(surface);
-
-        if (scheduleRetry && agent) {
-            try {
-                const auto weakSession = weak_from_this();
-                std::thread([weakSession, surface, agent, nativeRoot, sourceThread, sourceGeneration] {
-                    try {
-                        for (;;) {
-                            if (agent->IsDestroyed() || agent->Generation() != sourceGeneration ||
-                                agent->ThreadId() != sourceThread ||
-                                agent->Root() != nativeRoot || !IsWindow(nativeRoot)) break;
-                            if (ClearApplicationCloak(nativeRoot)) {
-                                SetWindowPos(nativeRoot, nullptr, 0, 0, 0, 0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                                    SWP_NOACTIVATE | SWP_FRAMECHANGED);
-                                {
-                                    std::scoped_lock lock(surface->mutex);
-                                    surface->state = SurfaceState::Closed;
-                                    surface->restoreRetryScheduled = false;
-                                }
-                                try { FluentShell::Log(L"Emergency native uncloak retry succeeded"); }
-                                catch (...) {}
-                                if (const auto session = weakSession.lock())
-                                    session->RetireSurfaceIfClosed(surface);
-                                return;
-                            }
-                            Sleep(250);
-                        }
-                    } catch (...) {
-                        // Never let a detached recovery thread terminate the
-                        // injected process.
-                    }
-                    try {
-                        std::scoped_lock lock(surface->mutex);
-                        surface->state = SurfaceState::Closed;
-                        surface->restoreRetryScheduled = false;
-                    } catch (...) {}
-                    if (const auto session = weakSession.lock())
-                        session->RetireSurfaceIfClosed(surface);
-                }).detach();
-            } catch (...) {
-                std::scoped_lock lock(surface->mutex);
-                surface->restoreRetryScheduled = false;
-            }
-        }
+        if (scheduleRetry) ScheduleEmergencyUncloakRetry(attempt);
     } catch (...) {
-        // Allocation/IPC failures must not escape a noexcept rollback boundary.
-        // Use only bounded, non-allocating emergency operations here.
-        if (!nativeRestored && nativeRoot && IsWindow(nativeRoot))
-            nativeRestored = ClearApplicationCloak(nativeRoot);
+        // Allocation and IPC failures must not escape a noexcept rollback
+        // boundary.  Only bounded, non-allocating emergency operations here.
+        if (!nativeRestored && attempt.nativeRoot && IsWindow(attempt.nativeRoot))
+            nativeRestored = ClearApplicationCloak(attempt.nativeRoot);
         try {
             std::scoped_lock lock(surface->mutex);
             surface->restoreInProgress = false;
-            if (nativeRestored || !nativeRoot) surface->state = SurfaceState::Closed;
-            else surface->state = SurfaceState::Restoring;
+            surface->state = nativeRestored || !attempt.nativeRoot
+                ? SurfaceState::Closed
+                : SurfaceState::Restoring;
         } catch (...) {}
         if (nativeRestored) RetireSurfaceIfClosed(surface);
     }

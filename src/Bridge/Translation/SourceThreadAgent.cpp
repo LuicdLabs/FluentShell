@@ -6,6 +6,7 @@
 #include <dwmapi.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
@@ -319,6 +320,475 @@ void InstallRootSubclass(SourceThreadAgent* agent) {
         reinterpret_cast<DWORD_PTR>(agent));
 }
 
+// ---------------------------------------------------------------------------
+// Source-thread command handlers
+//
+// Every stage below runs on the target window's own UI thread inside the
+// bounded dispatcher callback.  A stage returns true while the command is still
+// running and false once AbortIfCancelled has finished it, in which case the
+// caller must return immediately and never touch the command again.
+// ---------------------------------------------------------------------------
+
+bool ExecuteCapture(Command* command) {
+    auto* agent = command->agent;
+    command->success = agent->CaptureOnSourceThread(
+        command->capture.surfaceId,
+        command->capture.revision,
+        command->snapshot,
+        command->error);
+    if (AbortIfCancelled(command)) return false;
+    if (!command->success) return true;
+
+    // Observation is installed only for a capture that succeeded, so a rejected
+    // window never leaves subclasses behind.
+    InstallRootSubclass(agent);
+    for (const auto& node : command->snapshot.nodes) {
+        if (command->cancelled.load(std::memory_order_acquire)) break;
+        InstallChildSubclass(agent, node.hwnd);
+    }
+    if (command->cancelled.load(std::memory_order_acquire)) {
+        for (const auto& node : command->snapshot.nodes) {
+            RemoveWindowSubclass(node.hwnd, ControlSubclassProc, kControlSubclassId);
+        }
+        RemoveWindowSubclass(agent->Root(), RootSubclassProc, kRootSubclassId);
+        AbortIfCancelled(command);
+        return false;
+    }
+    agent->ClearDirty();
+    return true;
+}
+
+// --- Window-level actions ---------------------------------------------------
+
+bool ApplyActivate(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    command->success = SetForegroundWindow(agent->Root()) != FALSE;
+    return true;
+}
+
+bool ApplyGeometry(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    const RECT bounds = command->action.rect;
+    command->success = SetWindowPos(agent->Root(), nullptr,
+        bounds.left, bounds.top,
+        bounds.right - bounds.left, bounds.bottom - bounds.top,
+        SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
+    return true;
+}
+
+bool ApplyMinimize(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    ShowWindow(agent->Root(), SW_MINIMIZE);
+    command->success = IsIconic(agent->Root()) != FALSE;
+    return true;
+}
+
+bool ApplyMaximize(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    ShowWindow(agent->Root(), SW_MAXIMIZE);
+    command->success = IsZoomed(agent->Root()) != FALSE;
+    return true;
+}
+
+bool ApplyRestoreState(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    ShowWindow(agent->Root(), SW_RESTORE);
+    command->success = !IsIconic(agent->Root()) && !IsZoomed(agent->Root());
+    return true;
+}
+
+bool ApplyClose(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    // WM_CLOSE is allowed to enter an application-owned modal loop (for example
+    // an unsaved-document prompt).  Sending it from this bounded command would
+    // keep Invoke blocked until the user answers and make the Bridge tear down a
+    // healthy projection at its 2 s deadline.  Queue the request for the native
+    // message loop just as we do for buttons and menu commands.  Destruction is
+    // observed by the root subclass and the reconcile path; if the handler
+    // returns without destroying the root, reconcile reports closeRejected only
+    // after that complete modal/veto lifetime.
+    command->success = PostMessageW(agent->Root(), WM_CLOSE, 0, 0) != FALSE;
+    if (command->success) {
+        // This hook is executing on the source UI thread, so the posted message
+        // cannot reach RootSubclassProc until this command returns.  Registering
+        // after a successful post is therefore race-free.
+        command->outcome.closeSequence = agent->RegisterCloseRequest();
+    }
+    return true;
+}
+
+bool ApplyMenuCommand(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    // Menu handlers may enter a modal loop.  Queue the validated WM_COMMAND so
+    // this bounded source-thread command can return; periodic reconciliation
+    // captures the resulting native state.
+    command->success = PostMessageW(agent->Root(), WM_COMMAND,
+        MAKEWPARAM(command->action.menuCommandId, 0), 0) != FALSE;
+    return true;
+}
+
+using WindowAction = bool (*)(Command*, SourceThreadAgent*);
+
+struct WindowActionEntry final {
+    std::wstring_view name;
+    WindowAction apply;
+};
+
+constexpr std::array kWindowActions{
+    WindowActionEntry{ L"activate", &ApplyActivate },
+    WindowActionEntry{ L"move", &ApplyGeometry },
+    WindowActionEntry{ L"resize", &ApplyGeometry },
+    WindowActionEntry{ L"minimize", &ApplyMinimize },
+    WindowActionEntry{ L"maximize", &ApplyMaximize },
+    WindowActionEntry{ L"restore", &ApplyRestoreState },
+    WindowActionEntry{ L"close", &ApplyClose },
+    WindowActionEntry{ L"menuCommand", &ApplyMenuCommand },
+};
+
+WindowAction FindWindowAction(std::wstring_view action) noexcept {
+    for (const auto& entry : kWindowActions) {
+        if (entry.name == action) return entry.apply;
+    }
+    return nullptr;
+}
+
+// --- Node-level actions -----------------------------------------------------
+
+bool ClickButton(Command* command, HWND target) {
+    // A button handler is allowed to enter a synchronous MessageBox/TaskDialog.
+    // Queue BM_CLICK so this command can acknowledge within the bounded
+    // dispatcher deadline; the native message loop then runs the modal API
+    // normally after the hook returns.
+    if (AbortIfCancelled(command)) return false;
+    command->success = PostMessageW(target, BM_CLICK, 0, 0) != FALSE;
+    return true;
+}
+
+bool ActivateSysLink(Command* command, HWND target) {
+    // The bounded SysLink adapter accepts exactly one link.  Let the native
+    // control generate its normal NM_RETURN notification instead of fabricating
+    // a parent callback, and queue the keystrokes so this command is not held
+    // across a handler that may open another window.
+    if (AbortIfCancelled(command)) return false;
+    LITEM item{};
+    item.mask = LIF_ITEMINDEX | LIF_STATE;
+    item.iLink = 0;
+    item.stateMask = LIS_FOCUSED;
+    item.state = LIS_FOCUSED;
+    const bool focused = SendMessageW(
+        target, LM_SETITEM, 0, reinterpret_cast<LPARAM>(&item)) != FALSE;
+    // The native HWND is cloaked and the renderer owns the real keyboard focus,
+    // so a bounded synthetic focus lifetime is posted to the SysLink itself.
+    // Its standard WM_KEYDOWN handler then emits NM_RETURN without stealing the
+    // desktop focus from the proxy.
+    const bool focusEntered = focused &&
+        PostMessageW(target, WM_SETFOCUS, 0, 0) != FALSE;
+    const bool down = focusEntered &&
+        PostMessageW(target, WM_KEYDOWN, VK_RETURN, 1) != FALSE;
+    const bool up = down &&
+        PostMessageW(target, WM_KEYUP, VK_RETURN, 1 | (1ll << 30) | (1ll << 31)) != FALSE;
+    const bool focusLeft = up && PostMessageW(target, WM_KILLFOCUS, 0, 0) != FALSE;
+    command->success = focusLeft;
+    return true;
+}
+
+bool ApplyInvoke(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind == ControlKind::Button) return ClickButton(command, target);
+    if (node.kind == ControlKind::SysLink) return ActivateSysLink(command, target);
+    return true;
+}
+
+bool ApplySetText(
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    const bool writableText = node.kind == ControlKind::Edit ||
+        node.kind == ControlKind::Password ||
+        (node.kind == ControlKind::ComboBox && node.editable);
+    if (!writableText || node.readOnly) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = SetWindowTextW(target, command->action.text.c_str()) != FALSE;
+    if (!command->success || command->cancelled.load(std::memory_order_acquire)) {
+        return true;
+    }
+    // SetWindowTextW does not notify the parent, so the native handler that
+    // would have observed the user typing is invoked explicitly.
+    const bool combo = node.kind == ControlKind::ComboBox;
+    const HWND parent = combo ? GetParent(target) : agent->Root();
+    SendMessageW(parent ? parent : agent->Root(), WM_COMMAND,
+        MAKEWPARAM(node.controlId, combo ? CBN_EDITCHANGE : EN_CHANGE),
+        reinterpret_cast<LPARAM>(target));
+    return true;
+}
+
+bool ApplySetCheck(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    const bool toggle = node.kind == ControlKind::CheckBox ||
+        node.kind == ControlKind::ThreeState ||
+        node.kind == ControlKind::RadioButton;
+    if (!toggle) return true;
+    const int requested = command->action.integerValue;
+    const int maximum = node.kind == ControlKind::ThreeState ? 2 : 1;
+    const bool validValue = requested >= 0 && requested <= maximum &&
+        (node.kind != ControlKind::RadioButton || requested == 1);
+    if (!validValue) return true;
+    if (AbortIfCancelled(command)) return false;
+
+    // BM_SETCHECK would bypass the application handler, so the native control is
+    // clicked through its own state machine until it reports the requested
+    // value.  A click that does not move the state ends the walk.
+    int current = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
+    for (int attempt = 0; current != requested && attempt <= maximum; ++attempt) {
+        if (AbortIfCancelled(command)) return false;
+        SendMessageW(target, BM_CLICK, 0, 0);
+        const int next = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
+        if (next == current) break;
+        current = next;
+    }
+    command->success =
+        static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0)) == requested;
+    return true;
+}
+
+bool ApplySelect(
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    const bool selectable = node.kind == ControlKind::ComboBox ||
+        node.kind == ControlKind::ListBox;
+    if (!selectable) return true;
+    const int requested = command->action.integerValue;
+    const bool validIndex = requested >= -1 &&
+        (requested == -1 || static_cast<size_t>(requested) < node.items.size());
+    if (!validIndex) return true;
+    if (AbortIfCancelled(command)) return false;
+
+    const bool combo = node.kind == ControlKind::ComboBox;
+    SendMessageW(target, combo ? CB_SETCURSEL : LB_SETCURSEL, requested, 0);
+    const int selected = static_cast<int>(
+        SendMessageW(target, combo ? CB_GETCURSEL : LB_GETCURSEL, 0, 0));
+    if (selected != requested || command->cancelled.load(std::memory_order_acquire)) {
+        return true;
+    }
+    const HWND parent = combo ? GetParent(target) : agent->Root();
+    SendMessageW(parent ? parent : agent->Root(), WM_COMMAND,
+        MAKEWPARAM(node.controlId, combo ? CBN_SELCHANGE : LBN_SELCHANGE),
+        reinterpret_cast<LPARAM>(target));
+    command->success = true;
+    return true;
+}
+
+bool ApplySetSelection(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView) return true;
+    if (AbortIfCancelled(command)) return false;
+    const auto& requested = command->action.integerValues;
+
+    LVITEMW state{};
+    state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    state.state = 0;
+    SendMessageW(target, LVM_SETITEMSTATE,
+        static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(&state));
+    for (size_t index = 0; index < requested.size(); ++index) {
+        if (AbortIfCancelled(command)) return false;
+        state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        state.state = LVIS_SELECTED | (index == 0 ? LVIS_FOCUSED : 0);
+        SendMessageW(target, LVM_SETITEMSTATE,
+            static_cast<WPARAM>(requested[index]), reinterpret_cast<LPARAM>(&state));
+    }
+
+    // Read the selection back through the same enumeration the capture uses, so
+    // an accepted result always matches what the next snapshot will report.
+    std::vector<int> actual;
+    int previous = -1;
+    for (;;) {
+        const int selected = static_cast<int>(
+            SendMessageW(target, LVM_GETNEXTITEM, previous, LVNI_SELECTED));
+        if (selected < 0) break;
+        if (selected <= previous ||
+            static_cast<size_t>(selected) >= node.rows.size() ||
+            actual.size() >= node.rows.size()) {
+            return true;
+        }
+        actual.push_back(selected);
+        previous = selected;
+    }
+    command->success = actual == requested;
+    return true;
+}
+
+using NodeAction = bool (*)(Command*, SourceThreadAgent*, HWND, const ControlNode&);
+
+struct NodeActionEntry final {
+    std::wstring_view name;
+    NodeAction apply;
+};
+
+constexpr std::array kNodeActions{
+    NodeActionEntry{ L"invoke", &ApplyInvoke },
+    NodeActionEntry{ L"setText", &ApplySetText },
+    NodeActionEntry{ L"setCheck", &ApplySetCheck },
+    NodeActionEntry{ L"select", &ApplySelect },
+    NodeActionEntry{ L"setSelection", &ApplySetSelection },
+};
+
+NodeAction FindNodeAction(std::wstring_view action) noexcept {
+    for (const auto& entry : kNodeActions) {
+        if (entry.name == action) return entry.apply;
+    }
+    return nullptr;
+}
+
+// Resolves the addressed control in the baseline capture and hands it to its
+// action.  A node that is gone, non-interactive, or has no matching action
+// leaves command->success false, which the caller reports as a rejection.
+bool InvokeOnNode(
+    Command* command, SourceThreadAgent* agent, const WindowSnapshot& before) {
+    const auto& action = command->action;
+    const auto node = std::find_if(before.nodes.begin(), before.nodes.end(),
+        [&](const ControlNode& candidate) { return candidate.nodeId == *action.nodeId; });
+    if (node == before.nodes.end()) return true;
+    if (AbortIfCancelled(command)) return false;
+    if (!node->visible || !node->enabled) return true;
+    const NodeAction apply = FindNodeAction(action.action);
+    return apply == nullptr || apply(command, agent, node->hwnd, *node);
+}
+
+bool ExecuteInvoke(Command* command) {
+    auto* agent = command->agent;
+    const ActionRequest& action = command->action;
+
+    // Resolve the action against a fresh capture.  The caller has already
+    // checked the expected revision, so a full scan is the safest read here.
+    if (AbortIfCancelled(command)) return false;
+    WindowSnapshot before;
+    std::wstring captureError;
+    if (!agent->CaptureOnSourceThread(
+            action.surfaceId, action.expectedRevision, before, captureError)) {
+        command->error = captureError;
+        return true;
+    }
+    if (!ValidateActionForSnapshot(action, before, command->error)) return true;
+    if (AbortIfCancelled(command)) return false;
+
+    if (const WindowAction apply = FindWindowAction(action.action)) {
+        if (!apply(command, agent)) return false;
+    } else if (action.nodeId && !InvokeOnNode(command, agent, before)) {
+        return false;
+    }
+
+    if (command->success && (agent->IsDestroyed() || !IsWindow(agent->Root()))) {
+        command->outcome.destroyed = true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    if (command->success && !command->outcome.destroyed) {
+        // Verify: the accepted revision is whatever a fresh capture reports, not
+        // what the action asked for.
+        command->success = agent->CaptureOnSourceThread(
+            action.surfaceId, action.expectedRevision + 1,
+            command->outcome.snapshot, command->error);
+        if (AbortIfCancelled(command)) return false;
+        command->outcome.accepted = command->success;
+        command->outcome.revision = action.expectedRevision + 1;
+    }
+    return true;
+}
+
+// --- Cloak lifetime ---------------------------------------------------------
+
+// Applies DWMWA_CLOAK and confirms DWM published it.  Cancellation between the
+// two must never leave the native window hidden, so a cancelled cloak is undone
+// before the command is finished.
+bool SetCloakAndVerify(
+    Command* command, HWND root, bool cloaked, const wchar_t* failureReason) {
+    BOOL value = cloaked ? TRUE : FALSE;
+    const HRESULT applied = DwmSetWindowAttribute(root, DWMWA_CLOAK, &value, sizeof(value));
+    if (command->cancelled.load(std::memory_order_acquire)) {
+        if (cloaked) {
+            value = FALSE;
+            DwmSetWindowAttribute(root, DWMWA_CLOAK, &value, sizeof(value));
+        }
+        AbortIfCancelled(command);
+        return false;
+    }
+    DWORD reasons = cloaked ? 0 : DWM_CLOAKED_APP;
+    const HRESULT verified = DwmGetWindowAttribute(
+        root, DWMWA_CLOAKED, &reasons, sizeof(reasons));
+    command->success = SUCCEEDED(applied) && SUCCEEDED(verified) &&
+        ((reasons & DWM_CLOAKED_APP) != 0) == cloaked;
+    if (!command->success) command->error = failureReason;
+    return true;
+}
+
+bool ExecuteCloak(Command* command) {
+    if (AbortIfCancelled(command)) return false;
+    return SetCloakAndVerify(
+        command, command->agent->Root(), command->cloaked, L"DWMWA_CLOAK failed");
+}
+
+bool ExecuteCaptureAndCloak(Command* command) {
+    auto* agent = command->agent;
+    if (AbortIfCancelled(command)) return false;
+    command->success = agent->CaptureOnSourceThread(
+        command->capture.surfaceId,
+        command->capture.revision,
+        command->snapshot,
+        command->error);
+    command->captured = command->success;
+    // The barrier: cloak only the exact native state the renderer already
+    // validated, so a concurrent native change cannot be hidden behind a stale
+    // projection.
+    if (command->success &&
+        SnapshotFingerprint(command->snapshot) != command->expectedFingerprint) {
+        command->success = false;
+        command->error = L"native revision changed before cloak";
+    }
+    if (AbortIfCancelled(command)) return false;
+    if (!command->success) return true;
+    return SetCloakAndVerify(
+        command, agent->Root(), true, L"native cloak verification failed");
+}
+
+bool ExecuteRestore(Command* command) {
+    auto* agent = command->agent;
+    if (AbortIfCancelled(command)) return false;
+    if (!SetCloakAndVerify(command, agent->Root(), false,
+            L"native window remained application-cloaked")) {
+        return false;
+    }
+    if (command->success) {
+        // The frame was composited while cloaked; force a non-client repaint and
+        // hand activation back to the window the user is looking at again.
+        SetWindowPos(agent->Root(), nullptr, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        SetForegroundWindow(agent->Root());
+    }
+    return true;
+}
+
+bool ExecuteShutdown(Command* command) {
+    if (AbortIfCancelled(command)) return false;
+    EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM) -> BOOL {
+        RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
+        RemovePropW(child, kNodeGenerationProperty);
+        return TRUE;
+    }, 0);
+    RemoveWindowSubclass(command->agent->Root(), RootSubclassProc, kRootSubclassId);
+    command->success = true;
+    return true;
+}
+
+using CommandHandler = bool (*)(Command*);
+
+CommandHandler HandlerFor(UINT kind) noexcept {
+    switch (kind) {
+    case kCommandCapture: return &ExecuteCapture;
+    case kCommandInvoke: return &ExecuteInvoke;
+    case kCommandCloak: return &ExecuteCloak;
+    case kCommandCaptureAndCloak: return &ExecuteCaptureAndCloak;
+    case kCommandRestore: return &ExecuteRestore;
+    case kCommandShutdown: return &ExecuteShutdown;
+    default: return nullptr;
+    }
+}
+
 void ExecuteCommandImpl(Command* command) {
     auto* agent = command->agent;
     if (!agent || !IsWindow(agent->Root())) {
@@ -327,6 +797,8 @@ void ExecuteCommandImpl(Command* command) {
         Complete(command);
         return;
     }
+    // Every handler reads and writes physical pixel coordinates, whatever DPI
+    // awareness the injected thread inherited.
     PhysicalCoordinateScope dpiScope;
     if (!dpiScope.IsValid()) {
         command->error = L"cannot establish physical-coordinate DPI context";
@@ -335,343 +807,12 @@ void ExecuteCommandImpl(Command* command) {
     }
     if (AbortIfCancelled(command)) return;
 
-    switch (command->kind) {
-    case kCommandCapture: {
-        command->success = agent->CaptureOnSourceThread(
-            command->capture.surfaceId,
-            command->capture.revision,
-            command->snapshot,
-            command->error);
-        if (AbortIfCancelled(command)) return;
-        if (command->success) {
-            InstallRootSubclass(agent);
-            for (const auto& node : command->snapshot.nodes) {
-                if (command->cancelled.load(std::memory_order_acquire)) break;
-                InstallChildSubclass(agent, node.hwnd);
-            }
-            if (command->cancelled.load(std::memory_order_acquire)) {
-                for (const auto& node : command->snapshot.nodes) {
-                    RemoveWindowSubclass(node.hwnd, ControlSubclassProc, kControlSubclassId);
-                }
-                RemoveWindowSubclass(agent->Root(), RootSubclassProc, kRootSubclassId);
-                AbortIfCancelled(command);
-                return;
-            }
-            agent->ClearDirty();
-        }
-        break;
-    }
-    case kCommandInvoke: {
-        const auto& action = command->action;
-        HWND target = nullptr;
-        if (action.nodeId) {
-            // The node map is reconstructed from the latest capture by matching
-            // native control IDs; this also invalidates recreated HWND generations.
-            struct FindContext { uint64_t id; HWND result; };
-            (void)target;
-        }
-        // Resolve the node by a fresh capture.  The caller has already checked
-        // the expected revision, so a full scan is the safest source-thread read.
-        WindowSnapshot before;
-        std::wstring captureError;
-        if (AbortIfCancelled(command)) return;
-        if (!agent->CaptureOnSourceThread(
-                action.surfaceId, action.expectedRevision, before, captureError)) {
-            command->error = captureError;
-            break;
-        }
-        if (!ValidateActionForSnapshot(action, before, command->error)) break;
-        if (AbortIfCancelled(command)) return;
-        if (action.action == L"activate") {
-            if (AbortIfCancelled(command)) return;
-            command->success = SetForegroundWindow(agent->Root()) != FALSE;
-        } else if (action.action == L"move" || action.action == L"resize") {
-            if (AbortIfCancelled(command)) return;
-            const RECT r = action.rect;
-            command->success = SetWindowPos(agent->Root(), nullptr, r.left, r.top,
-                r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) != FALSE;
-        } else if (action.action == L"minimize") {
-            if (AbortIfCancelled(command)) return;
-            ShowWindow(agent->Root(), SW_MINIMIZE);
-            command->success = IsIconic(agent->Root()) != FALSE;
-        } else if (action.action == L"maximize") {
-            if (AbortIfCancelled(command)) return;
-            ShowWindow(agent->Root(), SW_MAXIMIZE);
-            command->success = IsZoomed(agent->Root()) != FALSE;
-        } else if (action.action == L"restore") {
-            if (AbortIfCancelled(command)) return;
-            ShowWindow(agent->Root(), SW_RESTORE);
-            command->success = !IsIconic(agent->Root()) && !IsZoomed(agent->Root());
-        } else if (action.action == L"close") {
-            if (AbortIfCancelled(command)) return;
-            // WM_CLOSE is allowed to enter an application-owned modal loop (for
-            // example Notepad's unsaved-document prompt).  Sending it from this
-            // bounded command would keep Invoke blocked until the user answers
-            // and make the Bridge tear down a healthy projection at its 2 s
-            // deadline.  Queue the request for the native message loop just as
-            // we do for buttons and menu commands.  Destruction is observed by
-            // the root subclass/reconcile path. If the handler returns without
-            // destroying the root, reconcile reports closeRejected only after
-            // that complete modal/veto lifetime.
-            command->success = PostMessageW(agent->Root(), WM_CLOSE, 0, 0) != FALSE;
-            if (command->success) {
-                // This hook is executing on the source UI thread, so the posted
-                // message cannot reach RootSubclassProc until this command
-                // returns. Registering after a successful post is race-free.
-                command->outcome.closeSequence = agent->RegisterCloseRequest();
-            }
-        } else if (action.action == L"menuCommand") {
-            if (AbortIfCancelled(command)) return;
-            // Menu handlers may enter a modal loop. Queue the validated
-            // WM_COMMAND so this bounded source-thread command can return;
-            // periodic reconciliation captures the resulting native state.
-            command->success = PostMessageW(agent->Root(), WM_COMMAND,
-                MAKEWPARAM(action.menuCommandId, 0), 0) != FALSE;
-        } else if (action.nodeId) {
-            for (const auto& node : before.nodes) {
-                if (node.nodeId != *action.nodeId) continue;
-                if (AbortIfCancelled(command)) return;
-                target = node.hwnd;
-                const bool interactive = node.visible && node.enabled;
-                if (action.action == L"invoke" &&
-                    node.kind == ControlKind::Button && interactive) {
-                    // A button handler is allowed to enter a synchronous
-                    // MessageBox/TaskDialog.  Queue BM_CLICK so the source
-                    // command can acknowledge within the bounded dispatcher
-                    // deadline; the native message loop then runs the modal
-                    // API normally after this hook returns.
-                    if (!AbortIfCancelled(command))
-                        command->success = PostMessageW(target, BM_CLICK, 0, 0) != FALSE;
-                } else if (action.action == L"invoke" &&
-                           node.kind == ControlKind::SysLink && interactive) {
-                    // The bounded SysLink adapter accepts exactly one link.
-                    // Let the native control generate its normal NM_RETURN
-                    // notification instead of fabricating a parent callback.
-                    // Queueing avoids holding this dispatcher command across a
-                    // handler that may open another window.
-                    if (!AbortIfCancelled(command)) {
-                        LITEM item{};
-                        item.mask = LIF_ITEMINDEX | LIF_STATE;
-                        item.iLink = 0;
-                        item.stateMask = LIS_FOCUSED;
-                        item.state = LIS_FOCUSED;
-                        const bool focused = SendMessageW(
-                            target, LM_SETITEM, 0, reinterpret_cast<LPARAM>(&item)) != FALSE;
-                        // The native HWND is cloaked and the renderer owns the
-                        // real keyboard focus. Queue a bounded synthetic focus
-                        // lifetime to the SysLink itself so its standard
-                        // WM_KEYDOWN handler emits NM_RETURN without stealing
-                        // the desktop focus from the proxy.
-                        const bool focusEntered = focused && PostMessageW(
-                            target, WM_SETFOCUS, 0, 0) != FALSE;
-                        const bool down = focusEntered && PostMessageW(
-                            target, WM_KEYDOWN, VK_RETURN, 1) != FALSE;
-                        const bool up = down && PostMessageW(
-                            target, WM_KEYUP, VK_RETURN, 1 | (1ll << 30) | (1ll << 31)) != FALSE;
-                        const bool focusLeft = up && PostMessageW(
-                            target, WM_KILLFOCUS, 0, 0) != FALSE;
-                        command->success = focused && focusEntered && down && up && focusLeft;
-                    }
-                } else if (action.action == L"setText" &&
-                            (node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
-                             (node.kind == ControlKind::ComboBox && node.editable)) &&
-                            !node.readOnly && interactive) {
-                    if (AbortIfCancelled(command)) return;
-                    command->success = SetWindowTextW(target, action.text.c_str()) != FALSE;
-                    if (command->success && !command->cancelled.load(std::memory_order_acquire)) {
-                        const HWND notificationTarget = node.kind == ControlKind::ComboBox
-                            ? GetParent(target) : agent->Root();
-                        SendMessageW(notificationTarget ? notificationTarget : agent->Root(), WM_COMMAND,
-                            MAKEWPARAM(node.controlId,
-                                node.kind == ControlKind::ComboBox ? CBN_EDITCHANGE : EN_CHANGE),
-                            reinterpret_cast<LPARAM>(target));
-                    }
-                } else if (action.action == L"setCheck" &&
-                           (node.kind == ControlKind::CheckBox || node.kind == ControlKind::ThreeState ||
-                             node.kind == ControlKind::RadioButton) && interactive) {
-                    const int maximum = node.kind == ControlKind::ThreeState ? 2 : 1;
-                    const bool validValue = action.integerValue >= 0 &&
-                        action.integerValue <= maximum &&
-                        (node.kind != ControlKind::RadioButton || action.integerValue == 1);
-                    if (validValue) {
-                        if (AbortIfCancelled(command)) return;
-                        int current = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
-                        for (int attempt = 0;
-                             current != action.integerValue && attempt <= maximum;
-                             ++attempt) {
-                            if (AbortIfCancelled(command)) return;
-                            SendMessageW(target, BM_CLICK, 0, 0);
-                            const int next = static_cast<int>(
-                                SendMessageW(target, BM_GETCHECK, 0, 0));
-                            if (next == current) break;
-                            current = next;
-                        }
-                        command->success = static_cast<int>(
-                            SendMessageW(target, BM_GETCHECK, 0, 0)) == action.integerValue;
-                    }
-                } else if (action.action == L"setSelection" &&
-                           node.kind == ControlKind::ListView && interactive) {
-                    if (AbortIfCancelled(command)) return;
-                    LVITEMW state{};
-                    state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-                    state.state = 0;
-                    SendMessageW(target, LVM_SETITEMSTATE, static_cast<WPARAM>(-1),
-                        reinterpret_cast<LPARAM>(&state));
-                    for (size_t index = 0; index < action.integerValues.size(); ++index) {
-                        if (AbortIfCancelled(command)) return;
-                        state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-                        state.state = LVIS_SELECTED |
-                            (index == 0 ? LVIS_FOCUSED : 0);
-                        SendMessageW(target, LVM_SETITEMSTATE,
-                            static_cast<WPARAM>(action.integerValues[index]),
-                            reinterpret_cast<LPARAM>(&state));
-                    }
-                    std::vector<int> actual;
-                    int previousSelected = -1;
-                    bool validEnumeration = true;
-                    while (true) {
-                        const int selected = static_cast<int>(SendMessageW(
-                            target, LVM_GETNEXTITEM, previousSelected, LVNI_SELECTED));
-                        if (selected < 0) break;
-                        if (selected <= previousSelected ||
-                            static_cast<size_t>(selected) >= node.rows.size() ||
-                            actual.size() >= node.rows.size()) {
-                            validEnumeration = false;
-                            break;
-                        }
-                        actual.push_back(selected);
-                        previousSelected = selected;
-                    }
-                    command->success = validEnumeration && actual == action.integerValues;
-                } else if (action.action == L"select" &&
-                           (node.kind == ControlKind::ComboBox || node.kind == ControlKind::ListBox) &&
-                           interactive) {
-                    const bool validIndex = action.integerValue >= -1 &&
-                        (action.integerValue == -1 ||
-                            static_cast<size_t>(action.integerValue) < node.items.size());
-                    if (validIndex) {
-                        if (AbortIfCancelled(command)) return;
-                        const bool combo = node.kind == ControlKind::ComboBox;
-                        SendMessageW(target, combo ? CB_SETCURSEL : LB_SETCURSEL,
-                            action.integerValue, 0);
-                        const int selected = static_cast<int>(SendMessageW(
-                            target, combo ? CB_GETCURSEL : LB_GETCURSEL, 0, 0));
-                        if (selected == action.integerValue && !command->cancelled.load(std::memory_order_acquire)) {
-                            const HWND notificationTarget = combo ? GetParent(target) : agent->Root();
-                            SendMessageW(notificationTarget ? notificationTarget : agent->Root(), WM_COMMAND,
-                                MAKEWPARAM(node.controlId,
-                                    combo ? CBN_SELCHANGE : LBN_SELCHANGE),
-                                reinterpret_cast<LPARAM>(target));
-                            command->success = true;
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        if (command->success &&
-            (agent->IsDestroyed() || !IsWindow(agent->Root()))) {
-            command->outcome.destroyed = true;
-        }
-        if (AbortIfCancelled(command)) return;
-        if (command->success && !command->outcome.destroyed) {
-            command->success = agent->CaptureOnSourceThread(
-                action.surfaceId, action.expectedRevision + 1,
-                command->outcome.snapshot, command->error);
-            if (AbortIfCancelled(command)) return;
-            command->outcome.accepted = command->success;
-            command->outcome.revision = action.expectedRevision + 1;
-        }
-        break;
-    }
-    case kCommandCloak: {
-        if (AbortIfCancelled(command)) return;
-        BOOL value = command->cloaked ? TRUE : FALSE;
-        const HRESULT hr = DwmSetWindowAttribute(
-            agent->Root(), DWMWA_CLOAK, &value, sizeof(value));
-        if (command->cancelled.load(std::memory_order_acquire)) {
-            if (command->cloaked) {
-                value = FALSE;
-                DwmSetWindowAttribute(agent->Root(), DWMWA_CLOAK, &value, sizeof(value));
-            }
-            AbortIfCancelled(command);
-            return;
-        }
-        DWORD reasons = 0;
-        const HRESULT verify = DwmGetWindowAttribute(
-            agent->Root(), DWMWA_CLOAKED, &reasons, sizeof(reasons));
-        const bool appCloaked = (reasons & DWM_CLOAKED_APP) != 0;
-        command->success = SUCCEEDED(hr) && SUCCEEDED(verify) &&
-            appCloaked == command->cloaked;
-        if (!command->success) command->error = L"DWMWA_CLOAK failed";
-        break;
-    }
-    case kCommandCaptureAndCloak: {
-        if (AbortIfCancelled(command)) return;
-        command->success = agent->CaptureOnSourceThread(
-            command->capture.surfaceId,
-            command->capture.revision,
-            command->snapshot,
-            command->error);
-        command->captured = command->success;
-        if (command->success &&
-            SnapshotFingerprint(command->snapshot) != command->expectedFingerprint) {
-            command->success = false;
-            command->error = L"native revision changed before cloak";
-        }
-        if (AbortIfCancelled(command)) return;
-        if (command->success) {
-            BOOL value = TRUE;
-            const HRESULT hr = DwmSetWindowAttribute(
-                agent->Root(), DWMWA_CLOAK, &value, sizeof(value));
-            if (command->cancelled.load(std::memory_order_acquire)) {
-                value = FALSE;
-                DwmSetWindowAttribute(agent->Root(), DWMWA_CLOAK, &value, sizeof(value));
-                AbortIfCancelled(command);
-                return;
-            }
-            DWORD reasons = 0;
-            const HRESULT verify = DwmGetWindowAttribute(
-                agent->Root(), DWMWA_CLOAKED, &reasons, sizeof(reasons));
-            command->success = SUCCEEDED(hr) && SUCCEEDED(verify) &&
-                (reasons & DWM_CLOAKED_APP) != 0;
-            if (!command->success) command->error = L"native cloak verification failed";
-        }
-        break;
-    }
-    case kCommandRestore: {
-        if (AbortIfCancelled(command)) return;
-        BOOL value = FALSE;
-        const HRESULT hr = DwmSetWindowAttribute(
-            agent->Root(), DWMWA_CLOAK, &value, sizeof(value));
-        if (AbortIfCancelled(command)) return;
-        DWORD reasons = DWM_CLOAKED_APP;
-        const HRESULT verify = DwmGetWindowAttribute(
-            agent->Root(), DWMWA_CLOAKED, &reasons, sizeof(reasons));
-        command->success = SUCCEEDED(hr) && SUCCEEDED(verify) &&
-            (reasons & DWM_CLOAKED_APP) == 0;
-        if (command->success) {
-            SetWindowPos(agent->Root(), nullptr, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            SetForegroundWindow(agent->Root());
-        } else {
-            command->error = L"native window remained application-cloaked";
-        }
-        break;
-    }
-    case kCommandShutdown:
-        if (AbortIfCancelled(command)) return;
-        EnumChildWindows(agent->Root(), [](HWND child, LPARAM) -> BOOL {
-            RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
-            RemovePropW(child, kNodeGenerationProperty);
-            return TRUE;
-        }, 0);
-        RemoveWindowSubclass(agent->Root(), RootSubclassProc, kRootSubclassId);
-        command->success = true;
-        break;
-    default:
+    const CommandHandler handler = HandlerFor(command->kind);
+    if (!handler) {
         command->error = L"unknown source-thread command";
-        break;
+    } else if (!handler(command)) {
+        // Cancelled mid-flight; the handler already finished the command.
+        return;
     }
     if (AbortIfCancelled(command)) return;
     Complete(command);

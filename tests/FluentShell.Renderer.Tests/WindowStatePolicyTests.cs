@@ -67,14 +67,14 @@ public sealed class WindowStatePolicyTests
     [InlineData(0x0240)] // WM_TOUCH
     [InlineData(0x0246)] // WM_POINTERDOWN
     public void ProvisionalCommitBlocksClientInput(uint message) =>
-        Assert.True(TranslatedWindow.IsGateBlockedInputMessage(message));
+        Assert.True(WindowMessages.IsInputMessage(message));
 
     [Theory]
     [InlineData(0x000F)] // WM_PAINT
     [InlineData(0x0046)] // WM_WINDOWPOSCHANGING is clamped separately
     [InlineData(0x0082)] // WM_NCDESTROY
     public void ProvisionalCommitAllowsLifecycleAndRenderMessages(uint message) =>
-        Assert.False(TranslatedWindow.IsGateBlockedInputMessage(message));
+        Assert.False(WindowMessages.IsInputMessage(message));
 
     [Theory]
     [InlineData(false, false, true)]
