@@ -65,6 +65,7 @@
   <ItemGroup>
     <ClCompile Include="Bridge\Ipc\FrameCodec.cpp" />
     <ClCompile Include="Bridge\Ipc\Protocol.cpp" />
+    <ClCompile Include="Bridge\Translation\ControlAdapters.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />
     <ClCompile Include="Bridge\Translation\RendererSession.cpp" />
     <ClCompile Include="Bridge\Translation\SourceThreadAgent.cpp" />
@@ -76,6 +77,7 @@
   <ItemGroup>
     <ClInclude Include="Bridge\Ipc\FrameCodec.h" />
     <ClInclude Include="Bridge\Ipc\Protocol.h" />
+    <ClInclude Include="Bridge\Translation\ControlAdapters.h" />
     <ClInclude Include="Bridge\Translation\DialogTranslator.h" />
     <ClInclude Include="Bridge\Translation\RendererSession.h" />
     <ClInclude Include="Bridge\Translation\SourceThreadAgent.h" />

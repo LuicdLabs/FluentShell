@@ -1,5 +1,6 @@
 #include "../../src/Bridge/Ipc/FrameCodec.h"
 #include "../../src/Bridge/Translation/WindowSnapshot.h"
+#include "../../src/Bridge/Translation/ControlAdapters.h"
 #include "../../src/Bridge/Translation/WindowCapture.h"
 
 #include <winrt/base.h>
@@ -605,6 +606,110 @@ bool CaptureSingleCombo(DWORD comboStyle, Translation::WindowSnapshot& snapshot)
     return captured;
 }
 
+// The adapter registry is the single place that decides which native class and
+// style combinations are inside the bounded translation boundary.  These cases
+// pin both directions of that decision so a registry edit cannot silently widen
+// or narrow the boundary.
+struct AdapterCase final {
+    const wchar_t* className;
+    DWORD style;
+    bool supported;
+    Translation::ControlKind kind;
+    const char* label;
+};
+
+void TestControlAdapterRegistry() {
+    HWND root = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"adapter-registry",
+        WS_OVERLAPPEDWINDOW, 20, 20, 480, 320, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    Check(root != nullptr, "adapter registry root was not created");
+    if (!root) return;
+
+    using Translation::ControlKind;
+    const AdapterCase cases[] = {
+        { L"Static", SS_LEFT, true, ControlKind::StaticText, "left Static" },
+        { L"Static", SS_ETCHEDHORZ, true, ControlKind::Separator, "etched Static" },
+        { L"Static", SS_BITMAP, false, ControlKind::StaticText, "bitmap Static" },
+        { L"Button", BS_PUSHBUTTON, true, ControlKind::Button, "push Button" },
+        { L"Button", BS_AUTOCHECKBOX, true, ControlKind::CheckBox, "check Button" },
+        { L"Button", BS_AUTO3STATE, true, ControlKind::ThreeState, "3-state Button" },
+        { L"Button", BS_AUTORADIOBUTTON, true, ControlKind::RadioButton, "radio Button" },
+        { L"Button", BS_GROUPBOX, true, ControlKind::GroupBox, "GroupBox" },
+        { L"Button", BS_GROUPBOX | WS_TABSTOP, false, ControlKind::GroupBox,
+          "tab-stop GroupBox" },
+        { L"Button", BS_OWNERDRAW, false, ControlKind::Button, "owner-draw Button" },
+        { L"Button", BS_PUSHBUTTON | BS_ICON, false, ControlKind::Button, "icon Button" },
+        { L"Edit", 0, true, ControlKind::Edit, "Edit" },
+        { L"Edit", ES_PASSWORD, true, ControlKind::Password, "password Edit" },
+        { L"ComboBox", CBS_DROPDOWNLIST, true, ControlKind::ComboBox, "dropdown-list ComboBox" },
+        { L"ComboBox", CBS_SIMPLE | CBS_HASSTRINGS, false, ControlKind::ComboBox,
+          "simple ComboBox" },
+        { L"ListBox", 0, true, ControlKind::ListBox, "ListBox" },
+        { L"ListBox", LBS_EXTENDEDSEL, false, ControlKind::ListBox, "multi-select ListBox" },
+        { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
+        { PROGRESS_CLASSW, PBS_MARQUEE, false, ControlKind::ProgressBar, "marquee ProgressBar" },
+        { STATUSCLASSNAMEW, 0, true, ControlKind::StatusBar, "StatusBar" },
+        { STATUSCLASSNAMEW, WS_TABSTOP, false, ControlKind::StatusBar, "tab-stop StatusBar" },
+        // SysLink is deliberately absent: its class is only registered by
+        // comctl32 v6, which this unmanifested test host does not activate.
+        // TestStructuredCommonControlCapture covers the SysLink capture path.
+    };
+
+    for (const auto& adapter : cases) {
+        HWND child = CreateWindowExW(0, adapter.className, L"probe",
+            WS_CHILD | adapter.style, 0, 0, 80, 24, root,
+            reinterpret_cast<HMENU>(300), GetModuleHandleW(nullptr), nullptr);
+        Check(child != nullptr, adapter.label);
+        if (!child) continue;
+        ControlKind kind = ControlKind::TreeView;
+        std::wstring reason;
+        const bool classified = Translation::ClassifyControl(child, kind, reason);
+        Check(classified == adapter.supported, adapter.label);
+        if (adapter.supported) {
+            Check(kind == adapter.kind, adapter.label);
+            Check(reason.empty(), adapter.label);
+        } else {
+            Check(!reason.empty(), adapter.label);
+        }
+        DestroyWindow(child);
+    }
+
+    // An unregistered class is rejected by name so the log identifies it.
+    HWND custom = CreateWindowExW(0, L"ScrollBar", L"probe", WS_CHILD,
+        0, 0, 40, 40, root, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (custom) {
+        ControlKind kind = ControlKind::TreeView;
+        std::wstring reason;
+        Check(!Translation::ClassifyControl(custom, kind, reason),
+            "unregistered class was accepted");
+        Check(reason.find(L"unsupported visible control class") != std::wstring::npos,
+            "unregistered class rejection does not name the class");
+        // Win32 reports the registered casing, so compare the way the registry does.
+        wchar_t buffer[Translation::kMaxClassNameChars]{};
+        const std::wstring reported(Translation::ClassNameOf(custom, buffer));
+        Check(_wcsicmp(reported.c_str(), L"ScrollBar") == 0,
+            "ClassNameOf did not report the native class");
+        DestroyWindow(custom);
+    }
+
+    // A ComboBox owns its edit and dropdown list, so they are part of its adapter
+    // contract rather than separate projected nodes.
+    HWND combo = CreateWindowExW(0, L"ComboBox", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | CBS_HASSTRINGS,
+        0, 0, 160, 24, root, reinterpret_cast<HMENU>(301),
+        GetModuleHandleW(nullptr), nullptr);
+    if (combo) {
+        COMBOBOXINFO info{ sizeof(info) };
+        Check(GetComboBoxInfo(combo, &info) != FALSE, "ComboBox info was unavailable");
+        Check(Translation::IsCompositeImplementationChild(info.hwndItem),
+            "ComboBox edit child was not treated as an implementation child");
+        Check(!Translation::IsCompositeImplementationChild(combo),
+            "ComboBox itself was treated as an implementation child");
+        DestroyWindow(combo);
+    }
+    DestroyWindow(root);
+}
+
 void TestStructuredCommonControlCapture() {
     HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"common-control-capture",
         WS_OVERLAPPEDWINDOW, 20, 20, 640, 420, nullptr, nullptr,
@@ -829,7 +934,7 @@ void TestMenuActionValidationAndSerialization() {
 int wmain() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     INITCOMMONCONTROLSEX controls{ sizeof(controls),
-        ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES };
+        ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
     Check(InitCommonControlsEx(&controls) != FALSE,
         "common-control classes were not initialized");
     TestHeaderValidation();
@@ -843,6 +948,7 @@ int wmain() {
     TestActionRevisionPolicy();
     TestErrorScopeParsing();
     TestExpandedControlSerialization();
+    TestControlAdapterRegistry();
     TestEditableComboCaptureBoundary();
     TestStructuredCommonControlCapture();
     TestStandardMenuCapture();
