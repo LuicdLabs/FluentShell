@@ -1,4 +1,5 @@
 #include "SourceThreadAgent.h"
+#include "DirectUiEngine.h"
 
 #include "../../Common/FluentShell.h"
 
@@ -29,7 +30,14 @@ constexpr UINT kCommandCloak = 3;
 constexpr UINT kCommandRestore = 4;
 constexpr UINT kCommandShutdown = 5;
 constexpr UINT kCommandCaptureAndCloak = 6;
+constexpr UINT kCommandCaptureDirectUiEvidence = 7;
+constexpr UINT kCommandVerifyDirectUiAndCloak = 8;
+constexpr UINT kCommandRestoreThenDirectUiClick = 9;
+constexpr UINT kCommandDirectUiToggle = 10;
+constexpr UINT kCommandDirectUiMove = 11;
+constexpr UINT kCommandCaptureDirectUiBootstrap = 12;
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
+constexpr wchar_t kDirectUiGenerationProperty[] = L"FluentShell.Bridge.DirectUiGeneration";
 
 class PhysicalCoordinateScope final {
 public:
@@ -57,6 +65,11 @@ struct Command final {
     ActionRequest action;
     CaptureContext capture;
     WindowSnapshot snapshot;
+    DirectUiNativeEvidence directUiEvidence;
+    DirectUiBootstrapEvidence directUiBootstrapEvidence;
+    DirectUiNativeEvidence expectedDirectUiEvidence;
+    DirectUiActionBinding directUiBinding;
+    const DirectUiWindowProfile* profile = nullptr;
     ActionOutcome outcome;
     bool captured = false;
     bool cloaked = false;
@@ -190,12 +203,12 @@ SourceThreadAgent* AgentForMessage(UINT message) noexcept {
     }
 }
 
-void MarkCurrentThreadAgentsDirty() noexcept {
+void MarkCurrentThreadAgentsDirty(HWND window = nullptr, UINT message = 0) noexcept {
     const DWORD threadId = GetCurrentThreadId();
     try {
         std::scoped_lock lock(g_agentsMutex);
         for (const auto& [_, agent] : g_agents) {
-            if (agent && agent->ThreadId() == threadId) agent->MarkDirty();
+            if (agent && agent->ThreadId() == threadId) agent->MarkDirty(window, message);
         }
     } catch (...) {}
 }
@@ -218,6 +231,20 @@ void MarkWindowCloseCompleted(HWND window) noexcept {
 }
 
 bool RelevantMessage(UINT message) noexcept {
+    // Common-control message values overlap heavily inside WM_USER. Keep the
+    // Toolbar mutators out of the switch so aliases cannot create duplicate cases.
+    if (message == TB_ENABLEBUTTON || message == TB_HIDEBUTTON ||
+        message == TB_INDETERMINATE || message == TB_MARKBUTTON ||
+        message == TB_PRESSBUTTON || message == TB_CHECKBUTTON ||
+        message == TB_SETSTATE || message == TB_ADDBUTTONSA ||
+        message == TB_ADDBUTTONSW || message == TB_INSERTBUTTONA ||
+        message == TB_INSERTBUTTONW || message == TB_DELETEBUTTON ||
+        message == TB_SETBUTTONINFOA || message == TB_SETBUTTONINFOW ||
+        message == TB_SETIMAGELIST || message == TB_SETHOTIMAGELIST ||
+        message == TB_SETDISABLEDIMAGELIST || message == TB_SETPRESSEDIMAGELIST ||
+        message == TB_SETEXTENDEDSTYLE || message == TB_SETBUTTONSIZE ||
+        message == TB_SETBITMAPSIZE || message == TB_SETROWS ||
+        message == TB_MOVEBUTTON || message == TB_AUTOSIZE) return true;
     switch (message) {
     case WM_SETTEXT:
     case WM_ENABLE:
@@ -234,6 +261,8 @@ bool RelevantMessage(UINT message) noexcept {
     case WM_UPDATEUISTATE:
     case WM_SETFONT:
     case BM_SETCHECK:
+    case STM_SETICON:
+    case STM_SETIMAGE:
     case CB_ADDSTRING:
     case CB_DELETESTRING:
     case CB_RESETCONTENT:
@@ -264,9 +293,23 @@ bool RelevantMessage(UINT message) noexcept {
     case LVM_SETEXTENDEDLISTVIEWSTYLE:
     case LVM_ENABLEGROUPVIEW:
     case LVM_SETVIEW:
+    case TCM_SETCURSEL:
+    case TCM_INSERTITEMA:
+    case TCM_INSERTITEMW:
+    case TCM_DELETEITEM:
+    case TCM_DELETEALLITEMS:
+    case TCM_SETITEMA:
+    case TCM_SETITEMW:
+    case TCM_SETIMAGELIST:
+    case TCM_SETITEMSIZE:
+    case TCM_SETITEMEXTRA:
+    case TCM_SETPADDING:
+    case TCM_REMOVEIMAGE:
+    case TCM_SETTOOLTIPS:
+    case TCM_SETMINTABWIDTH:
+    case TCM_SETEXTENDEDSTYLE:
     case SB_SIMPLE:
     case SB_SETTEXTW:
-    case SB_SETMINHEIGHT:
     // ProgressBar state is driven entirely by these messages.  Without them a
     // dirty-gated reconcile would never notice a native progress update.
     case PBM_SETPOS:
@@ -285,9 +328,11 @@ bool RelevantMessage(UINT message) noexcept {
 LRESULT CALLBACK ControlSubclassProc(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR subclassId, DWORD_PTR refData) {
-    auto* owner = reinterpret_cast<SourceThreadAgent*>(refData);
+    const bool statusBar = (refData & 1u) != 0;
+    auto* owner = reinterpret_cast<SourceThreadAgent*>(refData & ~DWORD_PTR{ 1 });
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
-    if (owner && RelevantMessage(message)) owner->MarkDirty();
+    if (owner && (RelevantMessage(message) || (statusBar && message == SB_SETMINHEIGHT)))
+        owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY) {
         RemoveWindowSubclass(window, ControlSubclassProc, subclassId);
     }
@@ -300,7 +345,7 @@ LRESULT CALLBACK RootSubclassProc(
     auto* owner = reinterpret_cast<SourceThreadAgent*>(refData);
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
     if (message == WM_CLOSE) MarkWindowCloseCompleted(window);
-    if (owner && RelevantMessage(message)) owner->MarkDirty();
+    if (owner && RelevantMessage(message)) owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY && owner) {
         owner->MarkDestroyed();
         RemoveWindowSubclass(window, RootSubclassProc, subclassId);
@@ -310,8 +355,14 @@ LRESULT CALLBACK RootSubclassProc(
 
 void InstallChildSubclass(SourceThreadAgent* agent, HWND hwnd) {
     if (hwnd && IsWindow(hwnd)) {
+        wchar_t className[64]{};
+        const bool statusBar = GetClassNameW(hwnd, className,
+            static_cast<int>(std::size(className))) > 0 &&
+            FluentShell::EqualsIgnoreCase(className, STATUSCLASSNAMEW);
+        const DWORD_PTR refData = reinterpret_cast<DWORD_PTR>(agent) |
+            static_cast<DWORD_PTR>(statusBar);
         SetWindowSubclass(hwnd, ControlSubclassProc, kControlSubclassId,
-            reinterpret_cast<DWORD_PTR>(agent));
+            refData);
     }
 }
 
@@ -513,8 +564,7 @@ bool ApplySetText(
     // SetWindowTextW does not notify the parent, so the native handler that
     // would have observed the user typing is invoked explicitly.
     const bool combo = node.kind == ControlKind::ComboBox;
-    const HWND parent = combo ? GetParent(target) : agent->Root();
-    SendMessageW(parent ? parent : agent->Root(), WM_COMMAND,
+    SendMessageW(SyntheticNotificationTarget(agent->Root(), target), WM_COMMAND,
         MAKEWPARAM(node.controlId, combo ? CBN_EDITCHANGE : EN_CHANGE),
         reinterpret_cast<LPARAM>(target));
     return true;
@@ -552,14 +602,22 @@ bool ApplySetCheck(
 bool ApplySelect(
     Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
     const bool selectable = node.kind == ControlKind::ComboBox ||
-        node.kind == ControlKind::ListBox;
+        node.kind == ControlKind::ListBox || node.kind == ControlKind::TabControl;
     if (!selectable) return true;
     const int requested = command->action.integerValue;
-    const bool validIndex = requested >= -1 &&
+    const bool tab = node.kind == ControlKind::TabControl;
+    const bool validIndex = requested >= (tab ? 0 : -1) &&
         (requested == -1 || static_cast<size_t>(requested) < node.items.size());
     if (!validIndex) return true;
     if (AbortIfCancelled(command)) return false;
 
+    if (tab) {
+        if (AbortIfCancelled(command)) return false;
+        command->success = SelectTabControl(
+            agent->Root(), target, node.controlId, requested,
+            static_cast<int>(node.items.size()));
+        return true;
+    }
     const bool combo = node.kind == ControlKind::ComboBox;
     SendMessageW(target, combo ? CB_SETCURSEL : LB_SETCURSEL, requested, 0);
     const int selected = static_cast<int>(
@@ -567,8 +625,7 @@ bool ApplySelect(
     if (selected != requested || command->cancelled.load(std::memory_order_acquire)) {
         return true;
     }
-    const HWND parent = combo ? GetParent(target) : agent->Root();
-    SendMessageW(parent ? parent : agent->Root(), WM_COMMAND,
+    SendMessageW(SyntheticNotificationTarget(agent->Root(), target), WM_COMMAND,
         MAKEWPARAM(node.controlId, combo ? CBN_SELCHANGE : LBN_SELCHANGE),
         reinterpret_cast<LPARAM>(target));
     command->success = true;
@@ -614,6 +671,58 @@ bool ApplySetSelection(
     return true;
 }
 
+bool ExecuteCaptureDirectUiEvidence(Command* command) {
+    command->success = command->profile &&
+        CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, command->directUiEvidence, command->error);
+    if (AbortIfCancelled(command)) return false;
+    if (!command->success) return true;
+    InstallRootSubclass(command->agent);
+    EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM raw) -> BOOL {
+        InstallChildSubclass(reinterpret_cast<SourceThreadAgent*>(raw), child);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(command->agent));
+    command->agent->ClearDirty();
+    return true;
+}
+
+bool ExecuteCaptureDirectUiBootstrap(Command* command) {
+    command->success = CaptureDirectUiBootstrapEvidenceOnSourceThread(
+        *command->agent, command->directUiBootstrapEvidence, command->error);
+    if (AbortIfCancelled(command)) return false;
+    if (!command->success) return true;
+    InstallRootSubclass(command->agent);
+    EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM raw) -> BOOL {
+        InstallChildSubclass(reinterpret_cast<SourceThreadAgent*>(raw), child);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(command->agent));
+    command->agent->ClearDirty();
+    return true;
+}
+
+bool ApplySetItemCheck(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView || !node.checkBoxes) return true;
+    const int index = command->action.itemIndex;
+    if (index < 0 || static_cast<size_t>(index) >= node.rows.size()) return true;
+    if (AbortIfCancelled(command)) return false;
+
+    const bool applied = SetListViewItemCheck(
+        target, index, command->action.booleanValue);
+    if (AbortIfCancelled(command)) return false;
+    command->success = applied;
+    return true;
+}
+
+bool ApplyToolbarCommand(
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::Toolbar) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = PostMessageW(SyntheticNotificationTarget(agent->Root(), target), WM_COMMAND,
+        MAKEWPARAM(command->action.menuCommandId, 0), reinterpret_cast<LPARAM>(target)) != FALSE;
+    return true;
+}
+
 using NodeAction = bool (*)(Command*, SourceThreadAgent*, HWND, const ControlNode&);
 
 struct NodeActionEntry final {
@@ -627,6 +736,8 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"setCheck", &ApplySetCheck },
     NodeActionEntry{ L"select", &ApplySelect },
     NodeActionEntry{ L"setSelection", &ApplySetSelection },
+    NodeActionEntry{ L"setItemCheck", &ApplySetItemCheck },
+    NodeActionEntry{ L"toolbarCommand", &ApplyToolbarCommand },
 };
 
 NodeAction FindNodeAction(std::wstring_view action) noexcept {
@@ -746,6 +857,166 @@ bool ExecuteCaptureAndCloak(Command* command) {
         command, agent->Root(), true, L"native cloak verification failed");
 }
 
+bool ExecuteVerifyDirectUiAndCloak(Command* command) {
+    DirectUiNativeEvidence current;
+    if (!command->profile ||
+        !CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, current, command->error) ||
+        !MatchDirectUiMutationBracket(*command->profile,
+            command->expectedDirectUiEvidence, current, command->error, false)) {
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    return SetCloakAndVerify(command, command->agent->Root(), true,
+        L"DirectUI native cloak verification failed");
+}
+
+bool ExecuteRestoreThenDirectUiClick(Command* command) {
+    DirectUiNativeEvidence current;
+    if (!command->profile ||
+        !CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, current, command->error) ||
+        !MatchDirectUiMutationBracket(*command->profile,
+            command->expectedDirectUiEvidence, current, command->error, false)) {
+        return true;
+    }
+    const DirectUiActionBinding& binding = command->directUiBinding;
+    const size_t slot = binding.slotIndex;
+    bool bindingMatches = slot < command->profile->slotCount &&
+        slot < current.slotWindows.size() &&
+        current.slotWindows[slot].hwnd == binding.hwnd &&
+        current.slotWindows[slot].generation == binding.generation;
+    if (!bindingMatches) {
+        command->error = L"DirectUI handoff backing generation changed";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    if (!SetCloakAndVerify(command, command->agent->Root(), false,
+            L"DirectUI handoff native uncloak failed")) return false;
+    if (!command->success) return true;
+    SetWindowPos(command->agent->Root(), nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    SetForegroundWindow(command->agent->Root());
+    DirectUiNativeEvidence restored;
+    if (!CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, restored, command->error)) {
+        command->success = false;
+        return true;
+    }
+    bindingMatches = slot < restored.slotWindows.size() &&
+        restored.slotWindows[slot].hwnd == binding.hwnd &&
+        restored.slotWindows[slot].generation == binding.generation;
+    DWORD cloak = DWM_CLOAKED_APP;
+    const bool visible = IsWindowVisible(command->agent->Root()) != FALSE;
+    const bool uncloaked = SUCCEEDED(DwmGetWindowAttribute(command->agent->Root(),
+        DWMWA_CLOAKED, &cloak, sizeof(cloak))) && (cloak & DWM_CLOAKED_APP) == 0;
+    if (!DirectUiHandoffMayPost(true, bindingMatches, true, visible, uncloaked)) {
+        command->success = false;
+        command->error = L"DirectUI handoff native visibility verification failed";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    command->success = PostMessageW(binding.hwnd, BM_CLICK, 0, 0) != FALSE;
+    if (!command->success) command->error = L"DirectUI handoff BM_CLICK post failed";
+    return true;
+}
+
+// A projected toggle stays inside the projection. The native checkbox is
+// clicked through its own state machine until it reports the requested value;
+// BM_SETCHECK would bypass the application handler and is never used.
+bool ExecuteDirectUiToggle(Command* command) {
+    const HWND target = command->directUiBinding.hwnd;
+    if (!target || !IsWindow(target)) {
+        command->error = L"DirectUI toggle backing window is gone";
+        return true;
+    }
+    const int requested = command->action.integerValue;
+    if (requested != 0 && requested != 1) {
+        command->error = L"DirectUI toggle requires a two-state value";
+        return true;
+    }
+    const HWND root = command->agent->Root();
+    struct ActiveWindowScope final {
+        HWND previous = nullptr;
+        bool changed = false;
+        ~ActiveWindowScope() { if (changed) SetActiveWindow(previous); }
+    } activeScope{ GetActiveWindow(), false };
+    if (activeScope.previous != root) {
+        SetActiveWindow(root);
+        activeScope.changed = GetActiveWindow() == root;
+        if (!activeScope.changed) {
+            command->error = L"DirectUI toggle could not activate the cloaked native dialog";
+            return true;
+        }
+    }
+    int current = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
+    const int initial = current;
+    const HWND active = GetActiveWindow();
+    const HWND foreground = GetForegroundWindow();
+    if (current != BST_CHECKED && current != BST_UNCHECKED) {
+        command->error = L"DirectUI toggle backing state is not two-state";
+        return true;
+    }
+    for (int attempt = 0; current != requested && attempt < 2; ++attempt) {
+        if (AbortIfCancelled(command)) return false;
+        SendMessageW(target, BM_CLICK, 0, 0);
+        const int next = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
+        if (next != BST_CHECKED && next != BST_UNCHECKED) break;
+        if (next == current) break;
+        current = next;
+    }
+    command->success = current == requested;
+    if (!command->success) {
+        command->error = L"DirectUI toggle did not reach the requested state (requested=" +
+            std::to_wstring(requested) + L", initial=" + std::to_wstring(initial) +
+            L", final=" + std::to_wstring(current) + L", active=" +
+            std::to_wstring(reinterpret_cast<uintptr_t>(active)) + L", foreground=" +
+            std::to_wstring(reinterpret_cast<uintptr_t>(foreground)) + L")";
+    }
+    return true;
+}
+
+bool ExecuteDirectUiMove(Command* command) {
+    DirectUiNativeEvidence before;
+    if (!command->profile ||
+        !CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, before, command->error) ||
+        !MatchDirectUiMutationBracket(*command->profile,
+            command->expectedDirectUiEvidence, before, command->error, false)) {
+        return true;
+    }
+    const RECT requested = command->action.rect;
+    const int64_t beforeWidth = static_cast<int64_t>(before.root.bounds.right) -
+        before.root.bounds.left;
+    const int64_t beforeHeight = static_cast<int64_t>(before.root.bounds.bottom) -
+        before.root.bounds.top;
+    const int64_t requestedWidth = static_cast<int64_t>(requested.right) - requested.left;
+    const int64_t requestedHeight = static_cast<int64_t>(requested.bottom) - requested.top;
+    if (beforeWidth != requestedWidth || beforeHeight != requestedHeight) {
+        command->error = L"DirectUI move cannot change the admitted window size";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    if (!SetWindowPos(command->agent->Root(), nullptr,
+            requested.left, requested.top,
+            static_cast<int>(requestedWidth), static_cast<int>(requestedHeight),
+            SWP_NOZORDER | SWP_NOACTIVATE)) {
+        command->error = L"DirectUI native move failed";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    DirectUiNativeEvidence after;
+    if (!CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, after, command->error) ||
+        !MatchDirectUiMoveTransition(*command->profile, before, after, command->error)) {
+        return true;
+    }
+    command->directUiEvidence = std::move(after);
+    command->agent->ClearDirty();
+    command->success = true;
+    return true;
+}
+
 bool ExecuteRestore(Command* command) {
     auto* agent = command->agent;
     if (AbortIfCancelled(command)) return false;
@@ -768,8 +1039,10 @@ bool ExecuteShutdown(Command* command) {
     EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM) -> BOOL {
         RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
         RemovePropW(child, kNodeGenerationProperty);
+        RemovePropW(child, kDirectUiGenerationProperty);
         return TRUE;
     }, 0);
+    RemovePropW(command->agent->Root(), kDirectUiGenerationProperty);
     RemoveWindowSubclass(command->agent->Root(), RootSubclassProc, kRootSubclassId);
     command->success = true;
     return true;
@@ -785,6 +1058,12 @@ CommandHandler HandlerFor(UINT kind) noexcept {
     case kCommandCaptureAndCloak: return &ExecuteCaptureAndCloak;
     case kCommandRestore: return &ExecuteRestore;
     case kCommandShutdown: return &ExecuteShutdown;
+    case kCommandCaptureDirectUiEvidence: return &ExecuteCaptureDirectUiEvidence;
+    case kCommandVerifyDirectUiAndCloak: return &ExecuteVerifyDirectUiAndCloak;
+    case kCommandRestoreThenDirectUiClick: return &ExecuteRestoreThenDirectUiClick;
+    case kCommandDirectUiToggle: return &ExecuteDirectUiToggle;
+    case kCommandDirectUiMove: return &ExecuteDirectUiMove;
+    case kCommandCaptureDirectUiBootstrap: return &ExecuteCaptureDirectUiBootstrap;
     default: return nullptr;
     }
 }
@@ -857,7 +1136,7 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
     case HCBT_DESTROYWND:
     case HCBT_MINMAX:
     case HCBT_MOVESIZE:
-        MarkCurrentThreadAgentsDirty();
+        MarkCurrentThreadAgentsDirty(reinterpret_cast<HWND>(wParam));
         break;
     default:
         break;
@@ -869,7 +1148,7 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code >= 0 && lParam) {
         const auto* message = reinterpret_cast<CWPRETSTRUCT*>(lParam);
         if (RelevantMessage(message->message) || message->message == WM_NCDESTROY) {
-            MarkCurrentThreadAgentsDirty();
+            MarkCurrentThreadAgentsDirty(message->hwnd, message->message);
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -881,6 +1160,16 @@ SourceThreadAgent::SourceThreadAgent(
     HWND root, HMODULE module, DWORD threadId, UINT message) noexcept
     : root_(root), module_(module), threadId_(threadId), message_(message),
       generation_(g_nextGeneration.fetch_add(1)) {}
+
+uint64_t SourceThreadAgent::DirectUiWindowGeneration(HWND window) noexcept {
+    if (!window || GetCurrentThreadId() != threadId_) return 0;
+    const auto existing = reinterpret_cast<uintptr_t>(
+        GetPropW(window, kDirectUiGenerationProperty));
+    if (existing) return existing;
+    const uint64_t value = nextDirectUiWindowGeneration_++;
+    return SetPropW(window, kDirectUiGenerationProperty,
+        reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value))) ? value : 0;
+}
 
 uint64_t SourceThreadAgent::RegisterCloseRequest() noexcept {
     const uint64_t sequence = closeIssued_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -954,14 +1243,14 @@ std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(HWND root, HMODULE 
     }
     command->capture.generation = agent->generation_;
     command->capture.surfaceId = L"00000000-0000-0000-0000-000000000000";
-    const bool posted = agent->Post(command, 2000, nullptr);
-    const bool success = posted && command->success;
-    if (!success) {
-        const std::wstring detail = posted
-            ? command->error
-            : L"source UI thread acknowledgement timed out";
+    bool posted = agent->Post(command, 2000, nullptr);
+    bool success = posted && command->success;
+    const std::wstring initialCaptureError = success
+        ? std::wstring()
+        : (posted ? command->error : L"source UI thread acknowledgement timed out");
+    if (!success && !posted) {
         FluentShell::Log(L"Initial source capture failed within the 2 s deadline: " +
-            detail);
+            initialCaptureError);
     }
     if (!posted) {
         // The hook may already be inside ExecuteCommand. Keep every pointer used
@@ -970,6 +1259,50 @@ std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(HWND root, HMODULE 
         ScheduleTimedOutAttachCleanup(agent, command);
     }
     Release(command);
+    if (!success && posted) {
+        // A generic-capture failure on a profile-matched process falls back to
+        // DirectUI admission; the resolved profile travels with the agent so
+        // every later evidence/handoff command validates the same contract.
+        std::wstring imagePath;
+        std::wstring processError;
+        const DirectUiWindowProfile* profile =
+            ResolveDirectUiWindowProfile(imagePath, processError);
+        if (profile) {
+            FluentShell::Log(L"Generic capture deferred to DirectUI adapter " +
+                std::wstring(profile->adapterId) + L" page=" +
+                std::wstring(profile->pageId) + L": " + initialCaptureError);
+            agent->directUiProfile_ = profile;
+            command = CreateCommand(kCommandCaptureDirectUiEvidence, agent.get());
+            if (command) {
+                command->profile = profile;
+                posted = agent->Post(command, 2000, nullptr);
+                success = posted && command->success;
+                if (!success) FluentShell::Log(L"Exact DirectUI profile page '" +
+                    std::wstring(profile->pageId) +
+                    L"' did not match at attach A: " + command->error);
+                Release(command);
+            }
+        } else {
+            FluentShell::Log(L"Initial source capture failed within the 2 s deadline: " +
+                initialCaptureError);
+            if (!processError.empty()) {
+                FluentShell::Log(L"DirectUI application adapter not applicable: " + processError);
+            }
+        }
+        if (!success && posted) {
+            std::wstring genericImagePath;
+            std::wstring genericError;
+            if (ResolveGenericDirectUiImage(genericImagePath, genericError)) {
+                agent->directUiProfile_ = nullptr;
+                agent->genericDirectUiCandidate_ = true;
+                success = true;
+                FluentShell::Log(
+                    L"DirectUI surface deferred to capability-derived generic admission");
+            } else {
+                FluentShell::Log(L"Generic DirectUI admission not applicable: " + genericError);
+            }
+        }
+    }
     if (!success) {
         if (posted) {
             agent->UnhookAll();
@@ -1138,6 +1471,138 @@ bool SourceThreadAgent::Restore(
     return success;
 }
 
+bool SourceThreadAgent::CaptureDirectUiNativeEvidence(
+    const DirectUiWindowProfile& profile,
+    DirectUiNativeEvidence& evidence,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandCaptureDirectUiEvidence, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI native evidence capture";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    if (success) evidence = std::move(command->directUiEvidence);
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::VerifyDirectUiAndCloak(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& expected,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandVerifyDirectUiAndCloak, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    command->expectedDirectUiEvidence = expected;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI cloak barrier";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::RestoreThenDirectUiButtonClick(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& expected,
+    const DirectUiActionBinding& binding,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandRestoreThenDirectUiClick, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    command->expectedDirectUiEvidence = expected;
+    command->directUiBinding = binding;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI handoff";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::InvokeDirectUiToggle(
+    const DirectUiActionBinding& binding,
+    int requested,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandDirectUiToggle, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->directUiBinding = binding;
+    command->action.integerValue = requested;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI toggle";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::CaptureDirectUiBootstrapEvidence(
+    DirectUiBootstrapEvidence& evidence,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandCaptureDirectUiBootstrap, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI bootstrap capture";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    if (success) evidence = std::move(command->directUiBootstrapEvidence);
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::MoveDirectUiWindow(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& expected,
+    const RECT& bounds,
+    DirectUiNativeEvidence& evidence,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandDirectUiMove, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    command->expectedDirectUiEvidence = expected;
+    command->action.action = L"move";
+    command->action.rect = bounds;
+    command->action.hasRect = true;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI move";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    if (success) evidence = std::move(command->directUiEvidence);
+    Release(command);
+    return success;
+}
+
 bool SourceThreadAgent::CaptureAndCloak(
     WindowSnapshot& snapshot,
     uint64_t expectedFingerprint,
@@ -1164,6 +1629,12 @@ bool SourceThreadAgent::CaptureAndCloak(
     if (!success) error = command->error;
     Release(command);
     return success;
+}
+
+void SourceThreadAgent::AdoptDirectUiProfile(
+    std::shared_ptr<DirectUiOwnedProfile> profile) noexcept {
+    ownedDirectUiProfile_ = std::move(profile);
+    directUiProfile_ = ownedDirectUiProfile_ ? &ownedDirectUiProfile_->profile : nullptr;
 }
 
 bool SourceThreadAgent::Shutdown() noexcept {

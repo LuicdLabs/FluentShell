@@ -16,6 +16,15 @@ namespace {
 constexpr size_t kMaxListViewColumns = 64;
 constexpr size_t kMaxStatusBarParts = 64;
 constexpr size_t kMaxStructuredTextChars = 256 * 1024;
+constexpr size_t kMaxTabLabelChars = 4096;
+
+struct IconBitmaps final {
+    ICONINFO info{};
+    ~IconBitmaps() {
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+    }
+};
 
 // Every adapter reports refusals the same way, so the rejection reason and the
 // `false` return can never drift apart.
@@ -43,6 +52,12 @@ bool ProbeStatic(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
     case SS_ETCHEDHORZ:
     case SS_ETCHEDVERT:
         kind = ControlKind::Separator;
+        return true;
+    case SS_ICON:
+        if ((style & (SS_NOTIFY | WS_TABSTOP)) != 0) {
+            return Reject(reason, L"interactive Static icon is not supported");
+        }
+        kind = ControlKind::StaticIcon;
         return true;
     default:
         return Reject(reason, L"unsupported Static draw style");
@@ -112,9 +127,9 @@ bool ProbeListBox(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
 }
 
 bool ProbeProgressBar(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & (PBS_MARQUEE | PBS_VERTICAL | WS_TABSTOP)) != 0) {
+    if ((style & (PBS_VERTICAL | WS_TABSTOP)) != 0) {
         return Reject(reason,
-            L"marquee, vertical, or tab-stop ProgressBar is not supported");
+            L"vertical or tab-stop ProgressBar is not supported");
     }
     kind = ControlKind::ProgressBar;
     return true;
@@ -132,21 +147,39 @@ bool ProbeSysLink(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
 }
 
 bool ProbeListView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & LVS_TYPEMASK) != LVS_REPORT || (style & LVS_NOCOLUMNHEADER) != 0 ||
+    if ((style & LVS_TYPEMASK) != LVS_REPORT ||
         (style & (LVS_OWNERDATA | LVS_OWNERDRAWFIXED | LVS_EDITLABELS)) != 0) {
         return Reject(reason,
-            L"ListView is virtual, owner-draw, label-editable, headerless, or not in report view");
+            L"ListView is virtual, owner-draw, label-editable, or not in report view");
     }
     if (SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0) != FALSE) {
         return Reject(reason, L"grouped ListView is not supported");
     }
-    constexpr DWORD unsupportedExtended = LVS_EX_CHECKBOXES | LVS_EX_HEADERDRAGDROP |
-        LVS_EX_TRACKSELECT | LVS_EX_ONECLICKACTIVATE | LVS_EX_TWOCLICKACTIVATE;
+    constexpr DWORD unsupportedExtended = LVS_EX_HEADERDRAGDROP | LVS_EX_TRACKSELECT |
+        LVS_EX_ONECLICKACTIVATE | LVS_EX_TWOCLICKACTIVATE;
     const auto extended = static_cast<DWORD>(
         SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
-    if ((extended & unsupportedExtended) != 0) {
-        return Reject(reason,
-            L"ListView requires unsupported checkbox, header-drag, or activation semantics");
+    const DWORD rejected = extended & unsupportedExtended;
+    if (rejected != 0) {
+        struct ExtendedFlag final { DWORD value; const wchar_t* name; };
+        static constexpr ExtendedFlag flags[] = {
+            { LVS_EX_HEADERDRAGDROP, L"LVS_EX_HEADERDRAGDROP" },
+            { LVS_EX_TRACKSELECT, L"LVS_EX_TRACKSELECT" },
+            { LVS_EX_ONECLICKACTIVATE, L"LVS_EX_ONECLICKACTIVATE" },
+            { LVS_EX_TWOCLICKACTIVATE, L"LVS_EX_TWOCLICKACTIVATE" },
+        };
+        reason = L"ListView has unsupported extended flag(s) ";
+        bool first = true;
+        for (const auto& flag : flags) {
+            if ((rejected & flag.value) == 0) continue;
+            if (!first) reason += L"|";
+            reason += flag.name;
+            first = false;
+        }
+        wchar_t numeric[64]{};
+        swprintf_s(numeric, L" (unsupported=0x%08lX, extended=0x%08lX)", rejected, extended);
+        reason += numeric;
+        return false;
     }
     kind = ControlKind::ListView;
     return true;
@@ -157,6 +190,114 @@ bool ProbeStatusBar(HWND, DWORD style, ControlKind& kind, std::wstring& reason) 
         return Reject(reason, L"tab-stop StatusBar is not supported");
     }
     kind = ControlKind::StatusBar;
+    return true;
+}
+
+bool ProbeToolbar(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    if (exStyle != 0) {
+        wchar_t text[112]{};
+        swprintf_s(text, L"ToolbarWindow32 requires exStyle 0 (actual=0x%08lX)", exStyle);
+        reason = text;
+        return false;
+    }
+    const DWORD toolbarStyle = style & 0xffffu;
+    constexpr DWORD accepted = CCS_TOP | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE |
+        TBSTYLE_FLAT | TBSTYLE_TRANSPARENT;
+    if ((toolbarStyle & ~accepted) != 0) {
+        wchar_t text[128]{};
+        swprintf_s(text, L"ToolbarWindow32 has unsupported style bits 0x%04lX (style=0x%08lX)",
+            toolbarStyle & ~accepted, style);
+        reason = text;
+        return false;
+    }
+    const auto extended = static_cast<DWORD>(SendMessageW(hwnd, TB_GETEXTENDEDSTYLE, 0, 0));
+    if (extended != 0) {
+        wchar_t text[112]{};
+        swprintf_s(text, L"ToolbarWindow32 has unsupported extended style 0x%08lX", extended);
+        reason = text;
+        return false;
+    }
+    if (SendMessageW(hwnd, TB_GETHOTIMAGELIST, 0, 0) != 0 ||
+        SendMessageW(hwnd, TB_GETDISABLEDIMAGELIST, 0, 0) != 0 ||
+        SendMessageW(hwnd, TB_GETPRESSEDIMAGELIST, 0, 0) != 0) {
+        return Reject(reason, L"ToolbarWindow32 has unsupported hot, disabled, or pressed image lists");
+    }
+    kind = ControlKind::Toolbar;
+    return true;
+}
+
+bool ProbeTabControl(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    const DWORD unsupportedExStyle = exStyle & ~WS_EX_NOPARENTNOTIFY;
+    if (unsupportedExStyle != 0) {
+        wchar_t text[112]{};
+        swprintf_s(text,
+            L"TabControl has unsupported window exStyle bits 0x%08lX (exStyle=0x%08lX)",
+            unsupportedExStyle, exStyle);
+        reason = text;
+        return false;
+    }
+    const DWORD tabStyle = style & 0xffffu;
+    if ((tabStyle & TCS_OWNERDRAWFIXED) != 0)
+        return Reject(reason, L"TabControl TCS_OWNERDRAWFIXED is not supported");
+    if ((tabStyle & (TCS_BUTTONS | TCS_FLATBUTTONS)) != 0)
+        return Reject(reason, L"TabControl button and flat-button modes are not supported");
+    if ((tabStyle & (TCS_VERTICAL | TCS_BOTTOM)) != 0)
+        return Reject(reason, L"TabControl vertical, right, and bottom placement is not supported");
+    if ((tabStyle & TCS_FIXEDWIDTH) != 0)
+        return Reject(reason, L"TabControl TCS_FIXEDWIDTH cannot be captured faithfully");
+    if ((tabStyle & TCS_TOOLTIPS) != 0 ||
+        SendMessageW(hwnd, TCM_GETTOOLTIPS, 0, 0) != 0)
+        return Reject(reason, L"TabControl tooltips are not supported");
+
+    constexpr DWORD accepted = TCS_MULTILINE | TCS_HOTTRACK;
+    const DWORD unsupported = tabStyle & ~accepted;
+    if (unsupported != 0) {
+        wchar_t text[128]{};
+        swprintf_s(text,
+            L"TabControl has unsupported style bits 0x%04lX (tabStyle=0x%04lX)",
+            unsupported, tabStyle);
+        reason = text;
+        return false;
+    }
+    const DWORD extended = static_cast<DWORD>(
+        SendMessageW(hwnd, TCM_GETEXTENDEDSTYLE, 0, 0));
+    if (extended != 0) {
+        wchar_t text[96]{};
+        swprintf_s(text, L"TabControl has unsupported extended style 0x%08lX", extended);
+        reason = text;
+        return false;
+    }
+    if (SendMessageW(hwnd, TCM_GETIMAGELIST, 0, 0) != 0)
+        return Reject(reason, L"TabControl image-backed tabs are not supported");
+    kind = ControlKind::TabControl;
+    return true;
+}
+
+bool ProbeDialogContainer(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    if ((style & (WS_CHILD | DS_CONTROL)) != (WS_CHILD | DS_CONTROL) ||
+        (exStyle & WS_EX_CONTROLPARENT) == 0) {
+        return Reject(reason, L"child dialog is not a DS_CONTROL navigation container");
+    }
+    constexpr DWORD unsupportedStyle = WS_CAPTION | WS_THICKFRAME | WS_BORDER |
+        WS_DLGFRAME | WS_HSCROLL | WS_VSCROLL | WS_SYSMENU | DS_MODALFRAME;
+    constexpr DWORD unsupportedExStyle = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE |
+        WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_LAYERED;
+    if ((style & unsupportedStyle) != 0 || (exStyle & unsupportedExStyle) != 0) {
+        return Reject(reason, L"DS_CONTROL child dialog has unsupported visible chrome");
+    }
+    if (const HMENU menu = GetMenu(hwnd); menu && IsMenu(menu)) {
+        return Reject(reason, L"DS_CONTROL child dialog has a menu");
+    }
+    HRGN region = CreateRectRgn(0, 0, 0, 0);
+    const int regionType = region ? GetWindowRgn(hwnd, region) : ERROR;
+    if (region) DeleteObject(region);
+    if (regionType != ERROR) {
+        return Reject(reason, L"DS_CONTROL child dialog has a custom region");
+    }
+    kind = ControlKind::DialogContainer;
     return true;
 }
 
@@ -178,7 +319,10 @@ constexpr std::array kClassAdapters{
     ClassAdapter{ PROGRESS_CLASSW, &ProbeProgressBar },
     ClassAdapter{ WC_LINK, &ProbeSysLink },
     ClassAdapter{ WC_LISTVIEWW, &ProbeListView },
+    ClassAdapter{ WC_TABCONTROLW, &ProbeTabControl },
+    ClassAdapter{ L"#32770", &ProbeDialogContainer },
     ClassAdapter{ STATUSCLASSNAMEW, &ProbeStatusBar },
+    ClassAdapter{ TOOLBARCLASSNAMEW, &ProbeToolbar },
 };
 
 // ---------------------------------------------------------------------------
@@ -187,6 +331,151 @@ constexpr std::array kClassAdapters{
 // One function per projected kind, reading only what that kind adds on top of
 // the facets every control shares.
 // ---------------------------------------------------------------------------
+
+bool ReadMaskBitmap(
+    HBITMAP bitmap,
+    int width,
+    int height,
+    std::vector<uint8_t>& bits,
+    size_t& stride,
+    std::wstring& reason) {
+    stride = (static_cast<size_t>(width) + 31u) / 32u * 4u;
+    if (height <= 0 || stride > Ipc::kMaxImageBytes ||
+        static_cast<size_t>(height) > Ipc::kMaxImageBytes / stride) {
+        return Reject(reason, L"Static icon mask dimensions are invalid");
+    }
+    bits.resize(stride * static_cast<size_t>(height));
+    struct MonoBitmapInfo final {
+        BITMAPINFOHEADER header{};
+        RGBQUAD colors[2]{};
+    } info;
+    info.header.biSize = sizeof(BITMAPINFOHEADER);
+    info.header.biWidth = width;
+    info.header.biHeight = height;
+    info.header.biPlanes = 1;
+    info.header.biBitCount = 1;
+    info.header.biCompression = BI_RGB;
+    info.colors[1] = RGBQUAD{ 0xff, 0xff, 0xff, 0 };
+    const HDC dc = GetDC(nullptr);
+    const int rows = dc ? GetDIBits(dc, bitmap, 0, static_cast<UINT>(height),
+        bits.data(), reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS) : 0;
+    if (dc) ReleaseDC(nullptr, dc);
+    if (rows != height) return Reject(reason, L"Static icon mask pixels are unavailable");
+    return true;
+}
+
+bool MaskBit(
+    const std::vector<uint8_t>& bits,
+    size_t stride,
+    int bitmapHeight,
+    int x,
+    int logicalY) noexcept {
+    const size_t row = static_cast<size_t>(bitmapHeight - 1 - logicalY) * stride;
+    return (bits[row + static_cast<size_t>(x) / 8] &
+        (0x80u >> (static_cast<unsigned>(x) & 7u))) != 0;
+}
+
+bool CaptureIconPixels(
+    HICON icon,
+    uint32_t& imageWidth,
+    uint32_t& imageHeight,
+    std::wstring& imageFormat,
+    std::vector<uint8_t>& imageData,
+    std::wstring& reason) {
+    IconBitmaps bitmaps;
+    if (!GetIconInfo(icon, &bitmaps.info) || !bitmaps.info.hbmMask) {
+        return Reject(reason, L"Static icon bitmap copies are unavailable");
+    }
+    BITMAP maskBitmap{};
+    BITMAP colorBitmap{};
+    if (GetObjectW(bitmaps.info.hbmMask, sizeof(maskBitmap), &maskBitmap) != sizeof(maskBitmap) ||
+        (bitmaps.info.hbmColor &&
+            GetObjectW(bitmaps.info.hbmColor, sizeof(colorBitmap), &colorBitmap) != sizeof(colorBitmap))) {
+        return Reject(reason, L"Static icon bitmap metadata is unavailable");
+    }
+    const int width = bitmaps.info.hbmColor ? colorBitmap.bmWidth : maskBitmap.bmWidth;
+    const int height = bitmaps.info.hbmColor ? colorBitmap.bmHeight : maskBitmap.bmHeight / 2;
+    if (width <= 0 || height <= 0 || width > static_cast<int>(Ipc::kMaxImageDimension) ||
+        height > static_cast<int>(Ipc::kMaxImageDimension) ||
+        maskBitmap.bmWidth < width ||
+        maskBitmap.bmHeight != height * (bitmaps.info.hbmColor ? 1 : 2)) {
+        return Reject(reason, L"Static icon dimensions exceed the bounded payload");
+    }
+    const size_t byteCount = static_cast<size_t>(width) * height * 4u;
+    if (byteCount == 0 || byteCount > Ipc::kMaxImageBytes) {
+        return Reject(reason, L"Static icon decoded payload exceeds the byte cap");
+    }
+
+    std::vector<uint8_t> mask;
+    size_t maskStride = 0;
+    if (!ReadMaskBitmap(bitmaps.info.hbmMask, maskBitmap.bmWidth,
+            maskBitmap.bmHeight, mask, maskStride, reason)) return false;
+
+    imageData.assign(byteCount, 0);
+    if (bitmaps.info.hbmColor) {
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        const HDC dc = GetDC(nullptr);
+        const int rows = dc ? GetDIBits(dc, bitmaps.info.hbmColor, 0,
+            static_cast<UINT>(height), imageData.data(), &info, DIB_RGB_COLORS) : 0;
+        if (dc) ReleaseDC(nullptr, dc);
+        if (rows != height) return Reject(reason, L"Static icon color pixels are unavailable");
+
+        bool anyAlpha = false;
+        for (size_t offset = 3; offset < imageData.size(); offset += 4) {
+            if (imageData[offset] != 0) { anyAlpha = true; break; }
+        }
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+                uint8_t& alpha = imageData[offset + 3];
+                if (!anyAlpha) alpha = MaskBit(mask, maskStride, maskBitmap.bmHeight, x, y) ? 0 : 255;
+                if (alpha == 0) {
+                    imageData[offset] = imageData[offset + 1] =
+                        imageData[offset + 2] = 0;
+                } else if (anyAlpha && alpha != 255) {
+                    for (size_t channel = 0; channel < 3; ++channel) {
+                        imageData[offset + channel] = static_cast<uint8_t>(
+                            (static_cast<unsigned>(imageData[offset + channel]) * alpha + 127u) / 255u);
+                    }
+                }
+            }
+        }
+    } else {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const bool transparent = MaskBit(mask, maskStride, maskBitmap.bmHeight, x, y);
+                const bool white = MaskBit(mask, maskStride, maskBitmap.bmHeight, x, y + height);
+                if (transparent && white) {
+                    return Reject(reason, L"Static monochrome icon contains unsupported invert pixels");
+                }
+                const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
+                imageData[offset] = imageData[offset + 1] =
+                    imageData[offset + 2] = white ? 255 : 0;
+                imageData[offset + 3] = transparent ? 0 : 255;
+                if (transparent) imageData[offset] = imageData[offset + 1] =
+                    imageData[offset + 2] = 0;
+            }
+        }
+    }
+    imageWidth = static_cast<uint32_t>(width);
+    imageHeight = static_cast<uint32_t>(height);
+    imageFormat = L"bgra8-premultiplied";
+    return true;
+}
+
+bool CaptureStaticIconState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    HICON icon = reinterpret_cast<HICON>(SendMessageW(hwnd, STM_GETICON, 0, 0));
+    if (!icon) icon = reinterpret_cast<HICON>(SendMessageW(hwnd, STM_GETIMAGE, IMAGE_ICON, 0));
+    if (!icon) return Reject(reason, L"Static icon has no current HICON");
+    return CaptureIconPixels(icon, node.imageWidth, node.imageHeight,
+        node.imageFormat, node.imageData, reason);
+}
 
 bool ReadStringItems(
     HWND hwnd,
@@ -331,6 +620,26 @@ bool ReadListViewSelection(
     }
 }
 
+bool ReadListViewChecks(
+    HWND hwnd,
+    size_t itemCount,
+    bool checkBoxes,
+    std::vector<int>& checkedIndices,
+    std::wstring& reason) {
+    checkedIndices.clear();
+    if (!checkBoxes) return true;
+    checkedIndices.reserve(itemCount);
+    for (size_t index = 0; index < itemCount; ++index) {
+        const UINT stateImage = ListView_GetItemState(
+            hwnd, static_cast<int>(index), LVIS_STATEIMAGEMASK) >> 12;
+        if (stateImage == 2) checkedIndices.push_back(static_cast<int>(index));
+        else if (stateImage != 1) {
+            return Reject(reason, L"ListView checkbox state image is not canonical");
+        }
+    }
+    return true;
+}
+
 bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const LRESULT count = SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0);
     if (count < 0 || count > static_cast<LRESULT>(Ipc::kMaxListItems)) {
@@ -338,10 +647,19 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     }
     const HWND header = reinterpret_cast<HWND>(SendMessageW(hwnd, LVM_GETHEADER, 0, 0));
     const int columnCount = header && IsWindow(header) ? Header_GetItemCount(header) : 0;
-    if (columnCount <= 0 || static_cast<size_t>(columnCount) > kMaxListViewColumns) {
-        return Reject(reason, L"ListView has no bounded report columns");
+    if (columnCount <= 0) {
+        return Reject(reason,
+            L"ListView has no native report columns for faithful bounded projection");
+    }
+    if (static_cast<size_t>(columnCount) > kMaxListViewColumns) {
+        return Reject(reason, L"ListView has excessive report columns");
     }
     if (!ValidateListViewColumns(hwnd, header, columnCount, reason)) return false;
+    node.columnHeadersVisible =
+        (static_cast<DWORD>(node.style) & LVS_NOCOLUMNHEADER) == 0;
+    const auto extended = static_cast<DWORD>(
+        SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
+    node.checkBoxes = (extended & LVS_EX_CHECKBOXES) != 0;
 
     size_t totalText = 0;
     const auto withinTextBudget = [&](size_t added) {
@@ -377,6 +695,10 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     }
 
     if (!ReadListViewSelection(hwnd, node.rows.size(), node.selectedIndices, reason)) {
+        return false;
+    }
+    if (!ReadListViewChecks(
+            hwnd, node.rows.size(), node.checkBoxes, node.checkedIndices, reason)) {
         return false;
     }
     node.focusedIndex = static_cast<int>(SendMessageW(
@@ -579,6 +901,7 @@ bool CaptureProgressState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.minimum = range.iLow;
     node.maximum = range.iHigh;
     node.position = static_cast<int>(SendMessageW(hwnd, PBM_GETPOS, 0, 0));
+    node.indeterminate = (static_cast<DWORD>(node.style) & PBS_MARQUEE) != 0;
     if (node.maximum <= node.minimum || node.position < node.minimum ||
         node.position > node.maximum) {
         return Reject(reason, L"ProgressBar has an invalid native range or position");
@@ -586,12 +909,198 @@ bool CaptureProgressState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     return true;
 }
 
+bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    const LRESULT rawCount = SendMessageW(hwnd, TCM_GETITEMCOUNT, 0, 0);
+    if (rawCount <= 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxTabItems))
+        return Reject(reason, L"TabControl item count is empty, invalid, or excessive");
+    const size_t count = static_cast<size_t>(rawCount);
+    const int selected = static_cast<int>(SendMessageW(hwnd, TCM_GETCURSEL, 0, 0));
+    if (selected < 0 || static_cast<size_t>(selected) >= count)
+        return Reject(reason, L"TabControl selected index is outside its items");
+
+    RECT client{};
+    if (!GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0)
+        return Reject(reason, L"TabControl client geometry is unavailable");
+    node.items.clear();
+    node.itemRects.clear();
+    node.items.reserve(count);
+    node.itemRects.reserve(count);
+    size_t totalText = 0;
+    std::vector<wchar_t> buffer(kMaxTabLabelChars + 1);
+    for (size_t index = 0; index < count; ++index) {
+        std::fill(buffer.begin(), buffer.end(), L'\0');
+        TCITEMW item{};
+        item.mask = TCIF_TEXT | TCIF_IMAGE | TCIF_PARAM | TCIF_STATE;
+        item.dwStateMask = 0xffffffffu;
+        item.pszText = buffer.data();
+        item.cchTextMax = static_cast<int>(buffer.size());
+        item.iImage = -1;
+        if (!SendMessageW(hwnd, TCM_GETITEMW, index, reinterpret_cast<LPARAM>(&item)))
+            return Reject(reason, L"TabControl item text or metadata is unavailable");
+        if (item.pszText == LPSTR_TEXTCALLBACKW)
+            return Reject(reason, L"TabControl callback text is not supported");
+        if (item.iImage != -1)
+            return Reject(reason, L"TabControl image-backed item is not supported");
+        // lParam is opaque application identity. It remains owned by the native
+        // item and is deliberately neither interpreted nor copied to ControlNode.
+        constexpr DWORD acceptedState = TCIS_BUTTONPRESSED | TCIS_HIGHLIGHTED;
+        if ((item.dwState & ~acceptedState) != 0)
+            return Reject(reason, L"TabControl custom item state is not supported");
+        const size_t length = wcsnlen_s(buffer.data(), buffer.size());
+        if (length == 0)
+            return Reject(reason, L"TabControl requires nonempty textual labels");
+        if (length >= kMaxTabLabelChars)
+            return Reject(reason, L"TabControl item label exceeds the text cap");
+        if (totalText > kMaxStructuredTextChars - length)
+            return Reject(reason, L"TabControl labels exceed the aggregate text cap");
+        totalText += length;
+
+        RECT rect{};
+        if (!SendMessageW(hwnd, TCM_GETITEMRECT, index, reinterpret_cast<LPARAM>(&rect)) ||
+            rect.left < 0 || rect.top < 0 || rect.right <= rect.left ||
+            rect.bottom <= rect.top || rect.right > client.right || rect.bottom > client.bottom)
+            return Reject(reason, L"TabControl item rectangle is malformed or outside client bounds");
+        for (const RECT& previous : node.itemRects) {
+            if (rect.left < previous.right && rect.right > previous.left &&
+                rect.top < previous.bottom && rect.bottom > previous.top)
+                return Reject(reason, L"TabControl item rectangles overlap");
+        }
+        node.items.emplace_back(buffer.data(), length);
+        node.itemRects.push_back(rect);
+    }
+    node.selectedIndex = selected;
+    return true;
+}
+
+bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    const LRESULT rawCount = SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0);
+    if (rawCount <= 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxToolbarItems))
+        return Reject(reason, L"ToolbarWindow32 button count is empty, invalid, or exceeds 64");
+    if (SendMessageW(hwnd, TB_GETROWS, 0, 0) != 1)
+        return Reject(reason, L"ToolbarWindow32 TB_GETROWS reports multiple rows");
+
+    const HIMAGELIST images = reinterpret_cast<HIMAGELIST>(
+        SendMessageW(hwnd, TB_GETIMAGELIST, 0, 0));
+    int imageWidth = 0;
+    int imageHeight = 0;
+    const int imageCount = images ? ImageList_GetImageCount(images) : 0;
+    if (!images || imageCount <= 0 || !ImageList_GetIconSize(images, &imageWidth, &imageHeight) ||
+        imageWidth <= 0 || imageHeight <= 0 ||
+        imageWidth > static_cast<int>(Ipc::kMaxImageDimension) ||
+        imageHeight > static_cast<int>(Ipc::kMaxImageDimension)) {
+        return Reject(reason, L"ToolbarWindow32 normal image list is missing, invalid, or outside the image cap");
+    }
+    RECT client{};
+    if (!GetClientRect(hwnd, &client) || client.right <= client.left || client.bottom <= client.top)
+        return Reject(reason, L"ToolbarWindow32 client geometry is unavailable");
+
+    std::vector<uint32_t> commandIds;
+    node.text.clear();
+    node.automationName = L"Toolbar";
+    node.toolbarItems.clear();
+    node.toolbarItems.reserve(static_cast<size_t>(rawCount));
+    bool haveVisibleBand = false;
+    LONG bandTop = 0;
+    LONG bandBottom = 0;
+    LONG previousRight = client.left;
+    size_t totalText = 0;
+    for (int index = 0; index < rawCount; ++index) {
+        TBBUTTON button{};
+        if (!SendMessageW(hwnd, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&button)))
+            return Reject(reason, L"ToolbarWindow32 TB_GETBUTTON failed");
+        if (button.dwData != 0)
+            return Reject(reason, L"ToolbarWindow32 button has nonzero opaque dwData semantics");
+        if ((button.fsState & ~(TBSTATE_ENABLED | TBSTATE_HIDDEN)) != 0) {
+            if ((button.fsState & TBSTATE_WRAP) != 0)
+                return Reject(reason, L"ToolbarWindow32 button has TBSTATE_WRAP multi-row semantics");
+            return Reject(reason, L"ToolbarWindow32 button has unsupported checked, pressed, marked, or indeterminate state");
+        }
+
+        ToolbarItemSnapshot item;
+        item.enabled = (button.fsState & TBSTATE_ENABLED) != 0;
+        item.hidden = (button.fsState & TBSTATE_HIDDEN) != 0;
+        const BYTE type = button.fsStyle & (BTNS_SEP | BTNS_CHECK | BTNS_GROUP | BTNS_DROPDOWN);
+        if (type == BTNS_SEP) {
+            if ((button.fsStyle & ~BTNS_SEP) != 0)
+                return Reject(reason, L"ToolbarWindow32 separator has unsupported style semantics");
+            item.kind = ToolbarItemKind::Separator;
+        } else {
+            constexpr BYTE acceptedButtonStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+            if (type != BTNS_BUTTON || (button.fsStyle & ~acceptedButtonStyle) != 0)
+                return Reject(reason, L"ToolbarWindow32 dropdown, check, group, or custom button style is not supported");
+            if (button.idCommand <= 0 || button.idCommand > 0xffff)
+                return Reject(reason, L"ToolbarWindow32 push button command ID is outside the 16-bit WM_COMMAND range");
+            item.commandId = static_cast<uint32_t>(button.idCommand);
+            if (std::find(commandIds.begin(), commandIds.end(), item.commandId) != commandIds.end())
+                return Reject(reason, L"ToolbarWindow32 push button command IDs are not unique");
+            commandIds.push_back(item.commandId);
+            if (button.iString == reinterpret_cast<INT_PTR>(LPSTR_TEXTCALLBACKW))
+                return Reject(reason, L"ToolbarWindow32 push button label is callback-only (LPSTR_TEXTCALLBACK)");
+            std::vector<wchar_t> label(kMaxTabLabelChars + 1, L'\0');
+            TBBUTTONINFOW info{};
+            info.cbSize = sizeof(info);
+            info.dwMask = TBIF_TEXT;
+            info.pszText = label.data();
+            info.cchText = static_cast<int>(label.size());
+            if (SendMessageW(hwnd, TB_GETBUTTONINFOW, item.commandId,
+                    reinterpret_cast<LPARAM>(&info)) < 0)
+                return Reject(reason, L"ToolbarWindow32 direct push button label read failed");
+            const size_t length = wcsnlen_s(label.data(), label.size());
+            if (length == 0)
+                return Reject(reason, L"ToolbarWindow32 push button requires a nonempty direct label");
+            if (length >= kMaxTabLabelChars)
+                return Reject(reason, L"ToolbarWindow32 push button label exceeds the bounded text cap");
+            if (totalText > kMaxStructuredTextChars - length)
+                return Reject(reason, L"ToolbarWindow32 labels exceed the aggregate text cap");
+            totalText += length;
+            item.text.assign(label.data(), length);
+
+            if (button.iBitmap == I_IMAGECALLBACK)
+                return Reject(reason, L"ToolbarWindow32 push button image is callback-only (I_IMAGECALLBACK)");
+            if (button.iBitmap < 0 || button.iBitmap >= imageCount)
+                return Reject(reason, L"ToolbarWindow32 push button has no valid normal image-list icon");
+            HICON icon = ImageList_GetIcon(images, button.iBitmap, ILD_NORMAL);
+            if (!icon)
+                return Reject(reason, L"ToolbarWindow32 normal image-list icon copy failed");
+            const bool copied = CaptureIconPixels(icon, item.imageWidth, item.imageHeight,
+                item.imageFormat, item.imageData, reason);
+            DestroyIcon(icon);
+            if (!copied) {
+                reason = L"ToolbarWindow32 normal image-list icon: " + reason;
+                return false;
+            }
+        }
+
+        RECT rect{};
+        if (!item.hidden) {
+            if (!SendMessageW(hwnd, TB_GETITEMRECT, index, reinterpret_cast<LPARAM>(&rect)) ||
+                rect.left < client.left || rect.top < client.top || rect.right <= rect.left ||
+                rect.bottom <= rect.top || rect.right > client.right || rect.bottom > client.bottom)
+                return Reject(reason, L"ToolbarWindow32 visible item rectangle is malformed or outside client bounds");
+            if (!haveVisibleBand) {
+                bandTop = rect.top;
+                bandBottom = rect.bottom;
+                haveVisibleBand = true;
+            } else if (rect.top != bandTop || rect.bottom != bandBottom) {
+                return Reject(reason, L"ToolbarWindow32 actual item geometry proves multiple rows or wrapping");
+            }
+            if (rect.left < previousRight)
+                return Reject(reason, L"ToolbarWindow32 visible item rectangles overlap or are not horizontally ordered");
+            previousRight = rect.right;
+        }
+        item.rect = rect;
+        node.toolbarItems.push_back(std::move(item));
+    }
+    if (!haveVisibleBand)
+        return Reject(reason, L"ToolbarWindow32 has no visible one-row item geometry");
+    return true;
+}
+
 using CaptureFn = bool (*)(HWND, ControlNode&, std::wstring&);
 
-// Sized from the last ControlKind enumerator.  A kind declared past StatusBar
-// falls outside the table and is rejected by CaptureControlDetail rather than
-// silently capturing nothing, so the failure is loud but never unsafe.
-constexpr size_t kControlKindCount = static_cast<size_t>(ControlKind::StatusBar) + 1;
+// The explicit sentinel prevents table sizing from silently becoming stale when
+// another kind is appended before it.
+constexpr size_t kControlKindCount = static_cast<size_t>(ControlKind::Count);
 
 // Kind -> typed state reader.  A null entry means the kind adds nothing to the
 // common facets, so lookup stays a single indexed load either way.
@@ -611,9 +1120,12 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
     at(ControlKind::ProgressBar) = &CaptureProgressState;
     at(ControlKind::SysLink) = &CaptureSysLinkState;
     at(ControlKind::ListView) = &CaptureListViewState;
+    at(ControlKind::StaticIcon) = &CaptureStaticIconState;
+    at(ControlKind::TabControl) = &CaptureTabControlState;
     at(ControlKind::StatusBar) = &CaptureStatusBarState;
-    // StaticText, Separator, and GroupBox are fully described by the common
-    // facets.  TreeView, TabControl, and Slider have no adapter yet, so no
+    at(ControlKind::Toolbar) = &CaptureToolbarState;
+    // StaticText, Separator, GroupBox, and DialogContainer are fully described by the common
+    // facets.  TreeView and Slider have no adapter yet, so no
     // probe can produce them.
     return table;
 }
@@ -621,6 +1133,16 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
 constexpr auto kCaptureTable = MakeCaptureTable();
 
 } // namespace
+
+bool CaptureOwnedIconPixels(
+    HICON icon,
+    uint32_t& imageWidth,
+    uint32_t& imageHeight,
+    std::wstring& imageFormat,
+    std::vector<uint8_t>& imageData,
+    std::wstring& reason) {
+    return CaptureIconPixels(icon, imageWidth, imageHeight, imageFormat, imageData, reason);
+}
 
 std::wstring_view ClassNameOf(HWND hwnd, wchar_t (&buffer)[kMaxClassNameChars]) noexcept {
     const int length = GetClassNameW(hwnd, buffer, static_cast<int>(kMaxClassNameChars));

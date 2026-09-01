@@ -15,18 +15,25 @@ public sealed class ControlNodeViewModel : ObservableObject
     private int _selectedIndex = -1;
     private int _focusedIndex = -1;
     private bool _multiSelect;
+    private bool _columnHeadersVisible;
+    private bool _checkBoxes;
     private int _selectionStart;
     private int _selectionLength;
     private int _minimum;
     private int _maximum = 100;
     private int _position;
+    private bool _indeterminate;
     private bool _editable;
     private PixelRect _rect = new();
+    private int _imageWidth;
+    private int _imageHeight;
+    private string _imageFormat = string.Empty;
+    private string _imageData = string.Empty;
     private readonly Dictionary<string, string> _pendingEventIds = new(StringComparer.Ordinal);
 
     public string NodeId { get; private set; } = "0";
     public string Generation { get; private set; } = "0";
-    public string NativeHwnd { get; private set; } = "0x0";
+    public string? NativeHwnd { get; private set; } = "0x0";
     public string? ParentNodeId { get; private set; }
     public string Kind { get; private set; } = string.Empty;
     public int ControlId { get; private set; }
@@ -48,17 +55,35 @@ public sealed class ControlNodeViewModel : ObservableObject
     public int SelectedIndex { get => _selectedIndex; private set => SetProperty(ref _selectedIndex, value); }
     public int FocusedIndex { get => _focusedIndex; private set => SetProperty(ref _focusedIndex, value); }
     public bool MultiSelect { get => _multiSelect; private set => SetProperty(ref _multiSelect, value); }
+    public bool ColumnHeadersVisible { get => _columnHeadersVisible; private set => SetProperty(ref _columnHeadersVisible, value); }
+    public bool CheckBoxes { get => _checkBoxes; private set => SetProperty(ref _checkBoxes, value); }
     public int SelectionStart { get => _selectionStart; private set => SetProperty(ref _selectionStart, value); }
     public int SelectionLength { get => _selectionLength; private set => SetProperty(ref _selectionLength, value); }
     public int Minimum { get => _minimum; private set => SetProperty(ref _minimum, value); }
     public int Maximum { get => _maximum; private set => SetProperty(ref _maximum, value); }
     public int Position { get => _position; private set => SetProperty(ref _position, value); }
+    public bool Indeterminate { get => _indeterminate; private set => SetProperty(ref _indeterminate, value); }
     public PixelRect Rect { get => _rect; private set => SetProperty(ref _rect, value); }
+    public int ImageWidth { get => _imageWidth; private set => SetProperty(ref _imageWidth, value); }
+    public int ImageHeight { get => _imageHeight; private set => SetProperty(ref _imageHeight, value); }
+    public string ImageFormat { get => _imageFormat; private set => SetProperty(ref _imageFormat, value); }
+    public string ImageData { get => _imageData; private set => SetProperty(ref _imageData, value); }
     public ObservableCollection<string> Items { get; } = [];
+    public ObservableCollection<PixelRect> ItemRects { get; } = [];
     public ObservableCollection<int> SelectedIndices { get; } = [];
+    public ObservableCollection<int> CheckedIndices { get; } = [];
     public ObservableCollection<string> Columns { get; } = [];
     public ObservableCollection<int> ColumnWidths { get; } = [];
     public ObservableCollection<IReadOnlyList<string>> Rows { get; } = [];
+    public ObservableCollection<ToolbarItemSnapshot> ToolbarItems { get; } = [];
+    public string AdapterId { get; private set; } = string.Empty;
+    public string PageId { get; private set; } = string.Empty;
+    public string SemanticKey { get; private set; } = string.Empty;
+    public string SourceKind { get; private set; } = string.Empty;
+    public string PresentationVariant { get; private set; } = string.Empty;
+    public IReadOnlyList<string> SupportedActions { get; private set; } = [];
+    public string HelpText { get; private set; } = string.Empty;
+    public string AccessKey { get; private set; } = string.Empty;
 
     public static ControlNodeViewModel FromSnapshot(ControlNode node)
     {
@@ -79,6 +104,14 @@ public sealed class ControlNodeViewModel : ObservableObject
         Generation = node.Generation;
         NativeHwnd = node.NativeHwnd;
         ParentNodeId = node.ParentNodeId;
+        AdapterId = node.AdapterId ?? string.Empty;
+        PageId = node.PageId ?? string.Empty;
+        SemanticKey = node.SemanticKey ?? string.Empty;
+        SourceKind = node.SourceKind ?? string.Empty;
+        PresentationVariant = node.PresentationVariant ?? string.Empty;
+        SupportedActions = node.SupportedActions ?? [];
+        HelpText = node.HelpText ?? string.Empty;
+        AccessKey = node.AccessKey ?? string.Empty;
         Kind = node.Kind;
         ControlId = node.ControlId;
         ZIndex = node.ZIndex;
@@ -95,6 +128,8 @@ public sealed class ControlNodeViewModel : ObservableObject
         SelectedIndex = node.SelectedIndex ?? -1;
         FocusedIndex = node.FocusedIndex ?? -1;
         MultiSelect = node.MultiSelect;
+        ColumnHeadersVisible = node.ColumnHeadersVisible ?? false;
+        CheckBoxes = node.CheckBoxes ?? false;
         SelectionStart = node.SelectionStart ?? 0;
         SelectionLength = node.SelectionLength ?? 0;
         ReadOnly = node.ReadOnly ?? false;
@@ -103,11 +138,20 @@ public sealed class ControlNodeViewModel : ObservableObject
         IsDefault = node.IsDefault ?? false;
         GroupStart = node.GroupStart ?? false;
         ApplyProgressState(node.Minimum ?? 0, node.Maximum ?? 100, node.Position ?? 0);
+        Indeterminate = node.Indeterminate ?? false;
         ReplaceItems(node.Items);
+        ReplaceItemRects(node.ItemRects ?? []);
         ReplaceSelectedIndices(node.SelectedIndices);
+        ReplaceCheckedIndices(node.CheckedIndices ?? []);
         ReplaceColumns(node.Columns);
         ReplaceColumnWidths(node.ColumnWidths);
         ReplaceRows(node.Rows);
+        ReplaceToolbarItems(node.ToolbarItems ?? []);
+        ApplyImageState(
+            node.ImageWidth ?? 0,
+            node.ImageHeight ?? 0,
+            node.ImageFormat ?? string.Empty,
+            node.ImageData ?? string.Empty);
         if (!preserveTransient) _pendingEventIds.Clear();
         else if (eventId is not null)
         {
@@ -131,6 +175,8 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (!IsPendingEcho(property, eventId)) return;
         _pendingEventIds.Remove(property);
         if (property == "text") DraftText = Text;
+        else if (property == "selectedIndex") RaisePropertyChanged(nameof(SelectedIndex));
+        else if (property == "checkedIndices") RaisePropertyChanged(nameof(CheckedIndices));
     }
 
     public void AcceptPending(string property, string eventId)
@@ -156,17 +202,27 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "selectedIndices": ReplaceSelectedIndices(value.Deserialize<List<int>>() ?? []); break;
             case "focusedIndex": FocusedIndex = value.GetInt32(); break;
             case "multiSelect": MultiSelect = value.GetBoolean(); break;
+            case "columnHeadersVisible": ColumnHeadersVisible = value.GetBoolean(); break;
+            case "checkBoxes": CheckBoxes = value.GetBoolean(); break;
+            case "checkedIndices": ReplaceCheckedIndices(value.Deserialize<List<int>>() ?? []); break;
             case "selectionStart": SelectionStart = value.GetInt32(); break;
             case "selectionLength": SelectionLength = value.GetInt32(); break;
             case "editable": Editable = value.GetBoolean(); break;
             case "minimum": Minimum = value.GetInt32(); break;
             case "maximum": Maximum = value.GetInt32(); break;
             case "position": Position = value.GetInt32(); break;
+            case "indeterminate": Indeterminate = value.GetBoolean(); break;
             case "rect": Rect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid node rect patch."); break;
             case "items": ReplaceItems(value.Deserialize<List<string>>() ?? []); break;
+            case "itemRects": ReplaceItemRects(value.Deserialize<List<PixelRect>>() ?? []); break;
             case "columns": ReplaceColumns(value.Deserialize<List<string>>() ?? []); break;
             case "columnWidths": ReplaceColumnWidths(value.Deserialize<List<int>>() ?? []); break;
             case "rows": ReplaceRows(value.Deserialize<List<List<string>>>() ?? []); break;
+            case "imageWidth": ImageWidth = value.GetInt32(); break;
+            case "imageHeight": ImageHeight = value.GetInt32(); break;
+            case "imageFormat": ImageFormat = value.GetString() ?? string.Empty; break;
+            case "imageData": ImageData = value.GetString() ?? string.Empty; break;
+            case "toolbarItems": ReplaceToolbarItems(value.Deserialize<List<ToolbarItemSnapshot>>() ?? []); break;
             default: throw new ProtocolException($"Unsupported node patch property '{property}'.");
         }
         if (matchingEcho) _pendingEventIds.Remove(property);
@@ -186,6 +242,22 @@ public sealed class ControlNodeViewModel : ObservableObject
         SelectedIndices.Clear();
         foreach (var index in selectedIndices) SelectedIndices.Add(index);
         RaisePropertyChanged(nameof(SelectedIndices));
+    }
+
+    private void ReplaceItemRects(IEnumerable<PixelRect> rects)
+    {
+        if (ItemRects.SequenceEqual(rects)) return;
+        ItemRects.Clear();
+        foreach (var rect in rects) ItemRects.Add(rect);
+        RaisePropertyChanged(nameof(ItemRects));
+    }
+
+    private void ReplaceCheckedIndices(IEnumerable<int> checkedIndices)
+    {
+        if (CheckedIndices.SequenceEqual(checkedIndices)) return;
+        CheckedIndices.Clear();
+        foreach (var index in checkedIndices) CheckedIndices.Add(index);
+        RaisePropertyChanged(nameof(CheckedIndices));
     }
 
     private void ReplaceColumns(IEnumerable<string> columns)
@@ -214,6 +286,14 @@ public sealed class ControlNodeViewModel : ObservableObject
         RaisePropertyChanged(nameof(Rows));
     }
 
+    private void ReplaceToolbarItems(IEnumerable<ToolbarItemSnapshot> items)
+    {
+        if (ToolbarItems.SequenceEqual(items)) return;
+        ToolbarItems.Clear();
+        foreach (var item in items) ToolbarItems.Add(item);
+        RaisePropertyChanged(nameof(ToolbarItems));
+    }
+
     private void ApplyProgressState(int minimum, int maximum, int position)
     {
         if (minimum > Maximum)
@@ -227,5 +307,18 @@ public sealed class ControlNodeViewModel : ObservableObject
             Maximum = maximum;
         }
         Position = position;
+    }
+
+    private void ApplyImageState(int width, int height, string format, string data)
+    {
+        if (_imageWidth == width && _imageHeight == height &&
+            _imageFormat == format && _imageData == data) return;
+        _imageWidth = width;
+        _imageHeight = height;
+        _imageFormat = format;
+        _imageData = data;
+        // The factory rebuilds from this notification after the complete image
+        // tuple has changed, never from an intermediate width/data combination.
+        RaisePropertyChanged(nameof(ImageData));
     }
 }

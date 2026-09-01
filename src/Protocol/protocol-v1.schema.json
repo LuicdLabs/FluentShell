@@ -84,7 +84,8 @@
       "allOf": [
         {
           "if": { "properties": { "kind": { "const": "progressBar" } }, "required": ["kind"] },
-          "then": { "required": ["minimum", "maximum", "position"] }
+          "then": { "required": ["minimum", "maximum", "position", "indeterminate"] },
+          "else": { "not": { "required": ["indeterminate"] } }
         },
         {
           "if": { "properties": { "kind": { "const": "slider" } }, "required": ["kind"] },
@@ -97,14 +98,51 @@
         {
           "if": { "properties": { "editable": { "const": true } }, "required": ["editable"] },
           "then": { "properties": { "kind": { "const": "comboBox" } }, "required": ["kind"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "staticIcon" } }, "required": ["kind"] },
+          "then": { "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["imageWidth"] },
+                { "required": ["imageHeight"] },
+                { "required": ["imageFormat"] },
+                { "required": ["imageData"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "listView" } }, "required": ["kind"] },
+          "then": { "required": ["columnHeadersVisible", "checkBoxes", "checkedIndices"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["columnHeadersVisible"] },
+                { "required": ["checkBoxes"] },
+                { "required": ["checkedIndices"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "tabControl" } }, "required": ["kind"] },
+          "then": { "required": ["selectedIndex", "itemRects"] },
+          "else": { "not": { "required": ["itemRects"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "toolbar" } }, "required": ["kind"] },
+          "then": { "required": ["toolbarItems"] },
+          "else": { "not": { "required": ["toolbarItems"] } }
         }
       ],
       "properties": {
         "nodeId": { "$ref": "#/$defs/u64String" },
         "generation": { "$ref": "#/$defs/u64String" },
-        "nativeHwnd": { "$ref": "#/$defs/hwndString" },
+        "nativeHwnd": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hwndString" }] },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "statusBar"] },
+        "kind": { "enum": ["static", "staticIcon", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "tabControl", "dialogContainer", "statusBar", "toolbar"] },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -132,6 +170,7 @@
         "minimum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "maximum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "position": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
+        "indeterminate": { "type": "boolean" },
         "smallChange": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
         "largeChange": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
         "vertical": { "type": "boolean" },
@@ -141,11 +180,46 @@
           "maxItems": 4096,
           "items": { "$ref": "#/$defs/text" }
         },
+        "itemRects": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/rect" } },
         "columns": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } },
         "columnWidths": { "type": "array", "maxItems": 64, "items": { "type": "integer", "minimum": 0, "maximum": 2147483647 } },
         "rows": { "type": "array", "maxItems": 4096, "items": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } } },
+        "columnHeadersVisible": { "type": "boolean" },
+        "checkBoxes": { "type": "boolean" },
+        "checkedIndices": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 4095 } },
         "itemDepths": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 31 } },
-        "itemExpanded": { "type": "array", "maxItems": 4096, "items": { "type": "boolean" } }
+        "itemExpanded": { "type": "array", "maxItems": 4096, "items": { "type": "boolean" } },
+        "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
+        "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
+        "imageFormat": { "const": "bgra8-premultiplied" },
+        "imageData": { "type": "string", "minLength": 8, "maxLength": 49152, "pattern": "^[A-Za-z0-9+/]+={0,2}$" },
+        "adapterId": { "enum": ["microsoft.mdsched.directui", "microsoft.recoverydrive.directui", "microsoft.windows.directui.semantic.v1"] },
+        "pageId": { "enum": ["initial", "first", "semantic-v1"] },
+        "semanticKey": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:-]+$" },
+        "sourceKind": { "enum": ["uiaVirtual", "nativeBacking"] },
+        "presentationVariant": { "enum": ["mainIcon", "instruction", "content", "commandLink", "standard", "wizardTitle", "header"] },
+        "supportedActions": { "type": "array", "maxItems": 1, "uniqueItems": true, "items": { "enum": ["invoke", "setCheck"] } },
+        "helpText": { "$ref": "#/$defs/text" },
+        "accessKey": { "$ref": "#/$defs/text" },
+        "toolbarItems": {
+          "type": "array", "minItems": 1, "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["kind", "commandId", "rect", "text", "enabled", "hidden"],
+            "properties": {
+              "kind": { "enum": ["pushButton", "separator"] },
+              "commandId": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "rect": { "$ref": "#/$defs/rect" },
+              "text": { "$ref": "#/$defs/text" },
+              "enabled": { "type": "boolean" },
+              "hidden": { "type": "boolean" },
+              "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
+              "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
+              "imageFormat": { "const": "bgra8-premultiplied" },
+              "imageData": { "type": "string", "minLength": 8, "maxLength": 49152, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            }
+          }
+        }
       }
     },
     "windowSnapshot": {
@@ -172,6 +246,8 @@
         "state": { "enum": ["normal", "minimized", "maximized"] },
         "showInTaskbar": { "type": "boolean" },
         "rtl": { "type": "boolean" },
+        "adapterId": { "enum": ["microsoft.mdsched.directui", "microsoft.recoverydrive.directui", "microsoft.windows.directui.semantic.v1"] },
+        "pageId": { "enum": ["initial", "first", "semantic-v1"] },
         "menu": {
           "type": "array",
           "maxItems": 256,
@@ -236,6 +312,24 @@
     "actionInvoke": {
       "type": "object",
       "required": ["messageType", "sessionNonce", "surfaceId", "eventId", "expectedRevision", "action", "value"],
+      "allOf": [
+        {
+          "if": { "properties": { "action": { "const": "setItemCheck" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "checked"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0, "maximum": 4095 },
+                  "checked": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "messageType": { "const": "action.invoke" },
         "sessionNonce": { "$ref": "#/$defs/nonce" },
@@ -243,7 +337,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "menuCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "toolbarCommand", "menuCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

@@ -10,6 +10,7 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Automation;
+using Microsoft.UI.Xaml.Automation.Peers;
 using Windows.Graphics;
 
 namespace FluentShell.Renderer.Windows;
@@ -17,7 +18,7 @@ namespace FluentShell.Renderer.Windows;
 public sealed class TranslatedWindow : Window
 {
     private readonly Grid _root = new();
-    private readonly Canvas _canvas = new();
+    private readonly SemanticContentViewport _canvas = new();
     private MenuBar? _menuBar;
     private readonly Func<ActionInvokeMessage, ulong, Task> _sendAction;
     private readonly Func<string> _nextEventId;
@@ -370,7 +371,18 @@ public sealed class TranslatedWindow : Window
         {
             var control = factory.Create(node);
             _controls[node.NodeId] = control;
-            _canvas.Children.Add(control);
+            if (node.ParentNodeId is null)
+            {
+                _canvas.Children.Add(control);
+            }
+            else if (_controls[node.ParentNodeId] is SemanticDialogContainer container)
+            {
+                container.Children.Add(control);
+            }
+            else
+            {
+                throw new InvalidOperationException("Validated control parent is not a dialog container.");
+            }
         }
     }
 
@@ -518,16 +530,18 @@ public sealed class TranslatedWindow : Window
 
     private void EmitNodeAction(ControlNodeViewModel node, string action, object? value)
     {
-        var property = action switch
+        EmitAction(node, PropertyForNodeAction(action), action, value);
+    }
+
+    internal static string PropertyForNodeAction(string action) => action switch
         {
             "setText" => "text",
             "setCheck" => "checked",
             "select" => "selectedIndex",
             "setSelection" => "selectedIndices",
+            "setItemCheck" => "checkedIndices",
             _ => action,
         };
-        EmitAction(node, property, action, value);
-    }
 
     private void EmitMenuAction(MenuItemViewModel item) =>
         EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId);
@@ -776,4 +790,28 @@ public sealed class TranslatedWindow : Window
         _renderDpi = dpi;
         RebuildControls();
     }
+}
+
+internal sealed class SemanticContentViewport : Canvas
+{
+    internal const string AutomationId = "FluentShell.ContentViewport";
+    internal static AutomationControlType ControlType => AutomationControlType.Pane;
+
+    public SemanticContentViewport()
+    {
+        AutomationProperties.SetAutomationId(this, AutomationId);
+    }
+
+    protected override AutomationPeer OnCreateAutomationPeer() =>
+        new SemanticContentViewportAutomationPeer(this);
+}
+
+internal sealed class SemanticContentViewportAutomationPeer(SemanticContentViewport owner) :
+    FrameworkElementAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        SemanticContentViewport.ControlType;
+    protected override string GetClassNameCore() => "ContentViewport";
+    protected override bool IsControlElementCore() => true;
+    protected override bool IsContentElementCore() => false;
 }

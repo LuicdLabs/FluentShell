@@ -60,8 +60,9 @@ cannot prove equivalent.
 ### Tranche B: Window Graph And Static Assets
 
 - Model owned top-level/modal graphs rather than rejecting every owned HWND.
-- Capture bounded `SS_ICON`, `SS_BITMAP`, and `SS_ENHMETAFILE` assets into an
-  owned, size-capped renderer payload; never transfer native handles.
+- Bounded `SS_ICON` capture is implemented as owned, size-capped premultiplied
+  BGRA data; native handles never cross the process boundary. `SS_BITMAP` and
+  `SS_ENHMETAFILE` remain unsupported.
 - Add standard `SysLink` text/link parsing and `NM_CLICK`/`NM_RETURN` action
   routing with canonical recapture.
 - Add tooltip and accessible label relationships.
@@ -81,7 +82,9 @@ This tranche is required before classic Notepad-like main windows can project.
 The bounded textual HMENU portion is now implemented: nested popup/command/
 separator capture, enabled/check/radio/default state, WinUI MenuBar projection,
 semantic `WM_COMMAND`, canonical recapture, persistent top-level UIA validation,
-and owner-draw/bitmap/callback/MDI fallback. Toolbar/status-bar work remains.
+and owner-draw/bitmap/callback/MDI fallback. Bounded one-row push/separator
+`ToolbarWindow32` and textual status-bar subsets are also implemented; toolbar
+dropdown/check/group, callback, custom-draw, and multi-row shapes remain native.
 
 ### Tranche D: Text Documents
 
@@ -96,7 +99,16 @@ adapter.
 
 ### Tranche E: Structured Common Controls
 
-- Add nonvirtual, non-owner/custom-draw Tab, ListView, TreeView, Header,
+- A bounded report-mode `SysListView32` subset is implemented with native
+  columns/rows, visible or hidden headers, independent selection, and optional
+  `LVS_EX_CHECKBOXES` state/actions. Virtual, owner/custom-draw, grouped,
+  label-editable, activation-tracking, and header-drag semantics remain native.
+- A bounded textual top-tab `SysTabControl32` subset is implemented with native
+  multiline header rectangles, semantic vetoable selection, and Tab/TabItem UIA.
+  Opaque native `TCITEM.lParam` identity is retained only by the source control.
+  Owner-draw, button, vertical/bottom, fixed-width, image, tooltip,
+  callback-text, excessive, and malformed geometry shapes remain native.
+- Add nonvirtual, non-owner/custom-draw TreeView, Header,
   DateTimePicker, MonthCalendar, Trackbar, UpDown, and tooltip subsets.
 - Model image lists, selection, expansion, grouping, editing, sorting, and
   notifications as typed capabilities.
@@ -111,6 +123,13 @@ adapter.
 - Never enable an application adapter globally by class name alone.
 
 This is the only supported lane for private/custom HWND contracts.
+
+The DirectUI translation engine is implemented generically in
+`DirectUiEngine.cpp` with declarative per-application profiles in
+`DirectUiProfiles.cpp`; see `DIRECTUI-APPLICATION-ADAPTERS.md`. Two exact
+first-page profiles are admitted: MdSched `10.0.26100.7309` and RecoveryDrive
+`10.0.26100.33296` (Microsoft-signed System32 images only). Later wizard pages
+and any other DirectUI host remain native.
 
 ## Target Findings
 

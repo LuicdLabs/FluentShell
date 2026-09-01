@@ -2,10 +2,14 @@
 #include "../../src/Bridge/Translation/WindowSnapshot.h"
 #include "../../src/Bridge/Translation/ControlAdapters.h"
 #include "../../src/Bridge/Translation/WindowCapture.h"
+#include "../../src/Bridge/Translation/SourceThreadAgent.h"
+#include "../../src/Bridge/Translation/UiAutomationGeometry.h"
+#include "../../src/Bridge/Translation/DirectUiEngine.h"
 
 #include <winrt/base.h>
 #include <objbase.h>
 #include <commctrl.h>
+#include <UIAutomation.h>
 
 #include <array>
 #include <filesystem>
@@ -20,6 +24,38 @@ namespace {
 using namespace FluentShell::Bridge;
 
 int g_failures = 0;
+int g_itemChanging = 0;
+int g_itemChanged = 0;
+bool g_vetoItemChange = false;
+int g_tabChanging = 0;
+int g_tabChanged = 0;
+bool g_vetoTabChange = false;
+std::vector<UINT> g_tabNotifications;
+
+LRESULT CALLBACK ListViewNotificationSubclass(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+    UINT_PTR subclassId, DWORD_PTR) {
+    if (message == WM_NOTIFY) {
+        const auto* header = reinterpret_cast<const NMHDR*>(lParam);
+        if (header && header->code == LVN_ITEMCHANGING) {
+            ++g_itemChanging;
+            if (g_vetoItemChange) return TRUE;
+        } else if (header && header->code == LVN_ITEMCHANGED) {
+            ++g_itemChanged;
+        } else if (header && header->code == TCN_SELCHANGING) {
+            ++g_tabChanging;
+            g_tabNotifications.push_back(TCN_SELCHANGING);
+            if (g_vetoTabChange) return TRUE;
+        } else if (header && header->code == TCN_SELCHANGE) {
+            ++g_tabChanged;
+            g_tabNotifications.push_back(TCN_SELCHANGE);
+        }
+    }
+    const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(
+        window, ListViewNotificationSubclass, subclassId);
+    return result;
+}
 
 void Check(bool condition, const char* message) {
     if (condition) return;
@@ -37,6 +73,279 @@ std::string ReplaceOnce(std::string value, std::string_view from, std::string_vi
     const auto position = value.find(from);
     if (position != std::string::npos) value.replace(position, from.size(), to);
     return value;
+}
+
+void TestVisibleUiaBoundsClipping() {
+    Check(Translation::ScreenHitTestMatchesExposure(true, true),
+        "an exposed proxy resolved by UIA was rejected");
+    Check(!Translation::ScreenHitTestMatchesExposure(true, false),
+        "an exposed proxy missed by UIA was accepted");
+    Check(Translation::ScreenHitTestMatchesExposure(false, false),
+        "a fully occluded proxy required an impossible desktop UIA hit");
+
+    const POINT contentOrigin{ 185, 216 };
+    const RECT rootViewport{ 185, 216, 517, 559 };
+    const RECT canonicalClient{ 0, 0, 353, 353 };
+    const RECT exactCanonicalViewport{ 185, 216, 538, 569 };
+    Check(Translation::ContentViewportFitsCanonicalSize(
+              exactCanonicalViewport, canonicalClient),
+        "renderer viewport matching canonical client size was rejected");
+    Check(Translation::ContentViewportFitsCanonicalSize(rootViewport, canonicalClient),
+        "live host-clipped renderer viewport was rejected");
+    const RECT hostClippedViewport{ 185, 216, 500, 540 };
+    Check(Translation::ContentViewportFitsCanonicalSize(hostClippedViewport, canonicalClient),
+        "host-clipped renderer viewport was rejected");
+    const RECT oversizedViewport{ 185, 216, 557, 588 };
+    Check(!Translation::ContentViewportFitsCanonicalSize(oversizedViewport, canonicalClient),
+        "renderer viewport exceeding canonical size and rounding tolerance was accepted");
+
+    const RECT unclippedNode{ 10, 12, 90, 36 };
+    const RECT expectedUnclipped{ 195, 228, 275, 252 };
+    RECT visible{};
+    Check(Translation::ComputeVisibleUiaBounds(
+              unclippedNode, contentOrigin, rootViewport, nullptr, visible) &&
+          EqualRect(&visible, &expectedUnclipped),
+        "unclipped UIA bounds lost exact physical-pixel geometry");
+
+    const RECT negativeContainer{ -11, 0, 342, 353 };
+    RECT containerVisible{};
+    Check(Translation::ComputeVisibleUiaBounds(
+              negativeContainer, contentOrigin, rootViewport, nullptr, containerVisible) &&
+          EqualRect(&containerVisible, &rootViewport),
+        "negative dialog container did not clip to the root client viewport");
+
+    const RECT child{ -20, 10, 350, 360 };
+    const RECT expectedChild{ 185, 226, 517, 559 };
+    RECT childVisible{};
+    Check(Translation::ComputeVisibleUiaBounds(
+              child, contentOrigin, rootViewport, &containerVisible, childVisible) &&
+          EqualRect(&childVisible, &expectedChild),
+        "nested dialog descendant did not inherit root and parent clipping");
+
+    const RECT nestedContainer{ 20, 20, 300, 300 };
+    const RECT expectedNested{ 205, 236, 485, 516 };
+    RECT nestedVisible{};
+    Check(Translation::ComputeVisibleUiaBounds(
+              nestedContainer, contentOrigin, rootViewport, &childVisible, nestedVisible) &&
+          EqualRect(&nestedVisible, &expectedNested),
+        "nested dialog container bounds did not retain ancestor clipping");
+
+    const RECT nestedChild{ 0, 0, 400, 400 };
+    RECT nestedChildVisible{};
+    Check(Translation::ComputeVisibleUiaBounds(
+              nestedChild, contentOrigin, rootViewport, &nestedVisible, nestedChildVisible) &&
+          EqualRect(&nestedChildVisible, &expectedNested),
+        "nested descendant did not clip to every structural ancestor");
+
+    const RECT outsideContainer{ 400, 0, 450, 50 };
+    Check(!Translation::ComputeVisibleUiaBounds(
+              outsideContainer, contentOrigin, rootViewport, nullptr, visible),
+        "fully out-of-client visible dialog container was accepted");
+}
+
+Translation::DirectUiWindowEvidence DirectUiWindow(
+    uintptr_t hwnd,
+    uint64_t generation,
+    LONG top,
+    DWORD style = WS_VISIBLE | WS_CHILD) {
+    Translation::DirectUiWindowEvidence value;
+    value.hwnd = reinterpret_cast<HWND>(hwnd);
+    value.generation = generation;
+    value.bounds = { 10, top, 310, top + 40 };
+    value.style = style;
+    value.visible = true;
+    value.enabled = true;
+    return value;
+}
+
+const Translation::DirectUiWindowProfile* TestProfileById(std::wstring_view adapterId) {
+    for (size_t index = 0; index < Translation::kDirectUiProfileCount; ++index) {
+        if (Translation::kDirectUiProfiles[index].adapterId == adapterId)
+            return &Translation::kDirectUiProfiles[index];
+    }
+    return nullptr;
+}
+
+// Builds profile-shaped native evidence. All slots get backing windows for
+// non-virtual slots; virtual slots keep null HWNDs.
+Translation::DirectUiNativeEvidence DirectUiNativeFixture(
+    const Translation::DirectUiWindowProfile& profile,
+    std::vector<HWND>& backingHandles) {
+    Translation::DirectUiNativeEvidence evidence;
+    evidence.root = DirectUiWindow(0x100, 1, 0, WS_VISIBLE | WS_POPUP);
+    evidence.directUi = DirectUiWindow(0x101, 2, 10);
+    evidence.root.bounds = { 0, 0, 400, 400 };
+    evidence.directUi.bounds = { 0, 0, 400, 400 };
+    evidence.title = L"localized window title";
+    evidence.dpi = 144;
+    evidence.mutationEpoch = 42;
+    evidence.slotWindows.assign(profile.slotCount, Translation::DirectUiWindowEvidence{});
+    backingHandles.clear();
+    HWND next = reinterpret_cast<HWND>(0x201);
+    for (size_t index = 0; index < profile.slotCount; ++index) {
+        const auto& slot = profile.slots[index];
+        if (slot.virtualSource) continue;
+        auto value = DirectUiWindow(reinterpret_cast<uintptr_t>(next), 3 + index, 100 + static_cast<LONG>(index * 50));
+        value.text = L"localized action";
+        evidence.slotWindows[index] = value;
+        backingHandles.push_back(next);
+        next = reinterpret_cast<HWND>(reinterpret_cast<uintptr_t>(next) + 0x10);
+    }
+    return evidence;
+}
+
+void TestDirectUiEvidenceContracts() {
+    std::wstring normalized;
+    Check(Translation::NormalizeDirectUiEvidenceText(L"Localized label", normalized) &&
+          normalized == L"Localized label",
+        "DirectUI evidence normalization changed localized text");
+    const std::wstring embeddedNull{ L'a', L'\0', L'b' };
+    Check(!Translation::NormalizeDirectUiEvidenceText(embeddedNull, normalized),
+        "ambiguous embedded-NUL DirectUI evidence was accepted");
+
+    // The mutation bracket is profile-independent: it compares root, anchor,
+    // and every backing slot window between A and B.
+    const auto* profile = TestProfileById(L"microsoft.mdsched.directui");
+    Check(profile != nullptr, "MdSched profile is missing from the registry");
+    if (!profile) return;
+    std::vector<HWND> backing;
+    auto before = DirectUiNativeFixture(*profile, backing);
+    auto after = before;
+    std::wstring error;
+    Check(Translation::MatchDirectUiMutationBracket(*profile, before, after, error),
+        "unchanged DirectUI A/U/B mutation bracket was rejected");
+    after.mutationEpoch++;
+    Check(!Translation::MatchDirectUiMutationBracket(*profile, before, after, error),
+        "DirectUI mutation epoch race was accepted");
+    Check(Translation::MatchDirectUiMutationBracket(*profile, before, after, error, false),
+        "equal native evidence was rejected by the post-admission barrier");
+    after = before;
+    for (auto& slot : after.slotWindows) {
+        if (slot.hwnd) { slot.generation++; break; }
+    }
+    Check(!Translation::MatchDirectUiMutationBracket(*profile, before, after, error),
+        "recreated DirectUI backing Button was accepted");
+    after = before;
+    after.title = L"changed";
+    Check(!Translation::MatchDirectUiMutationBracket(*profile, before, after, error),
+        "DirectUI root title change inside the bracket was accepted");
+
+    auto moved = before;
+    constexpr LONG moveX = 137;
+    constexpr LONG moveY = -42;
+    OffsetRect(&moved.root.bounds, moveX, moveY);
+    OffsetRect(&moved.directUi.bounds, moveX, moveY);
+    moved.clientOriginScreen.x += moveX;
+    moved.clientOriginScreen.y += moveY;
+    for (size_t index = 0; index < profile->slotCount; ++index) {
+        if (!profile->slots[index].virtualSource)
+            OffsetRect(&moved.slotWindows[index].bounds, moveX, moveY);
+    }
+    ++moved.mutationEpoch;
+    Check(Translation::MatchDirectUiMoveTransition(*profile, before, moved, error),
+        "pure DirectUI whole-window translation was rejected");
+    auto resized = moved;
+    ++resized.root.bounds.right;
+    Check(!Translation::MatchDirectUiMoveTransition(*profile, before, resized, error),
+        "DirectUI move transition accepted a native resize");
+    auto splitGeometry = moved;
+    for (size_t index = 0; index < profile->slotCount; ++index) {
+        if (!profile->slots[index].virtualSource) {
+            --splitGeometry.slotWindows[index].bounds.left;
+            break;
+        }
+    }
+    Check(!Translation::MatchDirectUiMoveTransition(
+              *profile, before, splitGeometry, error),
+        "DirectUI move transition accepted a backing control that did not move atomically");
+
+    // Semantic identity is adapter-scoped, so the same key under two profiles is
+    // two different nodes and a RuntimeId never leaks into identity.
+    const uint64_t first = Translation::DirectUiSemanticNodeId(
+        profile->adapterId, L"MainInstruction");
+    const uint64_t second = Translation::DirectUiSemanticNodeId(
+        profile->adapterId, L"MainInstruction");
+    Check(first == second && first != Translation::DirectUiSemanticNodeId(
+        profile->adapterId, L"ContentText"),
+        "DirectUI semantic identity is not stable and key-scoped");
+    Check(first != Translation::DirectUiSemanticNodeId(
+        L"microsoft.recoverydrive.directui", L"MainInstruction"),
+        "DirectUI semantic identity is not adapter-scoped");
+
+    Check(Translation::IsMicrosoftWindowsSignerName(L"Microsoft Windows") &&
+          Translation::IsMicrosoftWindowsSignerName(L"microsoft corporation") &&
+          !Translation::IsMicrosoftWindowsSignerName(L"Microsoft Windows Hardware Compatibility Publisher"),
+        "DirectUI signer-name predicate accepted the wrong signer boundary");
+    Check(Translation::DirectUiHandoffMayPost(true, true, true, true, true) &&
+          !Translation::DirectUiHandoffMayPost(true, true, false, true, true) &&
+          !Translation::DirectUiHandoffMayPost(true, false, true, true, true) &&
+          !Translation::DirectUiHandoffMayPost(true, true, true, true, false),
+        "DirectUI handoff ordering allowed a pre-restore or stale click");
+
+    // The admitted profile set is exactly the two known application pages.
+    Check(Translation::kDirectUiProfileCount == 2 &&
+          TestProfileById(L"microsoft.mdsched.directui") != nullptr &&
+          TestProfileById(L"microsoft.recoverydrive.directui") != nullptr,
+        "DirectUI profile registry does not contain exactly the two admitted pages");
+    const auto* recovery = TestProfileById(L"microsoft.recoverydrive.directui");
+    Check(recovery && recovery->rootClass == L"NativeHWNDHost" &&
+          recovery->fileVersion[3] == 33296,
+        "RecoveryDrive profile identity is not the exact admitted contract");
+    bool foundToggle = false;
+    bool foundDisabledBack = false;
+    bool foundPageText = false;
+    for (size_t index = 0; recovery && index < recovery->slotCount; ++index) {
+        const auto& slot = recovery->slots[index];
+        if (slot.action == Translation::DirectUiAction::ToggleCheck) foundToggle = true;
+        if (slot.semanticKey == L"backbutton" && !slot.project) {}
+        if (slot.semanticKey == L"backbutton" && slot.action == Translation::DirectUiAction::None &&
+            !slot.uiaEnabled)
+            foundDisabledBack = true;
+        if (slot.semanticKey == L"pageText" && slot.project && !slot.virtualSource &&
+            slot.nativeClass == L"Static")
+            foundPageText = true;
+    }
+    Check(foundToggle, "RecoveryDrive profile does not route the checkbox through native toggle");
+    Check(foundDisabledBack, "RecoveryDrive profile does not declare the back button inert");
+    Check(foundPageText && recovery->directUiOwnsTabOrder &&
+          recovery->census.visibleNotifyWrappers == 3 &&
+          recovery->census.hiddenNotifyWrappers == 2,
+        "RecoveryDrive profile does not pin its observed page text, tab owner, and census");
+}
+
+HICON CreateColorIcon(
+    int width,
+    int height,
+    std::array<uint8_t, 4> bgra,
+    bool transparentMask = false) {
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* rawPixels = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &rawPixels, nullptr, 0);
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    if (color && rawPixels) {
+        auto* pixels = static_cast<uint8_t*>(rawPixels);
+        for (size_t index = 0; index < pixelCount; ++index) {
+            std::copy(bgra.begin(), bgra.end(), pixels + index * 4);
+        }
+    }
+    const size_t maskStride = (static_cast<size_t>(width) + 15u) / 16u * 2u;
+    std::vector<uint8_t> maskBits(
+        maskStride * static_cast<size_t>(height), transparentMask ? 0xff : 0);
+    HBITMAP mask = CreateBitmap(width, height, 1, 1, maskBits.data());
+    ICONINFO iconInfo{};
+    iconInfo.fIcon = TRUE;
+    iconInfo.hbmColor = color;
+    iconInfo.hbmMask = mask;
+    HICON icon = color && mask ? CreateIconIndirect(&iconInfo) : nullptr;
+    if (color) DeleteObject(color);
+    if (mask) DeleteObject(mask);
+    return icon;
 }
 
 void TestHeaderValidation() {
@@ -298,7 +607,7 @@ void TestStrictMessageValidation() {
         ReplaceOnce(validHello, "\"protocolMajor\": 1", "\"protocolMajor\": 1.5"),
         hello, error), "fractional hello major was accepted");
     Check(Translation::ParseHello(
-        ReplaceOnce(validHello, "\"protocolMinor\": 1", "\"protocolMinor\": 2"),
+        ReplaceOnce(validHello, "\"protocolMinor\": 12", "\"protocolMinor\": 13"),
         hello, error), "future same-major hello minor was rejected");
 
     const std::string actionPrefix =
@@ -310,6 +619,23 @@ void TestStrictMessageValidation() {
     Check(!Translation::ParseActionInvoke(
         actionPrefix + "\"action\":\"setCheck\",\"value\":1.5}", nonce, action, error),
         "fractional setCheck value was accepted");
+    const auto itemCheckPrefix = actionPrefix + "\"action\":\"setItemCheck\",\"value\":";
+    Check(Translation::ParseActionInvoke(
+        itemCheckPrefix + "{\"index\":1,\"checked\":true}}", nonce, action, error) &&
+        action.itemIndex == 1 && action.booleanValue,
+        "canonical setItemCheck value was rejected");
+    Check(!Translation::ParseActionInvoke(
+        itemCheckPrefix + "{\"index\":1.5,\"checked\":true}}", nonce, action, error),
+        "fractional setItemCheck index was accepted");
+    Check(!Translation::ParseActionInvoke(
+        itemCheckPrefix + "{\"index\":4096,\"checked\":true}}", nonce, action, error),
+        "oversized setItemCheck index was accepted");
+    Check(!Translation::ParseActionInvoke(
+        itemCheckPrefix + "{\"index\":1,\"checked\":1}}", nonce, action, error),
+        "non-boolean setItemCheck state was accepted");
+    Check(!Translation::ParseActionInvoke(
+        itemCheckPrefix + "{\"index\":1,\"checked\":true,\"extra\":0}}", nonce, action, error),
+        "setItemCheck value with an extra field was accepted");
     Check(!Translation::ParseActionInvoke(
         ReplaceOnce(actionPrefix + "\"action\":\"invoke\",\"value\":null}",
             "\"eventId\":\"1\"", "\"eventId\":\"0\""),
@@ -383,6 +709,18 @@ void TestActionSemanticValidation() {
     editableCombo.nodeId = 7;
     editableCombo.editable = true;
     snapshot.nodes.push_back(editableCombo);
+    Translation::ControlNode listView;
+    listView.nodeId = 8;
+    listView.kind = Translation::ControlKind::ListView;
+    listView.rows = { { L"one" }, { L"two" } };
+    listView.checkBoxes = true;
+    snapshot.nodes.push_back(listView);
+    Translation::ControlNode tabControl;
+    tabControl.nodeId = 9;
+    tabControl.kind = Translation::ControlKind::TabControl;
+    tabControl.items = { L"one", L"two" };
+    tabControl.selectedIndex = 0;
+    snapshot.nodes.push_back(tabControl);
 
     std::wstring error;
     Translation::ActionRequest action;
@@ -424,6 +762,37 @@ void TestActionSemanticValidation() {
     action.nodeId = 7;
     Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
         "editable ComboBox rejected setText");
+    action.nodeId = 8;
+    action.action = L"setItemCheck";
+    action.itemIndex = 1;
+    action.booleanValue = true;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "bounded ListView item check was rejected");
+    action.itemIndex = 2;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "out-of-range ListView item check was accepted");
+    action.itemIndex = 0;
+    snapshot.nodes[snapshot.nodes.size() - 2].checkBoxes = false;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "item check on a checkbox-disabled ListView was accepted");
+    action.nodeId = 9;
+    action.action = L"select";
+    action.integerValue = 1;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "bounded TabControl selection was rejected");
+    action.integerValue = -1;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "TabControl accepted an empty selection");
+
+    snapshot.adapterId = L"microsoft.windows.directui.semantic.v1";
+    action.nodeId = 1;
+    action.action = L"invoke";
+    snapshot.nodes[0].supportedActions.clear();
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "application-adapter node accepted an undeclared action");
+    snapshot.nodes[0].supportedActions = { L"invoke" };
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "application-adapter node rejected its declared action");
 }
 
 void TestActionRevisionPolicy() {
@@ -435,8 +804,9 @@ void TestActionRevisionPolicy() {
           Translation::IsRequestSemanticAction(L"resize"),
         "geometry is latest-wins and must not reject a stale revision");
     Check(!Translation::IsRequestSemanticAction(L"activate") &&
-          !Translation::IsRequestSemanticAction(L"setText") &&
-          !Translation::IsRequestSemanticAction(L"setCheck") &&
+           !Translation::IsRequestSemanticAction(L"setText") &&
+           !Translation::IsRequestSemanticAction(L"setCheck") &&
+           !Translation::IsRequestSemanticAction(L"setItemCheck") &&
           !Translation::IsRequestSemanticAction(L"select") &&
           !Translation::IsRequestSemanticAction(L"menuCommand") &&
           !Translation::IsRequestSemanticAction(L"minimize") &&
@@ -498,6 +868,7 @@ void TestExpandedControlSerialization() {
     progress.minimum = -10;
     progress.maximum = 30;
     progress.position = 12;
+    progress.indeterminate = true;
     snapshot.nodes.push_back(progress);
     Translation::ControlNode combo;
     combo.nodeId = 3;
@@ -524,6 +895,9 @@ void TestExpandedControlSerialization() {
     list.columnWidths = { 120, 180 };
     list.rows = { { L"C:", L"OK" }, { L"D:", L"Unavailable" } };
     list.items = { L"C:", L"D:" };
+    list.columnHeadersVisible = true;
+    list.checkBoxes = true;
+    list.checkedIndices = { 1 };
     list.selectedIndices = { 0 };
     list.focusedIndex = 0;
     list.multiSelect = true;
@@ -535,6 +909,13 @@ void TestExpandedControlSerialization() {
     status.items = { L"Ln 1, Col 1", L"100%" };
     status.columnWidths = { 140, 80 };
     snapshot.nodes.push_back(status);
+    Translation::ControlNode dialogContainer;
+    dialogContainer.nodeId = 7;
+    dialogContainer.generation = 1;
+    dialogContainer.kind = Translation::ControlKind::DialogContainer;
+    dialogContainer.style = WS_CHILD | DS_CONTROL;
+    dialogContainer.exStyle = WS_EX_CONTROLPARENT;
+    snapshot.nodes.push_back(dialogContainer);
 
     const auto json = Translation::SerializeWindowOpen(
         L"00112233445566778899aabbccddeeff", snapshot);
@@ -543,17 +924,22 @@ void TestExpandedControlSerialization() {
     Check(json.find("\"kind\":\"progressBar\"") != std::string::npos &&
           json.find("\"minimum\":-10") != std::string::npos &&
           json.find("\"maximum\":30") != std::string::npos &&
-          json.find("\"position\":12") != std::string::npos,
+          json.find("\"position\":12") != std::string::npos &&
+          json.find("\"indeterminate\":true") != std::string::npos,
         "ProgressBar state was not serialized");
     Check(json.find("\"editable\":true") != std::string::npos &&
           json.find("\"text\":\"custom\"") != std::string::npos &&
           json.find("\"selectedIndex\":1") != std::string::npos,
         "editable ComboBox state was not serialized");
     Check(json.find("\"kind\":\"sysLink\"") != std::string::npos &&
-          json.find("\"kind\":\"listView\"") != std::string::npos &&
-          json.find("\"columns\":[\"Drive\",\"Status\"]") != std::string::npos &&
-          json.find("\"selectedIndices\":[0]") != std::string::npos &&
-          json.find("\"kind\":\"statusBar\"") != std::string::npos,
+           json.find("\"kind\":\"listView\"") != std::string::npos &&
+           json.find("\"columns\":[\"Drive\",\"Status\"]") != std::string::npos &&
+           json.find("\"columnHeadersVisible\":true") != std::string::npos &&
+           json.find("\"checkBoxes\":true") != std::string::npos &&
+           json.find("\"checkedIndices\":[1]") != std::string::npos &&
+           json.find("\"selectedIndices\":[0]") != std::string::npos &&
+           json.find("\"kind\":\"statusBar\"") != std::string::npos &&
+           json.find("\"kind\":\"dialogContainer\"") != std::string::npos,
         "expanded common-control state was not serialized");
 
     const auto editableFingerprint = Translation::SnapshotFingerprint(snapshot);
@@ -561,10 +947,23 @@ void TestExpandedControlSerialization() {
     Check(editableFingerprint != Translation::SnapshotFingerprint(snapshot),
         "editable state was omitted from the snapshot fingerprint");
 
+    const auto progressFingerprint = Translation::SnapshotFingerprint(snapshot);
+    snapshot.nodes[1].indeterminate = false;
+    Check(progressFingerprint != Translation::SnapshotFingerprint(snapshot),
+        "ProgressBar indeterminate state was omitted from the snapshot fingerprint");
+
     const auto listFingerprint = Translation::SnapshotFingerprint(snapshot);
     snapshot.nodes[4].selectedIndices = { 1 };
     Check(listFingerprint != Translation::SnapshotFingerprint(snapshot),
         "ListView selection was omitted from the snapshot fingerprint");
+    const auto listHeaderFingerprint = Translation::SnapshotFingerprint(snapshot);
+    snapshot.nodes[4].columnHeadersVisible = false;
+    Check(listHeaderFingerprint != Translation::SnapshotFingerprint(snapshot),
+        "ListView column-header visibility was omitted from the snapshot fingerprint");
+    const auto listCheckFingerprint = Translation::SnapshotFingerprint(snapshot);
+    snapshot.nodes[4].checkedIndices = { 0 };
+    Check(listCheckFingerprint != Translation::SnapshotFingerprint(snapshot),
+        "ListView checked rows were omitted from the snapshot fingerprint");
 
     Translation::ActionRequest invokeLink;
     invokeLink.action = L"invoke";
@@ -647,7 +1046,9 @@ void TestControlAdapterRegistry() {
         { L"ListBox", 0, true, ControlKind::ListBox, "ListBox" },
         { L"ListBox", LBS_EXTENDEDSEL, false, ControlKind::ListBox, "multi-select ListBox" },
         { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
-        { PROGRESS_CLASSW, PBS_MARQUEE, false, ControlKind::ProgressBar, "marquee ProgressBar" },
+        { PROGRESS_CLASSW, PBS_MARQUEE, true, ControlKind::ProgressBar, "marquee ProgressBar" },
+        { PROGRESS_CLASSW, PBS_VERTICAL, false, ControlKind::ProgressBar, "vertical ProgressBar" },
+        { PROGRESS_CLASSW, WS_TABSTOP, false, ControlKind::ProgressBar, "tab-stop ProgressBar" },
         { STATUSCLASSNAMEW, 0, true, ControlKind::StatusBar, "StatusBar" },
         { STATUSCLASSNAMEW, WS_TABSTOP, false, ControlKind::StatusBar, "tab-stop StatusBar" },
         // SysLink is deliberately absent: its class is only registered by
@@ -672,6 +1073,35 @@ void TestControlAdapterRegistry() {
             Check(!reason.empty(), adapter.label);
         }
         DestroyWindow(child);
+    }
+
+    HWND styledList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT,
+        0, 0, 80, 24, root, reinterpret_cast<HMENU>(302), GetModuleHandleW(nullptr), nullptr);
+    if (styledList) {
+        Translation::ControlKind kind{};
+        std::wstring reason;
+        ListView_SetExtendedListViewStyleEx(
+            styledList, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
+        Check(Translation::ClassifyControl(styledList, kind, reason) &&
+              kind == ControlKind::ListView,
+            "LVS_EX_CHECKBOXES was rejected by the ListView probe");
+        struct RejectedStyle { DWORD value; const wchar_t* name; };
+        const RejectedStyle rejectedStyles[] = {
+            { LVS_EX_HEADERDRAGDROP, L"LVS_EX_HEADERDRAGDROP" },
+            { LVS_EX_TRACKSELECT, L"LVS_EX_TRACKSELECT" },
+            { LVS_EX_ONECLICKACTIVATE, L"LVS_EX_ONECLICKACTIVATE" },
+            { LVS_EX_TWOCLICKACTIVATE, L"LVS_EX_TWOCLICKACTIVATE" },
+        };
+        for (const auto& rejectedStyle : rejectedStyles) {
+            ListView_SetExtendedListViewStyleEx(styledList, 0xffffffff,
+                LVS_EX_CHECKBOXES | rejectedStyle.value);
+            reason.clear();
+            Check(!Translation::ClassifyControl(styledList, kind, reason) &&
+                  reason.find(rejectedStyle.name) != std::wstring::npos &&
+                  reason.find(L"0x") != std::wstring::npos,
+                "unsupported ListView extended style lacked exact numeric diagnostics");
+        }
+        DestroyWindow(styledList);
     }
 
     // An unregistered class is rejected by name so the log identifies it.
@@ -717,8 +1147,11 @@ void TestStructuredCommonControlCapture() {
     Check(window != nullptr, "common-control capture root was not created");
     if (!window) return;
 
-    HWND list = CreateWindowExW(0, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL,
+    constexpr DWORD visibleHeaderStyle = 0x5021000D;
+    constexpr DWORD headerlessStyle = 0x5021400D;
+    constexpr DWORD targetExStyle = 0x00000204;
+    HWND list = CreateWindowExW(targetExStyle, WC_LISTVIEWW, L"",
+        visibleHeaderStyle,
         10, 10, 600, 260, window, reinterpret_cast<HMENU>(200),
         GetModuleHandleW(nullptr), nullptr);
     HWND status = CreateWindowExW(0, STATUSCLASSNAMEW, L"",
@@ -757,6 +1190,9 @@ void TestStructuredCommonControlCapture() {
     selection.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
     selection.state = LVIS_SELECTED | LVIS_FOCUSED;
     SendMessageW(list, LVM_SETITEMSTATE, 1, reinterpret_cast<LPARAM>(&selection));
+    ListView_SetExtendedListViewStyleEx(list, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
+    Check(Translation::SetListViewItemCheck(list, 1, true),
+        "native ListView checkbox state could not be initialized");
 
     int parts[] = { 260, -1 };
     SendMessageW(status, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
@@ -778,9 +1214,11 @@ void TestStructuredCommonControlCapture() {
         });
     Check(listNode != snapshot.nodes.end() &&
           listNode->columns == std::vector<std::wstring>{ L"Drive", L"Status" } &&
-          listNode->rows.size() == 2 && listNode->rows[1][1] == L"Unavailable" &&
-          listNode->selectedIndices == std::vector<int>{ 1 } &&
-          listNode->focusedIndex == 1 && !listNode->multiSelect,
+           listNode->rows.size() == 2 && listNode->rows[1][1] == L"Unavailable" &&
+           listNode->selectedIndices == std::vector<int>{ 1 } &&
+           listNode->focusedIndex == 1 && !listNode->multiSelect &&
+           listNode->columnHeadersVisible && listNode->checkBoxes &&
+           listNode->checkedIndices == std::vector<int>{ 1 },
         "bounded report ListView state was not captured canonically");
     const auto statusNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
         [](const Translation::ControlNode& node) {
@@ -790,6 +1228,39 @@ void TestStructuredCommonControlCapture() {
           statusNode->items == std::vector<std::wstring>{ L"Ln 1, Col 1", L"100%" } &&
           statusNode->columnWidths.size() == 2,
         "bounded StatusBar state was not captured canonically");
+
+    SetWindowLongPtrW(list, GWL_STYLE, headerlessStyle);
+    SetWindowPos(list, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    Translation::WindowSnapshot headerlessSnapshot;
+    context.revision = 2;
+    const auto actualHeaderlessStyle =
+        static_cast<DWORD>(GetWindowLongPtrW(list, GWL_STYLE));
+    // The control owns WS_VSCROLL and clears it when the current rows fit.
+    const bool exactStyle =
+        (actualHeaderlessStyle & ~WS_VSCROLL) == (headerlessStyle & ~WS_VSCROLL) &&
+        static_cast<DWORD>(GetWindowLongPtrW(list, GWL_EXSTYLE)) == targetExStyle;
+    const bool headerlessCaptured =
+        Translation::CaptureWindow(window, context, headerlessSnapshot, error);
+    if (!headerlessCaptured) std::wcerr << L"headerless capture rejection: " << error << L'\n';
+    Check(exactStyle && headerlessCaptured,
+        "exact headerless report ListView style did not capture");
+    const auto headerlessNode = std::find_if(
+        headerlessSnapshot.nodes.begin(), headerlessSnapshot.nodes.end(),
+        [](const Translation::ControlNode& node) {
+            return node.kind == Translation::ControlKind::ListView;
+        });
+    Check(headerlessNode != headerlessSnapshot.nodes.end() &&
+          !headerlessNode->columnHeadersVisible &&
+          headerlessNode->columns == std::vector<std::wstring>{ L"Drive", L"Status" } &&
+          headerlessNode->columnWidths == std::vector<int>{ 180, 260 } &&
+          headerlessNode->rows.size() == 2 &&
+          headerlessNode->rows[1][1] == L"Unavailable",
+        "headerless report ListView lost its canonical columns or row cells");
+    const auto headerlessJson = Translation::SerializeWindowOpen(
+        L"00112233445566778899aabbccddeeff", headerlessSnapshot);
+    Check(headerlessJson.find("\"columnHeadersVisible\":false") != std::string::npos,
+        "headerless report ListView visibility was not serialized");
 
     SendMessageW(status, SB_SETTEXTW, SBT_OWNERDRAW,
         reinterpret_cast<LPARAM>(reinterpret_cast<void*>(1)));
@@ -817,6 +1288,195 @@ void TestStructuredCommonControlCapture() {
     DestroyWindow(virtualWindow);
 }
 
+void TestListViewCheckNotificationSemantics() {
+    HWND window = CreateWindowExW(0, L"Static", L"list-check-action", WS_OVERLAPPEDWINDOW,
+        20, 20, 320, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND list = window ? CreateWindowExW(0, WC_LISTVIEWW, L"",
+        WS_CHILD | LVS_REPORT, 10, 10, 280, 120, window,
+        reinterpret_cast<HMENU>(440), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(window && list, "ListView notification test controls were not created");
+    if (!window || !list) {
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SetWindowSubclass(window, ListViewNotificationSubclass, 1, 0);
+    LVCOLUMNW column{};
+    column.mask = LVCF_TEXT | LVCF_WIDTH;
+    column.cx = 100;
+    column.pszText = const_cast<LPWSTR>(L"Name");
+    ListView_InsertColumn(list, 0, &column);
+    LVITEMW item{};
+    item.mask = LVIF_TEXT;
+    item.pszText = const_cast<LPWSTR>(L"row");
+    ListView_InsertItem(list, &item);
+    ListView_SetExtendedListViewStyleEx(list, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
+
+    g_itemChanging = g_itemChanged = 0;
+    g_vetoItemChange = false;
+    Check(Translation::SetListViewItemCheck(list, 0, true) &&
+          g_itemChanging == 1 && g_itemChanged == 1,
+        "setItemCheck did not preserve one native changing/changed notification pair");
+    g_vetoItemChange = true;
+    Check(!Translation::SetListViewItemCheck(list, 0, false) &&
+          ListView_GetCheckState(list, 0) && g_itemChanging == 2 && g_itemChanged == 1,
+        "setItemCheck ignored LVN_ITEMCHANGING veto or double-fired notifications");
+    g_vetoItemChange = false;
+    DestroyWindow(window);
+}
+
+void TestTabControlCaptureAndSelection() {
+    HWND window = CreateWindowExW(0, L"Static", L"tab-control", WS_OVERLAPPEDWINDOW,
+        20, 20, 440, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    constexpr DWORD targetStyle = 0x54030240;
+    constexpr DWORD targetExStyle = 0x00000004;
+    HWND tab = window ? CreateWindowExW(targetExStyle, WC_TABCONTROLW, L"", targetStyle,
+        10, 10, 260, 180, window, reinterpret_cast<HMENU>(450),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(window && tab, "TabControl capture controls were not created");
+    if (!window || !tab) {
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SetWindowSubclass(window, ListViewNotificationSubclass, 2, 0);
+    const wchar_t* labels[] = { L"General", L"Advanced options", L"Diagnostics", L"About" };
+    const std::array<LPARAM, 4> itemData{
+        static_cast<LPARAM>(0x1111222233334444ll),
+        static_cast<LPARAM>(0x2222333344445555ll),
+        static_cast<LPARAM>(0x3333444455556666ll),
+        static_cast<LPARAM>(0x4444555566667777ll),
+    };
+    for (int index = 0; index < static_cast<int>(std::size(labels)); ++index) {
+        TCITEMW item{};
+        item.mask = TCIF_TEXT | TCIF_PARAM;
+        item.pszText = const_cast<LPWSTR>(labels[index]);
+        item.lParam = itemData[static_cast<size_t>(index)];
+        Check(SendMessageW(tab, TCM_INSERTITEMW, index,
+            reinterpret_cast<LPARAM>(&item)) == index, "TabControl item insertion failed");
+    }
+    SendMessageW(tab, TCM_SETCURSEL, 2, 0);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"77777777-7777-7777-7777-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(window, context, snapshot, error);
+    if (!captured) std::wcerr << L"TabControl capture rejection: " << error << L'\n';
+    Check(captured, "bounded multiline/hot-track TabControl was rejected");
+    const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& candidate) {
+            return candidate.kind == Translation::ControlKind::TabControl;
+        });
+    Check(node != snapshot.nodes.end() && node->items.size() == std::size(labels) &&
+          node->itemRects.size() == node->items.size() && node->selectedIndex == 2,
+        "TabControl labels, local rectangles, or selection were not captured");
+    if (node != snapshot.nodes.end()) {
+        std::vector<std::pair<LONG, LONG>> rows;
+        bool strictRows = true;
+        for (const RECT& rect : node->itemRects) {
+            const auto row = std::find_if(rows.begin(), rows.end(),
+                [&rect](const auto& candidate) { return candidate.first == rect.top; });
+            if (row == rows.end()) rows.emplace_back(rect.top, rect.bottom - rect.top);
+            else if (row->second != rect.bottom - rect.top) strictRows = false;
+        }
+        std::sort(rows.begin(), rows.end());
+        for (size_t index = 1; index < rows.size(); ++index) {
+            if (rows[index - 1].first + rows[index - 1].second > rows[index].first)
+                strictRows = false;
+        }
+        Check(strictRows && rows.size() > 1,
+            "TCS_MULTILINE did not expose distinct ordered header-row geometry");
+        const auto json = Translation::SerializeWindowOpen(
+            L"00112233445566778899aabbccddeeff", snapshot);
+        Check(json.find("\"kind\":\"tabControl\"") != std::string::npos &&
+              json.find("\"itemRects\":[") != std::string::npos &&
+              json.find("\"lParam\"") == std::string::npos &&
+              json.find("\"itemData\"") == std::string::npos,
+            "TabControl state was not serialized or leaked opaque item data");
+        const auto fingerprint = Translation::SnapshotFingerprint(snapshot);
+        snapshot.nodes[static_cast<size_t>(node - snapshot.nodes.begin())].selectedIndex = 1;
+        Check(fingerprint != Translation::SnapshotFingerprint(snapshot),
+            "TabControl selection was omitted from the fingerprint");
+    }
+
+    const auto itemDataUnchanged = [&] {
+        for (int index = 0; index < static_cast<int>(itemData.size()); ++index) {
+            TCITEMW item{};
+            item.mask = TCIF_PARAM;
+            if (!SendMessageW(tab, TCM_GETITEMW, index, reinterpret_cast<LPARAM>(&item)) ||
+                item.lParam != itemData[static_cast<size_t>(index)]) return false;
+        }
+        return true;
+    };
+
+    g_tabChanging = g_tabChanged = 0;
+    g_tabNotifications.clear();
+    g_vetoTabChange = false;
+    Check(Translation::SelectTabControl(window, tab, 450, 1, 4) &&
+          TabCtrl_GetCurSel(tab) == 1 && g_tabChanging == 1 && g_tabChanged == 1 &&
+          g_tabNotifications == std::vector<UINT>{ TCN_SELCHANGING, TCN_SELCHANGE } &&
+          itemDataUnchanged(),
+        "TabControl selection changed item data or notification ordering");
+    g_tabNotifications.clear();
+    g_vetoTabChange = true;
+    Check(!Translation::SelectTabControl(window, tab, 450, 3, 4) &&
+          TabCtrl_GetCurSel(tab) == 1 && g_tabChanging == 2 && g_tabChanged == 1 &&
+          g_tabNotifications == std::vector<UINT>{ TCN_SELCHANGING } &&
+          itemDataUnchanged(),
+        "TabControl veto changed item data or notification ordering");
+    g_vetoTabChange = false;
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    struct RejectedStyle { DWORD value; const wchar_t* diagnostic; };
+    const RejectedStyle rejected[] = {
+        { TCS_OWNERDRAWFIXED, L"TCS_OWNERDRAWFIXED" },
+        { TCS_BUTTONS, L"button" },
+        { TCS_FLATBUTTONS, L"button" },
+        { TCS_VERTICAL, L"vertical" },
+        { TCS_BOTTOM, L"bottom" },
+        { TCS_FIXEDWIDTH, L"TCS_FIXEDWIDTH" },
+        { TCS_TOOLTIPS, L"tooltips" },
+    };
+    for (const auto& entry : rejected) {
+        SetWindowLongPtrW(tab, GWL_STYLE, targetStyle | entry.value);
+        reason.clear();
+        Check(!Translation::ClassifyControl(tab, kind, reason) &&
+              reason.find(entry.diagnostic) != std::wstring::npos,
+            "unsupported TabControl style lacked precise diagnostics");
+    }
+    SetWindowLongPtrW(tab, GWL_STYLE, targetStyle);
+    HIMAGELIST images = ImageList_Create(16, 16, ILC_COLOR32, 1, 1);
+    TabCtrl_SetImageList(tab, images);
+    reason.clear();
+    Check(images && !Translation::ClassifyControl(tab, kind, reason) &&
+          reason.find(L"image-backed") != std::wstring::npos,
+        "image-backed TabControl was accepted");
+    TabCtrl_SetImageList(tab, nullptr);
+    if (images) ImageList_Destroy(images);
+
+    Translation::ControlNode detail;
+    detail.kind = Translation::ControlKind::TabControl;
+    detail.style = targetStyle;
+    reason.clear();
+    Check(Translation::CaptureControlDetail(tab, detail, reason) && itemDataUnchanged(),
+        "opaque nonzero TabControl item data was rejected or mutated");
+    TCITEMW extra{};
+    extra.mask = TCIF_TEXT;
+    extra.pszText = const_cast<LPWSTR>(L"extra");
+    while (TabCtrl_GetItemCount(tab) <= static_cast<int>(Ipc::kMaxTabItems)) {
+        const int index = TabCtrl_GetItemCount(tab);
+        SendMessageW(tab, TCM_INSERTITEMW, index, reinterpret_cast<LPARAM>(&extra));
+    }
+    reason.clear();
+    Check(!Translation::CaptureControlDetail(tab, detail, reason) &&
+          reason.find(L"excessive") != std::wstring::npos,
+        "excessive TabControl item count was accepted");
+    DestroyWindow(window);
+}
+
 void TestEditableComboCaptureBoundary() {
     Translation::WindowSnapshot snapshot;
     Check(CaptureSingleCombo(CBS_DROPDOWNLIST, snapshot) &&
@@ -834,6 +1494,254 @@ void TestEditableComboCaptureBoundary() {
         "Win32-normalized string-backed CBS_DROPDOWN was rejected");
     Check(!CaptureSingleCombo(CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, snapshot),
         "owner-draw ComboBox was accepted");
+}
+
+void TestStaticIconCaptureBoundary() {
+    HWND window = CreateWindowExW(0, L"Static", L"icon-capture", WS_OVERLAPPEDWINDOW,
+        20, 20, 240, 180, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND iconControl = window ? CreateWindowExW(0, L"Static", nullptr,
+        WS_CHILD | WS_VISIBLE | SS_ICON, 10, 10, 32, 32, window,
+        reinterpret_cast<HMENU>(430), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HICON icon = CreateColorIcon(2, 2, { 100, 50, 200, 128 });
+    Check(window && iconControl && icon, "Static icon capture controls were not created");
+    if (!window || !iconControl || !icon) {
+        if (icon) DestroyIcon(icon);
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SendMessageW(iconControl, STM_SETICON, reinterpret_cast<WPARAM>(icon), 0);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    Translation::CaptureContext context;
+    context.surfaceId = L"66666666-6666-6666-6666-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    Check(Translation::CaptureWindow(window, context, snapshot, error),
+        "bounded SS_ICON was rejected");
+    const auto captured = snapshot.nodes.empty() ? nullptr : &snapshot.nodes[0];
+    Check(captured && captured->kind == Translation::ControlKind::StaticIcon &&
+          captured->imageWidth == 2 && captured->imageHeight == 2 &&
+          captured->imageFormat == L"bgra8-premultiplied" &&
+          captured->imageData.size() == 16 &&
+          captured->imageData[0] == 50 && captured->imageData[1] == 25 &&
+          captured->imageData[2] == 100 && captured->imageData[3] == 128,
+        "SS_ICON pixels were not copied as premultiplied BGRA");
+    const auto serialized = Translation::SerializeWindowOpen(
+        L"00112233445566778899aabbccddeeff", snapshot);
+    Check(serialized.find("\"kind\":\"staticIcon\"") != std::string::npos &&
+          serialized.find("\"imageWidth\":2") != std::string::npos &&
+          serialized.find("\"imageFormat\":\"bgra8-premultiplied\"") != std::string::npos &&
+          serialized.find("\"imageData\":") != std::string::npos,
+        "SS_ICON owned pixels were not serialized onto the wire");
+    const uint64_t firstFingerprint = Translation::SnapshotFingerprint(snapshot);
+    const auto copiedPixels = captured ? captured->imageData : std::vector<uint8_t>{};
+    DestroyIcon(icon);
+    icon = nullptr;
+    Check(captured && captured->imageData == copiedPixels,
+        "captured Static icon retained the source HICON lifetime");
+
+    HICON replacement = CreateColorIcon(1, 1, { 0, 0, 255, 0 }, true);
+    SendMessageW(iconControl, STM_SETICON, reinterpret_cast<WPARAM>(replacement), 0);
+    context.revision = 3;
+    Translation::WindowSnapshot replaced;
+    Check(replacement && Translation::CaptureWindow(window, context, replaced, error) &&
+          Translation::SnapshotFingerprint(replaced) != firstFingerprint &&
+          replaced.nodes[0].imageData == std::vector<uint8_t>{ 0, 0, 0, 0 },
+        "mask-based STM_SETICON replacement was not captured transparently");
+    if (replacement) DestroyIcon(replacement);
+
+    SendMessageW(iconControl, STM_SETICON, 0, 0);
+    context.revision = 3;
+    Translation::WindowSnapshot missing;
+    Check(!Translation::CaptureWindow(window, context, missing, error) &&
+          error.find(L"no current HICON") != std::wstring::npos,
+        "SS_ICON without an image was accepted");
+
+    HICON oversized = CreateColorIcon(
+        static_cast<int>(Ipc::kMaxImageDimension) + 1, 1, { 0, 0, 0, 255 });
+    SendMessageW(iconControl, STM_SETICON, reinterpret_cast<WPARAM>(oversized), 0);
+    context.revision = 4;
+    Check(oversized && !Translation::CaptureWindow(window, context, missing, error) &&
+          error.find(L"dimensions exceed") != std::wstring::npos,
+        "oversized SS_ICON payload was accepted");
+    if (oversized) DestroyIcon(oversized);
+    DestroyWindow(window);
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    HWND bitmap = CreateWindowExW(0, L"Static", nullptr, WS_CHILD | SS_BITMAP,
+        0, 0, 10, 10, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Check(bitmap && !Translation::ClassifyControl(bitmap, kind, reason),
+        "SS_BITMAP was accepted by the SS_ICON adapter");
+    if (bitmap) DestroyWindow(bitmap);
+}
+
+void TestAncestorEnabledTabOrderCapture() {
+    HWND window = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"tab-order-capture",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    HWND panel = window ? CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"",
+        WS_CHILD | WS_VISIBLE | WS_DISABLED, 10, 10, 320, 160, window,
+        reinterpret_cast<HMENU>(400), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND edit = panel ? CreateWindowExW(0, L"Edit", L"nested",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 10, 10, 180, 24, panel,
+        reinterpret_cast<HMENU>(401), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(window && panel && edit, "ancestor-enabled capture controls were not created");
+    if (!window || !panel || !edit) {
+        if (window) DestroyWindow(window);
+        return;
+    }
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"33333333-3333-3333-3333-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot disabledSnapshot;
+    std::wstring error;
+    Check(Translation::CaptureWindow(window, context, disabledSnapshot, error),
+        "tab stop below a disabled ancestor was rejected");
+    const auto disabledEdit = std::find_if(disabledSnapshot.nodes.begin(), disabledSnapshot.nodes.end(),
+        [edit](const Translation::ControlNode& node) { return node.hwnd == edit; });
+    Check(disabledEdit != disabledSnapshot.nodes.end() && !disabledEdit->enabled &&
+          disabledEdit->tabStop && disabledEdit->tabIndex == -1,
+        "disabled ancestor was not reflected in child enabledness and tab order");
+
+    EnableWindow(panel, TRUE);
+    context.revision = 2;
+    Translation::WindowSnapshot enabledSnapshot;
+    Check(Translation::CaptureWindow(window, context, enabledSnapshot, error),
+        "tab stop below an enabled control parent was rejected");
+    const auto enabledEdit = std::find_if(enabledSnapshot.nodes.begin(), enabledSnapshot.nodes.end(),
+        [edit](const Translation::ControlNode& node) { return node.hwnd == edit; });
+    Check(enabledEdit != enabledSnapshot.nodes.end() && enabledEdit->enabled &&
+          enabledEdit->tabStop && enabledEdit->tabIndex >= 0,
+        "enabled ancestor did not restore child enabledness and tab order");
+    Check(Translation::SnapshotFingerprint(disabledSnapshot) !=
+          Translation::SnapshotFingerprint(enabledSnapshot),
+        "ancestor enabledness change was omitted from the snapshot fingerprint");
+    DestroyWindow(window);
+}
+
+void TestTabOrderRejectionSpecificity() {
+    HWND dialogRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"dialog-container",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    HWND childDialog = dialogRoot ? CreateWindowExW(WS_EX_CONTROLPARENT, L"#32770", L"Page name",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | DS_CONTROL, 10, 10, 320, 160, dialogRoot,
+        reinterpret_cast<HMENU>(410), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND nestedEdit = childDialog ? CreateWindowExW(0, L"Edit", L"nested",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 10, 10, 180, 24, childDialog,
+        reinterpret_cast<HMENU>(411), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND nestedRadio = childDialog ? CreateWindowExW(0, L"Button", L"choice",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON,
+        10, 45, 180, 24, childDialog, reinterpret_cast<HMENU>(413),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(dialogRoot && childDialog && nestedEdit && nestedRadio,
+        "child dialog focus test controls were not created");
+    if (dialogRoot && childDialog && nestedEdit && nestedRadio) {
+        ShowWindow(dialogRoot, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"44444444-4444-4444-4444-555555555555";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        Check(Translation::CaptureWindow(dialogRoot, context, snapshot, error),
+            "bounded DS_CONTROL container was rejected");
+        const auto container = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [childDialog](const Translation::ControlNode& node) { return node.hwnd == childDialog; });
+        const auto editNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [nestedEdit](const Translation::ControlNode& node) { return node.hwnd == nestedEdit; });
+        const auto radioNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [nestedRadio](const Translation::ControlNode& node) { return node.hwnd == nestedRadio; });
+        Check(container != snapshot.nodes.end() &&
+              container->kind == Translation::ControlKind::DialogContainer &&
+              !container->tabStop && container->tabIndex == -1,
+            "DS_CONTROL container was not captured as a non-focusable structural node");
+        Check(container != snapshot.nodes.end() && editNode != snapshot.nodes.end() &&
+              editNode->parentNodeId == container->nodeId && editNode->tabIndex >= 0,
+            "nested Edit lost parent identity or dialog-manager tab order");
+        Check(container != snapshot.nodes.end() && container->automationName == L"Page name",
+            "DS_CONTROL accessibility name was not retained");
+        Check(container != snapshot.nodes.end() && radioNode != snapshot.nodes.end() &&
+              radioNode->parentNodeId == container->nodeId && radioNode->groupStart,
+            "nested radio control lost its container scope or group boundary");
+        Check(Translation::SyntheticNotificationTarget(dialogRoot, nestedEdit) == childDialog &&
+              Translation::SyntheticNotificationTarget(dialogRoot, childDialog) == dialogRoot,
+            "synthetic control notification would bypass the immediate dialog procedure");
+    }
+    if (dialogRoot) DestroyWindow(dialogRoot);
+
+    HWND unsupportedRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"unsupported-dialog",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    HWND unsupportedDialog = unsupportedRoot ? CreateWindowExW(
+        WS_EX_CONTROLPARENT | WS_EX_CLIENTEDGE, L"#32770", L"caption",
+        WS_CHILD | WS_VISIBLE | DS_CONTROL | WS_BORDER, 10, 10, 200, 100,
+        unsupportedRoot, nullptr, GetModuleHandleW(nullptr), nullptr) : nullptr;
+    if (unsupportedRoot && unsupportedDialog) {
+        ShowWindow(unsupportedRoot, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"44444444-4444-3333-4444-555555555555";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        Check(!Translation::CaptureWindow(unsupportedRoot, context, snapshot, error) &&
+              error.find(L"unsupported visible chrome") != std::wstring::npos,
+            "chromed DS_CONTROL child dialog was accepted");
+    }
+    if (unsupportedRoot) DestroyWindow(unsupportedRoot);
+
+    HWND listRoot = CreateWindowExW(0, L"Static", L"label-edit-list",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    HWND list = listRoot ? CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_EDITLABELS,
+        10, 10, 320, 160, listRoot, reinterpret_cast<HMENU>(412),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(listRoot && list, "label-edit ListView focus test controls were not created");
+    if (listRoot && list) {
+        ShowWindow(listRoot, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"55555555-5555-5555-5555-555555555555";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        Check(!Translation::CaptureWindow(listRoot, context, snapshot, error) &&
+              error.find(L"label-editable") != std::wstring::npos,
+            "non-dialog ListView did not reach its precise adapter rejection");
+    }
+    if (listRoot) DestroyWindow(listRoot);
+
+    HWND privateRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"private-host",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    HWND privateHost = privateRoot ? CreateWindowExW(0, L"Static", L"",
+        WS_CHILD | WS_VISIBLE, 10, 10, 320, 160, privateRoot,
+        reinterpret_cast<HMENU>(420), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND privateControl = privateHost ? CreateWindowExW(0, L"ScrollBar", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | SBS_HORZ, 10, 10, 180, 24, privateHost,
+        reinterpret_cast<HMENU>(421), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(privateRoot && privateHost && privateControl,
+        "nested unsupported focus test controls were not created");
+    if (privateRoot && privateHost && privateControl) {
+        ShowWindow(privateRoot, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"66666666-6666-6666-6666-555555555555";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        Check(!Translation::CaptureWindow(privateRoot, context, snapshot, error) &&
+              error.find(L"unsupported visible control class") != std::wstring::npos &&
+              error.find(L"ScrollBar") != std::wstring::npos,
+            "unsupported nested class was masked by dialog tab-order diagnostics");
+    }
+    if (privateRoot) DestroyWindow(privateRoot);
 }
 
 void TestStandardMenuCapture() {
@@ -929,9 +1837,97 @@ void TestMenuActionValidationAndSerialization() {
         "typed menu snapshot was not serialized");
 }
 
+void TestToolbarCaptureBoundary() {
+    HWND window = CreateWindowExW(0, L"Static", L"toolbar-capture", WS_OVERLAPPEDWINDOW,
+        20, 20, 480, 180, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    constexpr DWORD toolbarStyle = WS_CHILD | WS_VISIBLE | CCS_TOP | TBSTYLE_TOOLTIPS |
+        TBSTYLE_WRAPABLE | TBSTYLE_FLAT | TBSTYLE_TRANSPARENT;
+    HWND toolbar = window ? CreateWindowExW(0, TOOLBARCLASSNAMEW, nullptr, toolbarStyle,
+        0, 0, 440, 40, window, reinterpret_cast<HMENU>(500), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(window != nullptr && toolbar != nullptr, "ToolbarWindow32 capture controls were not created");
+    if (!window || !toolbar) {
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SendMessageW(toolbar, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    HIMAGELIST images = ImageList_Create(32, 32, ILC_COLOR32 | ILC_MASK, 1, 1);
+    HICON sourceIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    Check(images != nullptr && sourceIcon != nullptr && ImageList_AddIcon(images, sourceIcon) == 0,
+        "ToolbarWindow32 normal image list was not created");
+    SendMessageW(toolbar, TB_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(images));
+    wchar_t openLabel[] = L"Open";
+    wchar_t saveLabel[] = L"Save";
+    wchar_t hiddenLabel[] = L"Hidden";
+    TBBUTTON buttons[4]{};
+    buttons[0].iBitmap = 0;
+    buttons[0].idCommand = 100;
+    buttons[0].fsState = TBSTATE_ENABLED;
+    buttons[0].fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
+    buttons[0].iString = reinterpret_cast<INT_PTR>(openLabel);
+    buttons[1].iBitmap = 8;
+    buttons[1].fsState = TBSTATE_ENABLED;
+    buttons[1].fsStyle = BTNS_SEP;
+    buttons[2].iBitmap = 0;
+    buttons[2].idCommand = 101;
+    buttons[2].fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
+    buttons[2].iString = reinterpret_cast<INT_PTR>(saveLabel);
+    buttons[3].iBitmap = 0;
+    buttons[3].idCommand = 102;
+    buttons[3].fsState = TBSTATE_ENABLED | TBSTATE_HIDDEN;
+    buttons[3].fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
+    buttons[3].iString = reinterpret_cast<INT_PTR>(hiddenLabel);
+    Check(SendMessageW(toolbar, TB_ADDBUTTONSW, 4, reinterpret_cast<LPARAM>(buttons)) != FALSE,
+        "ToolbarWindow32 buttons were not added");
+    SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"11111111-2222-3333-4444-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(window, context, snapshot, error);
+    Check(captured, "bounded ToolbarWindow32 was rejected");
+    const auto found = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& node) { return node.kind == Translation::ControlKind::Toolbar; });
+    Check(found != snapshot.nodes.end(), "ToolbarWindow32 node was not captured");
+    if (found != snapshot.nodes.end()) {
+        Check(found->toolbarItems.size() == 4 &&
+              found->toolbarItems[0].text == L"Open" &&
+              !found->toolbarItems[2].enabled && found->toolbarItems[3].hidden &&
+              found->toolbarItems[0].imageFormat == L"bgra8-premultiplied" &&
+              !found->toolbarItems[0].imageData.empty(),
+            "ToolbarWindow32 typed items were not captured");
+        Translation::ActionRequest action;
+        action.action = L"toolbarCommand";
+        action.nodeId = found->nodeId;
+        action.menuCommandId = 100;
+        Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+            "enabled ToolbarWindow32 command was rejected");
+        action.menuCommandId = 101;
+        Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+            "disabled ToolbarWindow32 command was accepted");
+        const auto json = Translation::SerializeWindowOpen(
+            L"00112233445566778899aabbccddeeff", snapshot);
+        Check(json.find("\"kind\":\"toolbar\"") != std::string::npos &&
+              json.find("\"toolbarItems\":[") != std::string::npos &&
+              json.find("\"commandId\":100") != std::string::npos,
+            "ToolbarWindow32 typed items were not serialized");
+        const auto fingerprint = Translation::SnapshotFingerprint(snapshot);
+        snapshot.nodes[static_cast<size_t>(found - snapshot.nodes.begin())].toolbarItems[0].enabled = false;
+        Check(fingerprint != Translation::SnapshotFingerprint(snapshot),
+            "ToolbarWindow32 item state was omitted from the fingerprint");
+    }
+    DestroyWindow(window);
+    if (images) ImageList_Destroy(images);
+}
+
 } // namespace
 
 int wmain() {
+    TestVisibleUiaBoundsClipping();
+    TestDirectUiEvidenceContracts();
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     INITCOMMONCONTROLSEX controls{ sizeof(controls),
         ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
@@ -950,9 +1946,15 @@ int wmain() {
     TestExpandedControlSerialization();
     TestControlAdapterRegistry();
     TestEditableComboCaptureBoundary();
+    TestStaticIconCaptureBoundary();
+    TestAncestorEnabledTabOrderCapture();
+    TestTabOrderRejectionSpecificity();
     TestStructuredCommonControlCapture();
+    TestListViewCheckNotificationSemantics();
+    TestTabControlCaptureAndSelection();
     TestStandardMenuCapture();
     TestMenuActionValidationAndSerialization();
+    TestToolbarCaptureBoundary();
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";
         return 1;

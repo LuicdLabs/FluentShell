@@ -4,6 +4,7 @@
 #include "../../Common/ProcessPolicy.h"
 #include "../Ipc/FrameCodec.h"
 #include "UiAutomationValidator.h"
+#include "DirectUiEngine.h"
 
 #include <sddl.h>
 #include <winrt/base.h>
@@ -162,7 +163,7 @@ bool HideProxyForRestore(HWND window) noexcept {
     BOOL cloak = TRUE;
     const HRESULT set = DwmSetWindowAttribute(window, DWMWA_CLOAK, &cloak, sizeof(cloak));
     ShowWindowAsync(window, SW_HIDE);
-    const uint64_t deadline = GetTickCount64() + 250;
+    const uint64_t deadline = GetTickCount64() + 1000;
     do {
         if (!IsWindow(window) || !IsWindowVisible(window)) return true;
         DWORD reasons = 0;
@@ -218,6 +219,11 @@ struct RendererSession::Surface final {
     std::unordered_map<uint64_t, int> buttonResults;
     std::optional<int> cancelResult;
     std::optional<int> dialogResult;
+    bool directUiAdapter = false;
+    const DirectUiWindowProfile* directUiProfile = nullptr;
+    std::shared_ptr<DirectUiOwnedProfile> directUiOwnedProfile;
+    DirectUiNativeEvidence directUiEvidence;
+    std::unordered_map<uint64_t, DirectUiActionBinding> directUiBindings;
     HANDLE resultEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 };
 
@@ -835,6 +841,14 @@ bool RendererSession::SynchronizeNativeRevision(ProjectionAttempt& attempt) {
     if (!attempt.cloakNative || !attempt.agent) return true;
     const auto& surface = attempt.surface;
     const auto& agent = attempt.agent;
+    if (surface->directUiAdapter) {
+        std::wstring error;
+        if (agent->VerifyDirectUiAndCloak(
+                *surface->directUiProfile, surface->directUiEvidence, error,
+                2000, shutdownEvent_)) return true;
+        FluentShell::Log(L"DirectUI cloak barrier rejected: " + error);
+        return RejectProjection(L"DirectUI native revision barrier or cloak failed");
+    }
 
     constexpr unsigned kMaxResyncs = 4;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -1227,8 +1241,27 @@ bool RendererSession::OpenNativeWindow(HWND root) {
     surface->snapshot.surfaceId = Ipc::NewGuidString();
     surface->snapshot.revision = 1;
     std::wstring error;
+    const DirectUiWindowProfile* profile = agent->DirectUiProfile();
+    DirectUiAdmissionResult admission = DirectUiAdmissionResult::NotApplicable;
+    if (profile) {
+        admission = InspectDirectUiSurface(*agent, *profile, 2000, shutdownEvent_, error,
+            &surface->snapshot, &surface->directUiBindings, &surface->directUiEvidence);
+    } else if (agent->GenericDirectUiCandidate()) {
+        admission = InspectGenericDirectUiSurface(*agent, 2000, shutdownEvent_, error,
+            &surface->directUiOwnedProfile, &surface->snapshot,
+            &surface->directUiBindings, &surface->directUiEvidence);
+        profile = agent->DirectUiProfile();
+    }
+    if (admission == DirectUiAdmissionResult::Rejected) {
+        if (!agent->Shutdown()) RetainSourceThreadAgent(agent);
+        FluentShell::Log(error);
+        return false;
+    }
+    surface->directUiAdapter = admission == DirectUiAdmissionResult::Admitted;
+    surface->directUiProfile = profile;
     if (surface->snapshot.surfaceId.empty() ||
-        !agent->Capture(surface->snapshot, error, 2000, shutdownEvent_)) {
+        (!surface->directUiAdapter &&
+         !agent->Capture(surface->snapshot, error, 2000, shutdownEvent_))) {
         if (!agent->Shutdown()) RetainSourceThreadAgent(agent);
         FluentShell::Log(L"Native window remains untranslated: " + error);
         return false;
@@ -1420,6 +1453,260 @@ void RendererSession::HandleNativeAction(
         return;
     }
 
+    if (surface->directUiAdapter &&
+        (action.action == L"move" || action.action == L"resize")) {
+        const auto width = [](const RECT& bounds) {
+            return static_cast<int64_t>(bounds.right) - bounds.left;
+        };
+        const auto height = [](const RECT& bounds) {
+            return static_cast<int64_t>(bounds.bottom) - bounds.top;
+        };
+        if (action.action == L"resize" ||
+            width(action.rect) != width(surface->snapshot.bounds) ||
+            height(action.rect) != height(surface->snapshot.bounds)) {
+            FluentShell::Log(
+                L"DirectUI geometry changed size; restoring the non-resizable native window");
+            lock.unlock();
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"unsupported");
+            return;
+        }
+        const auto* directUiProfile = surface->directUiProfile;
+        const DirectUiNativeEvidence expectedEvidence = surface->directUiEvidence;
+        if (!directUiProfile) {
+            lock.unlock();
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"sourceIdentityChanged");
+            return;
+        }
+        lock.unlock();
+        DirectUiNativeEvidence movedEvidence;
+        std::wstring error;
+        if (!agent->MoveDirectUiWindow(*directUiProfile, expectedEvidence,
+                action.rect, movedEvidence, error, 2000, shutdownEvent_)) {
+            FluentShell::Log(L"DirectUI native move rejected: " + error);
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"restore");
+            return;
+        }
+
+        WindowSnapshot published;
+        uint64_t baseRevision = 0;
+        uint64_t revision = 0;
+        bool updated = false;
+        {
+            std::scoped_lock updateLock(surface->mutex);
+            if (surface->state == SurfaceState::Projected &&
+                !surface->restoreInProgress && surface->agent == agent &&
+                agent->Generation() == sourceGeneration &&
+                surface->directUiProfile == directUiProfile) {
+                baseRevision = surface->snapshot.revision;
+                surface->snapshot.bounds = movedEvidence.root.bounds;
+                surface->snapshot.clientBounds = movedEvidence.clientBounds;
+                surface->snapshot.dpi = movedEvidence.dpi;
+                ++surface->snapshot.revision;
+                surface->directUiEvidence = std::move(movedEvidence);
+                surface->fingerprint = SnapshotFingerprint(surface->snapshot);
+                revision = surface->snapshot.revision;
+                published = surface->snapshot;
+                updated = true;
+            }
+        }
+        if (!updated) {
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"sourceIdentityChanged");
+            return;
+        }
+        canonicalLock.unlock();
+        FluentShell::Log(L"DirectUI native move accepted: " +
+            DescribeRect(published.bounds));
+        Send(Ipc::MessageType::ActionResult, revision,
+            SerializeActionResult(nonce_, action, L"accepted", revision));
+        Send(Ipc::MessageType::WindowPatch, revision,
+            SerializeWindowPatch(nonce_, baseRevision, published, action.eventId));
+        return;
+    }
+
+    if (surface->directUiAdapter &&
+        (action.action == L"invoke" || action.action == L"close" ||
+         action.action == L"setCheck")) {
+        const auto fallbackWithoutClick = [&](std::wstring_view reason) {
+            lock.unlock();
+            canonicalLock.unlock();
+            RestoreSurface(surface, reason);
+        };
+        DirectUiActionBinding requested;
+        bool foundBinding = false;
+        if ((action.action == L"invoke" || action.action == L"setCheck") && action.nodeId) {
+            const auto found = surface->directUiBindings.find(*action.nodeId);
+            if (found != surface->directUiBindings.end()) {
+                requested = found->second;
+                foundBinding = true;
+            }
+        } else if (action.action == L"close") {
+            const auto found = std::find_if(surface->directUiBindings.begin(),
+                surface->directUiBindings.end(), [](const auto& entry) {
+                    return entry.second.cancel;
+                });
+            if (found != surface->directUiBindings.end()) {
+                requested = found->second;
+                foundBinding = true;
+            }
+        }
+        if (!foundBinding) {
+            fallbackWithoutClick(L"sourceIdentityChanged");
+            return;
+        }
+        if ((action.action == L"invoke" &&
+                requested.action != DirectUiAction::HandoffClick) ||
+            (action.action == L"setCheck" &&
+                requested.action != DirectUiAction::ToggleCheck) ||
+            (action.action == L"close" && !requested.cancel)) {
+            fallbackWithoutClick(L"sourceIdentityChanged");
+            return;
+        }
+        const auto* directUiProfile = surface->directUiProfile;
+        const DirectUiNativeEvidence expectedEvidence = surface->directUiEvidence;
+        if (!directUiProfile) {
+            fallbackWithoutClick(L"sourceIdentityChanged");
+            return;
+        }
+        // A projected toggle stays inside the projection. The initial UIA
+        // contract has already been admitted; while cloaked, actions use fresh
+        // native evidence and permit only the requested checkbox delta.
+        if (action.action == L"setCheck") {
+            std::wstring error;
+            lock.unlock();
+            DirectUiNativeEvidence beforeToggle;
+            if (!agent->CaptureDirectUiNativeEvidence(*directUiProfile, beforeToggle,
+                    error, 2000, shutdownEvent_) ||
+                !MatchDirectUiMutationBracket(*directUiProfile,
+                    expectedEvidence, beforeToggle, error, false) ||
+                requested.slotIndex >= beforeToggle.slotWindows.size() ||
+                beforeToggle.slotWindows[requested.slotIndex].hwnd != requested.hwnd ||
+                beforeToggle.slotWindows[requested.slotIndex].generation != requested.generation) {
+                canonicalLock.unlock();
+                RestoreSurface(surface, L"sourceIdentityChanged");
+                return;
+            }
+            if (!agent->InvokeDirectUiToggle(
+                    requested, action.integerValue, error, 2000, shutdownEvent_)) {
+                FluentShell::Log(L"DirectUI native toggle rejected: " + error);
+                canonicalLock.unlock();
+                RestoreSurface(surface, L"restore");
+                return;
+            }
+            FluentShell::Log(L"DirectUI native toggle accepted: requested=" +
+                std::to_wstring(action.integerValue));
+            DirectUiNativeEvidence expectedAfter = beforeToggle;
+            expectedAfter.slotWindows[requested.slotIndex].checked =
+                action.integerValue != 0;
+            DirectUiNativeEvidence afterToggle;
+            if (!agent->CaptureDirectUiNativeEvidence(*directUiProfile, afterToggle,
+                    error, 2000, shutdownEvent_) ||
+                !MatchDirectUiMutationBracket(*directUiProfile,
+                    expectedAfter, afterToggle, error, false)) {
+                canonicalLock.unlock();
+                RestoreSurface(surface, L"sourceIdentityChanged");
+                return;
+            }
+            WindowSnapshot published;
+            uint64_t revision = 0;
+            bool updated = false;
+            {
+                std::scoped_lock updateLock(surface->mutex);
+                if (surface->state != SurfaceState::Projected ||
+                    surface->restoreInProgress || surface->agent != agent ||
+                    agent->Generation() != sourceGeneration || !action.nodeId) {
+                    return;
+                }
+                const auto node = std::find_if(surface->snapshot.nodes.begin(),
+                    surface->snapshot.nodes.end(), [&](const auto& candidate) {
+                        return candidate.nodeId == *action.nodeId;
+                    });
+                if (node != surface->snapshot.nodes.end() &&
+                    node->generation == requested.generation) {
+                    node->checked = action.integerValue;
+                    ++surface->snapshot.revision;
+                    surface->directUiEvidence = std::move(afterToggle);
+                    surface->fingerprint = SnapshotFingerprint(surface->snapshot);
+                    revision = surface->snapshot.revision;
+                    published = surface->snapshot;
+                    updated = true;
+                }
+            }
+            if (!updated) {
+                canonicalLock.unlock();
+                RestoreSurface(surface, L"sourceIdentityChanged");
+                return;
+            }
+            canonicalLock.unlock();
+            Send(Ipc::MessageType::WindowPatch, revision,
+                SerializeWindowPatch(nonce_, revision - 1, published, action.eventId),
+                250, false);
+            Send(Ipc::MessageType::ActionResult, revision,
+                SerializeActionResult(nonce_, action, L"accepted", revision), 250, false);
+            return;
+        }
+        DirectUiNativeEvidence verifiedEvidence;
+        std::wstring error;
+        lock.unlock();
+        if (!agent->CaptureDirectUiNativeEvidence(*directUiProfile, verifiedEvidence,
+                error, 2000, shutdownEvent_) ||
+            !MatchDirectUiMutationBracket(*directUiProfile,
+                expectedEvidence, verifiedEvidence, error, false) ||
+            requested.slotIndex >= verifiedEvidence.slotWindows.size() ||
+            verifiedEvidence.slotWindows[requested.slotIndex].hwnd != requested.hwnd ||
+            verifiedEvidence.slotWindows[requested.slotIndex].generation != requested.generation) {
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"sourceIdentityChanged");
+            return;
+        }
+        const uint64_t revision = surface->snapshot.revision;
+        const HWND proxy = surface->ready.proxyHwnd;
+        FluentShell::Log(L"DirectUI projected-page handoff to native: adapter=" +
+            std::wstring(directUiProfile->adapterId) + L" page=" +
+            std::wstring(directUiProfile->pageId) + L" action=" + action.action);
+        Send(Ipc::MessageType::SurfaceCommit, revision,
+            SerializeSurfaceCommit(nonce_, surface->snapshot.surfaceId, revision, false, false),
+            250, false);
+        if (!HideProxyForRestore(proxy)) {
+            FluentShell::Log(L"DirectUI handoff could not isolate the renderer proxy");
+            TerminateRenderer(ERROR_CANCELLED);
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"restore");
+            return;
+        }
+        if (!agent->RestoreThenDirectUiButtonClick(
+                *directUiProfile, verifiedEvidence, requested,
+                error, 2000, shutdownEvent_)) {
+            FluentShell::Log(L"DirectUI restore-before-click rejected without posting: " + error);
+            canonicalLock.unlock();
+            RestoreSurface(surface, L"restore");
+            return;
+        }
+        {
+            std::scoped_lock terminalLock(surface->mutex);
+            surface->state = SurfaceState::Closed;
+        }
+        if (!agent->Shutdown()) {
+            surface->agentRetained = true;
+            RetainSourceThreadAgent(agent);
+        }
+        const auto surfaceId = surface->snapshot.surfaceId;
+        canonicalLock.unlock();
+        Send(Ipc::MessageType::ActionResult, revision,
+            SerializeActionResult(nonce_, action, L"accepted", revision), 250, false);
+        Send(Ipc::MessageType::WindowClose, revision,
+            SerializeWindowClose(nonce_, surfaceId, L"restore"), 250, false);
+        RetireSurfaceIfClosed(surface);
+        {
+            std::scoped_lock discoveryLock(surfacesMutex_);
+            discoveryAttempts_.erase(agent->Root());
+        }
+        return;
+    }
+
     lock.unlock();
     ActionOutcome outcome;
     if (!agent || !agent->Invoke(effectiveAction, outcome, 2000, shutdownEvent_)) {
@@ -1497,6 +1784,10 @@ struct RendererSession::ReconcilePass final {
     uint64_t sourceGeneration = 0;
     uint64_t baseRevision = 0;
     WindowSnapshot next;
+    bool directUiAdapter = false;
+    const DirectUiWindowProfile* directUiProfile = nullptr;
+    DirectUiNativeEvidence directUiEvidence;
+    std::unordered_map<uint64_t, DirectUiActionBinding> directUiBindings;
 };
 
 void RendererSession::ReconcileNativeSurfaces() {
@@ -1532,6 +1823,12 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
         pass.next = surface->snapshot;
         pass.baseRevision = pass.next.revision;
         pass.next.revision = pass.baseRevision + 1;
+        pass.directUiAdapter = surface->directUiAdapter;
+        pass.directUiProfile = surface->directUiProfile;
+        if (pass.directUiAdapter) {
+            pass.directUiEvidence = surface->directUiEvidence;
+            pass.directUiBindings = surface->directUiBindings;
+        }
     }
 
     // A quiet source thread does not need a full capture on every tick.  This is
@@ -1546,6 +1843,26 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
 
     std::wstring error;
     bool timedOut = false;
+    if (pass.directUiAdapter) {
+        DirectUiNativeEvidence current;
+        if (!pass.agent->CaptureDirectUiNativeEvidence(
+                *pass.directUiProfile, current, error, 2000, shutdownEvent_) ||
+            !MatchDirectUiMutationBracket(*pass.directUiProfile,
+                pass.directUiEvidence, current, error, false)) {
+            FluentShell::Log(L"DirectUI reconcile native evidence rejected: " + error);
+            return L"unsupported";
+        }
+        std::scoped_lock lock(surface->mutex);
+        if (surface->state != SurfaceState::Projected || surface->restoreInProgress ||
+            surface->agent != pass.agent ||
+            pass.agent->Generation() != pass.sourceGeneration ||
+            surface->snapshot.revision != pass.baseRevision ||
+            surface->directUiProfile != pass.directUiProfile)
+            return L"nativeStateChanged";
+        surface->directUiEvidence = std::move(current);
+        surface->captureTimeouts = 0;
+        return nullptr;
+    }
     if (!pass.agent->Capture(pass.next, error, 2000, shutdownEvent_, &timedOut)) {
         // A source thread inside a modal loop can miss a bounded deadline without
         // being broken, so a few misses keep the projection.
@@ -1586,7 +1903,22 @@ const wchar_t* RendererSession::PublishReconciledSnapshot(ReconcilePass& pass) {
             pass.next.generation != pass.sourceGeneration) {
             return L"nativeStateChanged";
         }
+        if (pass.directUiAdapter) {
+            if (!surface->directUiAdapter ||
+                pass.directUiBindings.size() != surface->directUiBindings.size())
+                return L"nativeStateChanged";
+            for (const auto& [nodeId, binding] : pass.directUiBindings) {
+                const auto existing = surface->directUiBindings.find(nodeId);
+                if (existing == surface->directUiBindings.end() ||
+                    existing->second.hwnd != binding.hwnd ||
+                    existing->second.generation != binding.generation ||
+                    existing->second.cancel != binding.cancel)
+                    return L"nativeStateChanged";
+            }
+            surface->directUiEvidence = pass.directUiEvidence;
+        }
         changed = fingerprint != surface->fingerprint;
+        if (pass.directUiAdapter && changed) return L"nativeStateChanged";
         if (changed) {
             surface->snapshot = std::move(pass.next);
             surface->fingerprint = fingerprint;

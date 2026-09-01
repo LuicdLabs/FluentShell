@@ -67,6 +67,8 @@
     <ClCompile Include="Bridge\Ipc\Protocol.cpp" />
     <ClCompile Include="Bridge\Translation\ControlAdapters.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />
+    <ClCompile Include="Bridge\Translation\DirectUiEngine.cpp" />
+    <ClCompile Include="Bridge\Translation\DirectUiProfiles.cpp" />
     <ClCompile Include="Bridge\Translation\RendererSession.cpp" />
     <ClCompile Include="Bridge\Translation\SourceThreadAgent.cpp" />
     <ClCompile Include="Bridge\Translation\WindowCapture.cpp" />
@@ -79,9 +81,11 @@
     <ClInclude Include="Bridge\Ipc\Protocol.h" />
     <ClInclude Include="Bridge\Translation\ControlAdapters.h" />
     <ClInclude Include="Bridge\Translation\DialogTranslator.h" />
+    <ClInclude Include="Bridge\Translation\DirectUiEngine.h" />
     <ClInclude Include="Bridge\Translation\RendererSession.h" />
     <ClInclude Include="Bridge\Translation\SourceThreadAgent.h" />
     <ClInclude Include="Bridge\Translation\WindowCapture.h" />
+    <ClInclude Include="Bridge\Translation\UiAutomationGeometry.h" />
     <ClInclude Include="Bridge\Translation\UiAutomationValidator.h" />
     <ClInclude Include="Bridge\Translation\WindowSnapshot.h" />
   </ItemGroup>

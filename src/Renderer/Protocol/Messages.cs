@@ -17,11 +17,25 @@ public sealed record PixelRect
     public int Height { get; init; }
 }
 
+public sealed record ToolbarItemSnapshot
+{
+    public string Kind { get; init; } = string.Empty;
+    public int CommandId { get; init; }
+    public PixelRect Rect { get; init; } = new();
+    public string Text { get; init; } = string.Empty;
+    public bool Enabled { get; init; }
+    public bool Hidden { get; init; }
+    public int? ImageWidth { get; init; }
+    public int? ImageHeight { get; init; }
+    public string? ImageFormat { get; init; }
+    public string? ImageData { get; init; }
+}
+
 public sealed record ControlNode
 {
     public string NodeId { get; init; } = "0";
     public string Generation { get; init; } = "0";
-    public string NativeHwnd { get; init; } = "0x0";
+    public string? NativeHwnd { get; init; } = "0x0";
     public string? ParentNodeId { get; init; }
     public string Kind { get; init; } = string.Empty;
     public int ControlId { get; init; }
@@ -53,16 +67,52 @@ public sealed record ControlNode
     public int? Minimum { get; init; }
     public int? Maximum { get; init; }
     public int? Position { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Indeterminate { get; init; }
     public int? SmallChange { get; init; }
     public int? LargeChange { get; init; }
     public bool Vertical { get; init; }
     public bool Reversed { get; init; }
     public List<string> Items { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<PixelRect>? ItemRects { get; init; }
     public List<string> Columns { get; init; } = [];
     public List<int> ColumnWidths { get; init; } = [];
     public List<List<string>> Rows { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ColumnHeadersVisible { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? CheckBoxes { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? CheckedIndices { get; init; }
     public List<int> ItemDepths { get; init; } = [];
     public List<bool> ItemExpanded { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ImageWidth { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ImageHeight { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ImageFormat { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ImageData { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ToolbarItemSnapshot>? ToolbarItems { get; init; }
+    public string? AdapterId { get; init; }
+    public string? PageId { get; init; }
+    public string? SemanticKey { get; init; }
+    public string? SourceKind { get; init; }
+    public string? PresentationVariant { get; init; }
+    public List<string>? SupportedActions { get; init; }
+    public string? HelpText { get; init; }
+    public string? AccessKey { get; init; }
+}
+
+public sealed record ListViewCheckActionValue
+{
+    [JsonPropertyName("index")]
+    public int Index { get; init; }
+    [JsonPropertyName("checked")]
+    public bool Checked { get; init; }
 }
 
 public sealed record MenuItemSnapshot
@@ -102,6 +152,8 @@ public sealed record WindowSnapshot
     public bool Rtl { get; init; }
     public List<MenuItemSnapshot> Menu { get; init; } = [];
     public List<ControlNode> Nodes { get; init; } = [];
+    public string? AdapterId { get; init; }
+    public string? PageId { get; init; }
 }
 
 public sealed record HelloMessage : IProtocolMessage

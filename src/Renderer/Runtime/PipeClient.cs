@@ -7,6 +7,7 @@ namespace FluentShell.Renderer.Runtime;
 
 public sealed class PipeClient : IAsyncDisposable
 {
+    private const long BridgeHeartbeatTimeoutMs = 6000;
     private readonly RendererOptions _options;
     private readonly NamedPipeClientStream _pipe;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
@@ -163,7 +164,7 @@ public sealed class PipeClient : IAsyncDisposable
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
             while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
             {
-                if (Environment.TickCount64 - Volatile.Read(ref _lastInboundTick) > 3000)
+                if (Environment.TickCount64 - Volatile.Read(ref _lastInboundTick) > BridgeHeartbeatTimeoutMs)
                     throw new ProtocolException("Bridge heartbeat expired.");
                 if (LivenessProbe is not null)
                 {

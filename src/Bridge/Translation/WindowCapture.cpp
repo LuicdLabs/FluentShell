@@ -136,6 +136,23 @@ BOOL CALLBACK CollectChild(HWND hwnd, LPARAM raw) {
     return enumeration.handles.size() <= Ipc::kMaxNodes;
 }
 
+bool IsEffectivelyEnabled(HWND root, HWND child) noexcept {
+    for (HWND current = child; current; current = GetParent(current)) {
+        if (!IsWindowEnabled(current)) return false;
+        if (current == root) return true;
+    }
+    return false;
+}
+
+bool IsDialogControlParent(HWND child) noexcept {
+    wchar_t classBuffer[kMaxClassNameChars]{};
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_EXSTYLE));
+    return FluentShell::EqualsIgnoreCase(ClassNameOf(child, classBuffer), L"#32770") &&
+        (style & (WS_CHILD | DS_CONTROL)) == (WS_CHILD | DS_CONTROL) &&
+        (exStyle & WS_EX_CONTROLPARENT) != 0;
+}
+
 bool CaptureNativeTabOrder(
     HWND root,
     const std::vector<HWND>& handles,
@@ -145,23 +162,32 @@ bool CaptureNativeTabOrder(
     for (const HWND child : handles) {
         if (IsCompositeImplementationChild(child)) continue;
         const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
-        if (IsWindowVisible(child) && IsWindowEnabled(child) &&
+        if (!IsDialogControlParent(child) && IsWindowVisible(child) &&
+            IsEffectivelyEnabled(root, child) &&
             (style & WS_TABSTOP) != 0) {
             candidates.insert(child);
         }
     }
     if (candidates.empty()) return true;
 
-    // GetNextDlgTabItem is the native dialog manager's source of truth. Do
-    // not silently substitute EnumChildWindows order when it cannot describe
-    // every currently focusable candidate; that would produce a misleading
-    // focus contract and should instead trigger whole-window fallback.
+    const auto seed = std::find_if(handles.begin(), handles.end(), [root](HWND child) {
+        return GetParent(child) == root;
+    });
+    if (seed == handles.end()) {
+        reason = L"native dialog manager has no direct child traversal seed";
+        return false;
+    }
+
+    // GetNextDlgTabItem is the native dialog manager's source of truth. A raw
+    // WS_TABSTOP that this walk omits is not an effective dialog tab stop; keep
+    // its style as evidence, but do not invent an order from HWND enumeration.
     std::unordered_set<HWND> visited;
-    HWND current = nullptr;
+    HWND current = *seed;
     for (size_t attempt = 0; attempt <= handles.size() + candidates.size(); ++attempt) {
         const HWND next = GetNextDlgTabItem(root, current, FALSE);
-        if (!next) {
-            reason = L"native dialog manager did not expose a complete tab order";
+        if (!next) break;
+        if (!IsChild(root, next)) {
+            reason = L"native dialog manager returned a tab stop outside the source window";
             return false;
         }
         if (!visited.insert(next).second) break;
@@ -169,10 +195,6 @@ bool CaptureNativeTabOrder(
             tabIndexes.emplace(next, static_cast<int>(tabIndexes.size()));
         }
         current = next;
-    }
-    if (tabIndexes.size() != candidates.size()) {
-        reason = L"native dialog manager tab order omitted a focusable control";
-        return false;
     }
     return true;
 }
@@ -401,8 +423,10 @@ bool CaptureCommonNodeFacets(
     node.style = static_cast<uint64_t>(GetWindowLongPtrW(child, GWL_STYLE));
     node.exStyle = static_cast<uint64_t>(GetWindowLongPtrW(child, GWL_EXSTYLE));
     node.visible = true;
-    node.enabled = IsWindowEnabled(child) != FALSE;
-    node.tabStop = (node.style & WS_TABSTOP) != 0;
+    node.enabled = IsEffectivelyEnabled(scope.root, child);
+    const bool nativeTabStop = (node.style & WS_TABSTOP) != 0;
+    node.tabStop = nativeTabStop &&
+        (!node.enabled || scope.tabIndexes->contains(child));
     if (const auto tab = scope.tabIndexes->find(child); tab != scope.tabIndexes->end()) {
         node.tabIndex = tab->second;
     }
@@ -426,6 +450,10 @@ bool CaptureCommonNodeFacets(
         ? L"Password edit"
         : node.text;
     node.groupStart = (node.style & WS_GROUP) != 0;
+    if (node.kind == ControlKind::DialogContainer) {
+        node.tabStop = false;
+        node.tabIndex = -1;
+    }
     return true;
 }
 
@@ -460,13 +488,31 @@ bool CaptureChildNodes(
         reason = L"window exceeds the 512 node limit";
         return false;
     }
+    // Probe adapters first so an unsupported focusable class reports its real
+    // support-boundary failure instead of a secondary dialog-navigation shape.
+    const DWORD rootThread = GetWindowThreadProcessId(root, nullptr);
+    for (const HWND child : enumeration.handles) {
+        if (!IsWindowVisible(child) || IsCompositeImplementationChild(child)) continue;
+        DWORD childProcess = 0;
+        const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
+        if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
+            reason = L"foreign-process or foreign-thread child HWND";
+            AppendWindowEvidence(child, reason);
+            return false;
+        }
+        ControlKind kind{};
+        if (!ClassifyControl(child, kind, reason)) {
+            AppendWindowEvidence(child, reason);
+            return false;
+        }
+    }
     std::unordered_map<HWND, int> tabIndexes;
     if (!CaptureNativeTabOrder(root, enumeration.handles, tabIndexes, reason)) return false;
 
     std::unordered_map<HWND, uint64_t> visibleNodeIds;
     ChildCaptureScope scope;
     scope.root = root;
-    scope.rootThread = GetWindowThreadProcessId(root, nullptr);
+    scope.rootThread = rootThread;
     scope.tabIndexes = &tabIndexes;
     scope.visibleNodeIds = &visibleNodeIds;
     for (const HWND child : enumeration.handles) {
@@ -555,6 +601,8 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
     HashString(hash, snapshot.state);
     HashBytes(hash, snapshot.showInTaskbar);
     HashBytes(hash, snapshot.rtl);
+    HashString(hash, snapshot.adapterId);
+    HashString(hash, snapshot.pageId);
     const auto hashMenu = [&](const auto& self,
                               const std::vector<MenuItemSnapshot>& items) -> void {
         HashBytes(hash, items.size());
@@ -608,12 +656,15 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.minimum);
         HashBytes(hash, node.maximum);
         HashBytes(hash, node.position);
+        HashBytes(hash, node.indeterminate);
         HashBytes(hash, node.smallChange);
         HashBytes(hash, node.largeChange);
         HashBytes(hash, node.vertical);
         HashBytes(hash, node.reversed);
         HashBytes(hash, node.items.size());
         for (const auto& item : node.items) HashString(hash, item);
+        HashBytes(hash, node.itemRects.size());
+        for (const auto& rect : node.itemRects) HashBytes(hash, rect);
         HashBytes(hash, node.columns.size());
         for (const auto& column : node.columns) HashString(hash, column);
         HashBytes(hash, node.columnWidths.size());
@@ -623,10 +674,42 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, row.size());
             for (const auto& cell : row) HashString(hash, cell);
         }
+        HashBytes(hash, node.columnHeadersVisible);
+        HashBytes(hash, node.checkBoxes);
+        HashBytes(hash, node.checkedIndices.size());
+        for (const int index : node.checkedIndices) HashBytes(hash, index);
         HashBytes(hash, node.itemDepths.size());
         for (const int depth : node.itemDepths) HashBytes(hash, depth);
         HashBytes(hash, node.itemExpanded.size());
         for (const bool expanded : node.itemExpanded) HashBytes(hash, expanded);
+        HashBytes(hash, node.imageWidth);
+        HashBytes(hash, node.imageHeight);
+        HashString(hash, node.imageFormat);
+        HashBytes(hash, node.imageData.size());
+        if (!node.imageData.empty()) HashRange(hash, node.imageData.data(), node.imageData.size());
+        HashBytes(hash, node.toolbarItems.size());
+        for (const auto& item : node.toolbarItems) {
+            HashBytes(hash, item.kind);
+            HashBytes(hash, item.commandId);
+            HashBytes(hash, item.rect);
+            HashString(hash, item.text);
+            HashBytes(hash, item.enabled);
+            HashBytes(hash, item.hidden);
+            HashBytes(hash, item.imageWidth);
+            HashBytes(hash, item.imageHeight);
+            HashString(hash, item.imageFormat);
+            HashBytes(hash, item.imageData.size());
+            if (!item.imageData.empty()) HashRange(hash, item.imageData.data(), item.imageData.size());
+        }
+        HashString(hash, node.adapterId);
+        HashString(hash, node.pageId);
+        HashString(hash, node.semanticKey);
+        HashString(hash, node.sourceKind);
+        HashString(hash, node.presentationVariant);
+        HashBytes(hash, node.supportedActions.size());
+        for (const auto& action : node.supportedActions) HashString(hash, action);
+        HashString(hash, node.helpText);
+        HashString(hash, node.accessKey);
     }
     return hash;
 }

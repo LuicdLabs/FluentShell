@@ -17,6 +17,7 @@ enum class SurfaceKind {
 
 enum class ControlKind {
     StaticText,
+    StaticIcon,
     Separator,
     Button,
     CheckBox,
@@ -33,7 +34,28 @@ enum class ControlKind {
     TreeView,
     TabControl,
     Slider,
+    DialogContainer,
     StatusBar,
+    Toolbar,
+    Count,
+};
+
+enum class ToolbarItemKind {
+    PushButton,
+    Separator,
+};
+
+struct ToolbarItemSnapshot final {
+    ToolbarItemKind kind = ToolbarItemKind::PushButton;
+    uint32_t commandId = 0;
+    RECT rect{};
+    std::wstring text;
+    bool enabled = true;
+    bool hidden = false;
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
 };
 
 struct ControlNode final {
@@ -44,7 +66,7 @@ struct ControlNode final {
     ControlKind kind = ControlKind::StaticText;
     int controlId = 0;
     int zIndex = 0;
-    // Native dialog-manager order among currently focusable tab stops. A
+    // Native dialog-manager order among currently effective tab stops. A
     // value of -1 means the control is not currently keyboard-focusable.
     int tabIndex = -1;
     RECT rect{};
@@ -52,6 +74,8 @@ struct ControlNode final {
     uint64_t exStyle = 0;
     bool visible = true;
     bool enabled = true;
+    // Effective dialog traversal state. The raw WS_TABSTOP bit remains in
+    // style even when the native dialog manager does not expose this control.
     bool tabStop = false;
     uint32_t dialogCode = 0;
     std::wstring text;
@@ -71,16 +95,35 @@ struct ControlNode final {
     int minimum = 0;
     int maximum = 100;
     int position = 0;
+    bool indeterminate = false;
     int smallChange = 1;
     int largeChange = 10;
     bool vertical = false;
     bool reversed = false;
     std::vector<std::wstring> items;
+    // TCM_GETITEMRECT results in TabControl client-local physical pixels.
+    std::vector<RECT> itemRects;
     std::vector<std::wstring> columns;
     std::vector<int> columnWidths;
     std::vector<std::vector<std::wstring>> rows;
+    bool columnHeadersVisible = false;
+    bool checkBoxes = false;
+    std::vector<int> checkedIndices;
     std::vector<int> itemDepths;
     std::vector<bool> itemExpanded;
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
+    std::vector<ToolbarItemSnapshot> toolbarItems;
+    std::wstring adapterId;
+    std::wstring pageId;
+    std::wstring semanticKey;
+    std::wstring sourceKind;
+    std::wstring presentationVariant;
+    std::vector<std::wstring> supportedActions;
+    std::wstring helpText;
+    std::wstring accessKey;
 };
 
 enum class MenuItemKind {
@@ -124,6 +167,8 @@ struct WindowSnapshot final {
     bool rtl = false;
     std::vector<MenuItemSnapshot> menu;
     std::vector<ControlNode> nodes;
+    std::wstring adapterId;
+    std::wstring pageId;
 };
 
 struct ActionRequest final {

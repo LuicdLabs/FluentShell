@@ -176,6 +176,7 @@ public sealed class ProtocolSerializerTests
                 Minimum = -10,
                 Maximum = 30,
                 Position = 12,
+                Indeterminate = true,
             },
         ] };
 
@@ -189,6 +190,7 @@ public sealed class ProtocolSerializerTests
 
         Assert.Equal("groupBox", message.Window.Nodes[0].Kind);
         Assert.Equal(12, message.Window.Nodes[1].Position);
+        Assert.True(message.Window.Nodes[1].Indeterminate);
     }
 
     [Theory]
@@ -206,6 +208,7 @@ public sealed class ProtocolSerializerTests
             Minimum = minimum,
             Maximum = maximum,
             Position = position,
+            Indeterminate = false,
         };
         var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
         {
@@ -317,9 +320,12 @@ public sealed class ProtocolSerializerTests
         Assert.Equal(["Name", "Status"], listView.Columns);
         Assert.Equal([160, 80], listView.ColumnWidths);
         Assert.Equal(["Drive C", "Ready"], listView.Rows[0]);
+        Assert.True(listView.CheckBoxes);
+        Assert.Equal([0], listView.CheckedIndices);
         Assert.Equal([1], listView.SelectedIndices);
         Assert.Equal(1, listView.FocusedIndex);
         Assert.False(listView.MultiSelect);
+        Assert.False(listView.ColumnHeadersVisible);
     }
 
     [Theory]
@@ -415,6 +421,9 @@ public sealed class ProtocolSerializerTests
     [InlineData("columns")]
     [InlineData("columnWidths")]
     [InlineData("rows")]
+    [InlineData("columnHeadersVisible")]
+    [InlineData("checkBoxes")]
+    [InlineData("checkedIndices")]
     public void RejectsMissingCanonicalListViewField(string property)
     {
         var snapshot = TestData.Snapshot();
@@ -429,6 +438,50 @@ public sealed class ProtocolSerializerTests
 
         Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
             FrameMessageType.WindowOpen, Encoding.UTF8.GetBytes(json.ToJsonString())));
+    }
+
+    [Fact]
+    public void RejectsColumnHeaderVisibilityOnNonListView()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with { ColumnHeadersVisible = true };
+
+        AssertSnapshotRejected(snapshot);
+    }
+
+    [Fact]
+    public void RejectsNonBooleanListViewColumnHeaderVisibility()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = BoundedListView(snapshot.Nodes[0]);
+        var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
+        {
+            SessionNonce = TestData.Nonce,
+            Window = snapshot,
+        });
+        var json = JsonNode.Parse(payload)!.AsObject();
+        json["window"]!["nodes"]![0]!["columnHeadersVisible"] = "false";
+
+        Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen, Encoding.UTF8.GetBytes(json.ToJsonString())));
+    }
+
+    [Fact]
+    public void RejectsInvalidCanonicalListViewCheckboxState()
+    {
+        var source = TestData.Snapshot().Nodes[0];
+        foreach (var node in new[]
+                 {
+                     BoundedListView(source) with { CheckedIndices = [1, 0] },
+                     BoundedListView(source) with { CheckedIndices = [0, 0] },
+                     BoundedListView(source) with { CheckedIndices = [2] },
+                     BoundedListView(source) with { CheckBoxes = false, CheckedIndices = [0] },
+                 })
+        {
+            var snapshot = TestData.Snapshot();
+            snapshot.Nodes[0] = node;
+            AssertSnapshotRejected(snapshot);
+        }
     }
 
     [Fact]
@@ -449,6 +502,31 @@ public sealed class ProtocolSerializerTests
             FrameMessageType.ActionInvoke, ProtocolSerializer.Serialize(action)));
 
         Assert.Equal([0, 2], decoded.Value.EnumerateArray().Select(value => value.GetInt32()));
+    }
+
+    [Fact]
+    public void PreservesCanonicalSetItemCheckAction()
+    {
+        var action = new ActionInvokeMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = TestData.Snapshot().SurfaceId,
+            NodeId = "10",
+            EventId = "2",
+            ExpectedRevision = "7",
+            Action = "setItemCheck",
+            Value = JsonSerializer.SerializeToElement(new ListViewCheckActionValue
+            {
+                Index = 1,
+                Checked = true,
+            }),
+        };
+
+        var decoded = Assert.IsType<ActionInvokeMessage>(ProtocolSerializer.Deserialize(
+            FrameMessageType.ActionInvoke, ProtocolSerializer.Serialize(action)));
+
+        Assert.Equal(1, decoded.Value.GetProperty("index").GetInt32());
+        Assert.True(decoded.Value.GetProperty("checked").GetBoolean());
     }
 
     [Theory]
@@ -534,6 +612,9 @@ public sealed class ProtocolSerializerTests
         SelectedIndices = [1],
         FocusedIndex = 1,
         MultiSelect = false,
+        ColumnHeadersVisible = false,
+        CheckBoxes = true,
+        CheckedIndices = [0],
     };
 
     private static void AssertSnapshotRejected(WindowSnapshot snapshot) =>

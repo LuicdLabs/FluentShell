@@ -42,4 +42,14 @@ bool CaptureControlDetail(HWND hwnd, ControlNode& node, std::wstring& reason);
 // adapter contract and are never separate projected nodes.
 bool IsCompositeImplementationChild(HWND hwnd) noexcept;
 
+// Copies an HICON into bounded, owned premultiplied BGRA pixels. Application
+// adapters may use this only after independently establishing a trusted source.
+bool CaptureOwnedIconPixels(
+    HICON icon,
+    uint32_t& imageWidth,
+    uint32_t& imageHeight,
+    std::wstring& imageFormat,
+    std::vector<uint8_t>& imageData,
+    std::wstring& reason);
+
 } // namespace FluentShell::Bridge::Translation

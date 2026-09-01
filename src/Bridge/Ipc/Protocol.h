@@ -18,15 +18,33 @@ namespace FluentShell::Bridge::Ipc {
 inline constexpr uint32_t kFrameMagic = 0x48534C46u; // "FLSH" in little endian.
 inline constexpr uint16_t kProtocolMajor = 1;
 // Writers emit this minor; same-major readers accept any uint16 minor and ignore unknown JSON fields.
-// Minor 1 requires the renderer-side provisional interaction gate. A Bridge
-// must not pair with a minor-0 renderer because that peer would treat the
+// Minor 1 requires the renderer-side provisional interaction gate. Minor 2
+// adds structural DS_CONTROL dialogContainer nodes and parent graph semantics.
+// Minor 3 adds bounded, owned staticIcon BGRA payloads. Minor 4 adds explicit
+// report ListView column-header visibility. Minor 5 adds bounded report
+// ListView checkbox state and mutation. Minor 6 adds bounded textual TabControl
+// headers, native item geometry, and semantic selection. Minor 7 adds bounded
+// ToolbarWindow32 push buttons, separators, owned icons, and command actions.
+// Minor 8 adds exact application-adapter metadata, nullable virtual node HWNDs,
+// semantic presentation, and supported-action declarations for the initial
+// MdSched page. Minor 9 adds the second DirectUI application profile
+// (RecoveryDrive first page) with projected native checkbox toggles. Minor 10
+// adds its native-backed explanatory text. Minor 11 adds the fail-closed
+// capability-derived DirectUI semantic adapter contract. Minor 12 adds
+// explicit determinate/marquee ProgressBar state. A Bridge
+// Must not pair with a minor-0 renderer because that peer would treat the
 // pre-UIA provisional commit as interactive.
-inline constexpr uint16_t kProtocolMinor = 1;
+inline constexpr uint16_t kProtocolMinor = 12;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
 inline constexpr size_t kMaxNodes = 512;
 inline constexpr size_t kMaxListItems = 4096;
+inline constexpr size_t kMaxTabItems = 128;
+inline constexpr size_t kMaxToolbarItems = 64;
+inline constexpr uint32_t kMaxImageDimension = 96;
+inline constexpr size_t kMaxImageBytes =
+    static_cast<size_t>(kMaxImageDimension) * kMaxImageDimension * 4;
 
 enum class MessageType : uint16_t {
     Hello = 1,

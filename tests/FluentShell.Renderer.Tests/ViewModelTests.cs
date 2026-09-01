@@ -257,6 +257,40 @@ public sealed class ViewModelTests
     }
 
     [Fact]
+    public void StaticIconSnapshotUpdatesOwnedPixelPayload()
+    {
+        var icon = TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "staticIcon",
+            TabStop = false,
+            TabIndex = -1,
+            ImageWidth = 1,
+            ImageHeight = 2,
+            ImageFormat = "bgra8-premultiplied",
+            ImageData = Convert.ToBase64String([0, 0, 0, 0, 0, 0, 0, 0]),
+        };
+        var viewModel = ControlNodeViewModel.FromSnapshot(icon);
+        var changed = new List<string?>();
+        viewModel.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+
+        var pixels = Convert.ToBase64String([1, 2, 3, 4, 1, 2, 3, 4]);
+        viewModel.ApplySnapshot(icon with { ImageData = pixels });
+
+        Assert.Equal(pixels, viewModel.ImageData);
+        Assert.Contains(nameof(viewModel.ImageData), changed);
+
+        changed.Clear();
+        viewModel.ApplySnapshot(icon with
+        {
+            ImageWidth = 2,
+            ImageHeight = 1,
+            ImageData = pixels,
+        });
+        Assert.Equal(2, viewModel.ImageWidth);
+        Assert.Contains(nameof(viewModel.ImageData), changed);
+    }
+
+    [Fact]
     public void PeriodicSnapshotReconcilesNativeProgressState()
     {
         var progress = TestData.Snapshot().Nodes[0] with
@@ -267,6 +301,7 @@ public sealed class ViewModelTests
             Minimum = 10,
             Maximum = 90,
             Position = 25,
+            Indeterminate = false,
         };
         var snapshot = TestData.Snapshot() with { Nodes = [progress] };
         var viewModel = WindowViewModel.FromSnapshot(snapshot);
@@ -282,7 +317,8 @@ public sealed class ViewModelTests
             Snapshot = snapshot with
             {
                 Revision = "8",
-                Nodes = [progress with { Minimum = 100, Maximum = 120, Position = 110 }],
+                Nodes = [progress with
+                    { Minimum = 100, Maximum = 120, Position = 110, Indeterminate = true }],
             },
         });
 
@@ -290,6 +326,7 @@ public sealed class ViewModelTests
         Assert.Equal(100, node.Minimum);
         Assert.Equal(120, node.Maximum);
         Assert.Equal(110, node.Position);
+        Assert.True(node.Indeterminate);
     }
 
     [Fact]
@@ -377,6 +414,9 @@ public sealed class ViewModelTests
             SelectedIndices = [1],
             FocusedIndex = 1,
             MultiSelect = true,
+            ColumnHeadersVisible = false,
+            CheckBoxes = true,
+            CheckedIndices = [0],
         });
 
         Assert.Equal("Open advanced settings.", link.Text);
@@ -387,6 +427,9 @@ public sealed class ViewModelTests
         Assert.Equal([1], list.SelectedIndices);
         Assert.Equal(1, list.FocusedIndex);
         Assert.True(list.MultiSelect);
+        Assert.False(list.ColumnHeadersVisible);
+        Assert.True(list.CheckBoxes);
+        Assert.Equal([0], list.CheckedIndices);
     }
 
     [Fact]
@@ -400,8 +443,12 @@ public sealed class ViewModelTests
             Rows = [["One"], ["Two"]],
             SelectedIndices = [0],
             FocusedIndex = 0,
+            ColumnHeadersVisible = true,
+            CheckBoxes = true,
+            CheckedIndices = [0],
         });
         node.RegisterPending("selectedIndices", "42");
+        node.RegisterPending("checkedIndices", "43");
 
         node.ApplyCanonical("columns", JsonSerializer.SerializeToElement(new[] { "Name", "State" }), null);
         node.ApplyCanonical("columnWidths", JsonSerializer.SerializeToElement(new[] { 120, 80 }), null);
@@ -412,6 +459,9 @@ public sealed class ViewModelTests
         }), null);
         node.ApplyCanonical("multiSelect", JsonSerializer.SerializeToElement(true), null);
         node.ApplyCanonical("focusedIndex", JsonSerializer.SerializeToElement(1), null);
+        node.ApplyCanonical("columnHeadersVisible", JsonSerializer.SerializeToElement(false), null);
+        node.ApplyCanonical("checkBoxes", JsonSerializer.SerializeToElement(true), null);
+        node.ApplyCanonical("checkedIndices", JsonSerializer.SerializeToElement(new[] { 1 }), "43");
         node.ApplyCanonical("selectedIndices", JsonSerializer.SerializeToElement(new[] { 0, 1 }), "42");
 
         Assert.Equal(["Name", "State"], node.Columns);
@@ -420,6 +470,106 @@ public sealed class ViewModelTests
         Assert.Equal([0, 1], node.SelectedIndices);
         Assert.Equal(1, node.FocusedIndex);
         Assert.True(node.MultiSelect);
+        Assert.False(node.ColumnHeadersVisible);
+        Assert.True(node.CheckBoxes);
+        Assert.Equal([1], node.CheckedIndices);
         Assert.False(node.IsPendingEcho("selectedIndices", "42"));
+        Assert.False(node.IsPendingEcho("checkedIndices", "43"));
+    }
+
+    [Fact]
+    public void RejectedListViewCheckActionRaisesCanonicalRollback()
+    {
+        var node = ControlNodeViewModel.FromSnapshot(TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "listView",
+            CheckBoxes = true,
+            CheckedIndices = [0],
+        });
+        var changed = new List<string?>();
+        node.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+        node.RegisterPending("checkedIndices", "99");
+
+        node.RejectPending("checkedIndices", "99");
+
+        Assert.Equal([0], node.CheckedIndices);
+        Assert.Contains(nameof(node.CheckedIndices), changed);
+        Assert.False(node.IsPendingEcho("checkedIndices", "99"));
+    }
+
+    [Fact]
+    public void TabControlSnapshotAndPatchReconcileGeometryAndSelection()
+    {
+        var snapshot = TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "tabControl",
+            Items = ["General", "Advanced"],
+            ItemRects =
+            [
+                new PixelRect { X = 0, Y = 0, Width = 80, Height = 24 },
+                new PixelRect { X = 80, Y = 0, Width = 100, Height = 24 },
+            ],
+            SelectedIndex = 0,
+        };
+        var node = ControlNodeViewModel.FromSnapshot(snapshot);
+
+        node.ApplyCanonical("selectedIndex", JsonSerializer.SerializeToElement(1), null);
+        node.ApplyCanonical("itemRects", JsonSerializer.SerializeToElement(new[]
+        {
+            new PixelRect { X = 0, Y = 0, Width = 90, Height = 24 },
+            new PixelRect { X = 0, Y = 24, Width = 100, Height = 24 },
+        }), null);
+
+        Assert.Equal(1, node.SelectedIndex);
+        Assert.Equal(24, node.ItemRects[1].Y);
+    }
+
+    [Fact]
+    public void RejectedTabSelectionRaisesCanonicalRollback()
+    {
+        var node = ControlNodeViewModel.FromSnapshot(TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "tabControl",
+            Items = ["General", "Advanced"],
+            ItemRects =
+            [
+                new PixelRect { X = 0, Y = 0, Width = 80, Height = 24 },
+                new PixelRect { X = 80, Y = 0, Width = 100, Height = 24 },
+            ],
+            SelectedIndex = 0,
+        });
+        var changed = new List<string?>();
+        node.PropertyChanged += (_, args) => changed.Add(args.PropertyName);
+        node.RegisterPending("selectedIndex", "100");
+
+        node.RejectPending("selectedIndex", "100");
+
+        Assert.Equal(0, node.SelectedIndex);
+        Assert.Contains(nameof(node.SelectedIndex), changed);
+        Assert.False(node.IsPendingEcho("selectedIndex", "100"));
+    }
+
+    [Fact]
+    public void ToolbarSnapshotAndPatchReplaceTypedItemsAtomically()
+    {
+        var first = new ToolbarItemSnapshot
+        {
+            Kind = "pushButton", CommandId = 100, Text = "Open", Enabled = true,
+            Rect = new PixelRect { X = 0, Y = 0, Width = 30, Height = 30 },
+            ImageWidth = 1, ImageHeight = 1, ImageFormat = "bgra8-premultiplied",
+            ImageData = Convert.ToBase64String([0, 0, 0, 0]),
+        };
+        var node = ControlNodeViewModel.FromSnapshot(TestData.Snapshot().Nodes[0] with
+        {
+            Kind = "toolbar",
+            ToolbarItems = [first],
+        });
+        var replacement = first with { CommandId = 101, Text = "Save", Enabled = false };
+
+        node.ApplyCanonical("toolbarItems", JsonSerializer.SerializeToElement(new[] { replacement }), null);
+
+        Assert.Single(node.ToolbarItems);
+        Assert.Equal("Save", node.ToolbarItems[0].Text);
+        Assert.False(node.ToolbarItems[0].Enabled);
     }
 }

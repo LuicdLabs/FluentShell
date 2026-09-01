@@ -14,6 +14,23 @@ namespace {
 
 using namespace winrt::Windows::Data::Json;
 
+std::wstring Base64Encode(const std::vector<uint8_t>& bytes) {
+    static constexpr wchar_t alphabet[] =
+        L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::wstring result;
+    result.reserve((bytes.size() + 2) / 3 * 4);
+    for (size_t offset = 0; offset < bytes.size(); offset += 3) {
+        const uint32_t value = static_cast<uint32_t>(bytes[offset]) << 16 |
+            (offset + 1 < bytes.size() ? static_cast<uint32_t>(bytes[offset + 1]) << 8 : 0) |
+            (offset + 2 < bytes.size() ? bytes[offset + 2] : 0);
+        result.push_back(alphabet[(value >> 18) & 63]);
+        result.push_back(alphabet[(value >> 12) & 63]);
+        result.push_back(offset + 1 < bytes.size() ? alphabet[(value >> 6) & 63] : L'=');
+        result.push_back(offset + 2 < bytes.size() ? alphabet[value & 63] : L'=');
+    }
+    return result;
+}
+
 JsonObject RectToJson(const RECT& rect) {
     JsonObject value;
     value.Insert(L"x", JsonValue::CreateNumberValue(rect.left));
@@ -98,7 +115,9 @@ JsonObject NodeToJson(const ControlNode& node) {
     JsonObject result;
     result.Insert(L"nodeId", JsonValue::CreateStringValue(Ipc::UInt64ToString(node.nodeId)));
     result.Insert(L"generation", JsonValue::CreateStringValue(Ipc::UInt64ToString(node.generation)));
-    result.Insert(L"nativeHwnd", JsonValue::CreateStringValue(Ipc::HwndToString(node.hwnd)));
+    result.Insert(L"nativeHwnd", node.hwnd
+        ? JsonValue::CreateStringValue(Ipc::HwndToString(node.hwnd))
+        : JsonValue::CreateNullValue());
     if (node.parentNodeId) {
         result.Insert(L"parentNodeId", JsonValue::CreateStringValue(Ipc::UInt64ToString(*node.parentNodeId)));
     } else {
@@ -136,6 +155,9 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"minimum", JsonValue::CreateNumberValue(node.minimum));
     result.Insert(L"maximum", JsonValue::CreateNumberValue(node.maximum));
     result.Insert(L"position", JsonValue::CreateNumberValue(node.position));
+    if (node.kind == ControlKind::ProgressBar) {
+        result.Insert(L"indeterminate", JsonValue::CreateBooleanValue(node.indeterminate));
+    }
     result.Insert(L"smallChange", JsonValue::CreateNumberValue(node.smallChange));
     result.Insert(L"largeChange", JsonValue::CreateNumberValue(node.largeChange));
     result.Insert(L"vertical", JsonValue::CreateBooleanValue(node.vertical));
@@ -145,6 +167,11 @@ JsonObject NodeToJson(const ControlNode& node) {
         items.Append(JsonValue::CreateStringValue(item));
     }
     result.Insert(L"items", items);
+    if (node.kind == ControlKind::TabControl) {
+        JsonArray itemRects;
+        for (const auto& rect : node.itemRects) itemRects.Append(RectToJson(rect));
+        result.Insert(L"itemRects", itemRects);
+    }
     JsonArray columns;
     for (const auto& column : node.columns) {
         columns.Append(JsonValue::CreateStringValue(column));
@@ -162,6 +189,16 @@ JsonObject NodeToJson(const ControlNode& node) {
         rows.Append(cells);
     }
     result.Insert(L"rows", rows);
+    if (node.kind == ControlKind::ListView) {
+        result.Insert(L"columnHeadersVisible",
+            JsonValue::CreateBooleanValue(node.columnHeadersVisible));
+        result.Insert(L"checkBoxes", JsonValue::CreateBooleanValue(node.checkBoxes));
+        JsonArray checkedIndices;
+        for (const int index : node.checkedIndices) {
+            checkedIndices.Append(JsonValue::CreateNumberValue(index));
+        }
+        result.Insert(L"checkedIndices", checkedIndices);
+    }
     JsonArray itemDepths;
     for (const int depth : node.itemDepths) {
         itemDepths.Append(JsonValue::CreateNumberValue(depth));
@@ -172,6 +209,46 @@ JsonObject NodeToJson(const ControlNode& node) {
         itemExpanded.Append(JsonValue::CreateBooleanValue(expanded));
     }
     result.Insert(L"itemExpanded", itemExpanded);
+    if (node.kind == ControlKind::StaticIcon) {
+        result.Insert(L"imageWidth", JsonValue::CreateNumberValue(node.imageWidth));
+        result.Insert(L"imageHeight", JsonValue::CreateNumberValue(node.imageHeight));
+        result.Insert(L"imageFormat", JsonValue::CreateStringValue(node.imageFormat));
+        result.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(node.imageData)));
+    }
+    if (node.kind == ControlKind::Toolbar) {
+        JsonArray toolbarItems;
+        for (const auto& item : node.toolbarItems) {
+            JsonObject value;
+            value.Insert(L"kind", JsonValue::CreateStringValue(
+                item.kind == ToolbarItemKind::PushButton ? L"pushButton" : L"separator"));
+            value.Insert(L"commandId", JsonValue::CreateNumberValue(item.commandId));
+            value.Insert(L"rect", RectToJson(item.rect));
+            value.Insert(L"text", JsonValue::CreateStringValue(item.text));
+            value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
+            value.Insert(L"hidden", JsonValue::CreateBooleanValue(item.hidden));
+            if (item.kind == ToolbarItemKind::PushButton) {
+                value.Insert(L"imageWidth", JsonValue::CreateNumberValue(item.imageWidth));
+                value.Insert(L"imageHeight", JsonValue::CreateNumberValue(item.imageHeight));
+                value.Insert(L"imageFormat", JsonValue::CreateStringValue(item.imageFormat));
+                value.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(item.imageData)));
+            }
+            toolbarItems.Append(value);
+        }
+        result.Insert(L"toolbarItems", toolbarItems);
+    }
+    if (!node.adapterId.empty()) {
+        result.Insert(L"adapterId", JsonValue::CreateStringValue(node.adapterId));
+        result.Insert(L"pageId", JsonValue::CreateStringValue(node.pageId));
+        result.Insert(L"semanticKey", JsonValue::CreateStringValue(node.semanticKey));
+        result.Insert(L"sourceKind", JsonValue::CreateStringValue(node.sourceKind));
+        result.Insert(L"presentationVariant", JsonValue::CreateStringValue(node.presentationVariant));
+        JsonArray actions;
+        for (const auto& action : node.supportedActions)
+            actions.Append(JsonValue::CreateStringValue(action));
+        result.Insert(L"supportedActions", actions);
+        result.Insert(L"helpText", JsonValue::CreateStringValue(node.helpText));
+        result.Insert(L"accessKey", JsonValue::CreateStringValue(node.accessKey));
+    }
     return result;
 }
 
@@ -217,6 +294,10 @@ JsonObject SnapshotToJson(const WindowSnapshot& snapshot) {
     result.Insert(L"state", JsonValue::CreateStringValue(snapshot.state));
     result.Insert(L"showInTaskbar", JsonValue::CreateBooleanValue(snapshot.showInTaskbar));
     result.Insert(L"rtl", JsonValue::CreateBooleanValue(snapshot.rtl));
+    if (!snapshot.adapterId.empty()) {
+        result.Insert(L"adapterId", JsonValue::CreateStringValue(snapshot.adapterId));
+        result.Insert(L"pageId", JsonValue::CreateStringValue(snapshot.pageId));
+    }
     JsonArray menu;
     for (const auto& item : snapshot.menu) menu.Append(MenuItemToJson(item));
     result.Insert(L"menu", menu);
@@ -322,9 +403,9 @@ bool ParseActionValue(
         return true;
     }
     if (action.action == L"setCheck" || action.action == L"select" ||
-        action.action == L"menuCommand") {
+        action.action == L"menuCommand" || action.action == L"toolbarCommand") {
         if (value.ValueType() != JsonValueType::Number) {
-            error = L"setCheck/select/menuCommand requires an integer value";
+            error = L"setCheck/select/menuCommand/toolbarCommand requires an integer value";
             return false;
         }
         const double number = value.GetNumber();
@@ -335,9 +416,9 @@ bool ParseActionValue(
             return false;
         }
         action.integerValue = static_cast<int>(number);
-        if (action.action == L"menuCommand") {
+        if (action.action == L"menuCommand" || action.action == L"toolbarCommand") {
             if (action.integerValue <= 0 || action.integerValue > 0xffff) {
-                error = L"menuCommand ID is outside WM_COMMAND range";
+                error = L"command ID is outside WM_COMMAND range";
                 return false;
             }
             action.menuCommandId = static_cast<uint32_t>(action.integerValue);
@@ -376,6 +457,27 @@ bool ParseActionValue(
         }
         return true;
     }
+    if (action.action == L"setItemCheck") {
+        if (value.ValueType() != JsonValueType::Object) {
+            error = L"setItemCheck requires an object value";
+            return false;
+        }
+        const auto object = value.GetObject();
+        if (object.Size() != 2 || !object.HasKey(L"index") || !object.HasKey(L"checked") ||
+            object.GetNamedValue(L"checked").ValueType() != JsonValueType::Boolean) {
+            error = L"setItemCheck requires exactly integer index and boolean checked";
+            return false;
+        }
+        LONG index = -1;
+        if (!JsonInteger(object, L"index", index) || index < 0 ||
+            static_cast<size_t>(index) >= Ipc::kMaxListItems) {
+            error = L"setItemCheck index is outside range";
+            return false;
+        }
+        action.itemIndex = index;
+        action.booleanValue = object.GetNamedBoolean(L"checked");
+        return true;
+    }
     if (action.action == L"move" || action.action == L"resize") {
         if (value.ValueType() != JsonValueType::Object) {
             error = L"move/resize requires a bounds object";
@@ -401,6 +503,7 @@ bool ParseActionValue(
 const wchar_t* ControlKindName(ControlKind kind) noexcept {
     switch (kind) {
     case ControlKind::StaticText: return L"static";
+    case ControlKind::StaticIcon: return L"staticIcon";
     case ControlKind::Separator: return L"separator";
     case ControlKind::Button: return L"button";
     case ControlKind::CheckBox: return L"checkBox";
@@ -417,7 +520,9 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::TreeView: return L"treeView";
     case ControlKind::TabControl: return L"tabControl";
     case ControlKind::Slider: return L"slider";
+    case ControlKind::DialogContainer: return L"dialogContainer";
     case ControlKind::StatusBar: return L"statusBar";
+    case ControlKind::Toolbar: return L"toolbar";
     }
     return L"static";
 }
@@ -659,7 +764,7 @@ bool ParseActionInvoke(
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
-            L"setSelection", L"menuCommand",
+            L"setSelection", L"setItemCheck", L"menuCommand", L"toolbarCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -668,7 +773,8 @@ bool ParseActionInvoke(
         }
         const bool requiresNode = action.action == L"invoke" || action.action == L"setText" ||
             action.action == L"setCheck" || action.action == L"select" ||
-            action.action == L"setSelection";
+            action.action == L"setSelection" || action.action == L"setItemCheck" ||
+            action.action == L"toolbarCommand";
         if (requiresNode != action.nodeId.has_value()) {
             error = L"action.invoke nodeId does not match action semantics";
             return false;
@@ -818,6 +924,12 @@ bool ValidateActionForSnapshot(
         error = L"action references a non-interactive node";
         return false;
     }
+    if (!snapshot.adapterId.empty() &&
+        std::find(node.supportedActions.begin(), node.supportedActions.end(),
+            action.action) == node.supportedActions.end()) {
+        error = L"application-adapter node does not admit the requested action";
+        return false;
+    }
     if (action.action == L"invoke") {
         if (node.kind == ControlKind::Button || node.kind == ControlKind::SysLink) return true;
         error = L"invoke requires a button or SysLink node";
@@ -843,9 +955,10 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"select") {
+        const bool tab = node.kind == ControlKind::TabControl;
         const bool selectable = node.kind == ControlKind::ComboBox ||
-            node.kind == ControlKind::ListBox;
-        const bool inRange = action.integerValue >= -1 &&
+            node.kind == ControlKind::ListBox || tab;
+        const bool inRange = action.integerValue >= (tab ? 0 : -1) &&
             (action.integerValue == -1 ||
                 static_cast<size_t>(action.integerValue) < node.items.size());
         if (selectable && inRange) return true;
@@ -866,6 +979,34 @@ bool ValidateActionForSnapshot(
         }
         return true;
     }
+    if (action.action == L"setItemCheck") {
+        if (node.kind != ControlKind::ListView || !node.checkBoxes) {
+            error = L"setItemCheck requires a checkbox-enabled ListView node";
+            return false;
+        }
+        if (action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= node.rows.size()) {
+            error = L"setItemCheck index is outside the ListView";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"toolbarCommand") {
+        if (node.kind != ControlKind::Toolbar) {
+            error = L"toolbarCommand requires a ToolbarWindow32 node";
+            return false;
+        }
+        const auto item = std::find_if(node.toolbarItems.begin(), node.toolbarItems.end(),
+            [&](const ToolbarItemSnapshot& candidate) {
+                return candidate.kind == ToolbarItemKind::PushButton &&
+                    candidate.commandId == action.menuCommandId;
+            });
+        if (item == node.toolbarItems.end() || !item->enabled || item->hidden) {
+            error = L"toolbarCommand references an unknown, disabled, or hidden push button";
+            return false;
+        }
+        return true;
+    }
     error = L"nodeId is not valid for this action";
     return false;
 }
@@ -876,7 +1017,7 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
     // drag that raced a reconcile capture into a stale rejection plus a full
     // resync, so these carry the same request semantics as invoke/close and are
     // rebased onto the current revision by HandleNativeAction.
-    return action == L"invoke" || action == L"close" ||
+    return action == L"invoke" || action == L"toolbarCommand" || action == L"close" ||
         action == L"move" || action == L"resize";
 }
 

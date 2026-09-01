@@ -25,7 +25,7 @@ public sealed class ProtocolFixtureTests
             ProtocolSerializer.Deserialize(FrameMessageType.Hello, Fixture("hello.renderer.future-minor.json")));
         Assert.Equal("renderer", hello.Role);
         Assert.Equal((ushort)1, hello.ProtocolMajor);
-        Assert.Equal((ushort)2, hello.ProtocolMinor);
+        Assert.Equal((ushort)(ProtocolConstants.Minor + 1), hello.ProtocolMinor);
     }
 
     [Fact]
