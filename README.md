@@ -1,6 +1,25 @@
 # FluentShell
 
-FluentShell translates supported Win32 top-level windows into real WinUI 3 Fluent windows. It is not a DWM recoloring layer and it does not initialize WinUI inside an injected third-party process.
+Turn a running Win32 window into a real WinUI 3 window, without changing the application.
+
+FluentShell captures a live HWND control tree, rebuilds it as genuine XAML in a separate
+WinUI 3 process, and keeps the two in sync: input on the projected window is replayed onto
+the native controls, and native changes patch back into the view. UI Automation reports real
+XAML controls, with framework theming, DPI handling, and accessibility, while the original
+HWNDs stay alive and remain the source of truth.
+
+Nothing is recolored or repainted along the way. There are no DWM attribute tricks and nothing
+is drawn on top of native controls; the native window is cloaked only once its XAML replacement
+has been proven, and the only thing that enters the target process is a small C++ DLL,
+`FluentShell.Bridge.dll`. All XAML lives in `Renderer\FluentShell.Renderer.exe`.
+
+The translation is all or nothing. A window projects only when every visible control can be
+proven against the adapter registry, and an unsupported control, a protocol fault, or a dead
+renderer restores the whole native window instead of leaving a half-XAML surface behind.
+Injection stays explicit and per target: you name an absolute image path, and a PID when that
+image is running more than once. There is no system-wide hooking and no watch mode.
+
+![Injecting built-in Windows dialogs from PowerShell](./scrshot.png)
 
 ## Architecture
 
@@ -12,10 +31,12 @@ FluentShell.Bridge.dll -- versioned pipe -- FluentShell.Renderer.exe
       target process                         separate WinUI 3 process
 ```
 
-- `FluentShell.Bridge.dll` is the only injected production DLL. It captures supported native controls on their owning UI thread and owns rollback.
-- `Renderer\FluentShell.Renderer.exe` is a self-contained, unpackaged x64 WinUI 3 process. It owns XAML windows, typed view models, binding, and temporary input state.
-- The native HWND tree remains authoritative. A renderer or protocol failure restores the complete native top-level window.
-- Unsupported controls cause whole-window fallback. FluentShell does not mix a native subtree into a translated WinUI surface.
+`FluentShell.Bridge.dll` is the only injected production DLL. It reads and writes native state
+exclusively on each HWND's own GUI thread, serves the pipe, and owns rollback.
+`Renderer\FluentShell.Renderer.exe` is a self-contained, unpackaged x64 WinUI 3 process that
+owns the XAML windows, typed view models, binding, and transient input state. The two sides
+meet only through the versioned `FLSH` frame and the JSON schema in
+`src/Protocol/protocol-v1.schema.json`, so neither reaches into the other's state directly.
 
 The current control boundary is bounded textual HMENU command bars, standard
 Static text and icons, Button/check/three-state/radio/GroupBox, Edit and
@@ -39,14 +60,13 @@ role that registry cannot prove. See
 
 ## Safety Boundary
 
-Injection is explicit and path-bound:
-
-- The target is an existing absolute executable image path, resolved through a file handle.
-- The path read from the selected process must match that canonical path.
-- If multiple processes use the same image, `--pid` is required.
-- `--sha256` can pin the target file. Signer pinning is intentionally rejected until implemented.
-- Shell, security, XAML hosts, the FluentShell renderer, and FluentShell tools are hard-denied.
-- There is no process-name injection, system-wide discovery, or injection watch mode.
+The target is an existing absolute executable image path, resolved through a file handle, and
+the path read back from the selected process must match that canonical path. `--pid` is
+required when several processes share one image, and `--sha256` pins the file itself; signer
+pinning is rejected on purpose until it is implemented. Shell, security, and XAML host
+processes are hard-denied, along with the FluentShell renderer and FluentShell's own tools.
+Process-name injection, system-wide discovery, and injection watch modes do not exist in the
+production Injector.
 
 The one-shot `l0` command is the only diagnostic exposed by the production Injector. `IslandDemo` remains a source-level diagnostic and is excluded from the default production build.
 
