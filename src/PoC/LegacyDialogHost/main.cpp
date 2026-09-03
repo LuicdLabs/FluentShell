@@ -313,7 +313,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     AppendMenuW(fileMenu, MF_STRING, IdMenuExit, L"E&xit");
     AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"&File");
 
-    gMain = CreateWindowExW(0, hostClass.lpszClassName, L"AnyFluent Win32 Translation Oracle",
+    gMain = CreateWindowExW(0, hostClass.lpszClassName, L"FluentShell Win32 Translation Oracle",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 720, 500,
         nullptr, menuBar, instance, nullptr);
     ShowWindow(gMain, show);

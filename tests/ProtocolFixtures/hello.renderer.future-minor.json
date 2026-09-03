@@ -5,7 +5,7 @@
   "processId": 4242,
   "processCreated": "133662144000000000",
   "protocolMajor": 1,
-  "protocolMinor": 13,
+  "protocolMinor": 15,
   "futureMinorField": {
     "capability": "forward-compatible"
   }

@@ -130,49 +130,138 @@ public class ProtocolValidatorTests
     {
         var adapter = ProtocolConstants.GenericDirectUiAdapterId;
         var page = ProtocolConstants.GenericDirectUiPageId;
-        var text = NodeOfKind("static") with
+
+        // One page that exercises the whole capability-derived lane: virtual
+        // provider text, a native command link, a native check box, a two-route
+        // editable combo box, a two-route checkbox ListView, an inert read-only
+        // text box that is still a traversal stop, owned BitmapDisplayClass
+        // pixels, an unnamed status bar, a tool bar that routes commands without
+        // being a tab stop of its own, and a BitmapSwitchClass radio that is
+        // legitimately actionable while its group's tab stop sits elsewhere.
+        ControlNode Semantic(string kind, int index, string key) => NodeOfKind(kind) with
         {
-            NodeId = "100", NativeHwnd = null, ZIndex = 0, TabIndex = -1,
-            AutomationName = "Localized instruction", AdapterId = adapter, PageId = page,
-            SemanticKey = "semantic.0.text", SourceKind = "uiaVirtual",
-            PresentationVariant = "instruction", SupportedActions = [],
-            HelpText = string.Empty, AccessKey = string.Empty,
+            NodeId = (100 + index).ToString(),
+            ZIndex = index,
+            TabIndex = -1,
+            TabStop = false,
+            AdapterId = adapter,
+            PageId = page,
+            SemanticKey = key,
+            SourceKind = "nativeBacking",
+            PresentationVariant = "standard",
+            SupportedActions = [],
+            HelpText = string.Empty,
+            AccessKey = string.Empty,
+            AutomationName = "Localized " + key,
         };
-        var button = NodeOfKind("button") with
+        var text = Semantic("static", 0, "pageText") with
+            { NativeHwnd = null, SourceKind = "uiaVirtual" };
+        var button = Semantic("button", 1, "nextbutton") with
         {
-            NodeId = "101", NativeHwnd = "0xABC", ZIndex = 1, TabIndex = 0,
-            TabStop = true, AutomationName = "Localized action", AdapterId = adapter,
-            PageId = page, SemanticKey = "semantic.1.button", SourceKind = "nativeBacking",
-            PresentationVariant = "standard", SupportedActions = ["invoke"],
-            HelpText = string.Empty, AccessKey = string.Empty,
+            PresentationVariant = "commandLink", TabStop = true, TabIndex = 0,
+            SupportedActions = ["invoke"],
         };
-        var checkBox = NodeOfKind("checkBox") with
+        var checkBox = Semantic("checkBox", 2, "backupSystemFiles") with
+            { Checked = 0, TabStop = true, TabIndex = 1, SupportedActions = ["setCheck"] };
+        var combo = Semantic("comboBox", 3, "driveList") with
         {
-            NodeId = "102", NativeHwnd = null, ZIndex = 2, TabIndex = 1,
-            TabStop = true, Checked = 0, AutomationName = "Localized option",
-            AdapterId = adapter, PageId = page, SemanticKey = "semantic.2.checkbox",
-            SourceKind = "uiaVirtual", PresentationVariant = "standard",
-            SupportedActions = ["setCheck"], HelpText = string.Empty, AccessKey = string.Empty,
+            Editable = true, TabStop = true, TabIndex = 2,
+            SupportedActions = ["select", "setText"],
+        };
+        var listView = Semantic("listView", 4, "volumes") with
+            { TabStop = true, TabIndex = 3, SupportedActions = ["setSelection", "setItemCheck"] };
+        var readOnly = Semantic("edit", 5, "summary") with
+            { ReadOnly = true, TabStop = true, TabIndex = 4 };
+        var icon = Semantic("staticIcon", 6, "preview") with
+            { PresentationVariant = "bitmapDisplay" };
+        var status = Semantic("statusBar", 7, "status") with { AutomationName = string.Empty };
+        var toolbar = Semantic("toolbar", 8, "commands") with
+            { SupportedActions = ["toolbarCommand"] };
+        var bitmapRadio = Semantic("radioButton", 9, "orientation") with
+        {
+            PresentationVariant = "bitmapSwitch", Checked = 1, SupportedActions = ["setCheck"],
+            ImageWidth = 1, ImageHeight = 1, ImageFormat = "bgra8-premultiplied",
+            ImageData = Convert.ToBase64String([0x10, 0x20, 0x30, 0x40]),
         };
         var snapshot = TestData.Snapshot() with
         {
             SurfaceKind = "window", CanCancel = false, AdapterId = adapter, PageId = page,
-            Nodes = [text, button, checkBox],
+            Nodes =
+            [
+                text, button, checkBox, combo, listView, readOnly, icon, status, toolbar,
+                bitmapRadio,
+            ],
         };
         ProtocolValidator.ValidateSnapshot(snapshot);
 
+        // Semantic identity is the node's name on this page, so it must be
+        // unique and canonical.
         snapshot.Nodes[2] = checkBox with { SemanticKey = button.SemanticKey };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
         snapshot.Nodes[2] = checkBox with { SemanticKey = "localized key" };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        // A route the role never offers, and a source shape that contradicts
+        // itself, are both refused.
         snapshot.Nodes[2] = checkBox with { SupportedActions = ["invoke"] };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
-        snapshot.Nodes[2] = checkBox with { SourceKind = "nativeBacking", NativeHwnd = null };
+        snapshot.Nodes[2] = checkBox with { NativeHwnd = null };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
         snapshot.Nodes[2] = checkBox;
-        snapshot.Nodes[1] = button with { Kind = "radioButton" };
+
+        // Only provider text, a provider separator, and a property-sheet button
+        // may arrive without a native backing control.
+        snapshot.Nodes[4] = listView with { SourceKind = "uiaVirtual", NativeHwnd = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        // Both second routes are conditional on that revision's own typed state.
+        snapshot.Nodes[4] = listView with { CheckBoxes = false, CheckedIndices = [] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[4] = listView;
+        snapshot.Nodes[3] = combo with { Editable = false };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[3] = combo;
+        snapshot.Nodes[5] = readOnly with { SupportedActions = ["setText"] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[5] = readOnly;
+
+        // A disabled slot offers nothing and an actionable one must be reachable.
+        snapshot.Nodes[1] = button with { Enabled = false };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[1] = button with { TabStop = false, TabIndex = -1 };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
         snapshot.Nodes[1] = button;
+
+        // Focus is the provider's to declare and does not follow from having a
+        // route: inside its own host DirectUI owns traversal, so a wizard's static
+        // page text and an unnamed status bar can both be stops the native page
+        // really has.  The renderer refuses only the contradiction it can see by
+        // itself -- a traversal stop on a slot that is disabled -- and says which
+        // slot it refused.
+        snapshot.Nodes[0] = text with { TabStop = true, TabIndex = 5 };
+        snapshot.Nodes[7] = status with { TabStop = true, TabIndex = 6 };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+        snapshot.Nodes[7] = status with { TabStop = true, TabIndex = 6, Enabled = false };
+        var refused = Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        Assert.Contains("traversal stop", refused.Message, StringComparison.Ordinal);
+        Assert.Contains("kind=statusBar", refused.Message, StringComparison.Ordinal);
+        Assert.Contains("key=status", refused.Message, StringComparison.Ordinal);
+        snapshot.Nodes[0] = text;
+        snapshot.Nodes[7] = status;
+
+        // Pixel-only and label-borrowing roles carry the accessible name the
+        // native control cannot supply, so an empty one rejects the surface.
+        snapshot.Nodes[6] = icon with { AutomationName = string.Empty };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[6] = icon;
+        snapshot.Nodes[3] = combo with { AutomationName = string.Empty };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[3] = combo;
+
+        // A kind outside the lane, and a page id the engine never publishes,
+        // both reject the whole surface rather than one node.
+        snapshot.Nodes[8] = toolbar with { Kind = "treeView", ToolbarItems = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[8] = toolbar;
+        ProtocolValidator.ValidateSnapshot(snapshot);
         var wrongPage = snapshot with { PageId = "future-semantic-page" };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(wrongPage));
     }

@@ -1,4 +1,4 @@
-# AnyFluent production build
+# FluentShell production build
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",

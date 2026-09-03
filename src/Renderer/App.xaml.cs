@@ -48,6 +48,13 @@ public sealed partial class App : Application
                     throw;
                 }
             });
+            // Admission refused one surface: roll that window back and answer the
+            // Bridge non-fatally.  The session and every other window survive.
+            _pipe.SurfaceFaulted = (surfaceId, detail) => dispatcher.EnqueueAsync(async () =>
+            {
+                if (_windows is null) return;
+                await _windows.FaultSurfaceAsync(surfaceId, detail);
+            });
             _pipe.Closed = exception => dispatcher.TryEnqueue(() =>
             {
                 if (exception is not null) RendererDiagnostics.Log("pipe closed: " + exception);

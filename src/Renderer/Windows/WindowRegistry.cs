@@ -27,7 +27,7 @@ public sealed class WindowRegistry
         // every other window in this target process is still projecting correctly.
         // Report it to the Bridge as a non-fatal, surface-scoped error so it rolls
         // that one window back to native, and keep reading frames.
-        var scope = SurfaceScopeOf(message);
+        var scope = ProtocolValidator.SurfaceScopeOf(message);
         if (scope is not { } faultedSurfaceId)
         {
             await DispatchAsync(message, headerRevision);
@@ -40,33 +40,29 @@ public sealed class WindowRegistry
         }
         catch (ProtocolException exception)
         {
-            RendererDiagnostics.Log(
-                $"surface fault {faultedSurfaceId} on {message.MessageType}: {exception.Message}");
-            FaultSurface(faultedSurfaceId);
-            await _send(new ErrorMessage
-            {
-                SessionNonce = _sessionNonce,
-                SurfaceId = faultedSurfaceId,
-                Code = "surface_protocol_fault",
-                Detail = exception.Message,
-                Fatal = false,
-            }, 0);
+            await FaultSurfaceAsync(faultedSurfaceId, $"{message.MessageType}: {exception.Message}");
         }
     }
 
     /// <summary>
-    /// The surface a fault while handling this message belongs to, or null when the
-    /// message is session-scoped and any violation in it is genuinely fatal.
+    /// Rolls one surface back and reports it to the Bridge as non-fatal.  Admission
+    /// (which runs inside deserialization, before this registry sees the frame) and
+    /// handling both land here, so a surface-scoped fault always reaches the local
+    /// window and the Bridge through the same path.
     /// </summary>
-    private static Guid? SurfaceScopeOf(IProtocolMessage message) => message switch
+    public async Task FaultSurfaceAsync(Guid surfaceId, string detail)
     {
-        WindowOpenMessage open => open.Window.SurfaceId,
-        WindowPatchMessage patch => patch.SurfaceId,
-        ActionResultMessage result => result.SurfaceId,
-        SurfaceCommitMessage commit => commit.SurfaceId,
-        WindowCloseMessage close => close.SurfaceId,
-        _ => null,
-    };
+        RendererDiagnostics.Log($"surface fault {surfaceId}: {detail}");
+        FaultSurface(surfaceId);
+        await _send(new ErrorMessage
+        {
+            SessionNonce = _sessionNonce,
+            SurfaceId = surfaceId,
+            Code = "surface_protocol_fault",
+            Detail = detail,
+            Fatal = false,
+        }, 0);
+    }
 
     private void FaultSurface(Guid surfaceId)
     {

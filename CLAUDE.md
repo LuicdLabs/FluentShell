@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-AnyFluent translates supported Win32 top-level windows into **real WinUI 3 windows** in a
+FluentShell translates supported Win32 top-level windows into **real WinUI 3 windows** in a
 **separate process**. It is not a DWM recoloring layer, and it never initializes WinUI inside
 an injected third-party process.
 
@@ -207,7 +207,7 @@ isolated in `NativeWindowInterop.cs`/`WindowMessages`.
 production entry point (plus the one-shot `l0` DWM diagnostic). The target is resolved through a file
 handle; the path read from the selected process must match that canonical path; `--pid` is mandatory
 when several processes share the image; injector and target integrity levels must match. Shell,
-security, XAML hosts, the renderer, and AnyFluent's own tools are hard-denied in
+security, XAML hosts, the renderer, and FluentShell's own tools are hard-denied in
 `src/Common/ProcessPolicy.h`. `--signer` is deliberately rejected until implemented. There is no
 process-name injection, system-wide discovery, or watch mode.
 

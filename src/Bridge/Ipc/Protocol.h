@@ -31,10 +31,14 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // (RecoveryDrive first page) with projected native checkbox toggles. Minor 10
 // adds its native-backed explanatory text. Minor 11 adds the fail-closed
 // capability-derived DirectUI semantic adapter contract. Minor 12 adds
-// explicit determinate/marquee ProgressBar state. A Bridge
+// explicit determinate/marquee ProgressBar state. Minor 13 adds bounded owned
+// DirectUI bitmap-display and bitmap-switch pixels. Minor 14 admits every UIA
+// control type the Win32 adapter registry can back on a capability-derived
+// DirectUI surface, and lets one projected node advertise two in-place routes.
+// A Bridge
 // Must not pair with a minor-0 renderer because that peer would treat the
 // pre-UIA provisional commit as interactive.
-inline constexpr uint16_t kProtocolMinor = 12;
+inline constexpr uint16_t kProtocolMinor = 14;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
@@ -45,6 +49,11 @@ inline constexpr size_t kMaxToolbarItems = 64;
 inline constexpr uint32_t kMaxImageDimension = 96;
 inline constexpr size_t kMaxImageBytes =
     static_cast<size_t>(kMaxImageDimension) * kMaxImageDimension * 4;
+inline constexpr uint32_t kMaxDirectUiBitmapDimension = 1024;
+inline constexpr size_t kMaxDirectUiBitmapBytes = 2u * 1024u * 1024u;
+inline constexpr size_t kMaxDirectUiBitmapBase64Chars =
+    ((kMaxDirectUiBitmapBytes + 2) / 3) * 4;
+inline constexpr size_t kMaxJsonStringChars = kMaxDirectUiBitmapBase64Chars;
 
 enum class MessageType : uint16_t {
     Hello = 1,

@@ -1,6 +1,6 @@
-# AnyFluent
+# FluentShell
 
-AnyFluent translates supported Win32 top-level windows into real WinUI 3 Fluent windows. It is not a DWM recoloring layer and it does not initialize WinUI inside an injected third-party process.
+FluentShell translates supported Win32 top-level windows into real WinUI 3 Fluent windows. It is not a DWM recoloring layer and it does not initialize WinUI inside an injected third-party process.
 
 ## Architecture
 
@@ -15,16 +15,27 @@ FluentShell.Bridge.dll -- versioned pipe -- FluentShell.Renderer.exe
 - `FluentShell.Bridge.dll` is the only injected production DLL. It captures supported native controls on their owning UI thread and owns rollback.
 - `Renderer\FluentShell.Renderer.exe` is a self-contained, unpackaged x64 WinUI 3 process. It owns XAML windows, typed view models, binding, and temporary input state.
 - The native HWND tree remains authoritative. A renderer or protocol failure restores the complete native top-level window.
-- Unsupported controls cause whole-window fallback. AnyFluent does not mix a native subtree into a translated WinUI surface.
+- Unsupported controls cause whole-window fallback. FluentShell does not mix a native subtree into a translated WinUI surface.
 
 The current control boundary is bounded textual HMENU command bars, standard
-Static, Button/check/radio/GroupBox, Edit, dropdown-list/editable dropdown
-ComboBox, ListBox, and determinate horizontal ProgressBar controls plus
-supported MessageBox and static TaskDialog shapes. Owner-draw, custom HWND
-classes, RichEdit, virtual controls, embedded browser/XAML,
-layered/nonrectangular windows, and custom non-client rendering remain native.
-The staged adapter expansion is documented in
+Static text and icons, Button/check/three-state/radio/GroupBox, Edit and
+password Edit, dropdown-list/editable dropdown ComboBox, ListBox, SysLink,
+report-mode SysListView32, textual top-tab SysTabControl32, one-row
+ToolbarWindow32, textual status bars, and determinate or marquee horizontal
+ProgressBar controls plus supported MessageBox and static TaskDialog shapes.
+Owner-draw, custom HWND classes, RichEdit, TreeView, Trackbar, uncontracted
+virtual controls, embedded browser/XAML, layered/nonrectangular windows, and
+custom non-client rendering remain native. The staged adapter expansion is
+documented in
 `docs/goals/win32-to-winui-translation/CONTROL-ADAPTER-ROADMAP.md`.
+
+Built-in DirectUI surfaces such as MdSched, RecoveryDrive, and the ClearType
+Text Tuner are admitted by a separate profile-driven engine. Two pinned
+executables have exact page profiles; every other Microsoft-signed canonical
+System32 page is admitted by capability, taking each projected slot's kind from
+the same Win32 adapter registry as above and rejecting the whole window on any
+role that registry cannot prove. See
+`docs/goals/win32-to-winui-translation/DIRECTUI-APPLICATION-ADAPTERS.md`.
 
 ## Safety Boundary
 
@@ -34,7 +45,7 @@ Injection is explicit and path-bound:
 - The path read from the selected process must match that canonical path.
 - If multiple processes use the same image, `--pid` is required.
 - `--sha256` can pin the target file. Signer pinning is intentionally rejected until implemented.
-- Shell, security, XAML hosts, the AnyFluent renderer, and AnyFluent tools are hard-denied.
+- Shell, security, XAML hosts, the FluentShell renderer, and FluentShell tools are hard-denied.
 - There is no process-name injection, system-wide discovery, or injection watch mode.
 
 The one-shot `l0` command is the only diagnostic exposed by the production Injector. `IslandDemo` remains a source-level diagnostic and is excluded from the default production build.

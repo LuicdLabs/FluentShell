@@ -54,7 +54,8 @@ internal sealed class ControlFactory
             "button" => CreateButton(viewModel),
             "checkBox" => CreateCheckBox(viewModel, false),
             "threeState" => CreateCheckBox(viewModel, true),
-            "radioButton" => CreateRadioButton(viewModel),
+            "radioButton" => viewModel.PresentationVariant == "bitmapSwitch"
+                ? CreateBitmapSwitch(viewModel) : CreateRadioButton(viewModel),
             "edit" => CreateTextBox(viewModel),
             "password" => CreatePasswordBox(viewModel),
             "comboBox" => CreateComboBox(viewModel),
@@ -126,13 +127,19 @@ internal sealed class ControlFactory
         };
     }
 
-    private static Image CreateStaticIcon(ControlNodeViewModel viewModel)
+    // A Static icon is projected as a bare Image unless its variant needs the
+    // stretched semantic wrapper. The wrapper republishes the node through its own
+    // peer; the bare Image *is* the node, so the two cases differ in whether the
+    // Image itself may leave the UIA control view.
+    internal static bool StaticIconUsesSemanticWrapper(string presentationVariant) =>
+        presentationVariant is "bitmapDisplay" or "monitorPalette";
+
+    private static FrameworkElement CreateStaticIcon(ControlNodeViewModel viewModel)
     {
+        var wrapped = StaticIconUsesSemanticWrapper(viewModel.PresentationVariant);
         var image = new Image
         {
-            // The HICON has already resolved native resource sizing. Do not
-            // resample it merely because the Static HWND bounds are larger.
-            Stretch = Stretch.None,
+            Stretch = wrapped ? Stretch.Fill : Stretch.None,
             IsHitTestVisible = false,
         };
         void ApplyPixels()
@@ -149,14 +156,34 @@ internal sealed class ControlFactory
         {
             if (args.PropertyName == nameof(viewModel.ImageData)) ApplyPixels();
         };
-        return image;
+        // The unwrapped variant projects this Image as the node element itself, so it
+        // must stay in the UIA control view: the Bridge's committed gate enumerates
+        // with the control-view condition and a Raw element is simply absent there.
+        // Only the wrapped variants may hide their inner Image, because the wrapper's
+        // own peer republishes the node.
+        if (!wrapped) return image;
+        AutomationProperties.SetAccessibilityView(image, AccessibilityView.Raw);
+        return new SemanticStaticIconControl
+        {
+            Content = image,
+            MinWidth = 0,
+            MinHeight = 0,
+            Padding = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+            IsHitTestVisible = false,
+        };
     }
 
     internal static byte[] DecodeImagePixels(ControlNodeViewModel viewModel)
     {
+        var maxDimension = viewModel.PresentationVariant is "bitmapDisplay" or "bitmapSwitch"
+            or "monitorPalette"
+            ? ProtocolConstants.MaxDirectUiBitmapDimension
+            : ProtocolConstants.MaxImageDimension;
         if (viewModel.ImageFormat != "bgra8-premultiplied" ||
-            viewModel.ImageWidth is <= 0 or > ProtocolConstants.MaxImageDimension ||
-            viewModel.ImageHeight is <= 0 or > ProtocolConstants.MaxImageDimension)
+            viewModel.ImageWidth is <= 0 || viewModel.ImageHeight is <= 0 ||
+            viewModel.ImageWidth > maxDimension || viewModel.ImageHeight > maxDimension)
             throw new InvalidOperationException("Validated Static icon metadata is unavailable.");
         var pixels = Convert.FromBase64String(viewModel.ImageData);
         if (pixels.Length != checked(viewModel.ImageWidth * viewModel.ImageHeight * 4))
@@ -312,11 +339,60 @@ internal sealed class ControlFactory
         Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
         control.Checked += (_, _) =>
         {
-            if (!_isApplyingCanonical() && viewModel.Checked != 1) _action(viewModel, "setCheck", 1);
+            if (!_isApplyingCanonical() && viewModel.Checked != 1 &&
+                AllowsAction(viewModel, "setCheck"))
+                _action(viewModel, "setCheck", 1);
         };
         viewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Checked)) control.IsChecked = viewModel.Checked == 1;
+        };
+        return control;
+    }
+
+    private FrameworkElement CreateBitmapSwitch(ControlNodeViewModel viewModel)
+    {
+        var image = new Image
+        {
+            Stretch = Stretch.Fill,
+            IsHitTestVisible = false,
+        };
+        AutomationProperties.SetAccessibilityView(image, AccessibilityView.Raw);
+        void ApplyPixels()
+        {
+            var pixels = DecodeImagePixels(viewModel);
+            var bitmap = new WriteableBitmap(viewModel.ImageWidth, viewModel.ImageHeight);
+            using var stream = bitmap.PixelBuffer.AsStream();
+            stream.Write(pixels, 0, pixels.Length);
+            bitmap.Invalidate();
+            image.Source = bitmap;
+        }
+        ApplyPixels();
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.ImageData)) ApplyPixels();
+        };
+        var control = new SemanticBitmapSwitchControl
+        {
+            Content = image,
+            MinWidth = 0,
+            MinHeight = 0,
+            Padding = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            VerticalContentAlignment = VerticalAlignment.Stretch,
+            GroupName = _radioGroups[viewModel.NodeId],
+            IsChecked = viewModel.Checked == 1,
+        };
+        control.Checked += (_, _) =>
+        {
+            if (!_isApplyingCanonical() && viewModel.Checked != 1 &&
+                AllowsAction(viewModel, "setCheck"))
+                _action(viewModel, "setCheck", 1);
+        };
+        viewModel.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.Checked))
+                control.IsChecked = viewModel.Checked == 1;
         };
         return control;
     }
@@ -345,7 +421,8 @@ internal sealed class ControlFactory
                 timer.Start();
                 return;
             }
-            if (_isApplyingCanonical() || control.Text == viewModel.Text || control.Text == pendingText) return;
+            if (_isApplyingCanonical() || !AllowsAction(viewModel, "setText") ||
+                control.Text == viewModel.Text || control.Text == pendingText) return;
             pendingText = control.Text;
             _action(viewModel, "setText", control.Text);
         }
@@ -395,7 +472,8 @@ internal sealed class ControlFactory
         control.PasswordChanged += (_, _) =>
         {
             viewModel.DraftText = control.Password;
-            if (!_isApplyingCanonical() && control.Password != viewModel.Text) _action(viewModel, "setText", control.Password);
+            if (!_isApplyingCanonical() && AllowsAction(viewModel, "setText") &&
+                control.Password != viewModel.Text) _action(viewModel, "setText", control.Password);
         };
         viewModel.PropertyChanged += (_, args) =>
         {
@@ -423,7 +501,7 @@ internal sealed class ControlFactory
         void CommitDraft()
         {
             retryTimer.Stop();
-            if (!viewModel.Editable || _isApplyingCanonical() ||
+            if (!viewModel.Editable || _isApplyingCanonical() || !AllowsAction(viewModel, "setText") ||
                 control.Text == viewModel.Text || control.Text == pendingText) return;
             if (_isImeComposing())
             {
@@ -439,7 +517,8 @@ internal sealed class ControlFactory
         control.LostFocus += (_, _) => CommitDraft();
         control.SelectionChanged += (_, _) =>
         {
-            if (!_isApplyingCanonical() && control.SelectedIndex != viewModel.SelectedIndex)
+            if (!_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
+                control.SelectedIndex != viewModel.SelectedIndex)
             {
                 retryTimer.Stop();
                 if (viewModel.Editable && control.SelectedIndex == -1 &&
@@ -480,7 +559,8 @@ internal sealed class ControlFactory
         };
         control.SelectionChanged += (_, _) =>
         {
-            if (!_isApplyingCanonical() && control.SelectedIndex != viewModel.SelectedIndex) _action(viewModel, "select", control.SelectedIndex);
+            if (!_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
+                control.SelectedIndex != viewModel.SelectedIndex) _action(viewModel, "select", control.SelectedIndex);
         };
         viewModel.PropertyChanged += (_, args) =>
         {
@@ -519,7 +599,7 @@ internal sealed class ControlFactory
             AutomationProperties.SetName(link, segments.Label);
             link.Click += (_, _) =>
             {
-                if (!_isApplyingCanonical()) _action(viewModel, "invoke", null);
+                if (!_isApplyingCanonical() && AllowsAction(viewModel, "invoke")) _action(viewModel, "invoke", null);
             };
             paragraph.Inlines.Add(link);
             if (segments.Suffix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Suffix });
@@ -588,7 +668,8 @@ internal sealed class ControlFactory
                     {
                         if (applyingSelection || _isApplyingCanonical()) return;
                         var requested = checkBox.IsChecked == true;
-                        if (viewModel.CheckedIndices.Contains(rowIndex) != requested)
+                        if (viewModel.CheckedIndices.Contains(rowIndex) != requested &&
+                            AllowsAction(viewModel, "setItemCheck"))
                         {
                             _action(viewModel, "setItemCheck", new ListViewCheckActionValue
                             {
@@ -681,7 +762,8 @@ internal sealed class ControlFactory
             var selection = CanonicalSelectionIndices(control.SelectedItems
                 .Cast<object>()
                 .Select(item => control.Items.IndexOf(item)));
-            if (!viewModel.SelectedIndices.SequenceEqual(selection))
+            if (!viewModel.SelectedIndices.SequenceEqual(selection) &&
+                AllowsAction(viewModel, "setSelection"))
                 _action(viewModel, "setSelection", selection);
         };
         viewModel.PropertyChanged += (_, args) =>
@@ -804,7 +886,8 @@ internal sealed class ControlFactory
                     var commandId = item.CommandId;
                     button.Click += (_, _) =>
                     {
-                        if (!_isApplyingCanonical()) _action(viewModel, "toolbarCommand", commandId);
+                        if (!_isApplyingCanonical() && AllowsAction(viewModel, "toolbarCommand"))
+                            _action(viewModel, "toolbarCommand", commandId);
                     };
                     element = button;
                 }
@@ -843,7 +926,8 @@ internal sealed class ControlFactory
     {
         var control = new SemanticTabControl(index =>
         {
-            if (!_isApplyingCanonical() && index != viewModel.SelectedIndex)
+            if (!_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
+                index != viewModel.SelectedIndex)
                 _action(viewModel, "select", index);
         });
 
@@ -1089,6 +1173,56 @@ internal sealed class SemanticProgressBarAutomationPeer(SemanticProgressBarContr
         throw new InvalidOperationException("Projected ProgressBar state is read-only.");
 }
 
+internal sealed class SemanticBitmapSwitchControl : RadioButton
+{
+    protected override AutomationPeer OnCreateAutomationPeer() =>
+        new SemanticBitmapSwitchAutomationPeer(this);
+}
+
+internal sealed class SemanticBitmapSwitchAutomationPeer(SemanticBitmapSwitchControl owner) :
+    RadioButtonAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        AutomationControlType.RadioButton;
+    protected override string GetClassNameCore() => "RadioButton";
+    protected override string GetNameCore() => AutomationProperties.GetName(owner);
+    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
+    {
+        var reported = base.GetBoundingRectangleCore();
+        if (owner.ActualWidth <= 0 || owner.ActualHeight <= 0 || reported.Width <= 0)
+            return reported;
+        var scale = reported.Width / owner.ActualWidth;
+        return new global::Windows.Foundation.Rect(
+            reported.X, reported.Y, reported.Width, owner.ActualHeight * scale);
+    }
+}
+
+internal sealed class SemanticStaticIconControl : ContentControl
+{
+    protected override AutomationPeer OnCreateAutomationPeer() =>
+        new SemanticStaticIconAutomationPeer(this);
+}
+
+internal sealed class SemanticStaticIconAutomationPeer(SemanticStaticIconControl owner) :
+    FrameworkElementAutomationPeer(owner)
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        ControlFactory.AutomationControlTypeFor("staticIcon");
+    protected override string GetClassNameCore() => "Image";
+    protected override string GetNameCore() => AutomationProperties.GetName(owner);
+    protected override bool IsControlElementCore() => true;
+    protected override bool IsContentElementCore() => true;
+    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
+    {
+        var reported = base.GetBoundingRectangleCore();
+        if (owner.ActualWidth <= 0 || owner.ActualHeight <= 0 || reported.Width <= 0)
+            return reported;
+        var scale = reported.Width / owner.ActualWidth;
+        return new global::Windows.Foundation.Rect(
+            reported.X, reported.Y, reported.Width, owner.ActualHeight * scale);
+    }
+}
+
 internal sealed class SemanticStaticTextControl : ContentControl
 {
     protected override AutomationPeer OnCreateAutomationPeer() => new SemanticStaticTextAutomationPeer(this);
@@ -1103,6 +1237,20 @@ internal sealed class SemanticStaticTextAutomationPeer(SemanticStaticTextControl
     protected override string GetNameCore() => AutomationProperties.GetName(owner);
     protected override bool IsControlElementCore() => true;
     protected override bool IsContentElementCore() => true;
+    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
+    {
+        var reported = base.GetBoundingRectangleCore();
+        if (owner.ActualWidth <= 0 || owner.ActualHeight <= 0 || reported.Width <= 0)
+            return reported;
+        var scale = reported.Width / owner.ActualWidth;
+        var semanticWidth = owner.ActualWidth * scale;
+        var semanticHeight = owner.ActualHeight * scale;
+        return new global::Windows.Foundation.Rect(
+            reported.X - (semanticWidth - reported.Width) / 2,
+            reported.Y - (semanticHeight - reported.Height) / 2,
+            semanticWidth,
+            semanticHeight);
+    }
 }
 
 internal sealed class SemanticGroupControl : ContentControl

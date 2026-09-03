@@ -25,6 +25,12 @@ public sealed class PipeClient : IAsyncDisposable
     public Action<Exception?>? Closed { get; set; }
     public Func<CancellationToken, Task>? LivenessProbe { get; set; }
 
+    /// <summary>
+    /// Reports a violation that names one surface: its id and the detail to send
+    /// back.  Left unset, such a fault stays fatal like any other.
+    /// </summary>
+    public Func<Guid, string, Task>? SurfaceFaulted { get; set; }
+
     public PipeClient(RendererOptions options)
     {
         _options = options;
@@ -119,7 +125,25 @@ public sealed class PipeClient : IAsyncDisposable
             {
                 var frame = await FrameCodec.ReadAsync(_pipe, cancellationToken).ConfigureAwait(false);
                 ValidateIncomingSequence(frame.Header.Sequence);
-                var message = ProtocolSerializer.Deserialize(frame.Header.MessageType, frame.Payload);
+                IProtocolMessage message;
+                try
+                {
+                    message = ProtocolSerializer.Deserialize(frame.Header.MessageType, frame.Payload);
+                }
+                catch (ProtocolException exception) when (SurfaceFaulted is not null &&
+                    exception.SurfaceScope is { } faultedSurfaceId &&
+                    string.Equals(exception.ScopeNonce, _options.Nonce, StringComparison.OrdinalIgnoreCase))
+                {
+                    // Admission refused one window's page.  The frame parsed and the
+                    // stream is still in sync, so ending the session here would roll
+                    // back every other correctly projecting window in this target as
+                    // well.  Fault that one surface and keep reading.
+                    Volatile.Write(ref _lastInboundTick, Environment.TickCount64);
+                    RendererDiagnostics.Log(
+                        $"surface admission refused {faultedSurfaceId}: {exception.Message}");
+                    await SurfaceFaulted(faultedSurfaceId, exception.Message).ConfigureAwait(false);
+                    continue;
+                }
                 ValidateNonce(message);
                 if (message is HelloMessage) throw new ProtocolException("Duplicate hello message.");
                 Volatile.Write(ref _lastInboundTick, Environment.TickCount64);

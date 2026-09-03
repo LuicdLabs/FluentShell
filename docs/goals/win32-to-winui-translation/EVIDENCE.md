@@ -14,7 +14,7 @@ into a freshly started `LegacyDialogHost.exe` on 2026-08-15. The bridge log
 recorded:
 
 ```text
-Projected native window: AnyFluent Win32 Translation Oracle
+Projected native window: FluentShell Win32 Translation Oracle
 ```
 
 No committed UIA gate failure or immediate native restore was recorded during
@@ -75,7 +75,7 @@ continued applying native-authoritative patches:
 ```text
 window.open ... revision=1 nodes=17
 surface prepared ... uia=True ...
-Projected native window: AnyFluent Win32 Translation Oracle
+Projected native window: FluentShell Win32 Translation Oracle
 window.patch applied rev=3 ...
 window.patch applied rev=4 ...
 ```

@@ -3,6 +3,7 @@
 #include "SourceThreadAgent.h"
 #include "ControlAdapters.h"
 #include "../../Common/FluentShell.h"
+#include "../Ipc/Protocol.h"
 
 #include <combaseapi.h>
 #include <dwmapi.h>
@@ -12,6 +13,7 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <commctrl.h>
+#include <prsht.h>
 #include <UIAutomation.h>
 #include <wrl/client.h>
 
@@ -35,6 +37,14 @@ using Microsoft::WRL::ComPtr;
 
 constexpr DWORD kUiaDeadlineMs = 1600;
 constexpr size_t kMaxTextChars = 4096;
+// Upper bound on the UIA subtree a single admitted page may present. Composite
+// controls contribute one element per item, so a list page legitimately exceeds
+// a few dozen elements; the bound stays an equality-checked rejection so an
+// unexpectedly large provider tree still keeps the surface native.
+constexpr int kMaxUiaDescendants = 512;
+// Items a single projected composite may own. Larger native lists stay native
+// rather than being truncated into a partially represented control.
+constexpr size_t kMaxCompositeItems = 256;
 
 bool Fail(std::wstring& error, std::wstring_view value) {
     error.assign(value);
@@ -51,6 +61,33 @@ bool SameRect(const RECT& left, const RECT& right) noexcept {
     return EqualRect(&left, &right) != FALSE;
 }
 
+bool SameImplementationIdentity(
+    const std::vector<DirectUiImplementationEvidence>& left,
+    const std::vector<DirectUiImplementationEvidence>& right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        if (left[index].hwnd != right[index].hwnd ||
+            left[index].generation != right[index].generation ||
+            left[index].parent != right[index].parent ||
+            left[index].className != right[index].className ||
+            left[index].visible != right[index].visible) return false;
+    }
+    return true;
+}
+
+bool IsPropertySheetButton(int value) noexcept {
+    return value == PSBTN_BACK || value == PSBTN_NEXT ||
+        value == PSBTN_FINISH || value == PSBTN_CANCEL;
+}
+
+HWND CurrentPropertySheetPage(HWND root, const std::vector<HWND>& pageHosts) noexcept {
+    if (!root || pageHosts.empty()) return nullptr;
+    const HWND page = reinterpret_cast<HWND>(
+        SendMessageW(root, PSM_GETCURRENTPAGEHWND, 0, 0));
+    return page && std::find(pageHosts.begin(), pageHosts.end(), page) != pageHosts.end()
+        ? page : nullptr;
+}
+
 bool SameWindow(const DirectUiWindowEvidence& left, const DirectUiWindowEvidence& right) noexcept {
     return left.hwnd == right.hwnd && left.generation == right.generation &&
         SameRect(left.bounds, right.bounds) && left.style == right.style &&
@@ -60,7 +97,10 @@ bool SameWindow(const DirectUiWindowEvidence& left, const DirectUiWindowEvidence
         left.controlId == right.controlId && left.dialogCode == right.dialogCode &&
         left.checked == right.checked && left.minimum == right.minimum &&
         left.maximum == right.maximum && left.position == right.position &&
-        left.indeterminate == right.indeterminate;
+        left.indeterminate == right.indeterminate &&
+        left.hasDetail == right.hasDetail &&
+        SameDirectUiDetailShape(left, right) &&
+        SameDirectUiDetailContent(left, right);
 }
 
 bool SameProfileWindow(
@@ -72,6 +112,8 @@ bool SameProfileWindow(
     normalized.style = left.style;
     if (styleChanged && slot.kind == ControlKind::Button)
         normalized.dialogCode = left.dialogCode;
+    if (styleChanged && slot.kind == ControlKind::RadioButton && slot.captureBitmap)
+        normalized.checked = left.checked;
     if (!SameWindow(left, normalized)) return false;
     if (!styleChanged) return true;
     const uint64_t alternateBits = static_cast<uint64_t>(slot.nativeStyleValue) ^
@@ -113,7 +155,85 @@ bool SameMovedWindow(
         before.controlId == after.controlId &&
         before.dialogCode == after.dialogCode && before.checked == after.checked &&
         before.minimum == after.minimum && before.maximum == after.maximum &&
-        before.position == after.position && before.indeterminate == after.indeterminate;
+        before.position == after.position && before.indeterminate == after.indeterminate &&
+        before.hasDetail == after.hasDetail &&
+        SameDirectUiDetailShape(before, after) &&
+        SameDirectUiDetailContent(before, after);
+}
+
+bool CaptureWindowClientPixels(
+    HWND window,
+    DirectUiWindowEvidence& value,
+    std::wstring& error) {
+    return CaptureOwnedWindowPixels(window, Ipc::kMaxDirectUiBitmapDimension,
+        Ipc::kMaxDirectUiBitmapBytes, value.imageWidth, value.imageHeight,
+        value.imageFormat, value.imageData, error);
+}
+
+// Reads this backing control's typed state through its own registered Win32
+// adapter. The DirectUI lane therefore inherits every proven control contract
+// (and every rejection) instead of re-deriving facets per application.
+bool CaptureSlotDetail(
+    HWND window,
+    ControlKind kind,
+    DirectUiWindowEvidence& value,
+    std::wstring& error) {
+    value.hasDetail = false;
+    value.detail = ControlNode{};
+    value.detail.kind = kind;
+    value.detail.hwnd = window;
+    value.detail.style = value.style;
+    value.detail.exStyle = value.exStyle;
+    value.detail.rect = value.bounds;
+    value.detail.text = value.text;
+    value.detail.enabled = value.enabled;
+    value.detail.visible = value.visible;
+    value.detail.controlId = value.controlId;
+    value.detail.dialogCode = value.dialogCode;
+    std::wstring reason;
+    if (!CaptureControlDetail(window, value.detail, reason))
+        return Fail(error, L"backing control typed state was rejected: " + reason);
+    value.hasDetail = true;
+    return true;
+}
+
+bool SameToolbarItems(
+    const std::vector<ToolbarItemSnapshot>& left,
+    const std::vector<ToolbarItemSnapshot>& right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        if (a.kind != b.kind || a.commandId != b.commandId || !SameRect(a.rect, b.rect) ||
+            a.text != b.text || a.enabled != b.enabled || a.hidden != b.hidden ||
+            a.imageWidth != b.imageWidth || a.imageHeight != b.imageHeight ||
+            a.imageFormat != b.imageFormat || a.imageData != b.imageData) return false;
+    }
+    return true;
+}
+
+// The part of a toolbar that is a contract rather than presentation: which
+// command each button posts and the caption that says so. Enabled state,
+// visibility, geometry, and images may move between revisions; a command or its
+// caption may not, because no UIA evidence corroborates it while cloaked.
+bool SameToolbarCommands(
+    const std::vector<ToolbarItemSnapshot>& left,
+    const std::vector<ToolbarItemSnapshot>& right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        if (left[index].kind != right[index].kind ||
+            left[index].commandId != right[index].commandId ||
+            left[index].text != right[index].text) return false;
+    }
+    return true;
+}
+
+bool SameRectList(const std::vector<RECT>& left, const std::vector<RECT>& right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        if (!SameRect(left[index], right[index])) return false;
+    }
+    return true;
 }
 
 // Reads one HWND facet block. All reads happen on the source GUI thread, so
@@ -124,7 +244,8 @@ bool ReadWindowEvidence(
     bool isButton,
     DirectUiWindowEvidence& value,
     std::wstring& error,
-    bool isProgress = false) {
+    bool isProgress = false,
+    bool captureBitmap = false) {
     if (!window || !IsWindow(window) || !GetWindowRect(window, &value.bounds))
         return Fail(error, L"window identity or geometry is unavailable");
     value.hwnd = window;
@@ -136,6 +257,8 @@ bool ReadWindowEvidence(
     value.controlId = GetDlgCtrlID(window);
     value.dialogCode = static_cast<uint32_t>(SendMessageW(window, WM_GETDLGCODE, 0, 0));
     if (isButton) value.checked = SendMessageW(window, BM_GETCHECK, 0, 0) != 0;
+    if (FluentShell::EqualsIgnoreCase(ClassName(window), L"BitmapSwitchClass"))
+        value.checked = (static_cast<DWORD>(value.style) & WS_TABSTOP) != 0;
     if (isProgress) {
         PBRANGE range{};
         SendMessageW(window, PBM_GETRANGE, FALSE, reinterpret_cast<LPARAM>(&range));
@@ -171,6 +294,7 @@ bool ReadWindowEvidence(
             }
         }
     }
+    if (captureBitmap && !CaptureWindowClientPixels(window, value, error)) return false;
     return value.generation != 0 || Fail(error, L"window generation is unavailable");
 }
 
@@ -191,6 +315,101 @@ bool ReadBasicWindowEvidence(
     return value.generation != 0 || Fail(error, L"window generation is unavailable");
 }
 
+// Kinds whose UIA provider publishes one element per item. Their items are
+// absorbed into the owner slot instead of each becoming its own slot, so the
+// engine needs a native census to hold the item count to an equality.
+bool IsDirectUiCompositeKind(ControlKind kind) noexcept {
+    switch (kind) {
+    case ControlKind::ComboBox:
+    case ControlKind::ListBox:
+    case ControlKind::ListView:
+    case ControlKind::TabControl:
+    case ControlKind::StatusBar:
+    case ControlKind::Toolbar:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The item collection each composite adapter fills. SIZE_MAX means the node is
+// not a composite, which is what rejects an unexpected absorption attempt.
+size_t DirectUiNativeItemCount(const ControlNode& node) noexcept {
+    switch (node.kind) {
+    case ControlKind::ListView:
+        return node.rows.size();
+    case ControlKind::Toolbar:
+        return node.toolbarItems.size();
+    case ControlKind::ComboBox:
+    case ControlKind::ListBox:
+    case ControlKind::TabControl:
+    case ControlKind::StatusBar:
+        return node.items.size();
+    default:
+        return static_cast<size_t>(-1);
+    }
+}
+
+// UIA descendants an already-slotted control legitimately owns, so the child is
+// absorbed into that slot instead of becoming a slot of its own. Absorption is
+// deliberately narrow: the point of it is that the owner's projected control
+// already represents and routes the child, so any role the owner cannot
+// represent must reject the surface rather than silently disappear. The owner's
+// own container element is never in this set, which is what keeps exactly one
+// retained semantic per backing HWND.
+bool IsAbsorbedChildControlType(ControlKind owner, int controlType) noexcept {
+    // Scroll chrome belongs to whichever control draws it, and the projected
+    // WinUI control brings its own scrolling.
+    if (controlType == UIA_ScrollBarControlTypeId ||
+        controlType == UIA_ThumbControlTypeId)
+        return true;
+    switch (owner) {
+    case ControlKind::ComboBox:
+        // The drop-down button, the edit field of an editable combo, the list
+        // popup, and every item in it.
+        return controlType == UIA_ListItemControlTypeId ||
+            controlType == UIA_EditControlTypeId ||
+            controlType == UIA_ListControlTypeId ||
+            controlType == UIA_ButtonControlTypeId;
+    case ControlKind::ListBox:
+        return controlType == UIA_ListItemControlTypeId;
+    case ControlKind::ListView:
+        return controlType == UIA_ListItemControlTypeId ||
+            controlType == UIA_DataItemControlTypeId ||
+            controlType == UIA_HeaderControlTypeId ||
+            controlType == UIA_HeaderItemControlTypeId ||
+            controlType == UIA_TextControlTypeId ||
+            controlType == UIA_ImageControlTypeId;
+    case ControlKind::TabControl:
+        return controlType == UIA_TabItemControlTypeId;
+    case ControlKind::StatusBar:
+        return controlType == UIA_TextControlTypeId ||
+            controlType == UIA_SeparatorControlTypeId ||
+            controlType == UIA_ImageControlTypeId;
+    case ControlKind::Toolbar:
+        return controlType == UIA_ButtonControlTypeId ||
+            controlType == UIA_SeparatorControlTypeId ||
+            controlType == UIA_ImageControlTypeId;
+    case ControlKind::SysLink:
+        // The control element itself is the Hyperlink; the text run below it is
+        // the same label the slot already publishes.
+        return controlType == UIA_TextControlTypeId;
+    case ControlKind::Edit:
+    case ControlKind::Password:
+        // A multiline edit publishes its own scroll chrome, handled above.
+        return false;
+    default:
+        return false;
+    }
+}
+
+// Behavior an absorbed child may carry. Selection, invocation, and toggling are
+// exactly what the owner slot's own routes dispatch; anything else (a writable
+// Value on an item, say) would be an unrepresented mutation path.
+constexpr uint32_t kAbsorbedChildPatternMask = DirectUiPatternInvoke |
+    DirectUiPatternToggle | DirectUiPatternSelectionItem |
+    DirectUiPatternExpandCollapse;
+
 bool CaptureDirectUiBootstrapCore(
     SourceThreadAgent& agent,
     DirectUiBootstrapEvidence& evidence,
@@ -202,6 +421,9 @@ bool CaptureDirectUiBootstrapCore(
         return Fail(error, L"bootstrap: root thread or process identity mismatch");
 
     evidence = {};
+    evidence.rootClass = ClassName(root);
+    if (evidence.rootClass.empty())
+        return Fail(error, L"bootstrap: root class is unavailable");
     evidence.native.mutationEpoch = agent.MutationEpoch();
     DWORD cloakReasons = 0;
     if (FAILED(DwmGetWindowAttribute(root, DWMWA_CLOAKED,
@@ -237,6 +459,31 @@ bool CaptureDirectUiBootstrapCore(
         value.className = ClassName(child);
         if (value.className.empty() ||
             !ReadBasicWindowEvidence(agent, child, value.window, error)) return false;
+        // A composite control's own implementation child is absorbed by its owner
+        // slot rather than projected. The probe interrogates the parent with
+        // messages, so it can only run here, on the control's own GUI thread. It
+        // is evaluated for hidden children too: a closed ComboBox keeps its list
+        // child hidden.
+        value.compositeImplementationChild = IsCompositeImplementationChild(child);
+        if (value.window.visible) {
+            std::wstring ignored;
+            value.controlSupported = ClassifyControl(
+                child, value.controlKind, ignored);
+            // Item census for composite controls, read through the control's own
+            // adapter here so profile generation on the supervisor thread can pin
+            // an equality against the UIA item count without a cross-thread send.
+            // A rejected read leaves SIZE_MAX, which refuses the absorption.
+            if (value.controlSupported && !value.compositeImplementationChild &&
+                IsDirectUiCompositeKind(value.controlKind)) {
+                ControlNode probe;
+                std::wstring ignoredDetail;
+                if (CaptureDirectUiSlotNode(child, value.controlKind, probe, ignoredDetail))
+                    value.nativeItemCount = DirectUiNativeItemCount(probe);
+            }
+        }
+        evidence.native.implementationWindows.push_back({
+            value.window.hwnd, value.window.generation, value.parent,
+            value.className, value.window.visible });
         if (FluentShell::EqualsIgnoreCase(value.className, L"DirectUIHWND") &&
             value.window.visible && value.parent == root) {
             if (evidence.native.directUi.hwnd ||
@@ -251,6 +498,10 @@ bool CaptureDirectUiBootstrapCore(
     }
     if (!evidence.native.directUi.hwnd)
         return Fail(error, L"bootstrap: one visible root DirectUI anchor is required");
+    if (FluentShell::EqualsIgnoreCase(evidence.rootClass, L"NativeHWNDHost")) {
+        evidence.native.propertySheetPageHwnd =
+            CurrentPropertySheetPage(root, evidence.native.pageHosts);
+    }
     evidence.native.mutationEpoch = agent.MutationEpoch();
     evidence.native.lastMutationHwnd = agent.LastMutationHwnd();
     evidence.native.lastMutationMessage = agent.LastMutationMessage();
@@ -517,6 +768,7 @@ bool ReadSemantic(
 bool ReadPatterns(IUIAutomationElement* element, DirectUiSemanticEvidence& semantic) {
     semantic.actionable = false;
     semantic.patternMask = DirectUiPatternNone;
+    semantic.capabilityMask = DirectUiCapabilityNone;
     struct PatternProperty final { PROPERTYID property; uint32_t bit; };
     constexpr PatternProperty properties[] = {
         { UIA_IsInvokePatternAvailablePropertyId, DirectUiPatternInvoke },
@@ -536,6 +788,31 @@ bool ReadPatterns(IUIAutomationElement* element, DirectUiSemanticEvidence& seman
             semantic.patternMask |= entry.bit;
             semantic.actionable = true;
         }
+        VariantClear(&value);
+    }
+
+    // Structural capabilities. A container advertising Selection/Text/Grid does
+    // not by itself gain a mutation route, so these are pinned as shape evidence
+    // in capabilityMask and never widen patternMask (which is what makes an
+    // element count as actionable).
+    struct CapabilityProperty final { PROPERTYID property; uint32_t bit; };
+    constexpr CapabilityProperty capabilities[] = {
+        { UIA_IsSelectionPatternAvailablePropertyId, DirectUiCapabilitySelection },
+        { UIA_IsTextPatternAvailablePropertyId, DirectUiCapabilityText },
+        { UIA_IsRangeValuePatternAvailablePropertyId, DirectUiCapabilityRangeValue },
+        { UIA_IsScrollPatternAvailablePropertyId, DirectUiCapabilityScroll },
+        { UIA_IsGridPatternAvailablePropertyId, DirectUiCapabilityGrid },
+        { UIA_IsTablePatternAvailablePropertyId, DirectUiCapabilityTable },
+    };
+    for (const auto& entry : capabilities) {
+        VARIANT value{};
+        VariantInit(&value);
+        const HRESULT result = element->GetCurrentPropertyValue(entry.property, &value);
+        if (FAILED(result) || value.vt != VT_BOOL) {
+            VariantClear(&value);
+            return false;
+        }
+        if (value.boolVal == VARIANT_TRUE) semantic.capabilityMask |= entry.bit;
         VariantClear(&value);
     }
 
@@ -654,7 +931,7 @@ bool CaptureUia(
     if (FAILED(root->FindAll(TreeScope_Descendants, condition.Get(), &descendants)) || !descendants)
         return Fail(error, L"UIA descendant enumeration failed");
     int count = 0;
-    if (FAILED(descendants->get_Length(&count)) || count < 1 || count > 64)
+    if (FAILED(descendants->get_Length(&count)) || count < 1 || count > kMaxUiaDescendants)
         return Fail(error, L"UIA descendant count is outside the exact bound");
     for (int index = 0; index < count; ++index) {
         ComPtr<IUIAutomationElement> element;
@@ -731,6 +1008,60 @@ std::wstring DisplayText(std::wstring_view value) {
     return result;
 }
 
+// The protocol action name a route advertises. A ListView selection is a
+// canonical index list rather than a single index, so it carries a different
+// name from the other list routes even though both are SelectListItem.
+std::wstring_view DirectUiActionName(DirectUiAction action, ControlKind kind) noexcept {
+    switch (action) {
+    case DirectUiAction::HandoffClick:
+    case DirectUiAction::HandoffPropertySheetButton:
+    case DirectUiAction::HandoffLinkClick:
+        return L"invoke";
+    case DirectUiAction::ToggleCheck:
+    case DirectUiAction::SelectRadio:
+        return L"setCheck";
+    case DirectUiAction::SetEditText:
+        return L"setText";
+    case DirectUiAction::SelectListItem:
+        return kind == ControlKind::ListView ? L"setSelection" : L"select";
+    case DirectUiAction::SetItemCheck:
+        return L"setItemCheck";
+    case DirectUiAction::ToolbarCommand:
+        return L"toolbarCommand";
+    default:
+        return {};
+    }
+}
+
+// A secondary route is advertised only when this revision's own typed state says
+// the control actually accepts it: an editable combo box, a checkbox ListView.
+// The declared route is the ceiling, never the guarantee.
+bool DirectUiSecondaryActionApplies(
+    DirectUiAction action,
+    const ControlNode& node) noexcept {
+    switch (action) {
+    case DirectUiAction::SetEditText:
+        return (node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
+            (node.kind == ControlKind::ComboBox && node.editable)) && !node.readOnly;
+    case DirectUiAction::SetItemCheck:
+        return node.kind == ControlKind::ListView && node.checkBoxes;
+    default:
+        return false;
+    }
+}
+
+void SetDirectUiSupportedActions(const DirectUiSlot& slot, ControlNode& node) {
+    node.supportedActions.clear();
+    if (!node.enabled) return;
+    const std::wstring_view primary = DirectUiActionName(slot.action, slot.kind);
+    if (!primary.empty()) node.supportedActions.emplace_back(primary);
+    const std::wstring_view secondary =
+        DirectUiActionName(slot.secondaryAction, slot.kind);
+    if (!secondary.empty() && secondary != primary &&
+        DirectUiSecondaryActionApplies(slot.secondaryAction, node))
+        node.supportedActions.emplace_back(secondary);
+}
+
 RECT ClientRectFor(const RECT& screen, const POINT& origin) noexcept {
     return { screen.left - origin.x, screen.top - origin.y,
         screen.right - origin.x, screen.bottom - origin.y };
@@ -761,6 +1092,104 @@ bool LoadTrustedIconResource(
     return captured && node.imageWidth == static_cast<uint32_t>(width) &&
         node.imageHeight == static_cast<uint32_t>(height) ||
         Fail(error, L"resource: application icon did not resolve to owned pixels");
+}
+
+// Publishes a backing control's adapter-read typed state onto the projected
+// node. Only the facets the projected kind actually owns are copied, so a
+// ControlNode field some other adapter uses can never leak into a kind that has
+// no meaning for it, and the renderer sees exactly the shape the Win32 lane
+// already sends for that kind.
+bool ApplyDirectUiDetailToNode(
+    const DirectUiSlot& slot,
+    const DirectUiWindowEvidence& backing,
+    ControlNode& node,
+    std::wstring& error) {
+    if (!slot.captureDetail) return true;
+    if (!backing.hasDetail || backing.detail.kind != slot.kind)
+        return Fail(error, L"snapshot: DirectUI backing typed state is unavailable");
+    const ControlNode& detail = backing.detail;
+    switch (slot.kind) {
+    case ControlKind::ThreeState:
+        // A BS_3STATE box reaches a value the shared bool facet cannot carry.
+        node.checked = detail.checked;
+        break;
+    case ControlKind::StaticIcon:
+        if (detail.imageFormat.empty() || detail.imageData.empty())
+            return Fail(error, L"snapshot: DirectUI icon pixels are unavailable");
+        node.imageWidth = detail.imageWidth;
+        node.imageHeight = detail.imageHeight;
+        node.imageFormat = detail.imageFormat;
+        node.imageData = detail.imageData;
+        break;
+    case ControlKind::SysLink:
+        // items carries the parsed link caption; the flattened markup stays in
+        // text, exactly as the Win32 lane publishes it.
+        node.text = detail.text;
+        node.items = detail.items;
+        node.automationName = detail.automationName;
+        // A link item can be disabled while its host HWND is not. Narrowing is
+        // monotone, so it cannot contradict the traversal state computed above.
+        if (!detail.enabled) {
+            node.enabled = false;
+            node.tabStop = false;
+        }
+        break;
+    case ControlKind::Edit:
+    case ControlKind::Password:
+        node.text = detail.text;
+        node.readOnly = detail.readOnly;
+        node.multiline = detail.multiline;
+        node.selectionStart = detail.selectionStart;
+        node.selectionLength = detail.selectionLength;
+        break;
+    case ControlKind::ComboBox:
+        node.text = detail.text;
+        node.items = detail.items;
+        node.selectedIndex = detail.selectedIndex;
+        node.editable = detail.editable;
+        node.readOnly = detail.readOnly;
+        break;
+    case ControlKind::ListBox:
+        node.items = detail.items;
+        node.selectedIndex = detail.selectedIndex;
+        node.selectedIndices = detail.selectedIndices;
+        node.multiSelect = detail.multiSelect;
+        break;
+    case ControlKind::ListView:
+        node.items = detail.items;
+        node.columns = detail.columns;
+        node.columnWidths = detail.columnWidths;
+        node.rows = detail.rows;
+        node.columnHeadersVisible = detail.columnHeadersVisible;
+        node.selectedIndex = detail.selectedIndex;
+        node.selectedIndices = detail.selectedIndices;
+        node.focusedIndex = detail.focusedIndex;
+        node.multiSelect = detail.multiSelect;
+        node.checkBoxes = detail.checkBoxes;
+        node.checkedIndices = detail.checkedIndices;
+        break;
+    case ControlKind::TabControl:
+        node.items = detail.items;
+        node.itemRects = detail.itemRects;
+        node.selectedIndex = detail.selectedIndex;
+        break;
+    case ControlKind::StatusBar:
+        // Parts carry the text; the adapter clears the bar's own caption so it
+        // is not duplicated in the name. Mirror what the Win32 lane sends.
+        node.items = detail.items;
+        node.columnWidths = detail.columnWidths;
+        node.text = detail.text;
+        node.automationName = detail.automationName;
+        break;
+    case ControlKind::Toolbar:
+        node.toolbarItems = detail.toolbarItems;
+        node.text = detail.text;
+        node.automationName = detail.automationName;
+        break;
+    default:
+        return Fail(error, L"snapshot: DirectUI slot kind carries no typed state");
+    }
+    return true;
 }
 
 // Builds the composite renderer snapshot from verified evidence. Every node is
@@ -816,14 +1245,6 @@ bool BuildCompositeSnapshot(
         node.helpText = L"";
         node.accessKey = L"";
         node.isDefault = slot.defaultButton;
-        if (slot.action == DirectUiAction::None) {
-            node.supportedActions = {};
-        } else if (slot.action == DirectUiAction::HandoffClick) {
-            node.supportedActions = { L"invoke" };
-        } else {
-            node.supportedActions = { L"setCheck" };
-        }
-
         if (slot.virtualSource) {
             const auto* semantic = FindSemanticByAutomationId(uia,
                 slot.uiaAutomationId.empty() ? slot.semanticKey : slot.uiaAutomationId);
@@ -866,13 +1287,37 @@ bool BuildCompositeSnapshot(
             node.helpText = semantic->helpText.empty() ? backing.note : semantic->helpText;
             node.accessKey = semantic->accessKey;
             node.checked = backing.checked ? 1 : 0;
+            node.groupStart = (backing.style & WS_GROUP) != 0;
             node.minimum = backing.minimum;
             node.maximum = backing.maximum;
             node.position = backing.position;
             node.indeterminate = backing.indeterminate;
-            bindings.emplace(node.nodeId,
-                DirectUiActionBinding{ backing.hwnd, backing.generation, index,
-                    slot.action, slot.cancel });
+            if (slot.captureBitmap) {
+                if (backing.imageFormat != L"bgra8-premultiplied" ||
+                    backing.imageWidth == 0 || backing.imageHeight == 0 ||
+                    backing.imageData.size() !=
+                        static_cast<size_t>(backing.imageWidth) * backing.imageHeight * 4)
+                    return Fail(error, L"snapshot: native bitmap pixels are missing");
+                node.imageWidth = backing.imageWidth;
+                node.imageHeight = backing.imageHeight;
+                node.imageFormat = backing.imageFormat;
+                node.imageData = backing.imageData;
+            }
+                // Typed state read through this control's own registered
+                // adapter. It runs after the common facets so a composite's
+                // canonical collection wins over the generic reading, and
+                // before the action census because a secondary route is only
+                // advertised when this revision's typed state accepts it.
+                if (!ApplyDirectUiDetailToNode(slot, backing, node, error)) return false;
+        }
+        if (!node.tabStop) node.tabIndex = -1;
+        SetDirectUiSupportedActions(slot, node);
+        if (slot.action != DirectUiAction::None) {
+            bindings.emplace(node.nodeId, DirectUiActionBinding{
+                slot.virtualSource ? native.root.hwnd : native.slotWindows[index].hwnd,
+                slot.virtualSource ? native.root.generation : native.slotWindows[index].generation,
+                index, slot.kind, slot.action, slot.secondaryAction, slot.cancel,
+                slot.propertySheetButton });
         }
         snapshot.nodes.push_back(std::move(node));
     }
@@ -885,7 +1330,8 @@ bool BuildGenericSemanticProfile(
     std::wstring_view imagePath,
     std::shared_ptr<DirectUiOwnedProfile>& owned,
     std::wstring& error) {
-    if (uia.semantics.empty() || uia.semantics.size() > 256)
+    if (uia.semantics.empty() ||
+        uia.semantics.size() > static_cast<size_t>(kMaxUiaDescendants))
         return Fail(error, L"generic U: semantic count is outside the capability bound");
     auto result = std::make_shared<DirectUiOwnedProfile>();
     const auto own = [&](std::wstring value) -> std::wstring_view {
@@ -907,13 +1353,69 @@ bool BuildGenericSemanticProfile(
         }
     }
 
+    // Pass one: the absorption census. A control's provider publishes elements
+    // for structure the control already carries in its own typed state - list
+    // items, a report header, an editable combo's field, scroll chrome. The
+    // admission contract requires exactly one retained semantic per backing
+    // HWND, so those children are folded into their owner before any slot is
+    // built. Absorption is deliberately narrow: the owner's projected control has
+    // to actually represent and route what it swallows, so a role the owner
+    // cannot represent rejects the whole surface instead of disappearing.
+    const auto findDescendant =
+        [&](HWND hwnd) -> const DirectUiBootstrapWindowEvidence* {
+        if (!hwnd) return nullptr;
+        const auto found = std::find_if(native.descendants.begin(),
+            native.descendants.end(), [&](const auto& candidate) {
+                return candidate.window.hwnd == hwnd;
+            });
+        return found == native.descendants.end() ? nullptr : &*found;
+    };
+    std::vector<bool> absorbed(uia.semantics.size(), false);
+    std::unordered_map<HWND, size_t> absorbedCounts;
+    for (size_t index = 0; index < uia.semantics.size(); ++index) {
+        const auto& semantic = uia.semantics[index];
+        const auto* backing = findDescendant(semantic.backingHwnd);
+        if (!backing) continue;
+        const auto* owner = backing;
+        if (backing->compositeImplementationChild) {
+            // An implementation child, and everything the provider hangs below
+            // it, belongs to the composite that created it.
+            owner = findDescendant(backing->parent);
+            if (!owner || !owner->controlSupported ||
+                !IsDirectUiCompositeKind(owner->controlKind)) continue;
+        } else if (!backing->controlSupported ||
+                   !IsAbsorbedChildControlType(
+                       backing->controlKind, semantic.controlType)) {
+            continue;
+        }
+        const uint32_t childPatterns = semantic.patternMask &
+            ~(semantic.valueReadOnly ? DirectUiPatternValue : DirectUiPatternNone);
+        if ((childPatterns & ~kAbsorbedChildPatternMask) != 0)
+            return Fail(error,
+                L"generic U: absorbed composite child exposes an unrepresented pattern");
+        if (!semantic.offscreen && !Inside(semantic.bounds, native.native.root.bounds))
+            return Fail(error,
+                L"generic U: absorbed composite child escaped the admitted root");
+        absorbed[index] = true;
+        if (++absorbedCounts[owner->window.hwnd] > kMaxCompositeItems)
+            return Fail(error,
+                L"generic U: absorbed composite child census exceeds the bound");
+    }
+
     std::unordered_set<std::wstring> virtualIds;
     std::unordered_set<HWND> backingHwnds;
     std::vector<DirectUiSemanticEvidence> admittedSemantics;
     admittedSemantics.reserve(uia.semantics.size());
     int nextTabIndex = 0;
     size_t semanticOrdinal = 0;
-    for (const auto& semantic : uia.semantics) {
+    const bool propertySheetSurface =
+        FluentShell::EqualsIgnoreCase(native.rootClass, L"NativeHWNDHost") &&
+        native.native.propertySheetPageHwnd != nullptr;
+    for (size_t semanticIndex = 0; semanticIndex < uia.semantics.size(); ++semanticIndex) {
+        // Folded into an owner slot in pass one. Dropping it from the retained
+        // set is what preserves one semantic per backing HWND.
+        if (absorbed[semanticIndex]) continue;
+        const auto& semantic = uia.semantics[semanticIndex];
         const auto describeSemantic = [&] {
             return L" (type=" + std::to_wstring(semantic.controlType) +
                 L", name=" + semantic.name + L", id=" + semantic.semanticKey +
@@ -929,7 +1431,7 @@ bool BuildGenericSemanticProfile(
             ~(semantic.valueReadOnly ? DirectUiPatternValue : DirectUiPatternNone);
         const bool insideRoot = Inside(semantic.bounds, native.native.root.bounds);
         const bool insideAnchor = Inside(semantic.bounds, native.native.directUi.bounds);
-        if (!insideRoot || semantic.offscreen)
+        if (!insideRoot && !semantic.offscreen)
             return Fail(error, L"generic U: semantic geometry escaped the admitted root");
 
         DirectUiSlot slot;
@@ -945,25 +1447,173 @@ bool BuildGenericSemanticProfile(
             ? DirectUiBoundsScope::Anchor : DirectUiBoundsScope::Root;
         slot.pinUiaPatterns = true;
         slot.uiaPatternMask = semantic.patternMask;
+        // Structural capabilities are pinned beside the behavioral patterns but
+        // deliberately never merged into them: a Selection or Table provider is a
+        // shape, not a mutation route.
+        slot.uiaCapabilityMask = semantic.capabilityMask;
         slot.uiaToggleState = semantic.toggleState;
+        slot.uiaOffscreen = semantic.offscreen;
+
+        // DirectUI wizards commonly precreate later-page semantics as offscreen
+        // provider nodes. Seal their complete UIA shape, but do not project or
+        // route them until a subsequent uncloaked page admission sees them.
+        if (semantic.offscreen) {
+            if (semantic.semanticKey.empty() ||
+                !virtualIds.insert(semantic.semanticKey).second)
+                return Fail(error,
+                    L"generic U: offscreen semantic AutomationId is empty or duplicated");
+            slot.project = false;
+            slot.virtualSource = true;
+            slot.kind = ControlKind::StaticText;
+            slot.presentationVariant = L"standard";
+            result->slots.push_back(slot);
+            admittedSemantics.push_back(semantic);
+            continue;
+        }
 
         const auto backing = std::find_if(native.descendants.begin(),
             native.descendants.end(), [&](const auto& candidate) {
                 return candidate.window.hwnd == semantic.backingHwnd;
             });
-        const bool standardBacking = backing != native.descendants.end() &&
-            (FluentShell::EqualsIgnoreCase(backing->className, L"Button") ||
-             FluentShell::EqualsIgnoreCase(backing->className, L"Static"));
-        const bool progressBacking = backing != native.descendants.end() &&
-            FluentShell::EqualsIgnoreCase(backing->className, PROGRESS_CLASSW);
+        const bool hasBacking = backing != native.descendants.end();
+        const bool nativeStatic = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::StaticText;
+        const bool nativeButton = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::Button;
+        const bool nativeCheckBox = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::CheckBox;
+        const bool nativeProgress = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::ProgressBar;
+        const bool nativeSeparator = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::Separator;
+        const bool nativeBitmapDisplay = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::StaticIcon &&
+            FluentShell::EqualsIgnoreCase(backing->className, L"BitmapDisplayClass");
+        const bool nativeBitmapSwitch = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::RadioButton &&
+            FluentShell::EqualsIgnoreCase(backing->className, L"BitmapSwitchClass");
+        const bool nativeMonitorPalette = hasBacking && backing->controlSupported &&
+            backing->controlKind == ControlKind::StaticIcon &&
+            FluentShell::EqualsIgnoreCase(backing->className, L"MonitorPaletteClass");
+        const bool nativePane = semantic.controlType == UIA_PaneControlTypeId &&
+            hasBacking && backing->controlSupported;
+        // The remaining kinds are matched by their registered adapter's verdict
+        // alone: the adapter already refused every owner-draw, virtual, and
+        // multi-select variant it cannot read, so the DirectUI lane inherits that
+        // bound instead of restating style bits here.
+        const auto nativeKindIs = [&](ControlKind kind) {
+            return hasBacking && backing->controlSupported && backing->controlKind == kind;
+        };
+        const bool nativeThreeState = nativeKindIs(ControlKind::ThreeState);
+        const bool nativeRadioButton = nativeKindIs(ControlKind::RadioButton) &&
+            FluentShell::EqualsIgnoreCase(backing->className, L"Button");
+        const bool nativeStaticIcon = nativeKindIs(ControlKind::StaticIcon) &&
+            FluentShell::EqualsIgnoreCase(backing->className, L"Static");
+        const bool nativeGroupBox = nativeKindIs(ControlKind::GroupBox);
+        const bool nativeEdit = nativeKindIs(ControlKind::Edit);
+        const bool nativePassword = nativeKindIs(ControlKind::Password);
+        const bool nativeComboBox = nativeKindIs(ControlKind::ComboBox);
+        const bool nativeListBox = nativeKindIs(ControlKind::ListBox);
+        const bool nativeListView = nativeKindIs(ControlKind::ListView);
+        const bool nativeTabControl = nativeKindIs(ControlKind::TabControl);
+        const bool nativeStatusBar = nativeKindIs(ControlKind::StatusBar);
+        const bool nativeToolbar = nativeKindIs(ControlKind::Toolbar);
+        const bool nativeSysLink = nativeKindIs(ControlKind::SysLink);
+        size_t absorbedChildren = 0;
+        if (hasBacking) {
+            const auto found = absorbedCounts.find(backing->window.hwnd);
+            if (found != absorbedCounts.end()) absorbedChildren = found->second;
+        }
 
         bool retain = true;
-        switch (semantic.controlType) {
+        if (nativePane && backing->controlKind == ControlKind::StaticText) {
+            if (semantic.name.empty() || semantic.focusable || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: native Static Pane exposes unsupported behavior" +
+                    describeSemantic());
+            slot.kind = ControlKind::StaticText;
+            slot.presentationVariant = L"standard";
+        } else if (nativePane && backing->controlKind == ControlKind::Button) {
+            if (semantic.name.empty() || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: native Button Pane lacks an inert UIA contract" +
+                    describeSemantic());
+            slot.kind = ControlKind::Button;
+            slot.presentationVariant =
+                ((backing->window.style & BS_TYPEMASK) == BS_COMMANDLINK ||
+                 (backing->window.style & BS_TYPEMASK) == BS_DEFCOMMANDLINK)
+                ? L"commandLink" : L"standard";
+            slot.cancel = FluentShell::EqualsIgnoreCase(
+                semantic.semanticKey, L"cancelbutton");
+            slot.action = DirectUiAction::HandoffClick;
+        } else if (nativePane && backing->controlKind == ControlKind::CheckBox) {
+            if (semantic.name.empty() || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: native CheckBox Pane exposes unsupported behavior" +
+                    describeSemantic());
+            slot.kind = ControlKind::CheckBox;
+            slot.presentationVariant = L"standard";
+            slot.action = DirectUiAction::ToggleCheck;
+        } else if ((nativePane || semantic.controlType == UIA_TextControlTypeId ||
+                    semantic.controlType == UIA_ImageControlTypeId) &&
+                   nativeBitmapDisplay) {
+            if (semantic.name.empty() || semantic.focusable || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone ||
+                (backing->window.style & (WS_TABSTOP | SS_NOTIFY)) != 0)
+                return Fail(error, L"generic U: BitmapDisplayClass is interactive or unlabeled" +
+                    describeSemantic());
+            slot.kind = ControlKind::StaticIcon;
+            slot.presentationVariant = L"bitmapDisplay";
+            slot.captureBitmap = true;
+        } else if ((nativePane || semantic.controlType == UIA_RadioButtonControlTypeId) &&
+                   nativeBitmapSwitch) {
+            if (semantic.name.empty() ||
+                behavioralPatternMask != DirectUiPatternSelectionItem ||
+                (backing->window.style & SS_NOTIFY) != 0)
+                return Fail(error, L"generic U: BitmapSwitchClass lacks a native radio contract" +
+                    describeSemantic());
+            slot.kind = ControlKind::RadioButton;
+            slot.presentationVariant = L"bitmapSwitch";
+            slot.captureBitmap = true;
+            slot.action = DirectUiAction::SelectRadio;
+        } else if ((nativePane || semantic.controlType == UIA_ImageControlTypeId) &&
+                   nativeMonitorPalette) {
+            if (semantic.name.empty() || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone ||
+                (backing->window.style & SS_NOTIFY) != 0)
+                return Fail(error, L"generic U: MonitorPaletteClass is interactive or unlabeled" +
+                    describeSemantic());
+            slot.kind = ControlKind::StaticIcon;
+            slot.presentationVariant = L"monitorPalette";
+            slot.captureBitmap = true;
+        } else if (semantic.controlType == UIA_GroupControlTypeId && nativeGroupBox) {
+            // A BS_GROUPBOX frame. Its caption is the only state it has, and the
+            // adapter already refused a tab-stop group box.
+            if (semantic.name.empty() || semantic.focusable || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: GroupBox exposes unsupported behavior" +
+                    describeSemantic());
+            slot.kind = ControlKind::GroupBox;
+            slot.presentationVariant = L"standard";
+        } else if ((semantic.controlType == UIA_ImageControlTypeId || nativePane) &&
+                   nativeStaticIcon) {
+            // SS_ICON static. Its pixels are read through the Static adapter, so
+            // the icon travels as owned bitmap data rather than a resource id.
+            if (semantic.focusable || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: Static icon is interactive" +
+                    describeSemantic());
+            slot.kind = ControlKind::StaticIcon;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+        } else switch (semantic.controlType) {
         case UIA_TextControlTypeId:
             if (semantic.focusable || semantic.actionable ||
                 behavioralPatternMask != DirectUiPatternNone ||
+                (hasBacking && !nativeStatic) ||
                 (semantic.name.empty() &&
-                    (backing == native.descendants.end() || semantic.semanticKey.empty())))
+                    (!hasBacking || semantic.semanticKey.empty())))
                 return Fail(error, L"generic U: Text semantic exposes unsupported behavior" +
                     describeSemantic());
             // Empty native Static providers are layout/implementation evidence,
@@ -975,7 +1625,8 @@ bool BuildGenericSemanticProfile(
             break;
         case UIA_SeparatorControlTypeId:
             if (semantic.focusable || semantic.actionable ||
-                semantic.patternMask != DirectUiPatternNone)
+                semantic.patternMask != DirectUiPatternNone ||
+                (hasBacking && !nativeSeparator))
                 return Fail(error, L"generic U: Separator semantic is actionable" +
                     describeSemantic());
             slot.kind = ControlKind::Separator;
@@ -988,34 +1639,193 @@ bool BuildGenericSemanticProfile(
                 return Fail(error, L"generic U: Button lacks an exact Invoke contract" +
                     describeSemantic());
             slot.kind = ControlKind::Button;
-            slot.presentationVariant = standardBacking &&
+            if (hasBacking && !nativeButton)
+                return Fail(error, L"generic U: Button has an unsupported native backing" +
+                    describeSemantic());
+            slot.presentationVariant = nativeButton &&
                 ((backing->window.style & BS_TYPEMASK) == BS_COMMANDLINK ||
                  (backing->window.style & BS_TYPEMASK) == BS_DEFCOMMANDLINK)
                 ? L"commandLink" : L"standard";
-            slot.action = semantic.enabled ? DirectUiAction::HandoffClick : DirectUiAction::None;
-            if (semantic.enabled && !standardBacking)
-                return Fail(error, L"generic U: virtual Invoke requires an isolated UIA action broker" +
+            slot.cancel = FluentShell::EqualsIgnoreCase(
+                semantic.semanticKey, L"cancelbutton");
+            if (nativeButton) {
+                slot.action = DirectUiAction::HandoffClick;
+            } else if (!hasBacking && propertySheetSurface) {
+                if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"backbutton"))
+                    slot.propertySheetButton = PSBTN_BACK;
+                else if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"nextbutton"))
+                    slot.propertySheetButton = PSBTN_NEXT;
+                else if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"finishbutton"))
+                    slot.propertySheetButton = PSBTN_FINISH;
+                else if (slot.cancel)
+                    slot.propertySheetButton = PSBTN_CANCEL;
+                if (slot.propertySheetButton < 0)
+                    return Fail(error, L"generic U: virtual Invoke requires an isolated UIA action broker" +
+                        describeSemantic());
+                slot.action = DirectUiAction::HandoffPropertySheetButton;
+            } else {
+                return Fail(error, L"generic U: virtual Invoke is not a proven property-sheet button" +
                     describeSemantic());
+            }
             break;
         case UIA_CheckBoxControlTypeId:
-            if (semantic.name.empty() || behavioralPatternMask != DirectUiPatternToggle ||
+            if (semantic.name.empty() ||
+                (behavioralPatternMask & DirectUiPatternToggle) == 0 ||
+                (behavioralPatternMask &
+                    ~(DirectUiPatternToggle | DirectUiPatternInvoke)) != 0 ||
                 (semantic.toggleState != ToggleState_Off &&
-                 semantic.toggleState != ToggleState_On) ||
-                (semantic.enabled && (!semantic.focusable || !standardBacking)))
-                return Fail(error, L"generic U: CheckBox lacks a binary native-backed Toggle contract" +
+                 semantic.toggleState != ToggleState_On &&
+                 !(nativeThreeState &&
+                   semantic.toggleState == ToggleState_Indeterminate)) ||
+                (!nativeCheckBox && !nativeThreeState) ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: CheckBox lacks a native-backed Toggle contract" +
                     describeSemantic());
-            slot.kind = ControlKind::CheckBox;
+            // A BS_3STATE box reaches a value a bool cannot carry, so it is read
+            // through its own adapter instead of the shared checked facet.
+            slot.kind = nativeThreeState ? ControlKind::ThreeState : ControlKind::CheckBox;
             slot.presentationVariant = L"standard";
-            slot.action = semantic.enabled ? DirectUiAction::ToggleCheck : DirectUiAction::None;
+            slot.action = DirectUiAction::ToggleCheck;
+            slot.captureDetail = nativeThreeState;
             break;
         case UIA_ProgressBarControlTypeId:
             if (semantic.name.empty() || semantic.actionable ||
-                behavioralPatternMask != DirectUiPatternNone || !progressBacking ||
+                behavioralPatternMask != DirectUiPatternNone || !nativeProgress ||
                 (backing->window.style & (PBS_VERTICAL | WS_TABSTOP)) != 0)
                 return Fail(error, L"generic U: ProgressBar lacks a read-only native backing contract" +
                     describeSemantic());
             slot.kind = ControlKind::ProgressBar;
             slot.presentationVariant = L"standard";
+            break;
+        case UIA_HyperlinkControlTypeId:
+            // The SysLink adapter admits exactly one link, and the source thread
+            // already has a proven route that lets the control raise its own
+            // NM_RETURN instead of fabricating a parent notification.
+            if (semantic.name.empty() || !nativeSysLink ||
+                (behavioralPatternMask & DirectUiPatternInvoke) == 0 ||
+                (behavioralPatternMask & ~DirectUiPatternInvoke) != 0 ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: Hyperlink lacks a native SysLink Invoke contract" +
+                    describeSemantic());
+            slot.kind = ControlKind::SysLink;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            slot.action = DirectUiAction::HandoffLinkClick;
+            break;
+        case UIA_EditControlTypeId: {
+            if (!nativeEdit && !nativePassword)
+                return Fail(error, L"generic U: Edit has no admitted native backing" +
+                    describeSemantic());
+            if (semantic.name.empty() ||
+                (behavioralPatternMask & ~DirectUiPatternValue) != 0 ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: Edit exposes behavior outside its text contract" +
+                    describeSemantic());
+            // The bridged provider derives IsReadOnly from ES_READONLY. Holding
+            // the two to each other keeps a projected TextBox from offering a
+            // write the application would refuse, and vice versa.
+            const bool readOnly = (backing->window.style & ES_READONLY) != 0;
+            if (readOnly == ((behavioralPatternMask & DirectUiPatternValue) != 0))
+                return Fail(error, L"generic U: Edit read-only style and UIA Value disagree" +
+                    describeSemantic());
+            slot.kind = nativePassword ? ControlKind::Password : ControlKind::Edit;
+            slot.presentationVariant = nativePassword ? L"password" : L"standard";
+            slot.captureDetail = true;
+            if (!readOnly) slot.action = DirectUiAction::SetEditText;
+            break;
+        }
+        case UIA_ComboBoxControlTypeId:
+            if (semantic.name.empty() || !nativeComboBox ||
+                (behavioralPatternMask & ~(DirectUiPatternExpandCollapse |
+                    DirectUiPatternValue | DirectUiPatternSelectionItem)) != 0 ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: ComboBox lacks a native selection contract" +
+                    describeSemantic());
+            slot.kind = ControlKind::ComboBox;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            slot.action = DirectUiAction::SelectListItem;
+            // A CBS_DROPDOWN combo also accepts typed text. Whether the route is
+            // advertised is decided per revision from the adapter's own
+            // `editable` verdict, not from the style read here.
+            slot.secondaryAction = DirectUiAction::SetEditText;
+            break;
+        case UIA_ListControlTypeId:
+            if (!nativeListBox && !nativeListView)
+                return Fail(error, L"generic U: List has no admitted native backing" +
+                    describeSemantic());
+            if (semantic.actionable || behavioralPatternMask != DirectUiPatternNone ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: List container exposes unsupported behavior" +
+                    describeSemantic());
+            slot.kind = nativeListView ? ControlKind::ListView : ControlKind::ListBox;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            slot.action = DirectUiAction::SelectListItem;
+            if (nativeListView) slot.secondaryAction = DirectUiAction::SetItemCheck;
+            break;
+        case UIA_DataGridControlTypeId:
+        case UIA_TableControlTypeId:
+            if (!nativeListView || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error,
+                    L"generic U: DataGrid lacks an inert report-mode ListView backing" +
+                    describeSemantic());
+            slot.kind = ControlKind::ListView;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            slot.action = DirectUiAction::SelectListItem;
+            slot.secondaryAction = DirectUiAction::SetItemCheck;
+            break;
+        case UIA_TabControlTypeId:
+            if (!nativeTabControl || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: Tab lacks an inert native TabControl backing" +
+                    describeSemantic());
+            slot.kind = ControlKind::TabControl;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            slot.action = DirectUiAction::SelectListItem;
+            break;
+        case UIA_RadioButtonControlTypeId:
+            // BitmapSwitchClass radios are handled above. This is a standard
+            // Button-class radio, and only the auto variant maintains its group's
+            // exclusivity itself; a plain BS_RADIOBUTTON is refused rather than
+            // projected with a selection the application never applies.
+            if (semantic.name.empty() || !nativeRadioButton ||
+                (backing->window.style & BS_TYPEMASK) != BS_AUTORADIOBUTTON ||
+                (behavioralPatternMask & DirectUiPatternSelectionItem) == 0 ||
+                (behavioralPatternMask &
+                    ~(DirectUiPatternSelectionItem | DirectUiPatternInvoke)) != 0 ||
+                (semantic.enabled && !semantic.focusable))
+                return Fail(error, L"generic U: RadioButton lacks an auto native group contract" +
+                    describeSemantic());
+            slot.kind = ControlKind::RadioButton;
+            slot.presentationVariant = L"standard";
+            slot.action = DirectUiAction::SelectRadio;
+            break;
+        case UIA_StatusBarControlTypeId:
+            // Status bar parts have no name of their own and neither does the
+            // bar, so the name requirement every projected role carries does not
+            // apply here; the adapter's part text is the whole contract.
+            if (!nativeStatusBar || semantic.focusable || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: StatusBar lacks an inert native backing" +
+                    describeSemantic());
+            slot.kind = ControlKind::StatusBar;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            break;
+        case UIA_ToolBarControlTypeId:
+            if (!nativeToolbar || semantic.actionable ||
+                behavioralPatternMask != DirectUiPatternNone)
+                return Fail(error, L"generic U: ToolBar lacks an inert native container contract" +
+                    describeSemantic());
+            slot.kind = ControlKind::Toolbar;
+            slot.presentationVariant = L"standard";
+            slot.captureDetail = true;
+            slot.action = DirectUiAction::ToolbarCommand;
             break;
         case UIA_ImageControlTypeId:
         case UIA_PaneControlTypeId:
@@ -1025,16 +1835,34 @@ bool BuildGenericSemanticProfile(
             // structural roots. It cannot mutate canonical state and is still
             // pinned in the generated evidence contract when the element has
             // a stable identity.
-            // A native-backed, nameless structural provider may advertise a
-            // focus stop solely to delegate focus into its child controls.
+            // A native-backed structural provider may advertise a focus stop
+            // solely to delegate focus into its child controls.
             // It has no mutable pattern and is accounted but not projected.
-            const bool delegatedStructuralFocus = semantic.focusable &&
+            const bool delegatedStructuralFocus =
+                semantic.controlType == UIA_PaneControlTypeId && semantic.focusable &&
                 !semantic.actionable && behavioralPatternMask == DirectUiPatternNone &&
-                backing != native.descendants.end() && semantic.name.empty() &&
+                hasBacking &&
+                backing->window.hwnd == native.native.propertySheetPageHwnd &&
+                FluentShell::EqualsIgnoreCase(backing->className, L"#32770") &&
                 !semantic.semanticKey.empty();
+            const bool compositePaletteEntry =
+                semantic.controlType == UIA_PaneControlTypeId &&
+                FluentShell::EqualsIgnoreCase(semantic.className, L"MonitorPaletteEntryClass") &&
+                !semantic.focusable && !semantic.actionable &&
+                behavioralPatternMask == DirectUiPatternNone;
             if ((semantic.focusable && !delegatedStructuralFocus) || semantic.actionable ||
                 behavioralPatternMask != DirectUiPatternNone)
                 return Fail(error, L"generic U: structural semantic is unexpectedly actionable" +
+                    describeSemantic());
+            if (compositePaletteEntry) {
+                slot.project = false;
+                slot.kind = ControlKind::StaticText;
+                slot.presentationVariant = L"standard";
+                retain = false;
+                break;
+            }
+            if (!semantic.name.empty() && !delegatedStructuralFocus)
+                return Fail(error, L"generic U: named structural semantic has no visual contract" +
                     describeSemantic());
             slot.project = false;
             slot.kind = ControlKind::StaticText;
@@ -1048,9 +1876,31 @@ bool BuildGenericSemanticProfile(
         }
 
         if (!retain) continue;
-        if ((!standardBacking && !progressBacking) || !slot.project ||
-            (slot.kind != ControlKind::Button && slot.kind != ControlKind::CheckBox &&
-             slot.kind != ControlKind::StaticText && slot.kind != ControlKind::ProgressBar)) {
+        const bool bindNative = slot.project &&
+            ((slot.kind == ControlKind::Button && nativeButton) ||
+             (slot.kind == ControlKind::CheckBox && nativeCheckBox) ||
+             (slot.kind == ControlKind::ThreeState && nativeThreeState) ||
+             (slot.kind == ControlKind::StaticText && nativeStatic) ||
+             (slot.kind == ControlKind::ProgressBar && nativeProgress) ||
+             (slot.kind == ControlKind::Separator && nativeSeparator) ||
+             (slot.kind == ControlKind::StaticIcon &&
+              (nativeBitmapDisplay || nativeMonitorPalette || nativeStaticIcon)) ||
+             (slot.kind == ControlKind::RadioButton &&
+              (nativeBitmapSwitch || nativeRadioButton)) ||
+             (slot.kind == ControlKind::GroupBox && nativeGroupBox) ||
+             (slot.kind == ControlKind::Edit && nativeEdit) ||
+             (slot.kind == ControlKind::Password && nativePassword) ||
+             (slot.kind == ControlKind::ComboBox && nativeComboBox) ||
+             (slot.kind == ControlKind::ListBox && nativeListBox) ||
+             (slot.kind == ControlKind::ListView && nativeListView) ||
+             (slot.kind == ControlKind::TabControl && nativeTabControl) ||
+             (slot.kind == ControlKind::StatusBar && nativeStatusBar) ||
+             (slot.kind == ControlKind::Toolbar && nativeToolbar) ||
+             (slot.kind == ControlKind::SysLink && nativeSysLink));
+        if (hasBacking && slot.project && !bindNative)
+            return Fail(error, L"generic U: projected semantic/native control kinds do not match" +
+                describeSemantic());
+        if (!bindNative) {
             slot.virtualSource = true;
             if (semantic.semanticKey.empty() || !virtualIds.insert(semantic.semanticKey).second)
                 return Fail(error, L"generic U: virtual semantic AutomationId is empty or duplicated");
@@ -1073,11 +1923,37 @@ bool BuildGenericSemanticProfile(
                     slot.nativeStyleAlt = (slot.nativeStyleValue & ~BS_TYPEMASK) |
                         (buttonType == BS_COMMANDLINK ? BS_DEFCOMMANDLINK : BS_COMMANDLINK);
                 }
+            } else if (slot.kind == ControlKind::RadioButton) {
+                // Both the BitmapSwitchClass radios and standard auto radios move
+                // WS_TABSTOP onto whichever member is selected, so the bit is a
+                // legitimate alternate rather than a topology change.
+                slot.nativeStyleAlt = slot.nativeStyleValue ^ WS_TABSTOP;
             }
             slot.nativeControlId = backing->window.controlId;
+            // Composite census. The provider's child count and the adapter's own
+            // item count are two independent observations of one collection: the
+            // adapter's count is pinned here and held to an equality across the
+            // A/B bracket, and the provider has to publish at least one element
+            // per item because headers and scroll chrome only ever add.
+            if (IsDirectUiCompositeKind(slot.kind)) {
+                if (backing->nativeItemCount == static_cast<size_t>(-1) ||
+                    backing->nativeItemCount > kMaxCompositeItems)
+                    return Fail(error,
+                        L"generic U: composite has no readable native item census" +
+                        describeSemantic());
+                if (absorbedChildren < backing->nativeItemCount)
+                    return Fail(error,
+                        L"generic U: composite provider published fewer elements than items" +
+                        describeSemantic());
+                slot.nativeItemCount = backing->nativeItemCount;
+            }
+            slot.compositeItemCount = absorbedChildren;
         }
-        if (slot.project && slot.action != DirectUiAction::None &&
-            semantic.enabled && semantic.focusable)
+        const bool nativeTabStop = backing != native.descendants.end() &&
+            (backing->window.style & WS_TABSTOP) != 0;
+        if (slot.project &&
+            ((semantic.enabled && semantic.focusable) ||
+             (slot.action != DirectUiAction::None && nativeTabStop)))
             slot.tabIndex = nextTabIndex++;
         result->slots.push_back(slot);
         admittedSemantics.push_back(semantic);
@@ -1089,7 +1965,7 @@ bool BuildGenericSemanticProfile(
     profile.adapterId = L"microsoft.windows.directui.semantic.v1";
     profile.pageId = L"semantic-v1";
     profile.executableBasename = own(std::wstring(FluentShell::FileNameOf(imagePath)));
-    profile.rootClass = own(ClassName(native.native.root.hwnd));
+    profile.rootClass = own(native.rootClass);
     profile.slots = result->slots.data();
     profile.slotCount = result->slots.size();
     profile.directUiOwnsTabOrder = true;
@@ -1099,6 +1975,25 @@ bool BuildGenericSemanticProfile(
     profile.implementationClassCount = result->implementationClasses.size();
     profile.genericSemantic = true;
     uia.semantics = std::move(admittedSemantics);
+
+    std::unordered_map<HWND, std::vector<const DirectUiBootstrapWindowEvidence*>> radioGroups;
+    for (const auto& descendant : native.descendants) {
+        if (!descendant.window.visible ||
+            !FluentShell::EqualsIgnoreCase(descendant.className, L"BitmapSwitchClass")) continue;
+        radioGroups[descendant.parent].push_back(&descendant);
+    }
+    for (const auto& [_, members] : radioGroups) {
+        if (members.size() < 2 || members.size() > 16)
+            return Fail(error, L"generic U: BitmapSwitchClass radio group size is outside bounds");
+        size_t selected = 0;
+        size_t grouped = 0;
+        for (const auto* member : members) {
+            if ((member->window.style & WS_TABSTOP) != 0) ++selected;
+            if ((member->window.style & WS_GROUP) != 0) ++grouped;
+        }
+        if (selected != 1 || grouped == 0)
+            return Fail(error, L"generic U: BitmapSwitchClass radio group is not exclusive");
+    }
     owned = std::move(result);
     return true;
 }
@@ -1113,7 +2008,11 @@ bool CaptureGeneratedProfileEvidence(
     if (!FluentShell::EqualsIgnoreCase(ClassName(agent.Root()), profile.rootClass) ||
         bootstrap.descendants.size() < profile.minDescendants ||
         bootstrap.descendants.size() > profile.maxDescendants) {
-        return Fail(error, L"generic A/B: root class or descendant count changed");
+        return Fail(error, L"generic A/B: root class or descendant count changed"
+            L" (expectedRoot=" + std::wstring(profile.rootClass) + L", actualRoot=" +
+            ClassName(agent.Root()) + L", expectedCount=" +
+            std::to_wstring(profile.minDescendants) + L", actualCount=" +
+            std::to_wstring(bootstrap.descendants.size()) + L")");
     }
 
     size_t accountedClasses = 0;
@@ -1138,6 +2037,9 @@ bool CaptureGeneratedProfileEvidence(
     std::vector<HWND> backingWindows;
     for (const auto& candidate : bootstrap.descendants) {
         if (!candidate.window.visible || candidate.window.hwnd == evidence.directUi.hwnd) continue;
+        // A composite's own implementation child (ComboBox edit/list, ListView
+        // header) is owned by its composite slot, not a backing of its own.
+        if (candidate.compositeImplementationChild) continue;
         const bool admittedClass = std::any_of(
             profile.slots, profile.slots + profile.slotCount,
             [&](const DirectUiSlot& slot) {
@@ -1169,7 +2071,8 @@ bool CaptureGeneratedProfileEvidence(
         DirectUiWindowEvidence value;
         const bool isButton = FluentShell::EqualsIgnoreCase(backingClass, L"Button");
         const bool isProgress = FluentShell::EqualsIgnoreCase(backingClass, PROGRESS_CLASSW);
-        if (!ReadWindowEvidence(agent, backing, isButton, value, error, isProgress)) return false;
+        if (!ReadWindowEvidence(agent, backing, isButton, value, error, isProgress))
+            return false;
         bool matched = false;
         for (size_t index = 0; index < profile.slotCount; ++index) {
             const auto& slot = profile.slots[index];
@@ -1206,6 +2109,18 @@ bool CaptureGeneratedProfileEvidence(
     evidence.mutationEpoch = agent.MutationEpoch();
     evidence.lastMutationHwnd = agent.LastMutationHwnd();
     evidence.lastMutationMessage = agent.LastMutationMessage();
+    for (size_t index = 0; index < profile.slotCount; ++index) {
+        const DirectUiSlot& slot = profile.slots[index];
+        if (slot.virtualSource) continue;
+        DirectUiWindowEvidence& value = evidence.slotWindows[index];
+        if (slot.captureBitmap && !CaptureWindowClientPixels(value.hwnd, value, error))
+            return false;
+        // Typed state through the backing control's own registered adapter. Its
+        // rejections are the DirectUI lane's rejections, so an application that
+        // grows an owner-draw or virtual variant of an admitted class stays native.
+        if (slot.captureDetail && !CaptureSlotDetail(value.hwnd, slot.kind, value, error))
+            return false;
+    }
     return true;
 }
 
@@ -1233,12 +2148,145 @@ bool MatchBootstrapToGenerated(
         before.native.clientOriginScreen.y != after.clientOriginScreen.y)
         return Fail(error, std::wstring(prefix) + L"client geometry");
     if (before.native.pageHosts != after.pageHosts ||
-        before.native.pageStatics != after.pageStatics)
+        before.native.pageStatics != after.pageStatics ||
+        before.native.propertySheetPageHwnd != after.propertySheetPageHwnd ||
+        !SameImplementationIdentity(
+            before.native.implementationWindows, after.implementationWindows))
         return Fail(error, std::wstring(prefix) + L"implementation HWND identity");
     return true;
 }
 
 } // namespace
+
+// Shape facets describe which control this is. A projected composite may change
+// its selection or content between revisions, but a shape change means the
+// native surface is no longer the control the profile admitted.
+bool SameDirectUiDetailShape(
+    const DirectUiWindowEvidence& left,
+    const DirectUiWindowEvidence& right) noexcept {
+    if (left.hasDetail != right.hasDetail) return false;
+    if (!left.hasDetail) return true;
+    const ControlNode& a = left.detail;
+    const ControlNode& b = right.detail;
+    return a.kind == b.kind && a.multiSelect == b.multiSelect &&
+        a.readOnly == b.readOnly && a.multiline == b.multiline &&
+        a.editable == b.editable && a.checkBoxes == b.checkBoxes &&
+        a.columnHeadersVisible == b.columnHeadersVisible &&
+        a.vertical == b.vertical && a.reversed == b.reversed &&
+        a.smallChange == b.smallChange && a.largeChange == b.largeChange &&
+        a.columns == b.columns && a.columnWidths == b.columnWidths;
+}
+
+// Content facets are the ones a still-admitted control may legitimately change:
+// selection, item text, caret, item check state, and progress. The A/B bracket
+// compares them for equality; only the projected refresh path normalizes them.
+bool SameDirectUiDetailContent(
+    const DirectUiWindowEvidence& left,
+    const DirectUiWindowEvidence& right) noexcept {
+    if (left.hasDetail != right.hasDetail) return false;
+    if (!left.hasDetail) return true;
+    const ControlNode& a = left.detail;
+    const ControlNode& b = right.detail;
+    return a.selectedIndex == b.selectedIndex &&
+        a.selectedIndices == b.selectedIndices &&
+        a.focusedIndex == b.focusedIndex &&
+        a.selectionStart == b.selectionStart &&
+        a.selectionLength == b.selectionLength && a.text == b.text &&
+        a.items == b.items && SameRectList(a.itemRects, b.itemRects) &&
+        a.rows == b.rows && a.checkedIndices == b.checkedIndices &&
+        a.itemDepths == b.itemDepths && a.itemExpanded == b.itemExpanded &&
+        a.checked == b.checked && a.minimum == b.minimum &&
+        a.maximum == b.maximum && a.position == b.position &&
+        a.indeterminate == b.indeterminate &&
+        SameToolbarItems(a.toolbarItems, b.toolbarItems);
+}
+
+// A composite owner absorbs these UIA item descendants instead of letting each
+// item become its own slot. Items have no backing HWND of their own and their
+// census is corroborated against the native control's own item count.
+bool IsDirectUiCompositeItemControlType(int controlType) noexcept {
+    switch (controlType) {
+    case UIA_ListItemControlTypeId:
+    case UIA_TreeItemControlTypeId:
+    case UIA_DataItemControlTypeId:
+    case UIA_TabItemControlTypeId:
+    case UIA_HeaderControlTypeId:
+    case UIA_HeaderItemControlTypeId:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// The requested protocol action must be one this binding's own slot advertised.
+// Resolving through the same name table the snapshot published is what keeps the
+// two from drifting: a renderer cannot reach a route the projected node never
+// offered, and a route the node did offer is dispatched by its declared kind.
+DirectUiAction DirectUiActionForRequest(
+    const DirectUiActionBinding& binding,
+    std::wstring_view action) noexcept {
+    if (action.empty()) return DirectUiAction::None;
+    if (binding.action != DirectUiAction::None &&
+        DirectUiActionName(binding.action, binding.kind) == action)
+        return binding.action;
+    if (binding.secondaryAction != DirectUiAction::None &&
+        DirectUiActionName(binding.secondaryAction, binding.kind) == action)
+        return binding.secondaryAction;
+    return DirectUiAction::None;
+}
+
+// In-place routes mutate a native-backed control through its own registered
+// adapter and its own notification path, so the surface stays projected and the
+// recapture accepts only that one control's delta. Handoff routes instead
+// restore native visibility first and give the page up.
+bool IsDirectUiInPlaceAction(DirectUiAction action) noexcept {
+    switch (action) {
+    case DirectUiAction::ToggleCheck:
+    case DirectUiAction::SelectRadio:
+    case DirectUiAction::SetEditText:
+    case DirectUiAction::SelectListItem:
+    case DirectUiAction::SetItemCheck:
+    case DirectUiAction::ToolbarCommand:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Reads the facets every adapter expects to find prefilled, then hands the node
+// to the control's own registered capture function. Any rejection the adapter
+// raises is carried through verbatim so the DirectUI lane inherits the same
+// bounded contract the Win32 lane already enforces.
+bool CaptureDirectUiSlotNode(
+    HWND window,
+    ControlKind kind,
+    ControlNode& node,
+    std::wstring& error) noexcept {
+    node = ControlNode{};
+    if (!window || !IsWindow(window) || !GetWindowRect(window, &node.rect))
+        return Fail(error, L"backing control identity or geometry is unavailable");
+    node.kind = kind;
+    node.hwnd = window;
+    node.style = static_cast<uint64_t>(GetWindowLongPtrW(window, GWL_STYLE));
+    node.exStyle = static_cast<uint64_t>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+    node.visible = IsWindowVisible(window) != FALSE;
+    node.enabled = IsWindowEnabled(window) != FALSE;
+    node.controlId = GetDlgCtrlID(window);
+    node.dialogCode = static_cast<uint32_t>(
+        SendMessageW(window, WM_GETDLGCODE, 0, 0));
+    const int textLength = GetWindowTextLengthW(window);
+    if (textLength < 0 || textLength > static_cast<int>(kMaxTextChars))
+        return Fail(error, L"backing control text exceeds bound");
+    std::wstring text(static_cast<size_t>(textLength) + 1, L'\0');
+    const int copied = GetWindowTextW(window, text.data(), static_cast<int>(text.size()));
+    if (copied < 0) return Fail(error, L"backing control text is unavailable");
+    text.resize(static_cast<size_t>(copied));
+    node.text = std::move(text);
+    std::wstring reason;
+    if (!CaptureControlDetail(window, node, reason))
+        return Fail(error, L"backing control typed state was rejected: " + reason);
+    return true;
+}
 
 const DirectUiWindowProfile* ResolveDirectUiWindowProfile(
     std::wstring& imagePath,
@@ -1383,6 +2431,11 @@ bool CaptureDirectUiNativeEvidenceOnSourceThread(
                 return Fail(error, L"A/B: descendant escaped the source thread/process");
             const auto name = ClassName(child);
             const bool visible = IsWindowVisible(child) != FALSE;
+            const uint64_t generation = agent.DirectUiWindowGeneration(child);
+            if (!generation)
+                return Fail(error, L"A/B: descendant generation is unavailable");
+            evidence.implementationWindows.push_back(
+                { child, generation, GetParent(child), name, visible });
             if (FluentShell::EqualsIgnoreCase(name, L"DirectUIHWND")) {
                 if (!visible || GetParent(child) != root || evidence.directUi.hwnd ||
                     !ReadWindowEvidence(agent, child, false, evidence.directUi, error))
@@ -1431,6 +2484,10 @@ bool CaptureDirectUiNativeEvidenceOnSourceThread(
             } else {
                 return Fail(error, L"A/B: unexpected visible or implementation HWND class");
             }
+        }
+        if (FluentShell::EqualsIgnoreCase(profile.rootClass, L"NativeHWNDHost")) {
+            evidence.propertySheetPageHwnd =
+                CurrentPropertySheetPage(root, evidence.pageHosts);
         }
         const DirectUiCensus& census = profile.census;
         if (!evidence.directUi.hwnd ||
@@ -1550,6 +2607,16 @@ bool CaptureDirectUiNativeEvidenceOnSourceThread(
                     evidence.slotWindows[index].tabIndex = slot.tabIndex;
             }
         }
+        // Typed state through each backing control's own registered adapter. The
+        // flag is lane-independent, so an exact profile row can pin a composite
+        // control exactly the way a generated one does.
+        for (size_t index = 0; index < profile.slotCount; ++index) {
+            const DirectUiSlot& slot = profile.slots[index];
+            if (slot.virtualSource || !slot.captureDetail) continue;
+            if (!CaptureSlotDetail(evidence.slotWindows[index].hwnd, slot.kind,
+                    evidence.slotWindows[index], error))
+                return false;
+        }
         evidence.mutationEpoch = agent.MutationEpoch();
         return true;
     } catch (...) {
@@ -1563,14 +2630,22 @@ bool MatchDirectUiMutationBracket(
     const DirectUiNativeEvidence& after,
     std::wstring& error,
     bool requireStableEpoch) noexcept {
+    if (before.slotWindows.size() != profile.slotCount ||
+        after.slotWindows.size() != profile.slotCount)
+        return Fail(error, L"B: DirectUI backing-slot evidence is incomplete");
     if (requireStableEpoch && before.mutationEpoch != after.mutationEpoch)
         return Fail(error, L"B: mutation epoch changed during UIA capture");
     if (before.dpi != after.dpi || !SameWindow(before.root, after.root) ||
         !SameWindow(before.directUi, after.directUi) ||
         before.ownerHwnd != after.ownerHwnd || before.title != after.title ||
+        before.cloaked != after.cloaked ||
         !SameRect(before.clientBounds, after.clientBounds) ||
         before.clientOriginScreen.x != after.clientOriginScreen.x ||
-        before.clientOriginScreen.y != after.clientOriginScreen.y)
+        before.clientOriginScreen.y != after.clientOriginScreen.y ||
+        before.pageHosts != after.pageHosts || before.pageStatics != after.pageStatics ||
+        before.propertySheetPageHwnd != after.propertySheetPageHwnd ||
+        !SameImplementationIdentity(
+            before.implementationWindows, after.implementationWindows))
         return Fail(error, L"B: root/anchor identity or native facets changed");
     for (size_t index = 0; index < profile.slotCount; ++index) {
         if (profile.slots[index].virtualSource) continue;
@@ -1599,6 +2674,43 @@ bool MatchDirectUiMutationBracket(
     return true;
 }
 
+// Accepts exactly one slot's own delta after an in-place action. The acting
+// slot's identity, geometry, styles, visibility, enabled state, traversal index,
+// and typed shape all stay pinned; only the facets that control legitimately
+// changes are taken from the post-action reading. Every other slot, the root,
+// the anchor, and the implementation inventory must be untouched, which is what
+// keeps an in-place route from being a back door to an unverified page change.
+bool MatchDirectUiInPlaceMutation(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& before,
+    const DirectUiNativeEvidence& after,
+    size_t slotIndex,
+    std::wstring& error) noexcept {
+    try {
+        if (slotIndex >= profile.slotCount ||
+            before.slotWindows.size() != profile.slotCount ||
+            after.slotWindows.size() != profile.slotCount)
+            return Fail(error, L"in-place: acting DirectUI slot is outside the profile");
+        const auto& acted = before.slotWindows[slotIndex];
+        const auto& result = after.slotWindows[slotIndex];
+        if (!SameDirectUiDetailShape(acted, result))
+            return Fail(error, L"in-place: acting DirectUI control changed shape");
+        auto expected = before;
+        auto& normalized = expected.slotWindows[slotIndex];
+        normalized.text = result.text;
+        normalized.checked = result.checked;
+        normalized.position = result.position;
+        normalized.minimum = result.minimum;
+        normalized.maximum = result.maximum;
+        normalized.indeterminate = result.indeterminate;
+        normalized.hasDetail = result.hasDetail;
+        normalized.detail = result.detail;
+        return MatchDirectUiMutationBracket(profile, expected, after, error, false);
+    } catch (...) {
+        return Fail(error, L"in-place: DirectUI delta comparison exception");
+    }
+}
+
 bool MatchDirectUiMoveTransition(
     const DirectUiWindowProfile& profile,
     const DirectUiNativeEvidence& before,
@@ -1621,7 +2733,10 @@ bool MatchDirectUiMoveTransition(
             after.clientOriginScreen.x ||
         static_cast<int64_t>(before.clientOriginScreen.y) + deltaY !=
             after.clientOriginScreen.y ||
-        before.pageHosts != after.pageHosts || before.pageStatics != after.pageStatics) {
+        before.pageHosts != after.pageHosts || before.pageStatics != after.pageStatics ||
+        before.propertySheetPageHwnd != after.propertySheetPageHwnd ||
+        !SameImplementationIdentity(
+            before.implementationWindows, after.implementationWindows)) {
         return Fail(error, L"move: DirectUI root or anchor changed beyond translation");
     }
     for (size_t index = 0; index < profile.slotCount; ++index) {
@@ -1632,6 +2747,112 @@ bool MatchDirectUiMoveTransition(
         }
     }
     return true;
+}
+
+bool MatchDirectUiRefreshTransition(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& before,
+    const DirectUiNativeEvidence& after,
+    std::wstring& error) noexcept {
+    if (before.slotWindows.size() != profile.slotCount ||
+        after.slotWindows.size() != profile.slotCount)
+        return Fail(error, L"refresh: DirectUI backing-slot evidence is incomplete");
+    if (!after.cloaked)
+        return Fail(error, L"refresh: native DirectUI root lost its application cloak");
+
+    const int64_t deltaX = static_cast<int64_t>(after.root.bounds.left) -
+        before.root.bounds.left;
+    const int64_t deltaY = static_cast<int64_t>(after.root.bounds.top) -
+        before.root.bounds.top;
+    auto root = after.root;
+    root.enabled = before.root.enabled;
+    auto directUi = after.directUi;
+    directUi.enabled = before.directUi.enabled;
+    if (!SameMovedWindow(before.root, root, deltaX, deltaY) ||
+        !SameMovedWindow(before.directUi, directUi, deltaX, deltaY) ||
+        before.dpi != after.dpi || before.ownerHwnd != after.ownerHwnd ||
+        before.title != after.title ||
+        !SameRect(before.clientBounds, after.clientBounds) ||
+        static_cast<int64_t>(before.clientOriginScreen.x) + deltaX !=
+            after.clientOriginScreen.x ||
+        static_cast<int64_t>(before.clientOriginScreen.y) + deltaY !=
+            after.clientOriginScreen.y ||
+        before.pageHosts != after.pageHosts || before.pageStatics != after.pageStatics ||
+        before.propertySheetPageHwnd != after.propertySheetPageHwnd ||
+        !SameImplementationIdentity(
+            before.implementationWindows, after.implementationWindows)) {
+        return Fail(error,
+            L"refresh: DirectUI root, owner, geometry, or implementation identity changed");
+    }
+
+    for (size_t index = 0; index < profile.slotCount; ++index) {
+        const DirectUiSlot& slot = profile.slots[index];
+        if (slot.virtualSource) continue;
+        const auto& oldValue = before.slotWindows[index];
+        const auto& newValue = after.slotWindows[index];
+        auto stable = newValue;
+        stable.bounds = oldValue.bounds;
+        stable.enabled = oldValue.enabled;
+        stable.text = oldValue.text;
+        stable.note = oldValue.note;
+        stable.checked = oldValue.checked;
+        stable.minimum = oldValue.minimum;
+        stable.maximum = oldValue.maximum;
+        stable.position = oldValue.position;
+        stable.indeterminate = oldValue.indeterminate;
+        // Typed content a still-admitted control may legitimately change:
+        // selection, item text, caret, item checks, and the item census itself
+        // as an application populates a collection. The shape facets that say
+        // which control this is stay pinned, and they are checked here rather
+        // than normalized away.
+        if (!SameDirectUiDetailShape(oldValue, newValue))
+            return Fail(error, L"refresh: DirectUI backing typed shape changed");
+        stable.hasDetail = oldValue.hasDetail;
+        stable.detail = oldValue.detail;
+        if (!SameProfileWindow(slot, oldValue, stable))
+            return Fail(error, L"refresh: DirectUI backing identity or stable facets changed");
+        // An actionable label is the contract for what its route does, and UIA
+        // cannot corroborate it while the source is cloaked. A rejection here
+        // clears the discovery record, so the page is re-evaluated with fresh
+        // UIA evidence rather than dispatched against a stale caption.
+        if ((oldValue.text != newValue.text || oldValue.note != newValue.note) &&
+            (slot.kind == ControlKind::Button || slot.kind == ControlKind::CheckBox ||
+             slot.kind == ControlKind::ThreeState ||
+             (slot.kind == ControlKind::RadioButton && !slot.captureBitmap)))
+            return Fail(error, L"refresh: actionable DirectUI label changed without UIA evidence");
+        if (slot.kind == ControlKind::SysLink &&
+            oldValue.detail.items != newValue.detail.items)
+            return Fail(error, L"refresh: DirectUI link caption changed without UIA evidence");
+        if (slot.kind == ControlKind::Toolbar &&
+            !SameToolbarCommands(oldValue.detail.toolbarItems, newValue.detail.toolbarItems))
+            return Fail(error, L"refresh: DirectUI toolbar command set changed without UIA evidence");
+        if (newValue.bounds.right <= newValue.bounds.left ||
+            newValue.bounds.bottom <= newValue.bounds.top ||
+            !Inside(newValue.bounds, after.directUi.bounds))
+            return Fail(error, L"refresh: DirectUI backing geometry escaped the anchor");
+    }
+    return true;
+}
+
+bool DirectUiCaptureFailureIsTopologyChange(std::wstring_view error) noexcept {
+    constexpr std::wstring_view prefixes[] = {
+        L"generic A/B: root class or descendant count changed",
+        L"generic A/B: implementation HWND inventory changed",
+        L"generic A/B: implementation HWND class is outside",
+        L"generic A/B: visible backing HWND count changed",
+        L"generic A/B: backing HWND no longer matches",
+        L"generic A/B: semantic backing slot is unavailable",
+        L"A/B: descendant count is outside the profile bound",
+        L"A/B: DirectUI anchor shape mismatch",
+        L"A/B: unexpected visible or implementation HWND class",
+        L"A/B: implementation HWND census mismatch",
+        L"A/B: visible native backing count does not match",
+        L"A/B: native backing class/style/control id is outside",
+        L"A/B: profile backing slot has no native window",
+        L"U: composite item census changed",
+    };
+    return std::any_of(std::begin(prefixes), std::end(prefixes),
+        [&](std::wstring_view prefix) { return error.starts_with(prefix); });
 }
 
 bool MatchDirectUiEvidence(
@@ -1666,16 +2887,18 @@ bool MatchDirectUiEvidence(
             if ((slot.uiaControlType && semantic->controlType != slot.uiaControlType) ||
                 (!slot.uiaClassName.empty() && semantic->className != slot.uiaClassName) ||
                 (!slot.uiaFrameworkId.empty() && semantic->frameworkId != slot.uiaFrameworkId) ||
+                (slot.project && semantic->backingHwnd != nullptr) ||
                 semantic->enabled != slot.uiaEnabled ||
                 semantic->focusable != slot.uiaFocusable ||
                 semantic->actionable != slot.uiaActionable ||
+                semantic->offscreen != slot.uiaOffscreen ||
                 (slot.pinUiaPatterns &&
                     (semantic->patternMask != slot.uiaPatternMask ||
                      semantic->toggleState != slot.uiaToggleState)) ||
-                (semantic->offscreen && !native.cloaked) ||
-                semantic->bounds.right <= semantic->bounds.left ||
-                semantic->bounds.bottom <= semantic->bounds.top ||
-                !Inside(semantic->bounds, scope)) {
+                (!slot.uiaOffscreen &&
+                    (semantic->bounds.right <= semantic->bounds.left ||
+                     semantic->bounds.bottom <= semantic->bounds.top ||
+                     !Inside(semantic->bounds, scope)))) {
                 error = L"U: virtual slot mismatch (slot=" + std::wstring(slot.semanticKey) +
                     L", id=" + semantic->semanticKey + L", class=" + semantic->className +
                     L", framework=" + semantic->frameworkId + L", type=" +
@@ -1707,17 +2930,67 @@ bool MatchDirectUiEvidence(
             byBacking->semanticKey == slot.uiaAutomationId;
         const bool expectedBacking = backingSeen.insert(backing.hwnd).second;
         const bool geometryMatches = RectNear(byBacking->bounds, backing.bounds);
-        const bool nativeLabelMatches = slot.kind == ControlKind::ProgressBar ||
+        // Kinds whose window text is content rather than a label: the provider's
+        // name comes from an associated static or is absent entirely, so holding
+        // the two to each other would reject every legitimate surface.
+        const bool labelIsWindowText = !(
+            slot.kind == ControlKind::ProgressBar ||
+            slot.kind == ControlKind::StaticIcon ||
+            slot.kind == ControlKind::Edit ||
+            slot.kind == ControlKind::Password ||
+            slot.kind == ControlKind::ComboBox ||
+            slot.kind == ControlKind::ListBox ||
+            slot.kind == ControlKind::ListView ||
+            slot.kind == ControlKind::TabControl ||
+            slot.kind == ControlKind::StatusBar ||
+            slot.kind == ControlKind::Toolbar ||
+            slot.kind == ControlKind::SysLink ||
+            (slot.kind == ControlKind::RadioButton && slot.captureBitmap));
+        const bool nativeLabelMatches = !labelIsWindowText ||
             DisplayText(backing.text) == byBacking->name;
+        // A status bar and a toolbar have no accessible name of their own; their
+        // parts and buttons carry the text and the adapter publishes those.
+        const bool nameRequired = slot.kind != ControlKind::StatusBar &&
+            slot.kind != ControlKind::Toolbar;
         const bool nativeNoteMatches = backing.note.empty() || backing.note == byBacking->helpText;
+        // A BS_3STATE box reaches a value the shared checked facet cannot carry,
+        // so its expected toggle comes from the adapter's own reading.
+        const int expectedToggleState = slot.kind == ControlKind::CheckBox
+            ? (backing.checked ? ToggleState_On : ToggleState_Off)
+            : (slot.kind == ControlKind::ThreeState && backing.hasDetail
+                ? (backing.detail.checked == 2
+                    ? ToggleState_Indeterminate
+                    : (backing.detail.checked == 1 ? ToggleState_On : ToggleState_Off))
+                : slot.uiaToggleState);
+        const bool patternMatches = !slot.pinUiaPatterns ||
+            (byBacking->patternMask == slot.uiaPatternMask &&
+             byBacking->capabilityMask == slot.uiaCapabilityMask &&
+             byBacking->toggleState == expectedToggleState);
+        // The adapter's item census pinned at discovery must still hold. This is
+        // the equality that catches a collection mutating across the bracket.
+        const bool itemCountMatches =
+            slot.nativeItemCount == static_cast<size_t>(-1) ||
+            (backing.hasDetail &&
+             DirectUiNativeItemCount(backing.detail) == slot.nativeItemCount);
+        if (!itemCountMatches) {
+            // A collection that grew or shrank is a new page state rather than a
+            // corrupt one, so it is reported as a topology change: the census the
+            // provider corroborated no longer holds, and the surface is
+            // re-evaluated from scratch instead of pinned to a stale count.
+            error = L"U: composite item census changed (slot=" +
+                std::wstring(slot.semanticKey) + L", items=" +
+                std::to_wstring(backing.hasDetail
+                    ? DirectUiNativeItemCount(backing.detail)
+                    : static_cast<size_t>(0)) +
+                L", expected=" + std::to_wstring(slot.nativeItemCount) + L")";
+            return false;
+        }
         if (!expectedBacking || byBacking->focusable != slot.uiaFocusable ||
             byBacking->enabled != slot.uiaEnabled ||
             byBacking->actionable != slot.uiaActionable ||
-            (slot.pinUiaPatterns &&
-                (byBacking->patternMask != slot.uiaPatternMask ||
-                 byBacking->toggleState != slot.uiaToggleState)) ||
-            (slot.project && byBacking->name.empty()) ||
-            (byBacking->offscreen && !native.cloaked) ||
+            byBacking->offscreen != slot.uiaOffscreen ||
+            !patternMatches ||
+            (slot.project && nameRequired && byBacking->name.empty()) ||
             !exactSemanticClass || !automationIdMatches || !geometryMatches ||
             !nativeLabelMatches || !nativeNoteMatches) {
             error = L"U: backing semantic mismatch (slot=" + std::wstring(slot.semanticKey) +
@@ -1788,6 +3061,134 @@ uint64_t DirectUiSemanticNodeId(
     return hash | (1ull << 63);
 }
 
+bool RefreshDirectUiSnapshotFromNative(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& native,
+    WindowSnapshot& snapshot,
+    std::unordered_map<uint64_t, DirectUiActionBinding>& bindings,
+    std::wstring& error) noexcept {
+    try {
+        if (native.slotWindows.size() != profile.slotCount)
+            return Fail(error, L"refresh: DirectUI backing evidence is incomplete");
+        const size_t projectedCount = static_cast<size_t>(std::count_if(
+            profile.slots, profile.slots + profile.slotCount,
+            [](const DirectUiSlot& slot) { return slot.project; }));
+        if (snapshot.nodes.size() != projectedCount)
+            return Fail(error, L"refresh: projected DirectUI topology changed");
+
+        snapshot.canCancel = std::any_of(profile.slots, profile.slots + profile.slotCount,
+            [](const DirectUiSlot& slot) { return slot.cancel; });
+        snapshot.nativeHwnd = native.root.hwnd;
+        snapshot.ownerHwnd = native.ownerHwnd;
+        snapshot.title = native.title;
+        snapshot.dpi = native.dpi;
+        snapshot.bounds = native.root.bounds;
+        snapshot.clientBounds = native.clientBounds;
+        snapshot.windowStyle = native.root.style;
+        snapshot.windowExStyle = native.root.exStyle;
+        snapshot.visible = native.root.visible;
+        snapshot.enabled = native.root.enabled;
+        snapshot.showInTaskbar = native.ownerHwnd == nullptr ||
+            (native.root.exStyle & WS_EX_APPWINDOW) != 0;
+        snapshot.rtl = (native.root.exStyle & WS_EX_LAYOUTRTL) != 0;
+        bindings.clear();
+
+        size_t nodeIndex = 0;
+        for (size_t slotIndex = 0; slotIndex < profile.slotCount; ++slotIndex) {
+            const DirectUiSlot& slot = profile.slots[slotIndex];
+            if (!slot.project) continue;
+            ControlNode& node = snapshot.nodes[nodeIndex++];
+            if (node.nodeId != DirectUiSemanticNodeId(profile.adapterId, slot.semanticKey) ||
+                node.kind != slot.kind || node.semanticKey != slot.semanticKey)
+                return Fail(error, L"refresh: projected DirectUI node identity changed");
+            node.isDefault = slot.defaultButton;
+            if (slot.virtualSource) {
+                node.generation = native.root.generation;
+                node.enabled = native.root.enabled && native.directUi.enabled && slot.uiaEnabled;
+                node.tabStop = node.enabled && slot.uiaFocusable && slot.tabIndex >= 0;
+                node.tabIndex = node.tabStop ? slot.tabIndex : -1;
+                SetDirectUiSupportedActions(slot, node);
+                if (slot.action != DirectUiAction::None) {
+                    bindings.emplace(node.nodeId, DirectUiActionBinding{
+                        native.root.hwnd, native.root.generation, slotIndex,
+                        slot.kind, slot.action, slot.secondaryAction, slot.cancel,
+                        slot.propertySheetButton });
+                }
+                continue;
+            }
+
+            const DirectUiWindowEvidence& backing = native.slotWindows[slotIndex];
+            if (!backing.hwnd || !backing.generation)
+                return Fail(error, L"refresh: DirectUI backing identity is unavailable");
+            node.generation = backing.generation;
+            node.hwnd = backing.hwnd;
+            node.controlId = backing.controlId;
+            node.tabIndex = backing.tabIndex;
+            node.rect = ClientRectFor(backing.bounds, native.clientOriginScreen);
+            node.style = backing.style;
+            node.exStyle = backing.exStyle;
+            node.visible = backing.visible;
+            node.enabled = native.root.enabled && native.directUi.enabled &&
+                backing.enabled;
+            node.tabStop = node.enabled && backing.tabIndex >= 0;
+            node.dialogCode = backing.dialogCode;
+            // Kinds whose window text is their label. The rest either carry
+            // content rather than a caption or take their name from an
+            // associated static, and a name UIA supplied at admission cannot be
+            // re-read while the source is cloaked.
+            if (slot.kind == ControlKind::StaticText ||
+                slot.kind == ControlKind::Button ||
+                slot.kind == ControlKind::CheckBox ||
+                slot.kind == ControlKind::ThreeState ||
+                slot.kind == ControlKind::GroupBox ||
+                (slot.kind == ControlKind::RadioButton && !slot.captureBitmap)) {
+                node.text = backing.text;
+                node.automationName = DisplayText(backing.text);
+            }
+            if (slot.kind == ControlKind::StaticText) {
+                node.helpText = backing.note;
+                node.accessKey.clear();
+            } else if (!backing.note.empty()) {
+                node.helpText = backing.note;
+            }
+            if (slot.kind == ControlKind::Button) {
+                const DWORD buttonType = static_cast<DWORD>(backing.style) & BS_TYPEMASK;
+                node.isDefault = buttonType == BS_DEFPUSHBUTTON ||
+                    buttonType == BS_DEFCOMMANDLINK;
+            }
+            node.checked = backing.checked ? 1 : 0;
+            node.groupStart = (backing.style & WS_GROUP) != 0;
+            node.minimum = backing.minimum;
+            node.maximum = backing.maximum;
+            node.position = backing.position;
+            node.indeterminate = backing.indeterminate;
+            if (slot.captureBitmap) {
+                if (backing.imageFormat != L"bgra8-premultiplied" ||
+                    backing.imageWidth == 0 || backing.imageHeight == 0 ||
+                    backing.imageData.size() !=
+                        static_cast<size_t>(backing.imageWidth) * backing.imageHeight * 4)
+                    return Fail(error, L"refresh: native bitmap pixels are missing");
+                node.imageWidth = backing.imageWidth;
+                node.imageHeight = backing.imageHeight;
+                node.imageFormat = backing.imageFormat;
+                node.imageData = backing.imageData;
+            }
+            if (!ApplyDirectUiDetailToNode(slot, backing, node, error)) return false;
+            if (!node.tabStop) node.tabIndex = -1;
+            SetDirectUiSupportedActions(slot, node);
+            if (slot.action != DirectUiAction::None) {
+                bindings.emplace(node.nodeId, DirectUiActionBinding{
+                    backing.hwnd, backing.generation, slotIndex,
+                    slot.kind, slot.action, slot.secondaryAction, slot.cancel,
+                    slot.propertySheetButton });
+            }
+        }
+        return true;
+    } catch (...) {
+        return Fail(error, L"refresh: DirectUI native snapshot exception");
+    }
+}
+
 bool NormalizeDirectUiEvidenceText(
     std::wstring_view input,
     std::wstring& output) noexcept {
@@ -1807,6 +3208,27 @@ bool IsMicrosoftWindowsSignerName(std::wstring_view name) noexcept {
         FluentShell::EqualsIgnoreCase(name, L"Microsoft Corporation");
 }
 
+// True when a handoff-declared route is a page navigation: the application
+// replaces the page inside the same top-level window, so the surface can keep its
+// projection and admit the next page in place instead of handing the whole window
+// back to native. Cancel is excluded because it ends the window rather than
+// navigating it, and so keeps the terminal handoff route.
+bool DirectUiNavigationMayStayProjected(
+    const DirectUiActionBinding& binding) noexcept {
+    if (binding.cancel) return false;
+    switch (binding.action) {
+    case DirectUiAction::HandoffClick:
+    case DirectUiAction::HandoffLinkClick:
+        return binding.propertySheetButton == -1;
+    case DirectUiAction::HandoffPropertySheetButton:
+        return binding.propertySheetButton == PSBTN_BACK ||
+            binding.propertySheetButton == PSBTN_NEXT ||
+            binding.propertySheetButton == PSBTN_FINISH;
+    default:
+        return false;
+    }
+}
+
 bool DirectUiHandoffMayPost(
     bool pageRevalidated,
     bool bindingGenerationMatches,
@@ -1815,6 +3237,104 @@ bool DirectUiHandoffMayPost(
     bool nativeUncloaked) noexcept {
     return pageRevalidated && bindingGenerationMatches && proxyIsolated &&
         nativeVisible && nativeUncloaked;
+}
+
+bool RevalidateAndPostDirectUiPropertySheetAction(
+    SourceThreadAgent& agent,
+    const DirectUiWindowProfile& profile,
+    const DirectUiActionBinding& binding,
+    DWORD timeoutMs,
+    HANDLE cancelEvent,
+    std::wstring& error) noexcept {
+    error.clear();
+    if (binding.action != DirectUiAction::HandoffPropertySheetButton ||
+        binding.slotIndex >= profile.slotCount ||
+        !profile.slots[binding.slotIndex].virtualSource ||
+        profile.slots[binding.slotIndex].propertySheetButton !=
+            binding.propertySheetButton ||
+        !IsPropertySheetButton(binding.propertySheetButton)) {
+        return Fail(error, L"property-sheet action binding is outside the admitted contract");
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeoutMs);
+    const auto remainingMs = [&]() -> DWORD {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count());
+    };
+    struct Result final { bool ok = false; DirectUiUiaEvidence value; std::wstring error; };
+    try {
+        DirectUiNativeEvidence before;
+        DWORD remaining = remainingMs();
+        if (!remaining || !agent.CaptureDirectUiNativeEvidence(
+                profile, before, error, remaining, cancelEvent)) {
+            return Fail(error, L"property-sheet action native A failed: " + error);
+        }
+        if (before.cloaked || before.root.hwnd != binding.hwnd ||
+            before.root.generation != binding.generation ||
+            !before.root.visible || !before.root.enabled ||
+            !before.propertySheetPageHwnd) {
+            return Fail(error, L"property-sheet action root is not current, visible, and uncloaked");
+        }
+
+        std::vector<std::wstring> virtualAutomationIds;
+        std::vector<HWND> backingWindows;
+        for (size_t index = 0; index < profile.slotCount; ++index) {
+            const DirectUiSlot& slot = profile.slots[index];
+            if (slot.virtualSource) {
+                virtualAutomationIds.emplace_back(slot.uiaAutomationId.empty()
+                    ? slot.semanticKey : slot.uiaAutomationId);
+            } else if (before.slotWindows[index].hwnd) {
+                backingWindows.push_back(before.slotWindows[index].hwnd);
+            }
+        }
+        auto promise = std::make_shared<std::promise<Result>>();
+        auto future = promise->get_future();
+        const HWND root = before.root.hwnd;
+        const HWND directUi = before.directUi.hwnd;
+        const DWORD processId = GetCurrentProcessId();
+        std::thread worker([promise, root, directUi, processId,
+                virtualAutomationIds = std::move(virtualAutomationIds),
+                backingWindows = std::move(backingWindows)] {
+            Result result;
+            try {
+                result.ok = CaptureUia(root, directUi, processId, true,
+                    virtualAutomationIds, backingWindows, false,
+                    result.value, result.error);
+            } catch (...) {
+                result.error = L"property-sheet UIA evidence worker exception";
+            }
+            try { promise->set_value(std::move(result)); } catch (...) {}
+        });
+        remaining = (std::min)(remainingMs(), kUiaDeadlineMs);
+        auto status = remaining
+            ? future.wait_for(std::chrono::milliseconds(remaining))
+            : std::future_status::timeout;
+        if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0)
+            status = std::future_status::timeout;
+        if (status != std::future_status::ready) {
+            agent.PoisonDirectUiUia();
+            worker.detach();
+            return Fail(error,
+                L"property-sheet UIA deadline expired; worker abandoned and agent poisoned");
+        }
+        worker.join();
+        auto uia = future.get();
+        if (!uia.ok)
+            return Fail(error, L"property-sheet UIA capture failed: " + uia.error);
+        if (!MatchDirectUiEvidence(profile, before, uia.value, error))
+            return Fail(error, L"property-sheet UIA contract changed: " + error);
+
+        remaining = remainingMs();
+        if (!remaining)
+            return Fail(error, L"property-sheet action deadline expired before native B");
+        return agent.PostDirectUiPropertySheetButton(
+            profile, before, binding, error, remaining, cancelEvent);
+    } catch (...) {
+        return Fail(error, L"property-sheet action revalidation exception");
+    }
 }
 
 DirectUiAdmissionResult InspectDirectUiSurface(
@@ -1987,7 +3507,7 @@ DirectUiAdmissionResult InspectGenericDirectUiSurface(
             std::thread worker([promise, root, directUi, processId] {
                 Result result;
                 try {
-                    result.ok = CaptureUia(root, directUi, processId, false, {}, {}, true,
+                    result.ok = CaptureUia(root, directUi, processId, true, {}, {}, true,
                         result.value, result.error);
                 } catch (...) {
                     result.error = L"generic UIA evidence worker exception";
@@ -2043,8 +3563,9 @@ DirectUiAdmissionResult InspectGenericDirectUiSurface(
                 return DirectUiAdmissionResult::Admitted;
             }
             if (attempt + 1 < kMutationBracketAttempts &&
-                diagnostic.starts_with(
-                    L"generic B: native evidence changed during semantic discovery"))
+                (diagnostic.starts_with(
+                    L"generic B: native evidence changed during semantic discovery") ||
+                 diagnostic.starts_with(L"generic A/B:")))
                 continue;
             diagnostic = L"Generic DirectUI adapter rejected at B: " + diagnostic;
             return DirectUiAdmissionResult::Rejected;

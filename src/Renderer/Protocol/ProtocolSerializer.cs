@@ -52,7 +52,20 @@ public static class ProtocolSerializer
 
             var message = Bind(frameType, root);
             ProtocolValidator.ValidateCommon(message);
-            ProtocolValidator.ValidateSemanticCaps(message);
+            try
+            {
+                ProtocolValidator.ValidateSemanticCaps(message);
+            }
+            catch (ProtocolException exception)
+                when (ProtocolValidator.SurfaceScopeOf(message) is { } surfaceId)
+            {
+                // The frame is well formed enough to name the surface it belongs
+                // to, so the violation is that one window's rather than the
+                // session's.  Admission runs here, before the registry sees the
+                // message, so the scope has to be attached at the throw site.
+                throw new ProtocolException(
+                    exception.Message, surfaceId, message.SessionNonce, exception);
+            }
             return message;
         }
         catch (JsonException exception)

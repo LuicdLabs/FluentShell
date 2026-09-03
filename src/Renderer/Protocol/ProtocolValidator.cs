@@ -49,6 +49,28 @@ internal static class ProtocolValidator
         }
     }
 
+    /// <summary>
+    /// The surface a violation in this message belongs to, or null when the message
+    /// is session-scoped and any violation in it is genuinely fatal.  One mapping
+    /// serves both admission (inside <see cref="ProtocolSerializer"/>) and handling
+    /// (inside the window registry), so the two can never disagree about whether a
+    /// fault takes the session down.  An absent surface id is session-scoped: there
+    /// is no one window to roll back.
+    /// </summary>
+    public static Guid? SurfaceScopeOf(IProtocolMessage message)
+    {
+        Guid? surfaceId = message switch
+        {
+            WindowOpenMessage open => open.Window?.SurfaceId,
+            WindowPatchMessage patch => patch.SurfaceId,
+            ActionResultMessage result => result.SurfaceId,
+            SurfaceCommitMessage commit => commit.SurfaceId,
+            WindowCloseMessage close => close.SurfaceId,
+            _ => null,
+        };
+        return surfaceId is { } scope && scope != Guid.Empty ? scope : null;
+    }
+
     private static void ValidateHello(HelloMessage hello)
     {
         if (hello.ProcessId == 0 || hello.ProtocolMajor != ProtocolConstants.Major ||
@@ -289,7 +311,7 @@ internal static class ProtocolValidator
             ["button"] = null,
             ["checkBox"] = null,
             ["threeState"] = null,
-            ["radioButton"] = null,
+            ["radioButton"] = ValidateRadioButton,
             ["edit"] = null,
             ["password"] = null,
             ["groupBox"] = null,
@@ -322,10 +344,10 @@ internal static class ProtocolValidator
             throw new ProtocolException("Control node state is outside the protocol range.");
         if (node.Editable && node.Kind != "comboBox")
             throw new ProtocolException("Only ComboBox nodes can be editable.");
-        if (node.Kind != "staticIcon" &&
+        if (node.Kind is not ("staticIcon" or "radioButton") &&
             (node.ImageWidth is not null || node.ImageHeight is not null ||
              node.ImageFormat is not null || node.ImageData is not null))
-            throw new ProtocolException("Only Static icon nodes can carry image fields.");
+            throw new ProtocolException("Only Static icon or BitmapSwitch nodes can carry image fields.");
         if (node.Kind != "listView" && node.ColumnHeadersVisible is not null)
             throw new ProtocolException("Only ListView nodes can carry columnHeadersVisible.");
         if (node.Kind != "listView" && (node.CheckBoxes is not null || node.CheckedIndices is not null))
@@ -432,6 +454,116 @@ internal static class ProtocolValidator
         }
     }
 
+    // One admitted capability-derived DirectUI role.  `Variants` is the exact
+    // set of presentation variants the Bridge engine can emit for that kind.
+    // `NamedVariants` and `FocusVariants` are the subsets whose wire contract is
+    // still enforceable after admission: a name is only required where the
+    // engine can never re-derive it from mutable window text, and a traversal
+    // stop only where the classifier refuses a non-focusable enabled provider.
+    // `VirtualAllowed` marks the three roles the classifier can admit without a
+    // native backing HWND at all: provider text, a provider separator, and an
+    // AeroWizard property-sheet button.
+    private sealed record GenericDirectUiRole(
+        string[] Variants,
+        string[]? NamedVariants = null,
+        string[]? FocusVariants = null,
+        bool VirtualAllowed = false);
+
+    // Mirror of the capability-derived classifier in DirectUiEngine.cpp.  Every
+    // role that lane can emit appears here exactly once and anything else is
+    // refused, so the renderer's admitted set can never drift wider than the
+    // Bridge's.  Adding a control to the DirectUI lane means adding one row
+    // here plus its route in GenericDirectUiActions.
+    //
+    // A name is read from UIA at admission, where the classifier already
+    // refuses a nameless provider for every role that carries a floor here.
+    // Refresh then re-derives the caption kinds from live window text --
+    // static, button, checkBox, threeState, groupBox, standard radioButton --
+    // so a floor on one of those is a live rule and not only an admission one.
+    // Static and groupBox captions may legitimately empty out and carry none;
+    // a labelled control whose text has gone empty rolls that one window back
+    // rather than projecting a control no screen reader can announce.
+    private static readonly Dictionary<string, GenericDirectUiRole> GenericDirectUiRoles =
+        new(StringComparer.Ordinal)
+        {
+            ["static"] = new(["standard"], VirtualAllowed: true),
+            ["separator"] = new(["standard"], VirtualAllowed: true),
+            ["groupBox"] = new(["standard"]),
+            ["staticIcon"] = new(["standard", "bitmapDisplay", "monitorPalette"],
+                NamedVariants: ["bitmapDisplay", "monitorPalette"]),
+            ["progressBar"] = new(["standard"], NamedVariants: ["standard"]),
+            ["statusBar"] = new(["standard"]),
+            ["button"] = new(["standard", "commandLink"],
+                NamedVariants: ["standard", "commandLink"],
+                FocusVariants: ["standard", "commandLink"], VirtualAllowed: true),
+            ["sysLink"] = new(["standard"], NamedVariants: ["standard"],
+                FocusVariants: ["standard"]),
+            ["checkBox"] = new(["standard"], NamedVariants: ["standard"],
+                FocusVariants: ["standard"]),
+            ["threeState"] = new(["standard"], NamedVariants: ["standard"],
+                FocusVariants: ["standard"]),
+            // A BitmapSwitchClass radio keeps WS_TABSTOP only while it is the
+            // selected member of its group, so only the standard variant can be
+            // held to a traversal stop.
+            ["radioButton"] = new(["standard", "bitmapSwitch"],
+                NamedVariants: ["standard", "bitmapSwitch"],
+                FocusVariants: ["standard"]),
+            ["edit"] = new(["standard"], NamedVariants: ["standard"],
+                FocusVariants: ["standard"]),
+            ["password"] = new(["password"], NamedVariants: ["password"],
+                FocusVariants: ["password"]),
+            ["comboBox"] = new(["standard"], NamedVariants: ["standard"],
+                FocusVariants: ["standard"]),
+            ["listBox"] = new(["standard"], FocusVariants: ["standard"]),
+            ["listView"] = new(["standard"], FocusVariants: ["standard"]),
+            // A tab control and a tool bar are containers the classifier admits
+            // without a name or a focus stop of their own; their items carry both.
+            ["tabControl"] = new(["standard"]),
+            ["toolbar"] = new(["standard"]),
+        };
+
+    // The routes one revision of a generic-lane node advertises.  The engine
+    // publishes the primary route first and appends a secondary one only when
+    // that revision's own typed state accepts it, so the order is part of the
+    // contract rather than a set comparison.  A disabled node offers nothing.
+    private static string[] GenericDirectUiActions(ControlNode node)
+    {
+        if (!node.Enabled) return [];
+        switch (node.Kind)
+        {
+            case "button":
+            case "sysLink":
+                return ["invoke"];
+            case "checkBox":
+            case "threeState":
+            case "radioButton":
+                return ["setCheck"];
+            // A read-only box is admitted for presentation; the engine declares
+            // no write route for it, so neither may the wire.
+            case "edit":
+            case "password":
+                return node.ReadOnly == false ? ["setText"] : [];
+            // Only a CBS_DROPDOWN combo accepts typed text alongside selection.
+            case "comboBox":
+                return node.Editable && node.ReadOnly != true
+                    ? ["select", "setText"]
+                    : ["select"];
+            case "listBox":
+            case "tabControl":
+                return ["select"];
+            // A ListView selection is a canonical index list, and LVS_EX_CHECKBOXES
+            // adds a per-item check the engine drives through the same adapter.
+            case "listView":
+                return node.CheckBoxes == true
+                    ? ["setSelection", "setItemCheck"]
+                    : ["setSelection"];
+            case "toolbar":
+                return ["toolbarCommand"];
+            default:
+                return [];
+        }
+    }
+
     private static void ValidateGenericDirectUiAdapter(WindowSnapshot snapshot)
     {
         if (snapshot.PageId != ProtocolConstants.GenericDirectUiPageId ||
@@ -451,46 +583,64 @@ internal static class ProtocolValidator
                 node.PresentationVariant is null || node.SupportedActions is null ||
                 node.HelpText is null || node.AccessKey is null ||
                 (node.SourceKind == "uiaVirtual" ? node.NativeHwnd is not null : node.NativeHwnd is null))
-                throw new ProtocolException("Generic DirectUI semantic identity or source shape is invalid.");
-
-            string? expectedAction;
-            string[] variants;
-            switch (node.Kind)
-            {
-                case "static":
-                    expectedAction = null;
-                    variants = ["standard", "instruction", "content", "wizardTitle", "header"];
-                    break;
-                case "separator":
-                    expectedAction = null;
-                    variants = ["standard"];
-                    break;
-                case "button":
-                    expectedAction = node.Enabled ? "invoke" : null;
-                    variants = ["standard", "commandLink"];
-                    break;
-                case "checkBox":
-                    if (node.Checked is not 0 and not 1)
-                        throw new ProtocolException("Generic DirectUI checkbox state is not binary.");
-                    expectedAction = node.Enabled ? "setCheck" : null;
-                    variants = ["standard"];
-                    break;
-                case "progressBar":
-                    expectedAction = null;
-                    variants = ["standard"];
-                    break;
-                default:
-                    throw new ProtocolException("Generic DirectUI semantic kind is not admitted.");
-            }
-            var expectedActions = expectedAction is null ? Array.Empty<string>() : [expectedAction];
-            if (!variants.Contains(node.PresentationVariant, StringComparer.Ordinal) ||
-                !node.SupportedActions.SequenceEqual(expectedActions) ||
-                (expectedAction is not null && (!node.Visible || !node.Enabled || !node.TabStop)) ||
-                (expectedAction is null && node.TabStop) ||
-                (node.Visible && string.IsNullOrEmpty(node.AutomationName)))
-                throw new ProtocolException("Generic DirectUI role, action, or focus contract is invalid.");
+                throw new ProtocolException(
+                    "Generic DirectUI semantic identity or source shape is invalid." + DescribeSlot(node));
+            if (!GenericDirectUiRoles.TryGetValue(node.Kind, out var role))
+                throw new ProtocolException(
+                    "Generic DirectUI semantic kind is not admitted." + DescribeSlot(node));
+            if (!role.VirtualAllowed && node.SourceKind != "nativeBacking")
+                throw new ProtocolException(
+                    "Generic DirectUI role requires a native backing control." + DescribeSlot(node));
+            if ((node.Kind is "checkBox" or "radioButton") && node.Checked is not (0 or 1))
+                throw new ProtocolException(
+                    "Generic DirectUI toggle state is not binary." + DescribeSlot(node));
+            if (node.Kind == "threeState" && node.Checked is not (0 or 1 or 2))
+                throw new ProtocolException(
+                    "Generic DirectUI three-state value is out of range." + DescribeSlot(node));
+            var expectedActions = GenericDirectUiActions(node);
+            if (!role.Variants.Contains(node.PresentationVariant, StringComparer.Ordinal) ||
+                !node.SupportedActions.SequenceEqual(expectedActions, StringComparer.Ordinal))
+                throw new ProtocolException(
+                    "Generic DirectUI role, variant, or action set is invalid." + DescribeSlot(node));
+            if (expectedActions.Length != 0 && (!node.Visible || !node.Enabled))
+                throw new ProtocolException(
+                    "Generic DirectUI actionable slot is not interactive." + DescribeSlot(node));
+            // Only the roles whose UIA contract the classifier refuses without
+            // keyboard focus can be held to a traversal stop.  A container role
+            // like ToolBar or Tab is legitimately actionable without one.
+            if (expectedActions.Length != 0 && !node.TabStop &&
+                (role.FocusVariants?.Contains(node.PresentationVariant, StringComparer.Ordinal) ?? false))
+                throw new ProtocolException(
+                    "Generic DirectUI actionable slot is not focusable." + DescribeSlot(node));
+            // Actionability does not bound focusability.  The provider owns
+            // traversal inside its own host (`directUiOwnsTabOrder`) and the
+            // built-in pages use that: a read-only text box, a wizard's static
+            // page text, a caption a screen reader stops on.  Each generated stop
+            // is a UIA IsKeyboardFocusable claim that the A/B bracket pins for
+            // the life of the projection, so the renderer holds it to the one
+            // contradiction it can see by itself rather than to a list of kinds
+            // allowed to make the claim at all.
+            if (node.TabStop && !node.Enabled)
+                throw new ProtocolException(
+                    "Generic DirectUI slot claims a traversal stop while disabled." + DescribeSlot(node));
+            if (node.Visible && string.IsNullOrEmpty(node.AutomationName) &&
+                (role.NamedVariants?.Contains(node.PresentationVariant, StringComparer.Ordinal) ?? false))
+                throw new ProtocolException(
+                    "Generic DirectUI projected slot has no accessible name." + DescribeSlot(node));
         }
     }
+
+    // A generic-lane page is generated from whatever the provider published, so
+    // a rejection is only actionable if it names the slot it refused: the same
+    // rule fires on a different control on every built-in page.  The Bridge logs
+    // this string verbatim, so it carries the fields the rules above test.
+    private static string DescribeSlot(ControlNode node) =>
+        $" [kind={node.Kind} variant={node.PresentationVariant ?? "-"}" +
+        $" key={node.SemanticKey ?? "-"} source={node.SourceKind ?? "-"}" +
+        $" visible={node.Visible} enabled={node.Enabled} tabStop={node.TabStop}" +
+        $" tabIndex={node.TabIndex?.ToString() ?? "-"}" +
+        $" routes={(node.SupportedActions is null ? "-" : string.Join('+', node.SupportedActions))}" +
+        $" named={!string.IsNullOrEmpty(node.AutomationName)}]";
 
     // A focusable control must have a unique nonnegative order; everything else
     // must be explicitly out of the tab order.
@@ -519,15 +669,22 @@ internal static class ProtocolValidator
             throw new ProtocolException("Progress node range or position is missing or invalid.");
     }
 
-    private static void ValidateStaticIcon(ControlNode node)
+    private static void ValidateOwnedPixels(ControlNode node, bool largeBitmap)
     {
-        if (node.TabStop || node.TabIndex is not null and not -1)
-            throw new ProtocolException("Static icon must not be a tab stop.");
+        var maxDimension = largeBitmap
+            ? ProtocolConstants.MaxDirectUiBitmapDimension
+            : ProtocolConstants.MaxImageDimension;
+        var maxBytes = largeBitmap
+            ? ProtocolConstants.MaxDirectUiBitmapBytes
+            : ProtocolConstants.MaxImageBytes;
+        var maxBase64 = largeBitmap
+            ? ProtocolConstants.MaxDirectUiBitmapBase64Chars
+            : ProtocolConstants.MaxImageBase64Chars;
         if (node.ImageWidth is not { } width || node.ImageHeight is not { } height ||
-            width is <= 0 or > ProtocolConstants.MaxImageDimension ||
-            height is <= 0 or > ProtocolConstants.MaxImageDimension ||
+            width is <= 0 || height is <= 0 ||
+            width > maxDimension || height > maxDimension ||
             node.ImageFormat != "bgra8-premultiplied" || node.ImageData is null ||
-            node.ImageData.Length > ProtocolConstants.MaxImageBase64Chars)
+            node.ImageData.Length > maxBase64)
             throw new ProtocolException("Static icon metadata is missing or outside the protocol cap.");
         byte[] decoded;
         try
@@ -539,15 +696,29 @@ internal static class ProtocolValidator
             throw new ProtocolException($"Static icon imageData is not base64: {exception.Message}");
         }
         if (decoded.Length != checked(width * height * 4) ||
-            decoded.Length > ProtocolConstants.MaxImageBytes ||
+            decoded.Length > maxBytes ||
             Convert.ToBase64String(decoded) != node.ImageData)
             throw new ProtocolException("Static icon imageData is non-canonical or has the wrong decoded length.");
         for (var offset = 0; offset < decoded.Length; offset += 4)
         {
             var alpha = decoded[offset + 3];
             if (decoded[offset] > alpha || decoded[offset + 1] > alpha || decoded[offset + 2] > alpha)
-                throw new ProtocolException("Static icon pixels are not premultiplied BGRA.");
+            throw new ProtocolException("Static icon pixels are not premultiplied BGRA.");
         }
+    }
+
+    private static void ValidateStaticIcon(ControlNode node)
+    {
+        if (node.TabStop || node.TabIndex is not null and not -1)
+            throw new ProtocolException("Static icon must not be a tab stop.");
+        ValidateOwnedPixels(node,
+            node.PresentationVariant is "bitmapDisplay" or "monitorPalette");
+    }
+
+    private static void ValidateRadioButton(ControlNode node)
+    {
+        if (node.PresentationVariant != "bitmapSwitch") return;
+        ValidateOwnedPixels(node, true);
     }
 
     private static void ValidateDialogContainer(ControlNode node)
@@ -959,9 +1130,10 @@ internal static class ProtocolValidator
                 throw new ProtocolException($"{context}.node carries ListView-only fields for a non-ListView kind.");
             }
             var imageFields = RequiredImageProperties.Count(name => node.TryGetProperty(name, out _));
-            if (kind == "staticIcon")
+            if (kind == "staticIcon" ||
+                (kind == "radioButton" && imageFields != 0))
             {
-                RequireProperties(node, $"{context}.staticIcon", RequiredImageProperties);
+                RequireProperties(node, $"{context}.image", RequiredImageProperties);
             }
             else if (imageFields != 0)
             {
@@ -1101,12 +1273,15 @@ internal static class ProtocolValidator
 
     // Depth is already capped by JsonDocumentOptions; this bounds the width of a
     // payload that parsed successfully but would still be unreasonable to bind.
-    public static void ValidateJsonTree(JsonElement element)
+    public static void ValidateJsonTree(JsonElement element, string? propertyName = null)
     {
         switch (element.ValueKind)
         {
             case JsonValueKind.String:
-                if ((element.GetString()?.Length ?? 0) > ProtocolConstants.MaxStringChars)
+                var cap = propertyName == "imageData"
+                    ? ProtocolConstants.MaxDirectUiBitmapBase64Chars
+                    : ProtocolConstants.MaxStringChars;
+                if ((element.GetString()?.Length ?? 0) > cap)
                     throw new ProtocolException("JSON string exceeds the protocol cap.");
                 break;
             case JsonValueKind.Array:
@@ -1117,7 +1292,7 @@ internal static class ProtocolValidator
                 {
                     if (Encoding.UTF8.GetByteCount(property.Name) > 256)
                         throw new ProtocolException("JSON property name is unreasonably long.");
-                    ValidateJsonTree(property.Value);
+                    ValidateJsonTree(property.Value, property.Name);
                 }
                 break;
         }

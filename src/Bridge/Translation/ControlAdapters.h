@@ -52,4 +52,14 @@ bool CaptureOwnedIconPixels(
     std::vector<uint8_t>& imageData,
     std::wstring& reason);
 
+bool CaptureOwnedWindowPixels(
+    HWND hwnd,
+    uint32_t maxDimension,
+    size_t maxBytes,
+    uint32_t& imageWidth,
+    uint32_t& imageHeight,
+    std::wstring& imageFormat,
+    std::vector<uint8_t>& imageData,
+    std::wstring& reason);
+
 } // namespace FluentShell::Bridge::Translation

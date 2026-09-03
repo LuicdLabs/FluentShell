@@ -100,7 +100,8 @@ public:
         DirectUiNativeEvidence& evidence,
         std::wstring& error,
         DWORD timeoutMs = 2000,
-        HANDLE cancelEvent = nullptr);
+        HANDLE cancelEvent = nullptr,
+        bool* timedOut = nullptr);
     bool VerifyDirectUiAndCloak(
         const DirectUiWindowProfile& profile,
         const DirectUiNativeEvidence& expected,
@@ -111,6 +112,26 @@ public:
         const DirectUiWindowProfile& profile,
         const DirectUiNativeEvidence& expected,
         const DirectUiActionBinding& binding,
+        std::wstring& error,
+        DWORD timeoutMs = 2000,
+        HANDLE cancelEvent = nullptr);
+    bool PostDirectUiPropertySheetButton(
+        const DirectUiWindowProfile& profile,
+        const DirectUiNativeEvidence& expected,
+        const DirectUiActionBinding& binding,
+        std::wstring& error,
+        DWORD timeoutMs = 2000,
+        HANDLE cancelEvent = nullptr);
+    // Drives one handoff-declared DirectUI navigation without giving the page up:
+    // the native root keeps its application cloak and the renderer proxy keeps the
+    // screen, so the session can admit the page that replaces this one in place.
+    // previousActive is returned whenever the command ran, because activation
+    // moved to the native dialog before its handler did.
+    bool NavigateDirectUiProjected(
+        const DirectUiWindowProfile& profile,
+        const DirectUiNativeEvidence& expected,
+        const DirectUiActionBinding& binding,
+        HWND& previousActive,
         std::wstring& error,
         DWORD timeoutMs = 2000,
         HANDLE cancelEvent = nullptr);
@@ -133,9 +154,30 @@ public:
     bool InvokeDirectUiToggle(
         const DirectUiActionBinding& binding,
         int requested,
+        HWND& previousActive,
         std::wstring& error,
         DWORD timeoutMs = 2000,
         HANDLE cancelEvent = nullptr);
+    // Drives one projected DirectUI slot through the same registered adapter the
+    // Win32 lane uses, so the surface stays projected and the caller accepts only
+    // that control's own delta. previousActive is returned whenever the command
+    // ran, because activation moved to the native dialog before the handler did.
+    bool InvokeDirectUiNodeAction(
+        const DirectUiWindowProfile& profile,
+        const DirectUiNativeEvidence& expected,
+        const DirectUiActionBinding& binding,
+        const ActionRequest& request,
+        HWND& previousActive,
+        std::wstring& error,
+        DWORD timeoutMs = 2000,
+        HANDLE cancelEvent = nullptr);
+    bool RestoreDirectUiActivation(
+        HWND previousActive,
+        std::wstring& error,
+        DWORD timeoutMs = 2000,
+        HANDLE cancelEvent = nullptr);
+    bool PlaceBehind(HWND sibling, std::wstring& error,
+        DWORD timeoutMs = 1000, HANDLE cancelEvent = nullptr);
     bool Shutdown() noexcept;
 
     HWND Root() const noexcept { return root_; }
@@ -176,6 +218,10 @@ public:
     void PoisonDirectUiUia() noexcept { directUiUiaPoisoned_.store(true); }
     const DirectUiWindowProfile* DirectUiProfile() const noexcept { return directUiProfile_; }
     bool GenericDirectUiCandidate() const noexcept { return genericDirectUiCandidate_; }
+    // Lets an exact-profile surface degrade to the capability-derived lane once the
+    // application navigates past the page its declarative row describes. Returns
+    // false when the process itself is not eligible for generic admission.
+    bool EnableGenericDirectUiCandidate() noexcept;
     void AdoptDirectUiProfile(std::shared_ptr<DirectUiOwnedProfile> profile) noexcept;
 
 private:

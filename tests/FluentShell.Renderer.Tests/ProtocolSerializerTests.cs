@@ -27,6 +27,38 @@ public sealed class ProtocolSerializerTests
     }
 
     [Fact]
+    public void SemanticViolationNamingOneSurfaceIsAttributedToIt()
+    {
+        // Admission runs inside deserialization, so a page the renderer refuses has
+        // to name its surface here.  Without that the read loop can only treat it as
+        // a session fault, and one bad page would send every other window in the
+        // target process back to native with it.
+        var snapshot = TestData.Snapshot() with { Revision = "0" };
+        var scoped = Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage
+            {
+                SessionNonce = TestData.Nonce,
+                Window = snapshot,
+            })));
+        Assert.Equal(snapshot.SurfaceId, scoped.SurfaceScope);
+        Assert.Equal(TestData.Nonce, scoped.ScopeNonce);
+        // The rule that refused the page stays reachable for the log.
+        Assert.NotNull(scoped.InnerException);
+
+        // A session-scoped frame names no surface, so its violation stays fatal.
+        var fatal = Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.Heartbeat,
+            ProtocolSerializer.Serialize(new HeartbeatMessage
+            {
+                SessionNonce = TestData.Nonce,
+                SentAt = "-1",
+            })));
+        Assert.Null(fatal.SurfaceScope);
+        Assert.Null(fatal.ScopeNonce);
+    }
+
+    [Fact]
     public void RejectsFrameAndPayloadTypeMismatch()
     {
         var payload = ProtocolSerializer.Serialize(new HeartbeatMessage { SessionNonce = TestData.Nonce, SentAt = "1" });

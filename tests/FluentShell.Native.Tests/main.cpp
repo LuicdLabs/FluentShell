@@ -9,6 +9,7 @@
 #include <winrt/base.h>
 #include <objbase.h>
 #include <commctrl.h>
+#include <prsht.h>
 #include <UIAutomation.h>
 
 #include <array>
@@ -17,6 +18,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -282,6 +284,118 @@ void TestDirectUiEvidenceContracts() {
           !Translation::DirectUiHandoffMayPost(true, true, true, true, false),
         "DirectUI handoff ordering allowed a pre-restore or stale click");
 
+    Translation::DirectUiSlot generatedSlots[2];
+    generatedSlots[0].semanticKey = L"semantic.back";
+    generatedSlots[0].kind = Translation::ControlKind::Button;
+    generatedSlots[0].virtualSource = true;
+    generatedSlots[0].uiaEnabled = true;
+    generatedSlots[0].uiaFocusable = true;
+    generatedSlots[0].tabIndex = 0;
+    generatedSlots[0].action = Translation::DirectUiAction::HandoffPropertySheetButton;
+    generatedSlots[0].propertySheetButton = PSBTN_BACK;
+    generatedSlots[1].semanticKey = L"semantic.progress";
+    generatedSlots[1].kind = Translation::ControlKind::ProgressBar;
+    generatedSlots[1].virtualSource = false;
+    generatedSlots[1].nativeClass = PROGRESS_CLASSW;
+    Translation::DirectUiWindowProfile generatedProfile;
+    generatedProfile.adapterId = L"microsoft.windows.directui.semantic.v1";
+    generatedProfile.pageId = L"semantic-v1";
+    generatedProfile.rootClass = L"NativeHWNDHost";
+    generatedProfile.slots = generatedSlots;
+    generatedProfile.slotCount = std::size(generatedSlots);
+    generatedProfile.genericSemantic = true;
+    Translation::DirectUiNativeEvidence generatedNative;
+    generatedNative.root = DirectUiWindow(0x500, 50, 0, WS_VISIBLE | WS_POPUP);
+    generatedNative.directUi = DirectUiWindow(0x501, 51, 0);
+    generatedNative.root.bounds = { 10, 20, 410, 320 };
+    generatedNative.directUi.bounds = { 20, 50, 400, 300 };
+    generatedNative.title = L"semantic page";
+    generatedNative.root.text = generatedNative.title;
+    generatedNative.dpi = 120;
+    generatedNative.clientBounds = { 0, 0, 400, 300 };
+    generatedNative.clientOriginScreen = { 10, 20 };
+    generatedNative.pageHosts = { reinterpret_cast<HWND>(0x503) };
+    generatedNative.propertySheetPageHwnd = generatedNative.pageHosts[0];
+    generatedNative.implementationWindows = {
+        { generatedNative.directUi.hwnd, generatedNative.directUi.generation,
+          generatedNative.root.hwnd, L"DirectUIHWND", true },
+        { generatedNative.pageHosts[0], 53, generatedNative.directUi.hwnd,
+          L"#32770", true },
+        { reinterpret_cast<HWND>(0x502), 52, generatedNative.directUi.hwnd,
+          PROGRESS_CLASSW, true },
+    };
+    generatedNative.slotWindows.resize(std::size(generatedSlots));
+    generatedNative.slotWindows[1] = DirectUiWindow(0x502, 52, 100);
+    generatedNative.slotWindows[1].bounds = { 30, 100, 200, 120 };
+    generatedNative.slotWindows[1].minimum = 10;
+    generatedNative.slotWindows[1].maximum = 90;
+    generatedNative.slotWindows[1].position = 40;
+    generatedNative.slotWindows[1].indeterminate = true;
+    Translation::WindowSnapshot generatedSnapshot;
+    generatedSnapshot.adapterId = generatedProfile.adapterId;
+    generatedSnapshot.pageId = generatedProfile.pageId;
+    for (const auto& slot : generatedSlots) {
+        Translation::ControlNode node;
+        node.nodeId = Translation::DirectUiSemanticNodeId(
+            generatedProfile.adapterId, slot.semanticKey);
+        node.kind = slot.kind;
+        node.semanticKey = slot.semanticKey;
+        generatedSnapshot.nodes.push_back(std::move(node));
+    }
+    std::unordered_map<uint64_t, Translation::DirectUiActionBinding> generatedBindings;
+    auto refreshedNative = generatedNative;
+    refreshedNative.cloaked = true;
+    refreshedNative.slotWindows[1].position = 45;
+    Check(Translation::MatchDirectUiRefreshTransition(
+              generatedProfile, generatedNative, refreshedNative, error),
+        "generated DirectUI refresh rejected a canonical progress-only delta");
+    auto recreatedNative = refreshedNative;
+    recreatedNative.slotWindows[1].generation++;
+    recreatedNative.implementationWindows[2].generation++;
+    Check(!Translation::MatchDirectUiRefreshTransition(
+              generatedProfile, generatedNative, recreatedNative, error),
+        "generated DirectUI refresh accepted a recreated backing HWND");
+    auto reparentedNative = refreshedNative;
+    reparentedNative.implementationWindows[1].parent = generatedNative.root.hwnd;
+    Check(!Translation::MatchDirectUiRefreshTransition(
+              generatedProfile, generatedNative, reparentedNative, error),
+        "generated DirectUI refresh accepted changed implementation parenting");
+    auto ownerChangedNative = refreshedNative;
+    ownerChangedNative.ownerHwnd = reinterpret_cast<HWND>(0x504);
+    Check(!Translation::MatchDirectUiRefreshTransition(
+              generatedProfile, generatedNative, ownerChangedNative, error),
+        "generated DirectUI refresh accepted a changed owner");
+    auto uncloakedNative = refreshedNative;
+    uncloakedNative.cloaked = false;
+    Check(!Translation::MatchDirectUiRefreshTransition(
+              generatedProfile, generatedNative, uncloakedNative, error),
+        "generated DirectUI refresh accepted cloak loss");
+    Check(Translation::DirectUiCaptureFailureIsTopologyChange(
+              L"generic A/B: root class or descendant count changed") &&
+          !Translation::DirectUiCaptureFailureIsTopologyChange(
+              L"source UI thread did not acknowledge DirectUI native evidence capture"),
+        "DirectUI topology-change classification is not fail-closed");
+    Check(Translation::RefreshDirectUiSnapshotFromNative(generatedProfile,
+              refreshedNative, generatedSnapshot, generatedBindings, error),
+        "generated DirectUI snapshot did not refresh from canonical native evidence");
+    const auto backBinding = generatedBindings.find(generatedSnapshot.nodes[0].nodeId);
+    Check(backBinding != generatedBindings.end() &&
+          backBinding->second.hwnd == generatedNative.root.hwnd &&
+          backBinding->second.generation == generatedNative.root.generation &&
+          backBinding->second.action ==
+              Translation::DirectUiAction::HandoffPropertySheetButton &&
+          backBinding->second.propertySheetButton == PSBTN_BACK,
+        "virtual property-sheet action was not rebound to the canonical root");
+    Check(generatedSnapshot.nodes[1].minimum == 10 &&
+          generatedSnapshot.nodes[1].maximum == 90 &&
+          generatedSnapshot.nodes[1].position == 45 &&
+          generatedSnapshot.nodes[1].indeterminate,
+        "native-backed DirectUI progress state was not refreshed");
+    generatedSnapshot.nodes[0].nodeId++;
+    Check(!Translation::RefreshDirectUiSnapshotFromNative(generatedProfile,
+              generatedNative, generatedSnapshot, generatedBindings, error),
+        "generated DirectUI refresh accepted a changed semantic identity");
+
     // The admitted profile set is exactly the two known application pages.
     Check(Translation::kDirectUiProfileCount == 2 &&
           TestProfileById(L"microsoft.mdsched.directui") != nullptr &&
@@ -311,6 +425,198 @@ void TestDirectUiEvidenceContracts() {
           recovery->census.visibleNotifyWrappers == 3 &&
           recovery->census.hiddenNotifyWrappers == 2,
         "RecoveryDrive profile does not pin its observed page text, tab owner, and census");
+}
+
+// The in-place routes are the ones that keep a capability-derived page
+// projected: a request only resolves to a route the binding actually
+// advertised, only the in-place routes are classified as in place, and the
+// recapture accepts nothing but the acting control's own mutable delta.
+void TestDirectUiInPlaceRoutes() {
+    Translation::DirectUiActionBinding combo;
+    combo.kind = Translation::ControlKind::ComboBox;
+    combo.action = Translation::DirectUiAction::SelectListItem;
+    combo.secondaryAction = Translation::DirectUiAction::SetEditText;
+    Check(Translation::DirectUiActionForRequest(combo, L"select") ==
+              Translation::DirectUiAction::SelectListItem &&
+          Translation::DirectUiActionForRequest(combo, L"setText") ==
+              Translation::DirectUiAction::SetEditText,
+        "editable combo binding did not resolve both advertised routes");
+    Check(Translation::DirectUiActionForRequest(combo, L"setSelection") ==
+              Translation::DirectUiAction::None &&
+          Translation::DirectUiActionForRequest(combo, L"invoke") ==
+              Translation::DirectUiAction::None &&
+          Translation::DirectUiActionForRequest(combo, L"") ==
+              Translation::DirectUiAction::None,
+        "combo binding accepted a route it never advertised");
+
+    Translation::DirectUiActionBinding list;
+    list.kind = Translation::ControlKind::ListView;
+    list.action = Translation::DirectUiAction::SelectListItem;
+    list.secondaryAction = Translation::DirectUiAction::SetItemCheck;
+    Check(Translation::DirectUiActionForRequest(list, L"setSelection") ==
+              Translation::DirectUiAction::SelectListItem &&
+          Translation::DirectUiActionForRequest(list, L"setItemCheck") ==
+              Translation::DirectUiAction::SetItemCheck &&
+          Translation::DirectUiActionForRequest(list, L"select") ==
+              Translation::DirectUiAction::None,
+        "ListView binding did not name its own selection route");
+
+    Translation::DirectUiActionBinding link;
+    link.kind = Translation::ControlKind::SysLink;
+    link.action = Translation::DirectUiAction::HandoffLinkClick;
+    Check(Translation::DirectUiActionForRequest(link, L"invoke") ==
+              Translation::DirectUiAction::HandoffLinkClick &&
+          !Translation::IsDirectUiInPlaceAction(link.action),
+        "a SysLink handoff was classified as an in-place mutation");
+    Check(Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::ToggleCheck) &&
+          Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::SelectRadio) &&
+          Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::SetEditText) &&
+          Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::SelectListItem) &&
+          Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::SetItemCheck) &&
+          Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::ToolbarCommand),
+        "an in-place DirectUI route was classified as a handoff");
+    Check(!Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::None) &&
+          !Translation::IsDirectUiInPlaceAction(Translation::DirectUiAction::HandoffClick) &&
+          !Translation::IsDirectUiInPlaceAction(
+              Translation::DirectUiAction::HandoffPropertySheetButton),
+        "a handoff DirectUI route was classified in place");
+
+    // Only a handoff that replaces the page inside the same top-level window may
+    // keep its projection. A route that ends the window must stay terminal.
+    Translation::DirectUiActionBinding sheet;
+    sheet.action = Translation::DirectUiAction::HandoffPropertySheetButton;
+    for (const int button : {PSBTN_BACK, PSBTN_NEXT, PSBTN_FINISH}) {
+        sheet.propertySheetButton = button;
+        Check(Translation::DirectUiNavigationMayStayProjected(sheet),
+            "a property-sheet page navigation was refused the in-place route");
+    }
+    sheet.propertySheetButton = PSBTN_CANCEL;
+    Check(!Translation::DirectUiNavigationMayStayProjected(sheet),
+        "Cancel was allowed to keep a projection it ends");
+    sheet.propertySheetButton = PSBTN_NEXT;
+    sheet.cancel = true;
+    Check(!Translation::DirectUiNavigationMayStayProjected(sheet),
+        "a cancel-declared property-sheet slot kept its projection");
+
+    Translation::DirectUiActionBinding click;
+    click.action = Translation::DirectUiAction::HandoffClick;
+    Check(Translation::DirectUiNavigationMayStayProjected(click),
+        "a plain handoff click was refused the in-place navigation route");
+    click.action = Translation::DirectUiAction::HandoffLinkClick;
+    Check(Translation::DirectUiNavigationMayStayProjected(click),
+        "a SysLink handoff was refused the in-place navigation route");
+    click.cancel = true;
+    Check(!Translation::DirectUiNavigationMayStayProjected(click),
+        "a cancel-declared link kept its projection");
+    click.cancel = false;
+    click.propertySheetButton = PSBTN_CANCEL;
+    Check(!Translation::DirectUiNavigationMayStayProjected(click),
+        "a click carrying a property-sheet button took the wrong navigation route");
+
+    Translation::DirectUiActionBinding inPlace;
+    inPlace.action = Translation::DirectUiAction::ToggleCheck;
+    Check(!Translation::DirectUiNavigationMayStayProjected(inPlace) &&
+          !Translation::DirectUiNavigationMayStayProjected(
+              Translation::DirectUiActionBinding{}),
+        "a non-handoff route claimed the in-place page navigation lane");
+
+    // Two native-backed slots on a capability-derived page: the acting edit box
+    // and a bystander ListView whose own state may not move alongside it.
+    constexpr uint32_t childStyle = static_cast<uint32_t>(WS_VISIBLE | WS_CHILD);
+    Translation::DirectUiSlot slots[2];
+    slots[0].semanticKey = L"summary";
+    slots[0].kind = Translation::ControlKind::Edit;
+    slots[0].virtualSource = false;
+    slots[0].nativeClass = L"Edit";
+    slots[0].action = Translation::DirectUiAction::SetEditText;
+    slots[0].nativeStyleValue = childStyle;
+    slots[0].nativeStyleAlt = childStyle;
+    slots[0].nativeStyleMask = UINT64_MAX;
+    slots[0].captureDetail = true;
+    slots[1].semanticKey = L"volumes";
+    slots[1].kind = Translation::ControlKind::ListView;
+    slots[1].virtualSource = false;
+    slots[1].nativeClass = WC_LISTVIEWW;
+    slots[1].action = Translation::DirectUiAction::SelectListItem;
+    slots[1].secondaryAction = Translation::DirectUiAction::SetItemCheck;
+    slots[1].nativeStyleValue = childStyle;
+    slots[1].nativeStyleAlt = childStyle;
+    slots[1].nativeStyleMask = UINT64_MAX;
+    slots[1].captureDetail = true;
+    Translation::DirectUiWindowProfile profile;
+    profile.adapterId = L"microsoft.windows.directui.semantic.v1";
+    profile.pageId = L"semantic-v1";
+    profile.rootClass = L"NativeHWNDHost";
+    profile.slots = slots;
+    profile.slotCount = std::size(slots);
+    profile.genericSemantic = true;
+
+    Translation::DirectUiNativeEvidence before;
+    before.root = DirectUiWindow(0x600, 60, 0, WS_VISIBLE | WS_POPUP);
+    before.directUi = DirectUiWindow(0x601, 61, 0);
+    before.root.bounds = { 0, 0, 500, 400 };
+    before.directUi.bounds = { 0, 0, 500, 400 };
+    before.title = L"in-place page";
+    before.root.text = before.title;
+    before.dpi = 96;
+    before.mutationEpoch = 7;
+    before.clientBounds = { 0, 0, 500, 400 };
+    before.slotWindows.resize(std::size(slots));
+    before.slotWindows[0] = DirectUiWindow(0x602, 62, 40);
+    before.slotWindows[0].text = L"before text";
+    before.slotWindows[0].hasDetail = true;
+    before.slotWindows[0].detail.kind = Translation::ControlKind::Edit;
+    before.slotWindows[0].detail.text = L"before text";
+    before.slotWindows[1] = DirectUiWindow(0x603, 63, 120);
+    before.slotWindows[1].hasDetail = true;
+    before.slotWindows[1].detail.kind = Translation::ControlKind::ListView;
+    before.slotWindows[1].detail.checkBoxes = true;
+    before.slotWindows[1].detail.items = { L"Volume 1", L"Volume 2" };
+    before.slotWindows[1].detail.selectedIndices = { 0 };
+    before.slotWindows[1].detail.checkedIndices = { 0 };
+
+    std::wstring error;
+    auto accepted = before;
+    accepted.mutationEpoch = before.mutationEpoch + 1;
+    accepted.slotWindows[0].text = L"after text";
+    accepted.slotWindows[0].detail.text = L"after text";
+    accepted.slotWindows[0].detail.selectionStart = 10;
+    Check(Translation::MatchDirectUiInPlaceMutation(profile, before, accepted, 0, error),
+        "in-place mutation rejected the acting edit slot's own text delta");
+    auto bystander = accepted;
+    bystander.slotWindows[1].detail.selectedIndices = { 1 };
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, bystander, 0, error),
+        "in-place mutation accepted an unrelated slot's selection change");
+    auto reshaped = accepted;
+    reshaped.slotWindows[0].detail.readOnly = true;
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, reshaped, 0, error),
+        "in-place mutation accepted a shape change on the acting slot");
+    // The pinned style mask is what keeps ES_READONLY and CBS_DROPDOWN from
+    // flipping under a projected page, so the derived route set stays true.
+    auto restyled = accepted;
+    restyled.slotWindows[0].style |= ES_READONLY;
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, restyled, 0, error),
+        "in-place mutation accepted a pinned style flip on the acting slot");
+    auto disabled = accepted;
+    disabled.slotWindows[0].enabled = false;
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, disabled, 0, error),
+        "in-place mutation accepted the acting slot disabling itself");
+    auto retitled = accepted;
+    retitled.title = L"another page";
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, retitled, 0, error),
+        "in-place mutation accepted a page-level change alongside the delta");
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, accepted, 2, error),
+        "in-place mutation accepted an acting slot outside the profile");
+
+    // The same delta is canonical when it is credited to the slot that produced
+    // it, and only to that slot.
+    auto listDelta = before;
+    listDelta.slotWindows[1].detail.selectedIndices = { 1 };
+    listDelta.slotWindows[1].detail.checkedIndices = { 0, 1 };
+    Check(Translation::MatchDirectUiInPlaceMutation(profile, before, listDelta, 1, error),
+        "in-place mutation rejected the ListView's own selection and check delta");
+    Check(!Translation::MatchDirectUiInPlaceMutation(profile, before, listDelta, 0, error),
+        "in-place mutation credited the ListView delta to the edit slot");
 }
 
 HICON CreateColorIcon(
@@ -606,8 +912,15 @@ void TestStrictMessageValidation() {
     Check(!Translation::ParseHello(
         ReplaceOnce(validHello, "\"protocolMajor\": 1", "\"protocolMajor\": 1.5"),
         hello, error), "fractional hello major was accepted");
+    // Derived from the constant so a minor bump cannot quietly turn this into a
+    // no-op: ReplaceOnce leaves the payload untouched when its needle is gone.
+    const std::string currentMinor =
+        "\"protocolMinor\": " + std::to_string(Ipc::kProtocolMinor);
+    Check(validHello.find(currentMinor) != std::string::npos,
+        "hello fixture no longer declares the current protocol minor");
     Check(Translation::ParseHello(
-        ReplaceOnce(validHello, "\"protocolMinor\": 12", "\"protocolMinor\": 13"),
+        ReplaceOnce(validHello, currentMinor,
+            "\"protocolMinor\": " + std::to_string(Ipc::kProtocolMinor + 1)),
         hello, error), "future same-major hello minor was rejected");
 
     const std::string actionPrefix =
@@ -1928,6 +2241,7 @@ void TestToolbarCaptureBoundary() {
 int wmain() {
     TestVisibleUiaBoundsClipping();
     TestDirectUiEvidenceContracts();
+    TestDirectUiInPlaceRoutes();
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     INITCOMMONCONTROLSEX controls{ sizeof(controls),
         ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };

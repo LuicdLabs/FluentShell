@@ -260,6 +260,22 @@ public sealed class ControlFactoryTests
         Assert.Equal(new global::Windows.Foundation.Rect(178, 203, 353, 379), expanded);
     }
 
+    // The Bridge's committed UIA gate enumerates the proxy with the control-view
+    // condition, so whichever element carries the node identity must remain in that
+    // view. Only a variant that wraps the Image in a peer-publishing ContentControl
+    // may drop the Image itself to the raw view.
+    [Theory]
+    [InlineData("standard", false)]
+    [InlineData("mainIcon", false)]
+    [InlineData("", false)]
+    [InlineData("bitmapDisplay", true)]
+    [InlineData("monitorPalette", true)]
+    public void StaticIconHidesItsImageOnlyWhenASemanticWrapperRepublishesIt(
+        string presentationVariant, bool wrapped)
+    {
+        Assert.Equal(wrapped, ControlFactory.StaticIconUsesSemanticWrapper(presentationVariant));
+    }
+
     [Fact]
     public void StaticIconPixelsAreOwnedBgraBytes()
     {
@@ -307,6 +323,52 @@ public sealed class ControlFactoryTests
         });
 
         Assert.Equal(expected, ControlFactory.AcceptsReturnFor(node));
+    }
+
+    [Fact]
+    public void CapabilityLaneActionGatesFollowEachSlotsAdvertisedRoutes()
+    {
+        static ControlNodeViewModel Semantic(string kind, params string[] actions) =>
+            ControlNodeViewModel.FromSnapshot(new ControlNode
+            {
+                NodeId = "1", Generation = "1", NativeHwnd = "0x2", Kind = kind,
+                Rect = new PixelRect { Width = 200, Height = 24 },
+                Visible = true, Enabled = true, Text = string.Empty,
+                AutomationName = "Localized " + kind,
+                AdapterId = "microsoft.windows.directui.semantic.v1", PageId = "semantic-v1",
+                SemanticKey = kind + "slot", SourceKind = "nativeBacking",
+                PresentationVariant = "standard", SupportedActions = [.. actions],
+                HelpText = string.Empty, AccessKey = string.Empty,
+            });
+
+        // A generated slot's routes come from that revision's own typed state, so
+        // the factory refuses anything the profile did not advertise even when the
+        // WinUI control is perfectly capable of raising it.
+        var checkList = Semantic("listView", "setSelection", "setItemCheck");
+        Assert.True(ControlFactory.AllowsAction(checkList, "setSelection"));
+        Assert.True(ControlFactory.AllowsAction(checkList, "setItemCheck"));
+        Assert.False(ControlFactory.AllowsAction(checkList, "select"));
+        Assert.False(ControlFactory.AllowsAction(Semantic("listView", "setSelection"), "setItemCheck"));
+
+        var editableCombo = Semantic("comboBox", "select", "setText");
+        Assert.True(ControlFactory.AllowsAction(editableCombo, "select"));
+        Assert.True(ControlFactory.AllowsAction(editableCombo, "setText"));
+        Assert.False(ControlFactory.AllowsAction(Semantic("comboBox", "select"), "setText"));
+
+        // A read-only edit box and a disabled slot advertise nothing at all.
+        Assert.False(ControlFactory.AllowsAction(Semantic("edit"), "setText"));
+        Assert.False(ControlFactory.AllowsAction(Semantic("button"), "invoke"));
+
+        Assert.True(ControlFactory.AllowsAction(Semantic("sysLink", "invoke"), "invoke"));
+        Assert.True(ControlFactory.AllowsAction(Semantic("radioButton", "setCheck"), "setCheck"));
+        var toolbar = Semantic("toolbar", "toolbarCommand");
+        Assert.True(ControlFactory.AllowsAction(toolbar, "toolbarCommand"));
+        Assert.False(ControlFactory.AllowsAction(toolbar, "invoke"));
+
+        // Ordinary Win32 surfaces carry no adapter id and no route list, so the
+        // gate stays open for them; closing it would make every dialog inert.
+        Assert.True(ControlFactory.AllowsAction(Node("win32", "listView", 0), "setSelection"));
+        Assert.True(ControlFactory.AllowsAction(Node("win32", "edit", 0), "setText"));
     }
 
     private static ControlNodeViewModel Node(

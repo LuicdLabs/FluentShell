@@ -126,6 +126,27 @@ bool ProbeListBox(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
     return true;
 }
 
+bool ProbeBitmapDisplay(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if ((style & (WS_TABSTOP | SS_NOTIFY)) != 0)
+        return Reject(reason, L"interactive BitmapDisplayClass is not supported");
+    kind = ControlKind::StaticIcon;
+    return true;
+}
+
+bool ProbeBitmapSwitch(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if ((style & SS_NOTIFY) != 0)
+        return Reject(reason, L"callback BitmapSwitchClass is not supported");
+    kind = ControlKind::RadioButton;
+    return true;
+}
+
+bool ProbeMonitorPalette(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if ((style & SS_NOTIFY) != 0)
+        return Reject(reason, L"callback MonitorPaletteClass is not supported");
+    kind = ControlKind::StaticIcon;
+    return true;
+}
+
 bool ProbeProgressBar(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
     if ((style & (PBS_VERTICAL | WS_TABSTOP)) != 0) {
         return Reject(reason,
@@ -312,6 +333,9 @@ struct ClassAdapter final {
 // establish support.
 constexpr std::array kClassAdapters{
     ClassAdapter{ L"Static", &ProbeStatic },
+    ClassAdapter{ L"BitmapDisplayClass", &ProbeBitmapDisplay },
+    ClassAdapter{ L"BitmapSwitchClass", &ProbeBitmapSwitch },
+    ClassAdapter{ L"MonitorPaletteClass", &ProbeMonitorPalette },
     ClassAdapter{ L"Button", &ProbeButton },
     ClassAdapter{ L"Edit", &ProbeEdit },
     ClassAdapter{ L"ComboBox", &ProbeComboBox },
@@ -469,7 +493,87 @@ bool CaptureIconPixels(
     return true;
 }
 
+bool CaptureToggleState(HWND hwnd, ControlNode& node, std::wstring&);
+
+bool CaptureWindowPixels(
+    HWND hwnd,
+    uint32_t maxDimension,
+    size_t maxBytes,
+    uint32_t& imageWidth,
+    uint32_t& imageHeight,
+    std::wstring& imageFormat,
+    std::vector<uint8_t>& imageData,
+    std::wstring& reason) {
+    RECT client{};
+    if (!GetClientRect(hwnd, &client))
+        return Reject(reason, L"bitmap display client bounds are unavailable");
+    const int width = client.right - client.left;
+    const int height = client.bottom - client.top;
+    if (width <= 0 || height <= 0 ||
+        width > static_cast<int>(maxDimension) ||
+        height > static_cast<int>(maxDimension)) {
+        return Reject(reason, L"bitmap display dimensions are outside the protocol cap");
+    }
+    const size_t byteCount = static_cast<size_t>(width) * height * 4;
+    if (byteCount == 0 || byteCount > maxBytes)
+        return Reject(reason, L"bitmap display pixels exceed the protocol cap");
+
+    HDC source = GetDC(hwnd);
+    HDC memory = source ? CreateCompatibleDC(source) : nullptr;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = memory ? CreateDIBSection(
+        memory, &info, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    HGDIOBJ previous = bitmap ? SelectObject(memory, bitmap) : nullptr;
+    const bool copied = source && memory && bitmap && bits && previous &&
+        (PrintWindow(hwnd, memory, PW_CLIENTONLY | PW_RENDERFULLCONTENT) != FALSE ||
+         BitBlt(memory, 0, 0, width, height, source, 0, 0, SRCCOPY | CAPTUREBLT) != FALSE);
+    if (copied) {
+        imageWidth = static_cast<uint32_t>(width);
+        imageHeight = static_cast<uint32_t>(height);
+        imageFormat = L"bgra8-premultiplied";
+        const auto* first = static_cast<const uint8_t*>(bits);
+        imageData.assign(first, first + byteCount);
+        for (size_t offset = 3; offset < imageData.size(); offset += 4)
+            imageData[offset] = 255;
+    }
+    if (previous) SelectObject(memory, previous);
+    if (bitmap) DeleteObject(bitmap);
+    if (memory) DeleteDC(memory);
+    if (source) ReleaseDC(hwnd, source);
+    return copied || Reject(reason, L"bitmap display pixels could not be copied");
+}
+
+bool CaptureBitmapSwitchState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    node.checked = (style & WS_TABSTOP) != 0 ? 1 : 0;
+    node.groupStart = (style & WS_GROUP) != 0;
+    return CaptureWindowPixels(hwnd, Ipc::kMaxDirectUiBitmapDimension,
+        Ipc::kMaxDirectUiBitmapBytes, node.imageWidth, node.imageHeight,
+        node.imageFormat, node.imageData, reason);
+}
+
+bool CaptureRadioState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    wchar_t className[kMaxClassNameChars]{};
+    if (FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, className), L"BitmapSwitchClass"))
+        return CaptureBitmapSwitchState(hwnd, node, reason);
+    return CaptureToggleState(hwnd, node, reason);
+}
+
 bool CaptureStaticIconState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    wchar_t className[kMaxClassNameChars]{};
+    if (FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, className), L"BitmapDisplayClass") ||
+        FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, className), L"MonitorPaletteClass")) {
+        return CaptureWindowPixels(hwnd, Ipc::kMaxDirectUiBitmapDimension,
+            Ipc::kMaxDirectUiBitmapBytes, node.imageWidth, node.imageHeight,
+            node.imageFormat, node.imageData, reason);
+    }
     HICON icon = reinterpret_cast<HICON>(SendMessageW(hwnd, STM_GETICON, 0, 0));
     if (!icon) icon = reinterpret_cast<HICON>(SendMessageW(hwnd, STM_GETIMAGE, IMAGE_ICON, 0));
     if (!icon) return Reject(reason, L"Static icon has no current HICON");
@@ -1112,7 +1216,7 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
     at(ControlKind::Button) = &CaptureButtonState;
     at(ControlKind::CheckBox) = &CaptureToggleState;
     at(ControlKind::ThreeState) = &CaptureToggleState;
-    at(ControlKind::RadioButton) = &CaptureToggleState;
+    at(ControlKind::RadioButton) = &CaptureRadioState;
     at(ControlKind::Edit) = &CaptureTextEntryState;
     at(ControlKind::Password) = &CaptureTextEntryState;
     at(ControlKind::ComboBox) = &CaptureStringListState;
@@ -1142,6 +1246,19 @@ bool CaptureOwnedIconPixels(
     std::vector<uint8_t>& imageData,
     std::wstring& reason) {
     return CaptureIconPixels(icon, imageWidth, imageHeight, imageFormat, imageData, reason);
+}
+
+bool CaptureOwnedWindowPixels(
+    HWND hwnd,
+    uint32_t maxDimension,
+    size_t maxBytes,
+    uint32_t& imageWidth,
+    uint32_t& imageHeight,
+    std::wstring& imageFormat,
+    std::vector<uint8_t>& imageData,
+    std::wstring& reason) {
+    return CaptureWindowPixels(hwnd, maxDimension, maxBytes, imageWidth, imageHeight,
+        imageFormat, imageData, reason);
 }
 
 std::wstring_view ClassNameOf(HWND hwnd, wchar_t (&buffer)[kMaxClassNameChars]) noexcept {
@@ -1184,9 +1301,13 @@ bool IsCompositeImplementationChild(HWND hwnd) noexcept {
         return GetComboBoxInfo(parent, &info) &&
             (hwnd == info.hwndItem || hwnd == info.hwndList);
     }
-    if (!FluentShell::EqualsIgnoreCase(parentClass, WC_LISTVIEWW)) return false;
     wchar_t childBuffer[kMaxClassNameChars]{};
-    return FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, childBuffer), WC_HEADERW);
+    if (FluentShell::EqualsIgnoreCase(parentClass, L"MonitorPaletteClass")) {
+        return FluentShell::EqualsIgnoreCase(
+            ClassNameOf(hwnd, childBuffer), L"MonitorPaletteEntryClass");
+    }
+    return FluentShell::EqualsIgnoreCase(parentClass, WC_LISTVIEWW) &&
+        FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, childBuffer), WC_HEADERW);
 }
 
 } // namespace FluentShell::Bridge::Translation

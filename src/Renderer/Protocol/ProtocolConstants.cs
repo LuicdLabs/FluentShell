@@ -17,8 +17,12 @@ public static class ProtocolConstants
     // page) with projected native checkbox toggles; minor 10 adds its canonical
     // native-backed explanatory text; minor 11 adds the fail-closed
     // capability-derived DirectUI semantic adapter contract; minor 12 adds
-    // explicit determinate/marquee ProgressBar state.
-    public const ushort Minor = 12;
+    // explicit determinate/marquee ProgressBar state; minor 13 adds bounded
+    // owned DirectUI bitmap-display and bitmap-switch pixels; minor 14 admits
+    // every UIA control type the Win32 adapter registry can back on a
+    // capability-derived DirectUI surface, and lets one projected node
+    // advertise two in-place routes.
+    public const ushort Minor = 14;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;
@@ -35,7 +39,10 @@ public static class ProtocolConstants
     public const int MaxMenuDepth = 8;
     public const int MaxImageDimension = 96;
     public const int MaxImageBytes = MaxImageDimension * MaxImageDimension * 4;
+    public const int MaxDirectUiBitmapDimension = 1024;
+    public const int MaxDirectUiBitmapBytes = 2 * 1024 * 1024;
     public const int MaxImageBase64Chars = (MaxImageBytes + 2) / 3 * 4;
+    public const int MaxDirectUiBitmapBase64Chars = (MaxDirectUiBitmapBytes + 2) / 3 * 4;
 }
 
 public enum FrameMessageType : ushort
@@ -88,7 +95,26 @@ public static class MessageTypeNames
     };
 }
 
-public sealed class ProtocolException(string message) : IOException(message);
+/// <summary>
+/// A protocol violation.  <see cref="SurfaceScope"/> names the surface the violation
+/// belongs to when the frame identified one: admission runs inside deserialization,
+/// so without that attribution a malformed page in one window would arrive as an
+/// untyped frame fault and take the whole session -- every other correctly projecting
+/// window in the target process -- down with it.  It is null for session-scoped
+/// frames, whose violations are genuinely fatal.  <see cref="ScopeNonce"/> carries
+/// the session nonce that frame declared, so a scope is only ever honoured for the
+/// session it was raised in.  Attributing a violation keeps the rule that raised it
+/// as the inner exception, so a fault that ends up reported as fatal after all still
+/// names the admission rule it came from.
+/// </summary>
+public sealed class ProtocolException(
+    string message, Guid? surfaceScope = null, string? scopeNonce = null,
+    Exception? inner = null) : IOException(message, inner)
+{
+    public Guid? SurfaceScope { get; } = surfaceScope;
+
+    public string? ScopeNonce { get; } = scopeNonce;
+}
 
 /// <summary>
 /// The Bridge closed the pipe at a frame boundary.  This is how an ordinary session

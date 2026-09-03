@@ -150,6 +150,26 @@ private:
     // after every lock this pass took has been released.
     const wchar_t* ReconcileSurface(const std::shared_ptr<Surface>& surface);
     const wchar_t* PublishReconciledSnapshot(ReconcilePass& pass);
+    // In-place DirectUI page swap.  A handoff-declared route that only replaces
+    // the page inside the same top-level window keeps its projection: the proxy
+    // holds the screen behind a re-armed input gate while the bridge admits the
+    // page that replaced this one and republishes it as one full-snapshot patch.
+    // All five run with the surface canonical barrier held.
+    uint64_t BeginDirectUiPageSwap(
+        const std::shared_ptr<Surface>& surface, std::wstring_view trigger);
+    void EndDirectUiPageSwap(const std::shared_ptr<Surface>& surface) noexcept;
+    const wchar_t* AdvanceDirectUiPageSwap(ReconcilePass& pass);
+    const wchar_t* ReadmitDirectUiPage(ReconcilePass& pass);
+    const wchar_t* ReleaseDirectUiSwapGate(ReconcilePass& pass);
+    // Gives a DirectUI surface back to native and permits exactly one more
+    // discovery attempt.  A navigation the lane refused is not evidence that the
+    // window itself is unsupportable, so the page the application settled on gets
+    // a chance instead of being stranded native for the rest of the process.
+    // Must be called with the surface canonical barrier released.
+    void FallBackFromDirectUiHandoff(
+        const std::shared_ptr<Surface>& surface,
+        const std::shared_ptr<SourceThreadAgent>& agent,
+        std::wstring_view reason) noexcept;
     // Everything the rollback path needs, captured once under the barrier so no
     // stage can read a surface another thread is concurrently changing.
     struct RestoreAttempt;

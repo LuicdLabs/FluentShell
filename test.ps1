@@ -1,4 +1,4 @@
-# AnyFluent test and production-layout gates
+# FluentShell test and production-layout gates
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",

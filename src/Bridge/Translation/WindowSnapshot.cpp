@@ -209,7 +209,8 @@ JsonObject NodeToJson(const ControlNode& node) {
         itemExpanded.Append(JsonValue::CreateBooleanValue(expanded));
     }
     result.Insert(L"itemExpanded", itemExpanded);
-    if (node.kind == ControlKind::StaticIcon) {
+    if (node.kind == ControlKind::StaticIcon ||
+        (node.kind == ControlKind::RadioButton && !node.imageData.empty())) {
         result.Insert(L"imageWidth", JsonValue::CreateNumberValue(node.imageWidth));
         result.Insert(L"imageHeight", JsonValue::CreateNumberValue(node.imageHeight));
         result.Insert(L"imageFormat", JsonValue::CreateStringValue(node.imageFormat));
@@ -336,7 +337,7 @@ bool ValidateJsonLimits(std::string_view payload, std::wstring& error) noexcept 
                 inString = false;
                 continue;
             }
-            if (++stringBytes > Ipc::kMaxStringChars) {
+            if (++stringBytes > Ipc::kMaxJsonStringChars) {
                 error = L"JSON string exceeds limit";
                 return false;
             }

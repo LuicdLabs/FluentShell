@@ -2,7 +2,7 @@
 
 ## Product Contract
 
-AnyFluent projects explicitly supported, interrogable Win32 control contracts
+FluentShell projects explicitly supported, interrogable Win32 control contracts
 into real WinUI 3 controls. Native HWND state remains authoritative. It does
 not claim that arbitrary GDI pixels or private window procedures can be
 reconstructed as equivalent XAML.
@@ -55,7 +55,9 @@ cannot prove equivalent.
 - Remove repeated discovery noise from the Bridge log.
 - Add noninteractive `BS_GROUPBOX` projection with UIA Group semantics.
 - Add determinate horizontal `msctls_progress32` projection with UIA RangeValue.
-- Keep marquee, vertical, custom-draw, and invalid-range progress controls native.
+- Marquee progress is represented explicitly as indeterminate WinUI ProgressBar
+  state and exposes no RangeValue pattern. Keep vertical, custom-draw, and
+  invalid-range progress controls native.
 
 ### Tranche B: Window Graph And Static Assets
 
@@ -124,12 +126,19 @@ adapter.
 
 This is the only supported lane for private/custom HWND contracts.
 
-The DirectUI translation engine is implemented generically in
-`DirectUiEngine.cpp` with declarative per-application profiles in
-`DirectUiProfiles.cpp`; see `DIRECTUI-APPLICATION-ADAPTERS.md`. Two exact
-first-page profiles are admitted: MdSched `10.0.26100.7309` and RecoveryDrive
-`10.0.26100.33296` (Microsoft-signed System32 images only). Later wizard pages
-and any other DirectUI host remain native.
+The DirectUI translation engine is implemented in `DirectUiEngine.cpp` with
+both declarative exact profiles and fail-closed, capability-derived per-surface
+profiles; see `DIRECTUI-APPLICATION-ADAPTERS.md`. Exact profiles remain for
+MdSched `10.0.26100.7309` and RecoveryDrive `10.0.26100.33296`. Generated
+profiles are restricted to Microsoft-signed canonical System32 images, and every
+projected slot takes its kind from the registered Win32 adapter that backs it, so
+the DirectUI lane's boundary is this roadmap's boundary rather than a second list
+maintained per application. Tranche A/B statics and buttons, Tranche C's one-row
+toolbar and textual status bar, and Tranche E's report ListView and textual tab
+control are all admissible on any built-in DirectUI page because their registry
+rows exist; `SysTreeView32` and `msctls_trackbar32` have no row, so they are the
+two roles that still keep a DirectUI page native. Unsupported custom or
+unexpectedly actionable roles keep the complete surface native.
 
 ## Target Findings
 

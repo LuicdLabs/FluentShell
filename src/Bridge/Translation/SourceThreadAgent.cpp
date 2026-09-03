@@ -4,6 +4,7 @@
 #include "../../Common/FluentShell.h"
 
 #include <commctrl.h>
+#include <prsht.h>
 #include <dwmapi.h>
 
 #include <algorithm>
@@ -36,6 +37,11 @@ constexpr UINT kCommandRestoreThenDirectUiClick = 9;
 constexpr UINT kCommandDirectUiToggle = 10;
 constexpr UINT kCommandDirectUiMove = 11;
 constexpr UINT kCommandCaptureDirectUiBootstrap = 12;
+constexpr UINT kCommandPostDirectUiPropertySheetButton = 13;
+constexpr UINT kCommandPlaceBehind = 14;
+constexpr UINT kCommandRestoreDirectUiActivation = 15;
+constexpr UINT kCommandDirectUiNodeAction = 16;
+constexpr UINT kCommandNavigateDirectUiProjected = 17;
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
 constexpr wchar_t kDirectUiGenerationProperty[] = L"FluentShell.Bridge.DirectUiGeneration";
 
@@ -70,6 +76,7 @@ struct Command final {
     DirectUiNativeEvidence expectedDirectUiEvidence;
     DirectUiActionBinding directUiBinding;
     const DirectUiWindowProfile* profile = nullptr;
+    HWND sibling = nullptr;
     ActionOutcome outcome;
     bool captured = false;
     bool cloaked = false;
@@ -319,6 +326,7 @@ bool RelevantMessage(UINT message) noexcept {
     case PBM_SETRANGE32:
     case PBM_SETSTEP:
     case PBM_SETSTATE:
+    case PBM_SETMARQUEE:
         return true;
     default:
         return false;
@@ -882,10 +890,17 @@ bool ExecuteRestoreThenDirectUiClick(Command* command) {
     }
     const DirectUiActionBinding& binding = command->directUiBinding;
     const size_t slot = binding.slotIndex;
-    bool bindingMatches = slot < command->profile->slotCount &&
+    // Both handoff routes are declared by the slot itself, so the binding may
+    // only reach the one its own profile row published.
+    const bool handoffRoute = binding.action == DirectUiAction::HandoffClick ||
+        binding.action == DirectUiAction::HandoffLinkClick;
+    bool bindingMatches = slot < command->profile->slotCount && handoffRoute &&
+        command->profile->slots[slot].action == binding.action &&
+        !command->profile->slots[slot].virtualSource &&
         slot < current.slotWindows.size() &&
         current.slotWindows[slot].hwnd == binding.hwnd &&
-        current.slotWindows[slot].generation == binding.generation;
+        current.slotWindows[slot].generation == binding.generation &&
+        current.slotWindows[slot].enabled;
     if (!bindingMatches) {
         command->error = L"DirectUI handoff backing generation changed";
         return true;
@@ -905,7 +920,8 @@ bool ExecuteRestoreThenDirectUiClick(Command* command) {
     }
     bindingMatches = slot < restored.slotWindows.size() &&
         restored.slotWindows[slot].hwnd == binding.hwnd &&
-        restored.slotWindows[slot].generation == binding.generation;
+        restored.slotWindows[slot].generation == binding.generation &&
+        restored.slotWindows[slot].enabled;
     DWORD cloak = DWM_CLOAKED_APP;
     const bool visible = IsWindowVisible(command->agent->Root()) != FALSE;
     const bool uncloaked = SUCCEEDED(DwmGetWindowAttribute(command->agent->Root(),
@@ -916,14 +932,72 @@ bool ExecuteRestoreThenDirectUiClick(Command* command) {
         return true;
     }
     if (AbortIfCancelled(command)) return false;
+    // Both routes give the page up, so the native control is driven exactly the
+    // way the Win32 lane drives it: a push button through BM_CLICK, a link
+    // through its own NM_RETURN notification.
+    if (binding.action == DirectUiAction::HandoffLinkClick) {
+        if (!ActivateSysLink(command, binding.hwnd)) return false;
+        if (!command->success)
+            command->error = L"DirectUI handoff link activation failed";
+        return true;
+    }
     command->success = PostMessageW(binding.hwnd, BM_CLICK, 0, 0) != FALSE;
     if (!command->success) command->error = L"DirectUI handoff BM_CLICK post failed";
     return true;
 }
 
-// A projected toggle stays inside the projection. The native checkbox is
-// clicked through its own state machine until it reports the requested value;
-// BM_SETCHECK would bypass the application handler and is never used.
+bool ExecutePostDirectUiPropertySheetButton(Command* command) {
+    DirectUiNativeEvidence current;
+    if (!command->profile ||
+        !CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, current, command->error) ||
+        !MatchDirectUiMutationBracket(*command->profile,
+            command->expectedDirectUiEvidence, current, command->error)) {
+        return true;
+    }
+    const auto& binding = command->directUiBinding;
+    const size_t slotIndex = binding.slotIndex;
+    const bool validButton = binding.propertySheetButton == PSBTN_BACK ||
+        binding.propertySheetButton == PSBTN_NEXT ||
+        binding.propertySheetButton == PSBTN_FINISH ||
+        binding.propertySheetButton == PSBTN_CANCEL;
+    const bool bindingMatches = validButton &&
+        binding.action == DirectUiAction::HandoffPropertySheetButton &&
+        slotIndex < command->profile->slotCount &&
+        command->profile->slots[slotIndex].virtualSource &&
+        command->profile->slots[slotIndex].uiaEnabled &&
+        command->profile->slots[slotIndex].action == binding.action &&
+        command->profile->slots[slotIndex].propertySheetButton ==
+            binding.propertySheetButton &&
+        current.root.hwnd == binding.hwnd &&
+        current.root.generation == binding.generation &&
+        current.propertySheetPageHwnd != nullptr &&
+        std::find(current.pageHosts.begin(), current.pageHosts.end(),
+            current.propertySheetPageHwnd) != current.pageHosts.end();
+    if (!bindingMatches) {
+        command->error = L"DirectUI property-sheet action provenance changed";
+        return true;
+    }
+    DWORD cloak = DWM_CLOAKED_APP;
+    const bool visible = IsWindowVisible(command->agent->Root()) != FALSE;
+    const bool enabled = IsWindowEnabled(command->agent->Root()) != FALSE;
+    const bool uncloaked = SUCCEEDED(DwmGetWindowAttribute(command->agent->Root(),
+        DWMWA_CLOAKED, &cloak, sizeof(cloak))) && (cloak & DWM_CLOAKED_APP) == 0;
+    if (!visible || !enabled || !uncloaked) {
+        command->error = L"DirectUI property-sheet root is not interactive";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    command->success = PostMessageW(command->agent->Root(), PSM_PRESSBUTTON,
+        static_cast<WPARAM>(binding.propertySheetButton), 0) != FALSE;
+    if (!command->success)
+        command->error = L"DirectUI handoff PSM_PRESSBUTTON post failed";
+    return true;
+}
+
+// Queue one native click and let the application-owned handler return through
+// its normal message loop. The action worker captures and verifies the resulting
+// canonical state before it acknowledges the renderer.
 bool ExecuteDirectUiToggle(Command* command) {
     const HWND target = command->directUiBinding.hwnd;
     if (!target || !IsWindow(target)) {
@@ -935,44 +1009,268 @@ bool ExecuteDirectUiToggle(Command* command) {
         command->error = L"DirectUI toggle requires a two-state value";
         return true;
     }
-    const HWND root = command->agent->Root();
-    struct ActiveWindowScope final {
-        HWND previous = nullptr;
-        bool changed = false;
-        ~ActiveWindowScope() { if (changed) SetActiveWindow(previous); }
-    } activeScope{ GetActiveWindow(), false };
-    if (activeScope.previous != root) {
-        SetActiveWindow(root);
-        activeScope.changed = GetActiveWindow() == root;
-        if (!activeScope.changed) {
-            command->error = L"DirectUI toggle could not activate the cloaked native dialog";
+    wchar_t className[64]{};
+    GetClassNameW(target, className, static_cast<int>(std::size(className)));
+    const bool bitmapSwitch = FluentShell::EqualsIgnoreCase(className, L"BitmapSwitchClass");
+    int current = 0;
+    if (bitmapSwitch) {
+        if (requested != 1) {
+            command->error = L"DirectUI radio cannot be unchecked";
+            return true;
+        }
+        current = (static_cast<DWORD>(GetWindowLongPtrW(target, GWL_STYLE)) & WS_TABSTOP) != 0;
+    } else {
+        current = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
+        if (current != BST_CHECKED && current != BST_UNCHECKED) {
+            command->error = L"DirectUI toggle backing state is not two-state";
             return true;
         }
     }
-    int current = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
-    const int initial = current;
-    const HWND active = GetActiveWindow();
-    const HWND foreground = GetForegroundWindow();
-    if (current != BST_CHECKED && current != BST_UNCHECKED) {
-        command->error = L"DirectUI toggle backing state is not two-state";
+    command->sibling = GetActiveWindow();
+    if (current == requested) {
+        command->success = true;
         return true;
     }
-    for (int attempt = 0; current != requested && attempt < 2; ++attempt) {
-        if (AbortIfCancelled(command)) return false;
-        SendMessageW(target, BM_CLICK, 0, 0);
-        const int next = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
-        if (next != BST_CHECKED && next != BST_UNCHECKED) break;
-        if (next == current) break;
-        current = next;
+    if (AbortIfCancelled(command)) return false;
+    const HWND root = command->agent->Root();
+    if (command->sibling != root) {
+        SetActiveWindow(root);
+        if (GetActiveWindow() != root) {
+            command->error = L"DirectUI toggle could not activate the native dialog";
+            return true;
+        }
     }
-    command->success = current == requested;
+    if (bitmapSwitch) {
+        RECT client{};
+        if (!GetClientRect(target, &client) ||
+            client.right <= client.left || client.bottom <= client.top) {
+            command->error = L"DirectUI radio client bounds are unavailable";
+            return true;
+        }
+        const LPARAM hit = MAKELPARAM((client.right - client.left) / 2,
+            (client.bottom - client.top) / 2);
+        command->success =
+            PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, hit) != FALSE &&
+            PostMessageW(target, WM_LBUTTONUP, 0, hit) != FALSE;
+        if (!command->success) {
+            SetActiveWindow(command->sibling);
+            command->error = L"DirectUI radio mouse click post failed";
+        }
+        return true;
+    }
+    command->success = PostMessageW(target, BM_CLICK, 0, 0) != FALSE;
     if (!command->success) {
-        command->error = L"DirectUI toggle did not reach the requested state (requested=" +
-            std::to_wstring(requested) + L", initial=" + std::to_wstring(initial) +
-            L", final=" + std::to_wstring(current) + L", active=" +
-            std::to_wstring(reinterpret_cast<uintptr_t>(active)) + L", foreground=" +
-            std::to_wstring(reinterpret_cast<uintptr_t>(foreground)) + L")";
+        SetActiveWindow(command->sibling);
+        command->error = L"DirectUI toggle BM_CLICK post failed";
     }
+    return true;
+}
+
+// Drives one projected DirectUI slot through its own registered Win32 adapter and
+// its own notification path, so the application handler observes exactly the
+// transition a user would have produced and the page stays projected. The route
+// must be one that slot itself declared, the backing HWND identity and lifecycle
+// generation must still match the binding, and the node handed to the action is
+// read fresh here rather than trusted from the published snapshot.
+bool ExecuteDirectUiNodeAction(Command* command) {
+    DirectUiNativeEvidence current;
+    if (!command->profile ||
+        !CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, current, command->error) ||
+        !MatchDirectUiMutationBracket(*command->profile,
+            command->expectedDirectUiEvidence, current, command->error, false)) {
+        return true;
+    }
+    const DirectUiActionBinding& binding = command->directUiBinding;
+    const size_t slot = binding.slotIndex;
+    const DirectUiAction route =
+        DirectUiActionForRequest(binding, command->action.action);
+    // Checkboxes and radios keep their dedicated route: it posts the click and
+    // walks the state machine instead of sending, because a toggle handler is the
+    // one in-place case already observed to open application-owned modal windows.
+    const bool dedicatedRoute = route == DirectUiAction::ToggleCheck ||
+        route == DirectUiAction::SelectRadio;
+    const bool bindingMatches = route != DirectUiAction::None && !dedicatedRoute &&
+        IsDirectUiInPlaceAction(route) &&
+        slot < command->profile->slotCount &&
+        !command->profile->slots[slot].virtualSource &&
+        command->profile->slots[slot].kind == binding.kind &&
+        (command->profile->slots[slot].action == route ||
+            command->profile->slots[slot].secondaryAction == route) &&
+        slot < current.slotWindows.size() &&
+        current.slotWindows[slot].hwnd == binding.hwnd &&
+        current.slotWindows[slot].generation == binding.generation &&
+        current.slotWindows[slot].visible &&
+        current.slotWindows[slot].enabled;
+    if (!bindingMatches) {
+        command->error = L"DirectUI in-place action provenance changed";
+        return true;
+    }
+    ControlNode node;
+    if (!CaptureDirectUiSlotNode(binding.hwnd, binding.kind, node, command->error)) {
+        return true;
+    }
+    if (!node.visible || !node.enabled) {
+        command->error = L"DirectUI in-place target is not interactive";
+        return true;
+    }
+    const NodeAction apply = FindNodeAction(command->action.action);
+    if (!apply) {
+        command->error = L"DirectUI in-place action has no native route";
+        return true;
+    }
+    // The native dialog owns activation while its own handler runs; the renderer
+    // proxy takes it back through RestoreDirectUiActivation once the action worker
+    // has accepted the resulting canonical state.
+    command->sibling = GetActiveWindow();
+    if (AbortIfCancelled(command)) return false;
+    const HWND root = command->agent->Root();
+    if (command->sibling != root) {
+        SetActiveWindow(root);
+        if (GetActiveWindow() != root) {
+            command->error =
+                L"DirectUI in-place action could not activate the native dialog";
+            return true;
+        }
+    }
+    if (!apply(command, command->agent, binding.hwnd, node)) return false;
+    if (!command->success) {
+        SetActiveWindow(command->sibling);
+        if (command->error.empty())
+            command->error = L"DirectUI in-place action was refused by the native control";
+    }
+    return true;
+}
+
+// Presses one handoff-declared DirectUI navigation control while the surface stays
+// projected: the root keeps its application cloak, the renderer proxy keeps the
+// screen, and the session admits whatever page replaces this one in place. The
+// pre-press UIA revalidation the giving-up route runs is deliberately absent -- a
+// cloaked root exposes no UIA subtree to walk -- and is not needed here, because
+// the press is followed by a full fresh admission of the resulting page, which is
+// a stronger check than revalidating the page being left. PSBTN_CANCEL is refused:
+// cancel ends the window rather than navigating, so it keeps the handoff route.
+bool ExecuteNavigateDirectUiProjected(Command* command) {
+    DirectUiNativeEvidence current;
+    if (!command->profile ||
+        !CaptureDirectUiNativeEvidenceOnSourceThread(
+            *command->agent, *command->profile, current, command->error) ||
+        !MatchDirectUiMutationBracket(*command->profile,
+            command->expectedDirectUiEvidence, current, command->error, false)) {
+        return true;
+    }
+    const DirectUiActionBinding& binding = command->directUiBinding;
+    // One definition of "this route navigates rather than ends the window" lives
+    // in the engine; refuse anything else here so a terminal route can never take
+    // the stay-projected path.
+    if (!DirectUiNavigationMayStayProjected(binding)) {
+        command->error = L"DirectUI projected navigation route is not a page navigation";
+        return true;
+    }
+    const size_t slot = binding.slotIndex;
+    if (slot >= command->profile->slotCount ||
+        command->profile->slots[slot].action != binding.action) {
+        command->error = L"DirectUI projected navigation provenance changed";
+        return true;
+    }
+    const DirectUiSlot& declared = command->profile->slots[slot];
+    bool bindingMatches = false;
+    if (binding.action == DirectUiAction::HandoffPropertySheetButton) {
+        // A virtual slot has no backing HWND, so its provenance is the property
+        // sheet itself: the admitted root identity and lifecycle generation, the
+        // button the slot declared, and a page host the sheet still owns.
+        bindingMatches = declared.virtualSource && declared.uiaEnabled &&
+            declared.propertySheetButton == binding.propertySheetButton &&
+            current.root.hwnd == binding.hwnd &&
+            current.root.generation == binding.generation &&
+            current.propertySheetPageHwnd != nullptr &&
+            std::find(current.pageHosts.begin(), current.pageHosts.end(),
+                current.propertySheetPageHwnd) != current.pageHosts.end();
+    } else if (binding.action == DirectUiAction::HandoffClick ||
+        binding.action == DirectUiAction::HandoffLinkClick) {
+        bindingMatches = !declared.virtualSource &&
+            slot < current.slotWindows.size() &&
+            current.slotWindows[slot].hwnd == binding.hwnd &&
+            current.slotWindows[slot].generation == binding.generation &&
+            current.slotWindows[slot].visible &&
+            current.slotWindows[slot].enabled;
+    }
+    if (!bindingMatches) {
+        command->error = L"DirectUI projected navigation provenance changed";
+        return true;
+    }
+    const HWND root = command->agent->Root();
+    DWORD cloak = 0;
+    const bool visible = IsWindowVisible(root) != FALSE;
+    const bool enabled = IsWindowEnabled(root) != FALSE;
+    const bool cloaked = SUCCEEDED(DwmGetWindowAttribute(
+        root, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
+        (cloak & DWM_CLOAKED_APP) != 0;
+    if (!visible || !enabled || !cloaked) {
+        command->error = L"DirectUI projected navigation root is not projected";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    // The native dialog owns activation while its own page handler runs; the proxy
+    // takes it back through RestoreDirectUiActivation once the session has
+    // accepted the page that replaced this one.
+    command->sibling = GetActiveWindow();
+    if (command->sibling != root) {
+        SetActiveWindow(root);
+        if (GetActiveWindow() != root) {
+            command->error =
+                L"DirectUI projected navigation could not activate the native dialog";
+            return true;
+        }
+    }
+    if (binding.action == DirectUiAction::HandoffLinkClick) {
+        if (!ActivateSysLink(command, binding.hwnd)) return false;
+        if (!command->success) {
+            SetActiveWindow(command->sibling);
+            command->error = L"DirectUI projected link activation failed";
+        }
+        return true;
+    }
+    if (binding.action == DirectUiAction::HandoffClick) {
+        command->success = PostMessageW(binding.hwnd, BM_CLICK, 0, 0) != FALSE;
+        if (!command->success) {
+            SetActiveWindow(command->sibling);
+            command->error = L"DirectUI projected BM_CLICK post failed";
+        }
+        return true;
+    }
+    command->success = PostMessageW(root, PSM_PRESSBUTTON,
+        static_cast<WPARAM>(binding.propertySheetButton), 0) != FALSE;
+    if (!command->success) {
+        SetActiveWindow(command->sibling);
+        command->error = L"DirectUI projected PSM_PRESSBUTTON post failed";
+    }
+    return true;
+}
+
+bool ExecuteRestoreDirectUiActivation(Command* command) {
+    if (AbortIfCancelled(command)) return false;
+    HWND desired = command->sibling;
+    if (desired && (!IsWindow(desired) ||
+        GetWindowThreadProcessId(desired, nullptr) != command->agent->ThreadId())) {
+        desired = nullptr;
+    }
+    SetActiveWindow(desired);
+    command->success = true;
+    return true;
+}
+
+bool ExecutePlaceBehind(Command* command) {
+    if (!command->sibling || !IsWindow(command->sibling) ||
+        GetAncestor(command->sibling, GA_ROOT) != command->sibling) {
+        command->error = L"proxy sibling is unavailable for native z-order placement";
+        return true;
+    }
+    if (AbortIfCancelled(command)) return false;
+    command->success = SetWindowPos(command->agent->Root(), command->sibling,
+        0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) != FALSE;
+    if (!command->success)
+        command->error = L"native/proxy relative z-order placement failed";
     return true;
 }
 
@@ -1064,6 +1362,13 @@ CommandHandler HandlerFor(UINT kind) noexcept {
     case kCommandDirectUiToggle: return &ExecuteDirectUiToggle;
     case kCommandDirectUiMove: return &ExecuteDirectUiMove;
     case kCommandCaptureDirectUiBootstrap: return &ExecuteCaptureDirectUiBootstrap;
+    case kCommandPostDirectUiPropertySheetButton:
+        return &ExecutePostDirectUiPropertySheetButton;
+    case kCommandPlaceBehind: return &ExecutePlaceBehind;
+    case kCommandRestoreDirectUiActivation: return &ExecuteRestoreDirectUiActivation;
+    case kCommandDirectUiNodeAction: return &ExecuteDirectUiNodeAction;
+    case kCommandNavigateDirectUiProjected:
+        return &ExecuteNavigateDirectUiProjected;
     default: return nullptr;
     }
 }
@@ -1476,7 +1781,9 @@ bool SourceThreadAgent::CaptureDirectUiNativeEvidence(
     DirectUiNativeEvidence& evidence,
     std::wstring& error,
     DWORD timeoutMs,
-    HANDLE cancelEvent) {
+    HANDLE cancelEvent,
+    bool* timedOut) {
+    if (timedOut) *timedOut = false;
     Command* command = CreateCommand(kCommandCaptureDirectUiEvidence, this);
     if (!command) {
         error = L"source command allocation failed";
@@ -1484,7 +1791,10 @@ bool SourceThreadAgent::CaptureDirectUiNativeEvidence(
     }
     command->profile = &profile;
     const bool posted = Post(command, timeoutMs, cancelEvent);
-    if (!posted) error = L"source UI thread did not acknowledge DirectUI native evidence capture";
+    if (!posted) {
+        error = L"source UI thread did not acknowledge DirectUI native evidence capture";
+        if (timedOut) *timedOut = true;
+    }
     else if (!command->success) error = command->error;
     const bool success = posted && command->success;
     if (success) evidence = std::move(command->directUiEvidence);
@@ -1536,12 +1846,69 @@ bool SourceThreadAgent::RestoreThenDirectUiButtonClick(
     return success;
 }
 
-bool SourceThreadAgent::InvokeDirectUiToggle(
+bool SourceThreadAgent::PostDirectUiPropertySheetButton(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& expected,
     const DirectUiActionBinding& binding,
-    int requested,
     std::wstring& error,
     DWORD timeoutMs,
     HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandPostDirectUiPropertySheetButton, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    command->expectedDirectUiEvidence = expected;
+    command->directUiBinding = binding;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted)
+        error = L"source UI thread did not acknowledge DirectUI property-sheet action";
+    else if (!command->success)
+        error = command->error;
+    const bool success = posted && command->success;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::NavigateDirectUiProjected(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& expected,
+    const DirectUiActionBinding& binding,
+    HWND& previousActive,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    previousActive = nullptr;
+    Command* command = CreateCommand(kCommandNavigateDirectUiProjected, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    command->expectedDirectUiEvidence = expected;
+    command->directUiBinding = binding;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted)
+        error = L"source UI thread did not acknowledge DirectUI projected navigation";
+    else if (!command->success)
+        error = command->error;
+    const bool success = posted && command->success;
+    // Activation moved to the native dialog before its page handler ran, so the
+    // caller gets it back even when the press itself was refused.
+    if (posted) previousActive = command->sibling;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::InvokeDirectUiToggle(
+    const DirectUiActionBinding& binding,
+    int requested,
+    HWND& previousActive,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    previousActive = nullptr;
     Command* command = CreateCommand(kCommandDirectUiToggle, this);
     if (!command) {
         error = L"source command allocation failed";
@@ -1551,6 +1918,75 @@ bool SourceThreadAgent::InvokeDirectUiToggle(
     command->action.integerValue = requested;
     const bool posted = Post(command, timeoutMs, cancelEvent);
     if (!posted) error = L"source UI thread did not acknowledge DirectUI toggle";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    if (success) previousActive = command->sibling;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::InvokeDirectUiNodeAction(
+    const DirectUiWindowProfile& profile,
+    const DirectUiNativeEvidence& expected,
+    const DirectUiActionBinding& binding,
+    const ActionRequest& request,
+    HWND& previousActive,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    previousActive = nullptr;
+    Command* command = CreateCommand(kCommandDirectUiNodeAction, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->profile = &profile;
+    command->expectedDirectUiEvidence = expected;
+    command->directUiBinding = binding;
+    command->action = request;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge DirectUI node action";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    // Activation moved to the native dialog before the handler ran, so the caller
+    // gets it back even when the action itself was refused.
+    if (posted) previousActive = command->sibling;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::PlaceBehind(
+    HWND sibling,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandPlaceBehind, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->sibling = sibling;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge z-order placement";
+    else if (!command->success) error = command->error;
+    const bool success = posted && command->success;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::RestoreDirectUiActivation(
+    HWND previousActive,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    Command* command = CreateCommand(kCommandRestoreDirectUiActivation, this);
+    if (!command) {
+        error = L"source command allocation failed";
+        return false;
+    }
+    command->sibling = previousActive;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    if (!posted) error = L"source UI thread did not acknowledge activation restore";
     else if (!command->success) error = command->error;
     const bool success = posted && command->success;
     Release(command);
@@ -1629,6 +2065,21 @@ bool SourceThreadAgent::CaptureAndCloak(
     if (!success) error = command->error;
     Release(command);
     return success;
+}
+
+bool SourceThreadAgent::EnableGenericDirectUiCandidate() noexcept {
+    if (genericDirectUiCandidate_) return true;
+    std::wstring imagePath;
+    std::wstring error;
+    if (!ResolveGenericDirectUiImage(imagePath, error)) {
+        FluentShell::Log(
+            L"DirectUI generic lane refused for this process: " + error);
+        return false;
+    }
+    genericDirectUiCandidate_ = true;
+    FluentShell::Log(
+        L"DirectUI surface degraded to the capability-derived generic lane");
+    return true;
 }
 
 void SourceThreadAgent::AdoptDirectUiProfile(
