@@ -434,6 +434,7 @@ bool CaptureDirectUiBootstrapCore(
     if (!evidence.native.dpi ||
         !ReadWindowEvidence(agent, root, false, evidence.native.root, error)) return false;
     evidence.native.ownerHwnd = GetWindow(root, GW_OWNER);
+    evidence.native.effectiveOwnerHwnd = EffectiveTopLevelOwner(root);
     evidence.native.title = evidence.native.root.text;
     if (!GetClientRect(root, &evidence.native.clientBounds))
         return Fail(error, L"bootstrap: root client geometry unavailable");
@@ -1211,7 +1212,7 @@ bool BuildCompositeSnapshot(
     snapshot.icon = L"none";
     snapshot.generation = agent.Generation();
     snapshot.nativeHwnd = native.root.hwnd;
-    snapshot.ownerHwnd = native.ownerHwnd;
+    snapshot.ownerHwnd = native.effectiveOwnerHwnd;
     snapshot.title = native.title;
     snapshot.dpi = native.dpi;
     snapshot.bounds = native.root.bounds;
@@ -2393,6 +2394,7 @@ bool CaptureDirectUiNativeEvidenceOnSourceThread(
         if (!evidence.dpi || !ReadWindowEvidence(agent, root, false, evidence.root, error))
             return false;
         evidence.ownerHwnd = GetWindow(root, GW_OWNER);
+        evidence.effectiveOwnerHwnd = EffectiveTopLevelOwner(root);
         evidence.title = evidence.root.text;
         if (!GetClientRect(root, &evidence.clientBounds))
             return Fail(error, L"A/B: root client geometry unavailable");
@@ -3079,7 +3081,7 @@ bool RefreshDirectUiSnapshotFromNative(
         snapshot.canCancel = std::any_of(profile.slots, profile.slots + profile.slotCount,
             [](const DirectUiSlot& slot) { return slot.cancel; });
         snapshot.nativeHwnd = native.root.hwnd;
-        snapshot.ownerHwnd = native.ownerHwnd;
+        snapshot.ownerHwnd = native.effectiveOwnerHwnd;
         snapshot.title = native.title;
         snapshot.dpi = native.dpi;
         snapshot.bounds = native.root.bounds;

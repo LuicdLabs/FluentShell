@@ -326,7 +326,13 @@ public sealed class ControlFactoryTests
         Assert.False(policy.CanDragTabs);
         Assert.False(policy.CanReorderTabs);
         Assert.False(policy.AreItemsClosable);
+        // TabView clears any Width assigned to a SizeToContent pill and sizes it from
+        // its content, so the native item rectangle is pinned by MinWidth from below
+        // and by a fitted label from above rather than by Width.
         Assert.Equal(TabViewWidthMode.SizeToContent, policy.TabWidthMode);
+        Assert.NotNull(typeof(SemanticTabControl).GetMethod(
+            "CalibrateRow",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic));
     }
 
     [Fact]

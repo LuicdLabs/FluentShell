@@ -754,6 +754,27 @@ bool IsProjectedContainerKind(ControlKind kind) noexcept {
     }
 }
 
+HWND EffectiveTopLevelOwner(HWND window) noexcept {
+    HWND owner = window ? GetWindow(window, GW_OWNER) : nullptr;
+    for (size_t depth = 0; owner && depth < 256; ++depth) {
+        if (IsWindowVisible(owner)) return owner;
+        const HWND next = GetWindow(owner, GW_OWNER);
+        if (next == owner) break;
+        owner = next;
+    }
+    return nullptr;
+}
+
+bool IsModalOwnedTopLevel(HWND window) noexcept {
+    const HWND owner = EffectiveTopLevelOwner(window);
+    // One level of owner graph only.  A dialog whose owner is itself owned inherits
+    // DWM cloaking from that owner (DWM_CLOAKED_INHERITED), so a refusal could not
+    // show it again, and the foreground slot the committed gate requires stays with
+    // the native chain instead of moving to the proxy.
+    return owner != nullptr && IsWindowEnabled(owner) == FALSE &&
+        EffectiveTopLevelOwner(owner) == nullptr;
+}
+
 const wchar_t* SurfaceKindName(SurfaceKind kind) noexcept {
     switch (kind) {
     case SurfaceKind::Window: return L"window";

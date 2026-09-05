@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cwctype>
 #include <limits>
 #include <utility>
@@ -35,6 +36,55 @@ bool Reject(std::wstring& reason, const wchar_t* text) {
     reason = text;
     return false;
 }
+
+// A control answers a geometry message in the coordinate space of its own window.
+// The capture pass reads window rectangles inside a per-monitor-aware scope, so
+// those are physical pixels, while a DPI-virtualized process answers in the
+// smaller space DWM stretches onto the screen -- a 96-DPI dialog on a 150%
+// monitor reports an 18 px tab band that occupies 27 physical px.  Everything
+// that travels in a snapshot is physical, so message-derived geometry is brought
+// into that space here.  Measuring one client rectangle in both spaces gives the
+// factor without inferring it from DPI semantics, and yields exactly 1 for a
+// window that is not virtualized, so a per-monitor-aware target is untouched.
+struct MessageGeometryScale final {
+    double x = 1.0;
+    double y = 1.0;
+
+    static MessageGeometryScale For(HWND hwnd) noexcept {
+        RECT physical{};
+        if (!GetClientRect(hwnd, &physical) || physical.right <= 0 || physical.bottom <= 0) {
+            return {};
+        }
+        const DPI_AWARENESS_CONTEXT ownContext = GetWindowDpiAwarenessContext(hwnd);
+        if (!ownContext) return {};
+        const DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(ownContext);
+        if (!previous) return {};
+        RECT own{};
+        const bool read = GetClientRect(hwnd, &own) != FALSE;
+        SetThreadDpiAwarenessContext(previous);
+        if (!read || own.right <= 0 || own.bottom <= 0) return {};
+        return MessageGeometryScale{
+            static_cast<double>(physical.right) / static_cast<double>(own.right),
+            static_cast<double>(physical.bottom) / static_cast<double>(own.bottom),
+        };
+    }
+
+    bool IsIdentity() const noexcept { return x == 1.0 && y == 1.0; }
+
+    int Horizontal(int value) const noexcept {
+        return IsIdentity() ? value : static_cast<int>(std::lround(value * x));
+    }
+
+    RECT Rect(const RECT& rect) const noexcept {
+        if (IsIdentity()) return rect;
+        return RECT{
+            static_cast<LONG>(std::lround(rect.left * x)),
+            static_cast<LONG>(std::lround(rect.top * y)),
+            static_cast<LONG>(std::lround(rect.right * x)),
+            static_cast<LONG>(std::lround(rect.bottom * y)),
+        };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Match(class) + Probe(styles)
@@ -1440,13 +1490,14 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.columns.reserve(static_cast<size_t>(columnCount));
     node.columnWidths.reserve(static_cast<size_t>(columnCount));
     if (!ReadListViewColumnOrder(hwnd, columnCount, node.columnOrder, reason)) return false;
+    const MessageGeometryScale geometry = MessageGeometryScale::For(hwnd);
     for (int column = 0; column < columnCount; ++column) {
         std::wstring label;
         int width = 0;
         if (!ReadListViewColumn(hwnd, column, label, width, reason)) return false;
         if (!withinTextBudget(label.size())) return false;
         node.columns.push_back(std::move(label));
-        node.columnWidths.push_back(width);
+        node.columnWidths.push_back(geometry.Horizontal(width));
     }
 
     node.rows.reserve(static_cast<size_t>(count));
@@ -1582,6 +1633,12 @@ bool CaptureStatusBarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     if (clientWidth < 0 || clientWidth > std::numeric_limits<int>::max()) {
         return Reject(reason, L"StatusBar client width is outside the bounded adapter");
     }
+    // SB_GETPARTS answers in the control's own coordinate space; -1 is the native
+    // stretch marker and stays as it is.
+    const MessageGeometryScale geometry = MessageGeometryScale::For(hwnd);
+    for (int& edge : rightEdges) {
+        if (edge > 0) edge = geometry.Horizontal(edge);
+    }
 
     size_t totalText = 0;
     int64_t previousRight = 0;
@@ -1713,6 +1770,7 @@ bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) 
     RECT client{};
     if (!GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0)
         return Reject(reason, L"TabControl client geometry is unavailable");
+    const MessageGeometryScale geometry = MessageGeometryScale::For(hwnd);
     node.items.clear();
     node.itemRects.clear();
     node.items.reserve(count);
@@ -1748,8 +1806,10 @@ bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) 
         totalText += length;
 
         RECT rect{};
-        if (!SendMessageW(hwnd, TCM_GETITEMRECT, index, reinterpret_cast<LPARAM>(&rect)) ||
-            rect.left < 0 || rect.top < 0 || rect.right <= rect.left ||
+        if (!SendMessageW(hwnd, TCM_GETITEMRECT, index, reinterpret_cast<LPARAM>(&rect)))
+            return Reject(reason, L"TabControl item rectangle is malformed or outside client bounds");
+        rect = geometry.Rect(rect);
+        if (rect.left < 0 || rect.top < 0 || rect.right <= rect.left ||
             rect.bottom <= rect.top || rect.right > client.right || rect.bottom > client.bottom)
             return Reject(reason, L"TabControl item rectangle is malformed or outside client bounds");
         for (const RECT& previous : node.itemRects) {

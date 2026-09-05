@@ -371,6 +371,21 @@ bool ValidateActionForSnapshot(
 bool IsRequestSemanticAction(std::wstring_view action) noexcept;
 
 const wchar_t* ControlKindName(ControlKind kind) noexcept;
+// The nearest owner that can put pixels on the screen, or null when the whole
+// owner chain is hidden.  A hidden owner -- the StubWindow32 behind a control
+// panel property sheet, a message-only owner behind a tool window -- is never
+// projected and never competes for z-order, so a window it owns is the
+// application's own top-level rather than a node in an owner graph.  A projected
+// root is cloaked rather than hidden and still reports WS_VISIBLE, so it keeps
+// being seen as an owner.
+HWND EffectiveTopLevelOwner(HWND window) noexcept;
+// A dialog the application is running modally against its owner: the owner can hold
+// the screen and the application disabled it for the dialog's lifetime.  That is the
+// only owner relationship the projection reproduces, because the proxy inherits the
+// real owner and blocks it -- which is exactly what the renderer's surface registry
+// and the committed UIA gate already validate for a translated MessageBox.  A
+// modeless owned top-level, and a dialog nested deeper than one level, stay native.
+bool IsModalOwnedTopLevel(HWND window) noexcept;
 // A kind whose projected element frames other nodes.  Only these may be named as a
 // node's parent: the renderer places a child inside its parent's own element, and
 // every other kind draws its content itself.

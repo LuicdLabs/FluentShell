@@ -253,6 +253,10 @@ struct DirectUiNativeEvidence final {
     uint32_t lastMutationMessage = 0;
     bool cloaked = false;
     HWND ownerHwnd = nullptr;
+    // The owner the projection has to reproduce: the nearest owner that can hold
+    // the screen.  ownerHwnd above stays raw, because taskbar presence and
+    // A/B identity both follow the raw chain.
+    HWND effectiveOwnerHwnd = nullptr;
     RECT clientBounds{};
     POINT clientOriginScreen{};
     std::wstring title;

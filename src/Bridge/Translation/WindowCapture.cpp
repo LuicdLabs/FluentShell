@@ -109,8 +109,13 @@ bool IsStandardTopLevel(HWND root, std::wstring& reason) {
         reason = L"child or layered top-level window";
         return false;
     }
-    if (GetWindow(root, GW_OWNER) != nullptr) {
-        reason = L"owned top-level window is outside the v1 owner graph";
+    // An owned top-level travels only when the application is running it modally
+    // against an owner that is on screen: the proxy can then inherit that owner and
+    // block it, which is the same contract a translated MessageBox already meets.
+    // A modeless owned window has no such contract, and cloaking its owner would
+    // strand it behind an unrelated renderer HWND.
+    if (EffectiveTopLevelOwner(root) != nullptr && !IsModalOwnedTopLevel(root)) {
+        reason = L"modeless owned top-level window is outside the v1 owner graph";
         return false;
     }
     if ((exStyle & WS_EX_MDICHILD) != 0) {
@@ -395,7 +400,10 @@ bool CaptureTopLevelFacets(
     std::wstring& reason) {
     next.surfaceId = context.surfaceId;
     next.surfaceKind = SurfaceKind::Window;
-    next.modal = false;
+    // Modality is not a style bit: the dialog manager states it by disabling the
+    // owner for the dialog's lifetime, and that is what the projection has to
+    // reproduce on the owner's proxy.
+    next.modal = IsModalOwnedTopLevel(root);
     // Escape cancels a dialog because the dialog manager maps it to IDCANCEL; an
     // ordinary top-level window receives the keystroke and normally ignores it.
     // Reporting cancel semantics for every window would make Escape close
@@ -408,7 +416,10 @@ bool CaptureTopLevelFacets(
     next.generation = context.generation;
     next.revision = context.revision;
     next.nativeHwnd = root;
-    next.ownerHwnd = GetWindow(root, GW_OWNER);
+    // The protocol field carries the owner relationship the proxy has to
+    // reproduce, so it names the owner that can actually hold the screen.  A
+    // window whose whole owner chain is hidden projects as an unowned window.
+    next.ownerHwnd = EffectiveTopLevelOwner(root);
     if (!WindowText(root, next.title, reason)) return false;
     next.dpi = GetDpiForWindow(root);
     if (next.dpi == 0) next.dpi = 96;
@@ -424,8 +435,11 @@ bool CaptureTopLevelFacets(
     next.visible = IsWindowVisible(root) != FALSE;
     next.enabled = IsWindowEnabled(root) != FALSE;
     next.state = minimized ? L"minimized" : (maximized ? L"maximized" : L"normal");
-    next.showInTaskbar =
-        next.ownerHwnd == nullptr || (next.windowExStyle & WS_EX_APPWINDOW) != 0;
+    // Taskbar presence follows the shell's own rule, which reads the raw owner:
+    // a hidden owner still suppresses the button unless WS_EX_APPWINDOW asks for
+    // one.  This is deliberately not the effective owner above.
+    next.showInTaskbar = GetWindow(root, GW_OWNER) == nullptr ||
+        (next.windowExStyle & WS_EX_APPWINDOW) != 0;
     next.rtl = (next.windowExStyle & WS_EX_LAYOUTRTL) != 0;
     return CaptureTopLevelMenu(root, next.menu, reason);
 }

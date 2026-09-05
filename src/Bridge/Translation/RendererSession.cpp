@@ -1073,46 +1073,116 @@ bool RendererSession::OpenSurface(
         CommitInteractive(attempt);
 }
 
-bool IsOwnedBy(HWND window, HWND possibleOwner) noexcept {
-    if (!window || !possibleOwner || window == possibleOwner) return false;
-    HWND owner = GetWindow(window, GW_OWNER);
-    for (size_t depth = 0; owner && depth < 256; ++depth) {
-        if (owner == possibleOwner) return true;
-        const HWND next = GetWindow(owner, GW_OWNER);
-        if (next == owner) break;
-        owner = next;
-    }
-    return false;
-}
-
 namespace {
 
-// Visible, unowned-or-owned application top-levels in this process.  Shell,
-// XAML host, and the transient HMENU popup surface are never candidates: the
-// projected MenuBar owns that command surface, and attaching a source agent to
-// the popup only produces a false owner-graph rejection.
-std::vector<HWND> EnumerateCandidateTopLevels() {
+// Discovery runs on the supervisor thread, where a blocking WM_GETTEXT to a busy
+// GUI thread would stall every surface.  The title is diagnostics only, so one
+// that cannot be read inside the bound is reported as unavailable instead.
+std::wstring BoundedWindowTitle(HWND window) {
+    wchar_t title[96]{};
+    DWORD_PTR handled = 0;
+    if (SendMessageTimeoutW(window, WM_GETTEXT, std::size(title),
+            reinterpret_cast<LPARAM>(title), SMTO_ABORTIFHUNG, 200, &handled) == 0) {
+        return L"<unavailable>";
+    }
+    title[std::size(title) - 1] = L'\0';
+    return title;
+}
+
+// Every discovery line names a window the same way: %TEMP%\FluentShell.log is the
+// only view into what the Bridge enumerated inside the injected process.
+std::wstring DescribeTopLevel(HWND window) {
+    wchar_t className[256]{};
+    GetClassNameW(window, className, static_cast<int>(std::size(className)));
+    std::wstring text = Ipc::HwndToString(window);
+    text += L" class='";
+    text += className;
+    text += L"' title='";
+    text += BoundedWindowTitle(window);
+    text += IsWindowVisible(window) ? L"' visible" : L"' hidden";
+    return text;
+}
+
+// Discovery classifies an owner graph with the same rule capture applies to a
+// top-level window: see EffectiveTopLevelOwner in WindowSnapshot.cpp.
+
+// What one discovery pass enumerated.  A process whose every top-level is
+// filtered leaves no other trace of why nothing was projected, so the dropped
+// windows travel alongside the candidates with the reason each was dropped.
+struct TopLevelCensus final {
+    std::vector<HWND> candidates;
+    std::vector<std::pair<HWND, const wchar_t*>> filtered;
+};
+
+// Visible application top-levels in this process are candidates.  Shell, XAML
+// host, and the transient HMENU popup surface never are: the projected MenuBar
+// owns that command surface, and attaching a source agent to the popup only
+// produces a false owner-graph rejection.
+TopLevelCensus EnumerateTopLevels() {
     struct Context final {
         DWORD processId;
-        std::vector<HWND> windows;
+        TopLevelCensus census;
     } context{ GetCurrentProcessId(), {} };
     EnumWindows([](HWND hwnd, LPARAM raw) -> BOOL {
         auto& context = *reinterpret_cast<Context*>(raw);
         DWORD processId = 0;
         GetWindowThreadProcessId(hwnd, &processId);
-        if (processId != context.processId || !IsWindowVisible(hwnd) ||
-            GetAncestor(hwnd, GA_ROOT) != hwnd) {
-            return TRUE;
-        }
+        if (processId != context.processId) return TRUE;
         wchar_t className[256]{};
         GetClassNameW(hwnd, className, static_cast<int>(std::size(className)));
-        if (FluentShell::EqualsIgnoreCase(className, L"#32768")) return TRUE;
-        if (!FluentShell::IsShellOrXamlWindowClass(className)) {
-            context.windows.push_back(hwnd);
+        const wchar_t* filtered = nullptr;
+        if (GetAncestor(hwnd, GA_ROOT) != hwnd) filtered = L"not a root window";
+        else if (!IsWindowVisible(hwnd)) filtered = L"hidden";
+        else if (FluentShell::EqualsIgnoreCase(className, L"#32768")) {
+            filtered = L"native menu popup";
+        } else if (FluentShell::IsShellOrXamlWindowClass(className)) {
+            filtered = L"shell or XAML chrome";
         }
+        if (filtered) context.census.filtered.emplace_back(hwnd, filtered);
+        else context.census.candidates.push_back(hwnd);
         return TRUE;
     }, reinterpret_cast<LPARAM>(&context));
-    return context.windows;
+    return context.census;
+}
+
+// Identifies the candidate set so the census is reported when it changes rather
+// than once per discovery tick.  Filtered windows are deliberately excluded: a
+// tooltip or IME helper appearing and disappearing is not a new enumeration.
+// Titles are excluded for the same reason.  The leading count keeps an empty
+// enumeration distinguishable from "nothing reported yet".
+std::wstring CensusSignature(const TopLevelCensus& census) {
+    std::wstring signature = std::to_wstring(census.candidates.size()) + L":";
+    for (const HWND window : census.candidates) {
+        signature += Ipc::HwndToString(window);
+        signature += L'+';
+    }
+    return signature;
+}
+
+void LogDiscoveryCensus(const TopLevelCensus& census, std::wstring& lastSignature) {
+    std::wstring signature = CensusSignature(census);
+    if (signature == lastSignature) return;
+    lastSignature = std::move(signature);
+    FluentShell::Log(L"Discovery enumerated " +
+        std::to_wstring(census.candidates.size()) + L" candidate top-level window(s), " +
+        std::to_wstring(census.filtered.size()) + L" filtered");
+    for (const HWND window : census.candidates) {
+        std::wstring line = L"Discovery candidate: " + DescribeTopLevel(window);
+        if (const HWND owner = EffectiveTopLevelOwner(window)) {
+            line += L"; owned by " + DescribeTopLevel(owner);
+        } else if (GetWindow(window, GW_OWNER)) {
+            line += L"; owner chain is entirely hidden, so the window counts as unowned";
+        }
+        FluentShell::Log(line);
+    }
+    // A process with a candidate explains itself through the projection gate.  One
+    // with none explains nothing at all unless the filtered windows are named, and
+    // that is exactly when the log would otherwise look like a Bridge that never ran.
+    if (!census.candidates.empty()) return;
+    for (const auto& [window, reason] : census.filtered) {
+        FluentShell::Log(std::wstring(L"Discovery filtered (") + reason + L"): " +
+            DescribeTopLevel(window));
+    }
 }
 
 } // namespace
@@ -1135,7 +1205,7 @@ void RendererSession::PruneDiscoveryState() {
 RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
     HWND window,
     bool ownsVisibleTopLevel) {
-    const HWND directOwner = GetWindow(window, GW_OWNER);
+    const HWND directOwner = EffectiveTopLevelOwner(window);
     DiscoveryDecision decision;
     std::scoped_lock lock(surfacesMutex_);
 
@@ -1166,30 +1236,51 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
     // rejected window does not reappear in the log every second.
     if (!discoveryAttempts_.insert(window).second) return decision;
 
-    std::shared_ptr<Surface> projectedOwner;
     for (const auto& [_, surface] : surfaces_) {
         if (surface->agent && surface->agent->Root() == window) return decision;
-        if (!directOwner || surface->virtualDialog || !surface->agent) continue;
-        // Owner graphs are not projected by the bounded v1 adapter.  If a visible
-        // owned top-level appears above a projected native ancestor, keeping that
-        // ancestor cloaked can strand the child behind an unrelated renderer
-        // HWND, so the ancestor is resolved back to native instead.
-        if (IsOwnedBy(window, surface->agent->Root())) {
+    }
+    // Every projected ancestor in this window's owner chain, nearest first.  A window
+    // the projection cannot take has to hand the whole chain back at once: a graph
+    // with some native and some projected windows is the hybrid surface the
+    // projection forbids, and a native window owned by a cloaked one inherits that
+    // cloak and cannot be shown at all.
+    std::vector<std::shared_ptr<Surface>> projectedOwners;
+    for (HWND owner = directOwner; owner; owner = EffectiveTopLevelOwner(owner)) {
+        for (const auto& [_, surface] : surfaces_) {
+            if (surface->virtualDialog || !surface->agent ||
+                surface->agent->Root() != owner) {
+                continue;
+            }
             std::scoped_lock surfaceLock(surface->mutex);
-            if (surface->state == SurfaceState::Projected) projectedOwner = surface;
+            if (surface->state == SurfaceState::Projected) projectedOwners.push_back(surface);
         }
     }
 
     if (directOwner) {
         // An owned surface is never projected independently from its owner: it is
         // either covered by the fallback below or already fully native.
-        if (!projectedOwner) return decision;
+        if (projectedOwners.empty()) {
+            decision.skipReason = L"an owned window stays native while a visible owner "
+                L"the Bridge does not project holds the screen";
+            decision.skipEvidence = directOwner;
+            return decision;
+        }
+        decision.projectedOwners = std::move(projectedOwners);
+        // A dialog the application runs modally against a projected owner is a
+        // surface in its own right: the proxy inherits the real owner and blocks it.
+        // Anything else in the owner graph resolves the ancestors back to native,
+        // because keeping them cloaked can strand the child behind an unrelated
+        // renderer HWND.
+        if (IsModalOwnedTopLevel(window)) {
+            decision.action = DiscoveryAction::ProjectOwnedDialog;
+            return decision;
+        }
         decision.action = DiscoveryAction::RestoreOwnerGraph;
-        decision.projectedOwner = std::move(projectedOwner);
-        const HWND ownerRoot = decision.projectedOwner->agent
-            ? decision.projectedOwner->agent->Root()
-            : nullptr;
-        if (ownerRoot) ownerGraphDeferrals_.insert_or_assign(ownerRoot, 0);
+        for (const auto& owner : decision.projectedOwners) {
+            if (const HWND ownerRoot = owner->agent ? owner->agent->Root() : nullptr) {
+                ownerGraphDeferrals_.insert_or_assign(ownerRoot, 0);
+            }
+        }
         return decision;
     }
     if (ownsVisibleTopLevel) {
@@ -1208,20 +1299,45 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
 }
 
 void RendererSession::DiscoverTopLevelWindows() {
-    const auto candidates = EnumerateCandidateTopLevels();
+    const TopLevelCensus census = EnumerateTopLevels();
+    const std::vector<HWND>& candidates = census.candidates;
+    LogDiscoveryCensus(census, discoveryCensusSignature_);
     PruneDiscoveryState();
     for (const HWND window : candidates) {
-        const bool ownsVisibleTopLevel = !GetWindow(window, GW_OWNER) &&
+        const bool ownsVisibleTopLevel = !EffectiveTopLevelOwner(window) &&
             std::any_of(candidates.begin(), candidates.end(),
-                [window](HWND candidate) { return IsOwnedBy(candidate, window); });
+                [window](HWND candidate) { return EffectiveTopLevelOwner(candidate) == window; });
         auto decision = ClassifyTopLevel(window, ownsVisibleTopLevel);
+        if (decision.skipReason) {
+            std::wstring line = L"Native window remains untranslated: ";
+            line += decision.skipReason;
+            line += L"; window " + DescribeTopLevel(window);
+            if (decision.skipEvidence) {
+                line += L"; owner " + DescribeTopLevel(decision.skipEvidence);
+            }
+            FluentShell::Log(line);
+        }
         switch (decision.action) {
         case DiscoveryAction::Skip:
             break;
         case DiscoveryAction::RestoreOwnerGraph:
             FluentShell::Log(
                 L"Visible owned top-level requires native owner-graph fallback");
-            RestoreSurface(decision.projectedOwner, L"ownedTopLevel");
+            for (const auto& owner : decision.projectedOwners) {
+                RestoreSurface(owner, L"ownedTopLevel");
+            }
+            break;
+        case DiscoveryAction::ProjectOwnedDialog:
+            // The owner stays projected only while its dialog projects too.  A refused
+            // dialog would otherwise float natively over the owner's proxy, so the
+            // whole graph goes back to native together.
+            if (!OpenNativeWindow(window)) {
+                FluentShell::Log(L"Owned modal dialog could not be projected; "
+                    L"restoring the owner graph to native");
+                for (const auto& owner : decision.projectedOwners) {
+                    RestoreSurface(owner, L"ownedTopLevel");
+                }
+            }
             break;
         case DiscoveryAction::DeferOwnerGraph:
             if (decision.firstDeferral) {

@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace FluentShell::Bridge::Translation {
 
@@ -87,14 +88,27 @@ private:
         DeferOwnerGraph,
         Project,
         ProjectAfterDeferral,
+        // A modal dialog whose owner is already projected: it becomes a surface of
+        // its own, owned by the owner's proxy.  RestoreOwnerGraph is the fallback if
+        // the projection gate refuses it.
+        ProjectOwnedDialog,
     };
     struct DiscoveryDecision final {
         DiscoveryAction action = DiscoveryAction::Skip;
-        // Set for RestoreOwnerGraph: the projected ancestor to roll back.
-        std::shared_ptr<Surface> projectedOwner;
+        // Set for RestoreOwnerGraph and ProjectOwnedDialog: every projected ancestor
+        // in the window's owner chain, nearest first.  A graph is handed back to
+        // native as a whole, immediately or only if the owned projection is refused.
+        std::vector<std::shared_ptr<Surface>> projectedOwners;
         // Set for DeferOwnerGraph: true the first time this root is deferred, so
         // a steady state does not repeat the log line every pass.
         bool firstDeferral = false;
+        // Set when classification refused the window and no other stage would
+        // report it.  A silent skip is indistinguishable from a Bridge that never
+        // ran, so every refusal names itself once.  The caller composes the line
+        // outside the surface-map lock, because describing a window messages its
+        // GUI thread.
+        const wchar_t* skipReason = nullptr;
+        HWND skipEvidence = nullptr;
     };
 
     bool CreatePipeAndRenderer(uint64_t handshakeDeadline);
@@ -253,6 +267,10 @@ private:
     std::unordered_set<std::wstring> retiredSurfaceIds_;
     std::deque<std::wstring> retiredSurfaceOrder_;
     std::unordered_set<HWND> discoveryAttempts_;
+    // Identifies the last enumeration reported to the log, so the census is
+    // written when the window set changes instead of once per second.  Touched
+    // only by the supervisor thread, which is the only caller of discovery.
+    std::wstring discoveryCensusSignature_;
     // Zero means an owned top-level is still visible. A nonzero tick starts the
     // quiet period that must elapse before the native owner is projected again.
     std::unordered_map<HWND, uint64_t> ownerGraphDeferrals_;

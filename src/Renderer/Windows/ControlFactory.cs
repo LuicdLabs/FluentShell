@@ -1228,6 +1228,21 @@ internal sealed class ControlFactory
                 control.Rebuild(viewModel.Items, viewModel.ItemRects, viewModel.SelectedIndex, _scale);
         }
         RebuildHeaders();
+        // A native tab strip is a band of exact rectangles, and WinUI's TabView
+        // template applies its own minimum item height and overflow behavior on top
+        // of the sizes the projection asks for.  Recording both is the only way to
+        // tell a capture that reported a wrong band from a strip WinUI reshaped.
+        void LogTabLayout(object? sender, object args)
+        {
+            control.LayoutUpdated -= LogTabLayout;
+            RendererDiagnostics.Log(
+                $"tabControl layout requested={viewModel.Rect.Width}x{viewModel.Rect.Height} " +
+                $"scale={_scale:F3} owner={control.ActualWidth:F1}x{control.ActualHeight:F1} " +
+                $"headers=[{string.Join("; ", control.Headers.Select(header => header is null ? "null" : $"{header.ActualWidth:F1}x{header.ActualHeight:F1}"))}] " +
+                $"rows=[{string.Join("; ", control.Rows.Select(row => $"{Canvas.GetLeft(row):F1},{Canvas.GetTop(row):F1} {row.ActualWidth:F1}x{row.ActualHeight:F1}"))}] " +
+                $"itemRects=[{string.Join("; ", viewModel.ItemRects.Select(rect => $"{rect.X},{rect.Y} {rect.Width}x{rect.Height}"))}]");
+        }
+        control.LayoutUpdated += LogTabLayout;
         viewModel.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects))
@@ -1840,6 +1855,8 @@ internal sealed class SemanticTabControl : ContentControl
     private readonly List<TabViewItem> _headers = [];
     private readonly List<TabView> _rows = [];
     private readonly Dictionary<TabView, TabHeaderRow> _rowGeometry = [];
+    private readonly Dictionary<TabView, global::Windows.Foundation.Rect> _rowBands = [];
+    private readonly Dictionary<TabViewItem, double> _pillWidths = [];
     private readonly Dictionary<TabViewItem, int> _indices = [];
     private readonly Canvas _headerCanvas = new() { Background = null };
     private int _selectedIndex = -1;
@@ -1868,13 +1885,6 @@ internal sealed class SemanticTabControl : ContentControl
     public int SelectedIndex => _selectedIndex;
     public global::Windows.Foundation.Rect HeaderUnionBounds { get; private set; }
 
-    internal static TabViewPolicy Policy { get; } = new(
-        IsAddTabButtonVisible: false,
-        CanDragTabs: false,
-        CanReorderTabs: false,
-        AreItemsClosable: false,
-        TabWidthMode: TabViewWidthMode.SizeToContent);
-
     public void Rebuild(
         IReadOnlyList<string> labels,
         IReadOnlyList<PixelRect> rects,
@@ -1885,6 +1895,8 @@ internal sealed class SemanticTabControl : ContentControl
         _headers.Clear();
         _rows.Clear();
         _rowGeometry.Clear();
+        _rowBands.Clear();
+        _pillWidths.Clear();
         _indices.Clear();
         if (labels.Count != rects.Count)
             throw new ArgumentException("Tab labels and rectangles must have matching counts.", nameof(rects));
@@ -1900,6 +1912,10 @@ internal sealed class SemanticTabControl : ContentControl
         _headers.AddRange(Enumerable.Repeat<TabViewItem>(null!, labels.Count));
         foreach (var row in ControlFactory.GroupTabHeaderRows(rects))
         {
+            // The row is deliberately unsized.  Constraining a TabView to the native
+            // band height makes its own template clip the tab strip to a few pixels,
+            // so it is left to size to its content and calibrated into place after
+            // layout instead.
             var tabView = new TabView
             {
                 IsAddTabButtonVisible = Policy.IsAddTabButtonVisible,
@@ -1910,40 +1926,119 @@ internal sealed class SemanticTabControl : ContentControl
                 MinWidth = 0,
                 MinHeight = 0,
                 Padding = new Thickness(0),
-                Width = row.Bounds.Width * scale,
-                Height = row.Bounds.Height * scale,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                VerticalAlignment = VerticalAlignment.Top,
             };
             var previousRight = row.Bounds.X;
             foreach (var placement in row.Items)
             {
+                var text = Win32Mnemonic.DisplayText(labels[placement.Index]);
+                var pillWidth = placement.Rect.Width * scale;
+                // The native control sized each pill by measuring its label with GDI, and
+                // WinUI's text metrics are wider at the same point size.  The label is
+                // fitted to the room the pill already committed to, which is also what
+                // keeps the pill at the native width: TabView clears any Width the
+                // projection assigns and sizes SizeToContent pills from their content, so
+                // the width is pinned by MinWidth from below and by the fitted content
+                // from above.
+                var label = new TextBlock
+                {
+                    Text = text,
+                    FontSize = NativeTabFontSize,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
+                };
+                ControlFactory.FitLabelToWidth(label,
+                    pillWidth - (HeaderChrome.Left + HeaderChrome.Right));
+                AutomationProperties.SetAccessibilityView(label, AccessibilityView.Raw);
+                var content = new Border
+                {
+                    Child = label,
+                    Background = null,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    // The vertical half of the template's own header padding is given
+                    // back, so an 18 DIP band still measures a full line box instead of
+                    // clipping the label's descenders.
+                    Margin = new Thickness(0, -HeaderChrome.Top, 0, -HeaderChrome.Bottom),
+                };
                 var header = new TabViewItem
                 {
-                    Header = Win32Mnemonic.DisplayText(labels[placement.Index]),
+                    Header = content,
                     IsClosable = Policy.AreItemsClosable,
                     FontSize = NativeTabFontSize,
                     MinWidth = 0,
                     MinHeight = 0,
-                    Padding = new Thickness(4, 0, 4, 0),
                     HorizontalContentAlignment = HorizontalAlignment.Center,
                     VerticalContentAlignment = VerticalAlignment.Center,
-                    Width = placement.Rect.Width * scale,
                     Height = placement.Rect.Height * scale,
                     Margin = new Thickness((placement.Rect.X - previousRight) * scale, 0, 0, 0),
                 };
-                AutomationProperties.SetName(header, Win32Mnemonic.DisplayText(labels[placement.Index]));
+                AutomationProperties.SetName(header, text);
+                _pillWidths[header] = pillWidth;
                 tabView.TabItems.Add(header);
                 _headers[placement.Index] = header;
                 _indices.Add(header, placement.Index);
                 previousRight = placement.Rect.X + placement.Rect.Width;
             }
             tabView.SelectionChanged += OnRowSelectionChanged;
-            Canvas.SetLeft(tabView, row.Bounds.X * scale);
-            Canvas.SetTop(tabView, row.Bounds.Y * scale);
+            tabView.LayoutUpdated += (_, _) => CalibrateRow(tabView);
             Children.Add(tabView);
             _rows.Add(tabView);
             _rowGeometry.Add(tabView, row);
+            _rowBands.Add(tabView, new global::Windows.Foundation.Rect(
+                row.Bounds.X * scale,
+                row.Bounds.Y * scale,
+                row.Bounds.Width * scale,
+                row.Bounds.Height * scale));
         }
         ApplySelection(selectedIndex);
+    }
+
+    // WinUI's TabView owns the strip's internal metrics: an inset above the tab row,
+    // its own padding, and a width manager that clears whatever Width the projection
+    // assigns.  None of those are contracts the projection may depend on, so the row
+    // is placed by measurement rather than by arithmetic over theme resources: once
+    // the template has realized the pills, the offset from the row's own origin to
+    // the first pill is known, and the row is shifted so that pill lands exactly on
+    // the native band.  The clip then bounds the row to the band, which keeps the tab
+    // content area WinUI reserves below the strip from covering the projected page or
+    // swallowing clicks over it.
+    private void CalibrateRow(TabView row)
+    {
+        if (!_rowBands.TryGetValue(row, out var band) ||
+            !_rowGeometry.TryGetValue(row, out var geometry)) return;
+        var pills = geometry.Items
+            .Select(placement => _headers[placement.Index])
+            .Where(pill => pill is not null && pill.ActualWidth > 0 && pill.ActualHeight > 0)
+            .ToList();
+        if (pills.Count != geometry.Items.Count) return;
+        var origin = pills[0].TransformToVisual(row)
+            .TransformPoint(new global::Windows.Foundation.Point(0, 0));
+        var left = band.X - origin.X;
+        var top = band.Y - origin.Y;
+        if (Canvas.GetLeft(row) != left) Canvas.SetLeft(row, left);
+        if (Canvas.GetTop(row) != top) Canvas.SetTop(row, top);
+        var clip = new global::Windows.Foundation.Rect(
+            origin.X, origin.Y, band.Width, band.Height);
+        if (row.Clip is not RectangleGeometry existing || existing.Rect != clip)
+            row.Clip = new RectangleGeometry { Rect = clip };
+
+        // TabView clears any Width assigned to a SizeToContent pill and sizes it from
+        // its content plus template chrome that no public property exposes.  The chrome
+        // is therefore measured -- pill width minus content width -- and the content is
+        // sized to whatever is left of the native item rectangle.  One extra layout pass
+        // converges, because the chrome does not depend on the content.
+        foreach (var pill in pills)
+        {
+            if (pill.Header is not Border content || content.ActualWidth <= 0 ||
+                !_pillWidths.TryGetValue(pill, out var pillWidth)) continue;
+            var target = pillWidth - (pill.ActualWidth - content.ActualWidth);
+            if (target <= 0 ||
+                (!double.IsNaN(content.Width) && Math.Abs(content.Width - target) <= 0.5)) continue;
+            content.Width = target;
+            if (content.Child is TextBlock label) ControlFactory.FitLabelToWidth(label, target);
+        }
     }
 
     public void ApplySelection(int selectedIndex)
@@ -1958,32 +2053,49 @@ internal sealed class SemanticTabControl : ContentControl
         finally { _applyingSelection = false; }
     }
 
+    // The native control owns selection, so a click is a request: the canonical index
+    // is re-asserted immediately and the pill only moves when the accepted action's
+    // patch says the native page changed.
+    private void OnRowSelectionChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (_applyingSelection || sender is not TabView row ||
+            row.SelectedItem is not TabViewItem selected ||
+            !_indices.TryGetValue(selected, out var index)) return;
+        ApplySelection(_selectedIndex);
+        RequestSelection(index);
+    }
+
     public void RequestSelection(int index)
     {
         if (index >= 0 && index < _headers.Count) _selectionRequested(index);
     }
 
-    private void OnRowSelectionChanged(object sender, SelectionChangedEventArgs args)
-    {
-        if (_applyingSelection || sender is not TabView selectedRow ||
-            selectedRow.SelectedItem is not TabViewItem selected || !_indices.TryGetValue(selected, out var index))
-            return;
-        _applyingSelection = true;
-        try
-        {
-            _selectedIndex = index;
-            foreach (var row in _rows)
-            {
-                if (!ReferenceEquals(row, selectedRow)) row.SelectedIndex = -1;
-            }
-        }
-        finally { _applyingSelection = false; }
-        RequestSelection(index);
-    }
-
     protected override AutomationPeer OnCreateAutomationPeer() => new SemanticTabControlAutomationPeer(this);
 
+    internal static TabViewPolicy Policy { get; } = new(
+        IsAddTabButtonVisible: false,
+        CanDragTabs: false,
+        CanReorderTabs: false,
+        AreItemsClosable: false,
+        TabWidthMode: TabViewWidthMode.SizeToContent);
+
     private const double NativeTabFontSize = 12;
+    // WinUI applies TabViewItemHeaderPadding inside the TabViewItem template, where a
+    // local Padding never reaches it.  The value is read from the framework's own
+    // dictionary so the projection compensates for whatever the current SDK uses,
+    // rather than hardcoding today's 8,3,4,3.
+    private static readonly Thickness HeaderChrome = ReadHeaderChrome();
+
+    private static Thickness ReadHeaderChrome()
+    {
+        if (Application.Current?.Resources.TryGetValue(
+                "TabViewItemHeaderPadding", out var value) == true &&
+            value is Thickness padding)
+        {
+            return padding;
+        }
+        return new Thickness(0);
+    }
 }
 
 internal sealed class SemanticTabControlAutomationPeer(SemanticTabControl owner) :

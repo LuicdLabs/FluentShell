@@ -62,6 +62,15 @@ cannot prove equivalent.
 ### Tranche B: Window Graph And Static Assets
 
 - Model owned top-level/modal graphs rather than rejecting every owned HWND.
+  One level is now implemented: a dialog the application runs modally against a
+  projected owner (the owner is on screen and disabled for the dialog's lifetime)
+  becomes a surface of its own, and its proxy inherits the real owner and blocks
+  it -- the same contract a translated MessageBox already met. A window whose whole
+  owner chain is hidden (the `StubWindow32` behind a control-panel property sheet)
+  counts as unowned. A modeless owned top-level, and a dialog nested deeper than
+  one level, still resolve the whole graph back to native together: a nested dialog
+  inherits DWM cloaking from its cloaked owner and the proxy cannot take the
+  foreground slot the committed gate requires.
 - Bounded `SS_ICON` capture is implemented as owned, size-capped premultiplied
   BGRA data; native handles never cross the process boundary. `SS_BITMAP` and
   `SS_ENHMETAFILE` remain unsupported.
@@ -108,7 +117,14 @@ adapter.
   activation-tracking, and header-drag semantics remain native.
 - A bounded textual top-tab `SysTabControl32` subset is implemented with native
   multiline header rectangles, semantic vetoable selection, and Tab/TabItem UIA.
-  Opaque native `TCITEM.lParam` identity is retained only by the source control.
+  The strip is a real WinUI `TabView`. Its template reserves an inset above the tab
+  row and applies `TabViewItemHeaderPadding` inside the item, and `UpdateTabWidths`
+  clears any `Width` a `SizeToContent` pill is given, so none of the native band's
+  geometry can be asserted through public properties. The row is therefore
+  calibrated by measurement after layout: it is shifted so the realized pills land
+  on the native band, clipped to that band so the reserved content area cannot cover
+  or swallow clicks over the projected page, and each pill's content is sized to the
+  native item rectangle minus the measured template chrome. Opaque native `TCITEM.lParam` identity is retained only by the source control.
   Owner-draw, button, vertical/bottom, fixed-width, image, tooltip,
   callback-text, excessive, and malformed geometry shapes remain native.
 - A bounded `SysTreeView32` subset is implemented: the whole inserted hierarchy is

@@ -3124,6 +3124,13 @@ void TestMdiFrameCaptureAndCommands() {
 } // namespace
 
 int wmain() {
+    // Capture always runs inside a per-monitor-aware scope, so every rectangle it
+    // reads is in physical pixels.  A DPI-unaware test process would have its own
+    // windows virtualized by DWM, leaving window rectangles and the geometry a
+    // control reports about itself in two different coordinate spaces -- which is
+    // precisely what MessageGeometryScale corrects for a real target.  The tests
+    // declare the same awareness so their fixtures live in one space.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     TestVisibleUiaBoundsClipping();
     TestDirectUiEvidenceContracts();
     TestDirectUiInPlaceRoutes();
