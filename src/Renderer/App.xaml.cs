@@ -28,6 +28,10 @@ public sealed partial class App : Application
         try
         {
             RendererDiagnostics.Log("launch activated; parsing renderer identity");
+            // Resolving the framework's theme dictionary is a one-time UI-thread
+            // cost.  Paying it here keeps it out of the first projected surface's
+            // rasterization, which competes with the Bridge's bounded UIA gate.
+            ControlFactory.WarmThemeResources();
             var options = RendererOptions.Parse(Environment.GetCommandLineArgs().Skip(1).ToArray());
             _pipe = new PipeClient(options);
             _windows = new WindowRegistry(options.Nonce, (message, revision) => _pipe.SendAsync(message, revision));

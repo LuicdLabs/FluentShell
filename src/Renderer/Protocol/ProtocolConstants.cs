@@ -21,8 +21,25 @@ public static class ProtocolConstants
     // owned DirectUI bitmap-display and bitmap-switch pixels; minor 14 admits
     // every UIA control type the Win32 adapter registry can back on a
     // capability-derived DirectUI surface, and lets one projected node
-    // advertise two in-place routes.
-    public const ushort Minor = 14;
+    // advertise two in-place routes; minor 15 adds the bounded textual
+    // SysTreeView32 and msctls_trackbar32 adapters: treeView/slider kinds,
+    // per-item depth/expansion/child evidence, and the setValue and setExpand
+    // routes.
+    // routes; minor 16 adds projected MDI frames: the mdiClient and mdiChild
+    // container kinds, per-child caption state and client geometry, and the
+    // mdiCommand route; minor 17 adds per-item icons through a bounded shared
+    // image list, and in-place item renaming through the native control's own
+    // label-edit session.
+    // label-edit session; minor 18 adds the geometric container-pane adapter: the
+    // paneContainer kind, the splits between its child panes, and the setSplit
+    // route that resizes exactly the two panes a split divides, plus the bands such a
+    // container paints itself as bounded BGRA chrome regions.
+    // painted bands as bounded BGRA chrome regions; minor 19 adds accessible islands:
+    // the accessibleIsland kind for a host window whose content owns no HWND, its
+    // elements as typed items read through the accessibility contract the window
+    // answers, and the islandInvoke route that performs one element's own default
+    // action.
+    public const ushort Minor = 19;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;
@@ -32,7 +49,18 @@ public static class ProtocolConstants
     public const int MaxNodes = 512;
     public const int MaxItems = 4_096;
     public const int MaxTabItems = 128;
+    // itemDepths carries a projected TreeView item's nesting level, so the
+    // deepest admissible level is one less than the level count.
+    public const int MaxTreeDepth = 31;
     public const int MaxToolbarItems = 64;
+    public const int MaxPaneSplits = 8;
+    public const int MaxChromeRegions = 4;
+    public const int MaxChromeRegionDimension = 1_024;
+    public const int MaxChromeRegionBytes = 1_024 * 1_024;
+    public const int MaxIslandItems = 32;
+    public const int MaxCoordinate = 65_535;
+    public const int MaxImageListImages = 64;
+    public const int MaxImageListDimension = 64;
     public const int MaxColumns = 64;
     public const int MaxPatchOperations = 1_024;
     public const int MaxMenuItems = 256;

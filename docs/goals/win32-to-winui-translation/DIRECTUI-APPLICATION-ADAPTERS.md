@@ -66,6 +66,8 @@ lane inherits proven typed contracts instead of re-deriving one per application.
 | Tab | `SysTabControl32` | `tabControl` / standard | `select` |
 | ToolBar | `ToolbarWindow32` | `toolbar` / standard | `toolbarCommand` |
 
+Tree and Slider are deliberately absent from this table; see the note below.
+
 A parenthesized second route is advertised only when that revision's own typed
 state says the control accepts it: `setText` when the combo box is `CBS_DROPDOWN`
 and not read-only, `setItemCheck` when the ListView carries
@@ -92,10 +94,17 @@ projected page: a route set derived from typed state stays true for the life of
 the projection. The two deliberate alternates are a Button's default-push bit and
 a radio group's `WS_TABSTOP`, both of which move between members by design.
 
-`TreeView` (`SysTreeView32`) and `Slider` (`msctls_trackbar32`) are outside the
-lane. Neither has a row in `kClassAdapters`, an entry in `kCaptureTable`, or a
-name in the protocol's `kind` enum, so a DirectUI page that contains one stays
-native rather than projecting a control the boundary cannot describe.
+`TreeView` (`SysTreeView32`) and `Slider` (`msctls_trackbar32`) have Win32
+adapter rows and protocol kinds, but they are still outside this lane: the
+capability-derived classifier switches on UIA control type and has no Tree or
+Slider case, so a DirectUI page that contains one stays native. Admitting them
+here is a separate step from the Win32 adapter, because a tree is a composite
+whose absorbed UIA item subtree has to be pinned across the A/U/B bracket and a
+slider needs an in-place mutation rule of its own.
+
+The MDI container kinds (`mdiClient`, `mdiChild`) are outside the lane for the
+same reason and one more: a DirectUI host is one page inside one window, while an
+MDI frame owns child windows whose lifetime the page contract does not describe.
 
 ## Admission contract
 

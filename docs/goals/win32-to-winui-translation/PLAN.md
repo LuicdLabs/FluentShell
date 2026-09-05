@@ -24,11 +24,15 @@
 - Frame header is the fixed 32-byte little-endian v1 layout specified by `protocol-v1.schema.json`; payload limits and ordering violations fail native.
 - Every native object has a generation ID; sequence is monotonic per pipe direction and revision is monotonic per top-level window.
 - Property actions carry an expected revision and are rejected as stale when it no
-  longer matches. Request-semantic actions -- `invoke`, `close`, `move`, and
-  `resize` -- are rebased onto the current revision instead, because the user's
-  pointer, not a snapshot revision, is the truth for whether they still apply.
-  Geometry is coalesced latest-wins by the renderer and emitted once per move/size
-  gesture rather than once per frame.
+  longer matches. Request-semantic actions -- `invoke`, `close`, `move`, `resize`,
+  and `setValue` -- are rebased onto the current revision instead, because the
+  user's pointer, not a snapshot revision, is the truth for whether they still
+  apply. Geometry is coalesced latest-wins by the renderer and emitted once per
+  move/size gesture rather than once per frame.
+- An action the application itself declines (a vetoed rename, for example) is
+  reported as a rejected action plus a patch from canonical state; the surface
+  stays projected. Only an operation that could not be carried out at all restores
+  the whole window.
 - Native reads and writes run on the owning GUI thread. The IPC thread only queues commands.
 - Renderer ViewModels use typed binding. Native patches are canonical; matching event IDs suppress only their own echoes.
 - Any unsupported visible descendant or runtime capability change restores the entire native top-level window.
@@ -45,16 +49,29 @@
 
 ## V1 Support Boundary
 
-Supported: standard rectangular overlapped/dialog windows; bounded textual HMENU
-command bars; Static text/separators; push/default/check/three-state/radio Button;
-noninteractive GroupBox; standard Edit including multiline/read-only/password;
-string dropdown-list and editable dropdown ComboBox; string ListBox;
-determinate horizontal ProgressBar; standard MessageBox; static TaskDialog.
+Supported: standard rectangular overlapped/dialog windows; MDI frames with their
+client area and child frames; bounded textual HMENU command bars; Static
+text/separators/icons; push/default/check/three-state/radio Button;
+noninteractive GroupBox; standard Edit including
+multiline/read-only/password; string dropdown-list and editable dropdown
+ComboBox; string ListBox; determinate horizontal ProgressBar; single-link
+SysLink; report-mode ListView; TreeView with expansion; per-item icons and
+in-place label renaming for both tree and list; reorderable report-list columns;
+geometrically admitted private container panes with real splitters and their own
+painted bands reproduced as bounded pixels; accessible islands whose HWND-less
+elements are read and driven through the window's own accessibility contract; textual
+top-tab TabControl; bounded Trackbar; one-row Toolbar including icon-only, latched,
+dropdown, callback-image, and custom-drawn buttons; textual StatusBar;
+DS_CONTROL dialog containers; standard MessageBox; static TaskDialog.
 
 Native fallback: owner/custom draw, RichEdit, virtual data, foreign/custom HWND,
-tree/tab/list-view, owner-draw/callback/MDI menus, toolbar/status, MDI,
-ActiveX/OLE, browser/XAML children, layered/nonrectangular/custom nonclient
-windows, custom accelerator/focus/IME behavior.
+checkbox or state-image trees, private container classes, owner-draw/callback
+menus, ActiveX/OLE, browser/XAML children, layered/nonrectangular/custom
+nonclient windows, custom accelerator/focus/IME behavior.
+
+Each adapter's exact admitted subset, and the rejection reason for everything
+outside it, is owned by `CONTROL-ADAPTER-ROADMAP.md` and by the probe functions in
+`src/Bridge/Translation/ControlAdapters.cpp`.
 
 The staged expansion program and the non-goals of universal pixel translation
 are defined in `CONTROL-ADAPTER-ROADMAP.md`.

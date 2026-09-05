@@ -5,6 +5,8 @@
 #include "../../src/Bridge/Translation/SourceThreadAgent.h"
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
+#include "../../src/Bridge/Translation/DialogSnapshots.h"
+#include "../../src/Bridge/Translation/AccessibleIsland.h"
 
 #include <winrt/base.h>
 #include <objbase.h>
@@ -33,12 +35,29 @@ int g_tabChanging = 0;
 int g_tabChanged = 0;
 bool g_vetoTabChange = false;
 std::vector<UINT> g_tabNotifications;
+std::vector<WPARAM> g_scrollNotifications;
+int g_labelEditsBegun = 0;
+int g_labelEditsEnded = 0;
+bool g_acceptLabelEdit = true;
 
 LRESULT CALLBACK ListViewNotificationSubclass(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR subclassId, DWORD_PTR) {
+    if (message == WM_HSCROLL || message == WM_VSCROLL) {
+        g_scrollNotifications.push_back(wParam);
+    }
     if (message == WM_NOTIFY) {
         const auto* header = reinterpret_cast<const NMHDR*>(lParam);
+        if (header && (header->code == TVN_BEGINLABELEDITW ||
+                       header->code == LVN_BEGINLABELEDITW)) {
+            ++g_labelEditsBegun;
+            return FALSE;
+        }
+        if (header && (header->code == TVN_ENDLABELEDITW ||
+                       header->code == LVN_ENDLABELEDITW)) {
+            ++g_labelEditsEnded;
+            return g_acceptLabelEdit ? TRUE : FALSE;
+        }
         if (header && header->code == LVN_ITEMCHANGING) {
             ++g_itemChanging;
             if (g_vetoItemChange) return TRUE;
@@ -1034,6 +1053,22 @@ void TestActionSemanticValidation() {
     tabControl.items = { L"one", L"two" };
     tabControl.selectedIndex = 0;
     snapshot.nodes.push_back(tabControl);
+    Translation::ControlNode treeView;
+    treeView.nodeId = 10;
+    treeView.kind = Translation::ControlKind::TreeView;
+    treeView.items = { L"root", L"child" };
+    treeView.itemDepths = { 0, 1 };
+    treeView.itemExpanded = { true, false };
+    treeView.itemHasChildren = { true, false };
+    treeView.selectedIndex = 0;
+    snapshot.nodes.push_back(treeView);
+    Translation::ControlNode slider;
+    slider.nodeId = 11;
+    slider.kind = Translation::ControlKind::Slider;
+    slider.minimum = 0;
+    slider.maximum = 20;
+    slider.position = 7;
+    snapshot.nodes.push_back(slider);
 
     std::wstring error;
     Translation::ActionRequest action;
@@ -1085,7 +1120,12 @@ void TestActionSemanticValidation() {
     Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
         "out-of-range ListView item check was accepted");
     action.itemIndex = 0;
-    snapshot.nodes[snapshot.nodes.size() - 2].checkBoxes = false;
+    // Address the ListView by its identity rather than by position, so appending
+    // another node to this snapshot cannot silently retarget the rule.
+    const auto listViewNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& candidate) { return candidate.nodeId == 8; });
+    Check(listViewNode != snapshot.nodes.end(), "ListView semantic node is missing");
+    if (listViewNode != snapshot.nodes.end()) listViewNode->checkBoxes = false;
     Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
         "item check on a checkbox-disabled ListView was accepted");
     action.nodeId = 9;
@@ -1096,6 +1136,43 @@ void TestActionSemanticValidation() {
     action.integerValue = -1;
     Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
         "TabControl accepted an empty selection");
+
+    action.nodeId = 10;
+    action.action = L"select";
+    action.integerValue = 1;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "bounded TreeView selection was rejected");
+    action.integerValue = -1;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "TreeView accepted an empty selection");
+    action.action = L"setExpand";
+    action.itemIndex = 0;
+    action.booleanValue = true;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "TreeView parent expansion was rejected");
+    action.itemIndex = 1;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "TreeView leaf expansion was accepted");
+    action.itemIndex = 2;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "out-of-range TreeView expansion was accepted");
+    action.nodeId = 9;
+    action.itemIndex = 0;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "setExpand on a TabControl was accepted");
+
+    action.nodeId = 11;
+    action.action = L"setValue";
+    action.integerValue = 20;
+    Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "in-range Trackbar value was rejected");
+    action.integerValue = 21;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "out-of-range Trackbar value was accepted");
+    action.nodeId = 10;
+    action.integerValue = 1;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "setValue on a TreeView was accepted");
 
     snapshot.adapterId = L"microsoft.windows.directui.semantic.v1";
     action.nodeId = 1;
@@ -1116,10 +1193,13 @@ void TestActionRevisionPolicy() {
     Check(Translation::IsRequestSemanticAction(L"move") &&
           Translation::IsRequestSemanticAction(L"resize"),
         "geometry is latest-wins and must not reject a stale revision");
+    Check(Translation::IsRequestSemanticAction(L"setValue"),
+        "a Trackbar drag is latest-wins and must not reject a stale revision");
     Check(!Translation::IsRequestSemanticAction(L"activate") &&
            !Translation::IsRequestSemanticAction(L"setText") &&
            !Translation::IsRequestSemanticAction(L"setCheck") &&
            !Translation::IsRequestSemanticAction(L"setItemCheck") &&
+           !Translation::IsRequestSemanticAction(L"setExpand") &&
           !Translation::IsRequestSemanticAction(L"select") &&
           !Translation::IsRequestSemanticAction(L"menuCommand") &&
           !Translation::IsRequestSemanticAction(L"minimize") &&
@@ -1364,6 +1444,18 @@ void TestControlAdapterRegistry() {
         { PROGRESS_CLASSW, WS_TABSTOP, false, ControlKind::ProgressBar, "tab-stop ProgressBar" },
         { STATUSCLASSNAMEW, 0, true, ControlKind::StatusBar, "StatusBar" },
         { STATUSCLASSNAMEW, WS_TABSTOP, false, ControlKind::StatusBar, "tab-stop StatusBar" },
+        { WC_TREEVIEWW, TVS_HASBUTTONS | TVS_HASLINES, true, ControlKind::TreeView, "TreeView" },
+        { WC_TREEVIEWW, TVS_CHECKBOXES, false, ControlKind::TreeView, "checkbox TreeView" },
+        { WC_TREEVIEWW, TVS_EDITLABELS, true, ControlKind::TreeView, "label-editing TreeView" },
+        { WC_TREEVIEWW, TVS_SINGLEEXPAND, false, ControlKind::TreeView, "single-expand TreeView" },
+        { TRACKBAR_CLASSW, TBS_AUTOTICKS, true, ControlKind::Slider, "Trackbar" },
+        { TRACKBAR_CLASSW, TBS_VERT | TBS_BOTH, true, ControlKind::Slider, "vertical Trackbar" },
+        { TRACKBAR_CLASSW, TBS_ENABLESELRANGE, false, ControlKind::Slider,
+          "selection-range Trackbar" },
+        { TRACKBAR_CLASSW, TBS_TOOLTIPS, false, ControlKind::Slider, "tooltip Trackbar" },
+        { TRACKBAR_CLASSW, TBS_NOTHUMB, false, ControlKind::Slider, "thumbless Trackbar" },
+        { TRACKBAR_CLASSW, TBS_NOTIFYBEFOREMOVE, false, ControlKind::Slider,
+          "veto-snapping Trackbar" },
         // SysLink is deliberately absent: its class is only registered by
         // comctl32 v6, which this unmanifested test host does not activate.
         // TestStructuredCommonControlCapture covers the SysLink capture path.
@@ -1375,7 +1467,7 @@ void TestControlAdapterRegistry() {
             reinterpret_cast<HMENU>(300), GetModuleHandleW(nullptr), nullptr);
         Check(child != nullptr, adapter.label);
         if (!child) continue;
-        ControlKind kind = ControlKind::TreeView;
+        ControlKind kind = ControlKind::Count;
         std::wstring reason;
         const bool classified = Translation::ClassifyControl(child, kind, reason);
         Check(classified == adapter.supported, adapter.label);
@@ -1400,7 +1492,6 @@ void TestControlAdapterRegistry() {
             "LVS_EX_CHECKBOXES was rejected by the ListView probe");
         struct RejectedStyle { DWORD value; const wchar_t* name; };
         const RejectedStyle rejectedStyles[] = {
-            { LVS_EX_HEADERDRAGDROP, L"LVS_EX_HEADERDRAGDROP" },
             { LVS_EX_TRACKSELECT, L"LVS_EX_TRACKSELECT" },
             { LVS_EX_ONECLICKACTIVATE, L"LVS_EX_ONECLICKACTIVATE" },
             { LVS_EX_TWOCLICKACTIVATE, L"LVS_EX_TWOCLICKACTIVATE" },
@@ -1417,11 +1508,66 @@ void TestControlAdapterRegistry() {
         DestroyWindow(styledList);
     }
 
+    // A reorderable header is projected, not refused: the display order travels as a
+    // permutation of the logical columns so the projection can present them in
+    // header order while every index on the wire keeps the application's meaning.
+    {
+        HWND orderRoot = CreateWindowExW(0, L"Static", L"list-order", WS_OVERLAPPEDWINDOW,
+            10, 10, 320, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND orderList = orderRoot ? CreateWindowExW(0, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT, 0, 0, 300, 160, orderRoot,
+            reinterpret_cast<HMENU>(431), GetModuleHandleW(nullptr), nullptr) : nullptr;
+        Check(orderRoot && orderList, "column order test controls were not created");
+        if (orderRoot && orderList) {
+            ListView_SetExtendedListViewStyleEx(orderList,
+                LVS_EX_HEADERDRAGDROP, LVS_EX_HEADERDRAGDROP);
+            for (int index = 0; index < 3; ++index) {
+                LVCOLUMNW column{};
+                column.mask = LVCF_TEXT | LVCF_WIDTH;
+                wchar_t label[8]{};
+                swprintf_s(label, L"C%d", index);
+                column.pszText = label;
+                column.cx = 60 + index;
+                SendMessageW(orderList, LVM_INSERTCOLUMNW, index,
+                    reinterpret_cast<LPARAM>(&column));
+            }
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.pszText = const_cast<LPWSTR>(L"row");
+            SendMessageW(orderList, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
+            int order[3] = { 2, 0, 1 };
+            SendMessageW(orderList, LVM_SETCOLUMNORDERARRAY, 3,
+                reinterpret_cast<LPARAM>(order));
+            ShowWindow(orderRoot, SW_SHOWNOACTIVATE);
+            Translation::ControlKind orderKind{};
+            std::wstring orderReason;
+            Check(Translation::ClassifyControl(orderList, orderKind, orderReason) &&
+                  orderKind == Translation::ControlKind::ListView,
+                "a reorderable ListView header was refused");
+            Translation::ControlNode detail;
+            detail.kind = Translation::ControlKind::ListView;
+            orderReason.clear();
+            Check(Translation::CaptureControlDetail(orderList, detail, orderReason) &&
+                  detail.columnOrder == std::vector<int>{ 2, 0, 1 } &&
+                  detail.columns.size() == 3 && detail.columns[0] == L"C0",
+                "ListView column display order was not captured in header order");
+            // The action route sets the order the same way the native header does.
+            Check(Translation::SetListViewColumnOrder(orderList, { 1, 2, 0 }),
+                "a projected column reorder was refused by the list");
+            detail.columnOrder.clear();
+            orderReason.clear();
+            Check(Translation::CaptureControlDetail(orderList, detail, orderReason) &&
+                  detail.columnOrder == std::vector<int>{ 1, 2, 0 },
+                "a projected column reorder did not reach the native header");
+        }
+        if (orderRoot) DestroyWindow(orderRoot);
+    }
+
     // An unregistered class is rejected by name so the log identifies it.
     HWND custom = CreateWindowExW(0, L"ScrollBar", L"probe", WS_CHILD,
         0, 0, 40, 40, root, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (custom) {
-        ControlKind kind = ControlKind::TreeView;
+        ControlKind kind = ControlKind::Count;
         std::wstring reason;
         Check(!Translation::ClassifyControl(custom, kind, reason),
             "unregistered class was accepted");
@@ -1511,6 +1657,14 @@ void TestStructuredCommonControlCapture() {
     SendMessageW(status, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(parts));
     SendMessageW(status, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(L"Ln 1, Col 1"));
     SendMessageW(status, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(L"100%"));
+    // A status bar's text lives in its own parts.  An application that parks an empty
+    // child window in one -- MMC keeps a simple Static and a hidden progress bar there
+    // -- contributes nothing the projection can lose, so the child is absorbed rather
+    // than refusing the whole window.
+    HWND statusPlaceholder = CreateWindowExW(0, L"Static", L"",
+        WS_CHILD | WS_VISIBLE | SS_SIMPLE, 4, 2, 120, 18, status,
+        reinterpret_cast<HMENU>(4097), GetModuleHandleW(nullptr), nullptr);
+    Check(statusPlaceholder != nullptr, "StatusBar placeholder child was not created");
     ShowWindow(window, SW_SHOWNOACTIVATE);
 
     Translation::CaptureContext context;
@@ -1541,6 +1695,22 @@ void TestStructuredCommonControlCapture() {
           statusNode->items == std::vector<std::wstring>{ L"Ln 1, Col 1", L"100%" } &&
           statusNode->columnWidths.size() == 2,
         "bounded StatusBar state was not captured canonically");
+    // The absorbed placeholder must not appear as a node of its own: the status bar's
+    // parts already carry every piece of text the window shows there.
+    Check(std::none_of(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [&](const Translation::ControlNode& node) {
+                return node.hwnd == statusPlaceholder;
+            }),
+        "StatusBar placeholder child was projected as a node of its own");
+    // One carrying text is content, and content inside a status bar is not something
+    // the parts can describe, so it still refuses the window.
+    SetWindowTextW(statusPlaceholder, L"Ready");
+    Translation::WindowSnapshot textualChild;
+    context.revision = 7;
+    Check(!Translation::CaptureWindow(window, context, textualChild, error),
+        "StatusBar child carrying text was absorbed instead of refused");
+    SetWindowTextW(statusPlaceholder, L"");
+    context.revision = 1;
 
     SetWindowLongPtrW(list, GWL_STYLE, headerlessStyle);
     SetWindowPos(list, nullptr, 0, 0, 0, 0,
@@ -2015,18 +2185,34 @@ void TestTabOrderRejectionSpecificity() {
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_EDITLABELS,
         10, 10, 320, 160, listRoot, reinterpret_cast<HMENU>(412),
         GetModuleHandleW(nullptr), nullptr) : nullptr;
-    Check(listRoot && list, "label-edit ListView focus test controls were not created");
+    Check(listRoot && list, "label-edit ListView test controls were not created");
     if (listRoot && list) {
         ShowWindow(listRoot, SW_SHOWNOACTIVATE);
+        LVCOLUMNW column{};
+        column.mask = LVCF_TEXT | LVCF_WIDTH;
+        column.pszText = const_cast<LPWSTR>(L"Name");
+        column.cx = 200;
+        SendMessageW(list, LVM_INSERTCOLUMNW, 0, reinterpret_cast<LPARAM>(&column));
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.pszText = const_cast<LPWSTR>(L"Volume");
+        SendMessageW(list, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
         Translation::CaptureContext context;
         context.surfaceId = L"55555555-5555-5555-5555-555555555555";
         context.generation = 1;
         context.revision = 1;
         Translation::WindowSnapshot snapshot;
         std::wstring error;
-        Check(!Translation::CaptureWindow(listRoot, context, snapshot, error) &&
-              error.find(L"label-editable") != std::wstring::npos,
-            "non-dialog ListView did not reach its precise adapter rejection");
+        // A label-editable report list is projected, and the capture says so, so
+        // the projection can offer the rename instead of hiding the capability.
+        const bool captured = Translation::CaptureWindow(listRoot, context, snapshot, error);
+        if (!captured) std::wcerr << L"label-edit ListView rejection: " << error << L'\n';
+        const auto listNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [](const Translation::ControlNode& candidate) {
+                return candidate.kind == Translation::ControlKind::ListView;
+            });
+        Check(captured && listNode != snapshot.nodes.end() && listNode->editableLabels,
+            "a label-editable report ListView was not projected as renamable");
     }
     if (listRoot) DestroyWindow(listRoot);
 
@@ -2150,6 +2336,257 @@ void TestMenuActionValidationAndSerialization() {
         "typed menu snapshot was not serialized");
 }
 
+// The translated dialog lane answers the native call itself, so its snapshots are
+// built without any HWND tree.  They still travel over the same protocol, so they
+// have to satisfy the same cross-node invariants the renderer enforces on
+// admission: unique nonzero node IDs, unique z-index per node, and no node
+// claiming a native window.  A missing z-index here is invisible in the Bridge and
+// faults the surface only once a dialog actually opens.
+void CheckVirtualDialogSnapshot(
+    const Translation::WindowSnapshot& snapshot,
+    const char* label) {
+    std::unordered_map<uint64_t, int> seenIds;
+    std::unordered_map<int, int> seenZ;
+    bool ok = !snapshot.nodes.empty();
+    for (const auto& node : snapshot.nodes) {
+        if (node.nodeId == 0 || node.generation == 0) ok = false;
+        if (node.hwnd != nullptr) ok = false;
+        if (++seenIds[node.nodeId] > 1) ok = false;
+        if (++seenZ[node.zIndex] > 1) ok = false;
+    }
+    Check(ok, label);
+}
+
+// A private container is admitted geometrically, so the suite builds a real one: a
+// class the registry does not know, a caption band it paints itself, and two panes
+// separated by a thin strip.  The band has to arrive as chrome pixels and the strip
+// as a draggable split that moves exactly those two panes.
+LRESULT CALLBACK PaneContainerProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_ERASEBKGND) {
+        RECT client{};
+        GetClientRect(window, &client);
+        HBRUSH brush = CreateSolidBrush(RGB(0x20, 0x40, 0x60));
+        if (brush) {
+            FillRect(reinterpret_cast<HDC>(wParam), &client, brush);
+            DeleteObject(brush);
+        }
+        return 1;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+// An accessible island: a host window whose content owns no HWND at all.  The suite
+// builds a real one out of an ordinary Static, because a Static answers accessibility
+// for itself and exposes no accessible children, which is exactly the shape that has
+// to be refused.  MMC's DirectUI Actions pane is the admitted case; the rules that
+// decide between them are what this covers.
+void TestAccessibleIslandBoundary() {
+    HWND root = CreateWindowExW(0, L"Static", L"island-host", WS_OVERLAPPEDWINDOW,
+        40, 40, 320, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND leaf = root ? CreateWindowExW(0, L"Static", L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 200, 40, root, reinterpret_cast<HMENU>(720),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && leaf, "accessible island test controls were not created");
+    if (!root || !leaf) {
+        if (root) DestroyWindow(root);
+        return;
+    }
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+
+    // The host class list is closed: DirectUI's window class belongs to Windows, so it
+    // is named, and an application class is not.
+    Check(Translation::IsAccessibleIslandClass(L"DirectUIHWND"),
+        "the DirectUI host class is not recognized as an island host");
+    Check(Translation::IsAccessibleIslandClass(L"directuihwnd"),
+        "island host class matching is case sensitive");
+    Check(!Translation::IsAccessibleIslandClass(L"AfxWnd42u") &&
+          !Translation::IsAccessibleIslandClass(L"Static"),
+        "an application class was treated as an island host");
+
+    // A window whose accessible object exposes no children is not an island: there is
+    // nothing to project, and admitting it would produce an empty surface.
+    std::vector<Translation::AccessibleIslandItem> items;
+    std::wstring reason;
+    const bool admitted = Translation::ReadAccessibleIslandItems(leaf, items, reason);
+    if (admitted) std::wcerr << L"childless island produced " << items.size() << L" items\n";
+    Check(!admitted && items.empty() &&
+          reason.find(L"not a container") != std::wstring::npos,
+        "a window that is not an element container was admitted as an accessible island");
+
+    // A destroyed window is refused rather than crashing the capture.
+    HWND gone = CreateWindowExW(0, L"Static", L"", WS_CHILD, 0, 0, 10, 10, root,
+        nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (gone) DestroyWindow(gone);
+    reason.clear();
+    Check(!Translation::ReadAccessibleIslandItems(gone, items, reason),
+        "a destroyed island window was admitted");
+    reason.clear();
+    Check(!Translation::InvokeAccessibleIslandItem(leaf, 0, L"Anything", L"Act", reason),
+        "an island action ran against a window with no elements");
+
+    // The accessible name of an internal child is what lets an icon-only toolbar
+    // button project; a window that publishes none reports an empty string rather than
+    // inventing one.
+    Check(Translation::AccessibleChildName(leaf, 0).empty() &&
+          Translation::AccessibleChildName(nullptr, 1).empty(),
+        "an accessible child name was invented for a window that has none");
+    DestroyWindow(root);
+}
+
+void TestPaneContainerCaptureAndSplit() {
+    WNDCLASSEXW containerClass{};
+    containerClass.cbSize = sizeof(containerClass);
+    containerClass.lpfnWndProc = PaneContainerProc;
+    containerClass.hInstance = GetModuleHandleW(nullptr);
+    containerClass.lpszClassName = L"FluentShellTestPaneHost";
+    RegisterClassExW(&containerClass);
+
+    HWND root = CreateWindowExW(0, L"Static", L"pane-host", WS_OVERLAPPEDWINDOW,
+        30, 30, 360, 280, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND container = root ? CreateWindowExW(0, L"FluentShellTestPaneHost", L"",
+        WS_CHILD | WS_VISIBLE, 0, 0, 300, 200, root, reinterpret_cast<HMENU>(700),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    // A 30 px caption band at the top is chrome; the panes tile everything below it.
+    HWND left = container ? CreateWindowExW(0, L"Static", L"left", WS_CHILD | WS_VISIBLE,
+        0, 30, 148, 170, container, reinterpret_cast<HMENU>(701),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND right = container ? CreateWindowExW(0, L"Static", L"right", WS_CHILD | WS_VISIBLE,
+        151, 30, 149, 170, container, reinterpret_cast<HMENU>(702),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && container && left && right, "pane container test controls were not created");
+    if (!root || !container || !left || !right) {
+        if (root) DestroyWindow(root);
+        return;
+    }
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    UpdateWindow(root);
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(container, kind, reason) &&
+          kind == Translation::ControlKind::PaneContainer,
+        "a container whose children tile it was not admitted");
+    if (kind != Translation::ControlKind::PaneContainer) {
+        std::wcerr << L"pane container rejection: " << reason << L'\n';
+    }
+
+    Translation::ControlNode node;
+    node.kind = Translation::ControlKind::PaneContainer;
+    reason.clear();
+    Check(Translation::CaptureControlDetail(container, node, reason),
+        "container pane state was not captured");
+    Check(node.splits.size() == 1 && node.splits[0].vertical &&
+          node.splits[0].position == 148 && node.splits[0].thickness == 3 &&
+          node.splits[0].minimum < node.splits[0].maximum,
+        "the strip between two panes was not captured as one draggable split");
+    Check(node.chromeRegions.size() == 1 &&
+          node.chromeRegions[0].rect.top == 0 && node.chromeRegions[0].rect.bottom == 30 &&
+          node.chromeRegions[0].imageWidth == 300 && node.chromeRegions[0].imageHeight == 30 &&
+          node.chromeRegions[0].imageFormat == L"bgra8-premultiplied" &&
+          node.chromeRegions[0].imageData.size() == 300 * 30 * 4,
+        "the band the container paints itself was not captured as bounded pixels");
+    if (node.splits.size() != 1 || node.chromeRegions.size() != 1) {
+        std::wcerr << L"splits=" << node.splits.size()
+            << L" chrome=" << node.chromeRegions.size() << L'\n';
+    }
+
+    // Moving the split resizes exactly the two panes it divides.
+    Check(Translation::SetPaneSplit(container, 0, 100),
+        "a projected split move was refused");
+    RECT leftRect{};
+    RECT rightRect{};
+    GetWindowRect(left, &leftRect);
+    GetWindowRect(right, &rightRect);
+    MapWindowPoints(nullptr, container, reinterpret_cast<POINT*>(&leftRect), 2);
+    MapWindowPoints(nullptr, container, reinterpret_cast<POINT*>(&rightRect), 2);
+    Check(leftRect.right == 100 && rightRect.left == 103 &&
+          leftRect.left == 0 && rightRect.right == 300,
+        "a split move did not land on exactly the two panes it divides");
+
+    // The range is bounded by the two panes, and a position outside it is refused
+    // rather than collapsing a pane.
+    Check(!Translation::SetPaneSplit(container, 0, 0) &&
+          !Translation::SetPaneSplit(container, 0, 299) &&
+          !Translation::SetPaneSplit(container, 3, 120),
+        "an out-of-range split move was accepted");
+
+    // A container keeps its own proportion in private data that no message writes, so a
+    // split the user asked for is expressed again against the new extent after the
+    // application re-lays the container out.  The proportion is what carries, and the
+    // range the container currently offers is what bounds it.
+    Check(Translation::ProportionalSplitTarget(100, 300, 600, 24, 573) == 200 &&
+          Translation::ProportionalSplitTarget(100, 300, 300, 24, 273) == 100 &&
+          Translation::ProportionalSplitTarget(290, 300, 60, 24, 33) == 33 &&
+          Translation::ProportionalSplitTarget(10, 300, 600, 24, 573) == 24,
+        "a remembered split did not scale with the container or stay inside its range");
+    // A degenerate measurement carries no proportion, so nothing is asserted from it.
+    Check(Translation::ProportionalSplitTarget(100, 0, 600, 24, 573) == 100 &&
+          Translation::ProportionalSplitTarget(100, 300, 0, 24, 573) == 100 &&
+          Translation::ProportionalSplitTarget(100, 300, 600, 573, 24) == 100,
+        "a split target was invented from a degenerate measurement");
+
+    // A container that paints more than the caps allow is refused, with the offending
+    // rectangle as evidence: that is the line between a frame and a custom control.
+    // Widening the container leaves a band wider than the protocol cap.
+    MoveWindow(container, 0, 0, 1100, 200, TRUE);
+    reason.clear();
+    Check(!Translation::ClassifyControl(container, kind, reason) &&
+          reason.find(L"paints more than") != std::wstring::npos,
+        "a container with an oversized painted band was accepted");
+    if (reason.find(L"paints more than") == std::wstring::npos) {
+        std::wcerr << L"oversized container reason: " << reason << L'\n';
+    }
+    DestroyWindow(root);
+}
+
+void TestVirtualDialogSnapshots() {
+    std::unordered_map<uint64_t, int> results;
+    const auto messageBox = Translation::BuildMessageBoxSnapshot(
+        nullptr, L"The call was answered by the projection.", L"Oracle",
+        MB_YESNOCANCEL | MB_ICONEXCLAMATION, results);
+    Check(messageBox.surfaceKind == Translation::SurfaceKind::MessageBox &&
+          messageBox.icon == L"warning" && messageBox.canCancel &&
+          messageBox.nodes.size() == 4 && results.size() == 3,
+        "MessageBox translation did not describe its buttons");
+    CheckVirtualDialogSnapshot(messageBox, "translated MessageBox broke a protocol invariant");
+
+    // Every text block, the verification checkbox, and every button share one
+    // snapshot, which is where duplicate z-indexes came from.
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.dwFlags = TDF_VERIFICATION_FLAG_CHECKED | TDF_ALLOW_DIALOG_CANCELLATION;
+    config.pszMainIcon = TD_INFORMATION_ICON;
+    config.nDefaultButton = IDOK;
+    const std::vector<std::pair<int, std::wstring>> buttons{
+        { IDOK, L"OK" }, { IDCANCEL, L"Cancel" }
+    };
+    std::unordered_map<uint64_t, int> dialogResults;
+    std::optional<uint64_t> verificationNode;
+    const auto taskDialog = Translation::BuildTaskDialogSnapshot(
+        config, buttons, L"Oracle", L"Main instruction", L"Body content",
+        L"Footer", L"Do not ask again", dialogResults, verificationNode);
+    Check(taskDialog.surfaceKind == Translation::SurfaceKind::TaskDialog &&
+          taskDialog.icon == L"info" && taskDialog.canCancel &&
+          taskDialog.nodes.size() == 6 && dialogResults.size() == 2 &&
+          verificationNode.has_value(),
+        "TaskDialog translation did not describe its content");
+    CheckVirtualDialogSnapshot(taskDialog, "translated TaskDialog broke a protocol invariant");
+
+    // An empty text block is skipped rather than projected as a blank node, and the
+    // remaining nodes still form one contiguous, unique z-order.
+    TASKDIALOGCONFIG spare{};
+    spare.cbSize = sizeof(spare);
+    std::unordered_map<uint64_t, int> spareResults;
+    std::optional<uint64_t> spareVerification;
+    const auto minimal = Translation::BuildTaskDialogSnapshot(
+        spare, { { IDOK, L"OK" } }, L"", L"Only an instruction", L"", L"", L"",
+        spareResults, spareVerification);
+    Check(minimal.nodes.size() == 2 && !spareVerification.has_value() &&
+          minimal.title == L"Dialog" && minimal.icon == L"none",
+        "a sparse TaskDialog was not reduced to its real content");
+    CheckVirtualDialogSnapshot(minimal, "sparse TaskDialog broke a protocol invariant");
+}
+
 void TestToolbarCaptureBoundary() {
     HWND window = CreateWindowExW(0, L"Static", L"toolbar-capture", WS_OVERLAPPEDWINDOW,
         20, 20, 480, 180, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -2171,10 +2608,14 @@ void TestToolbarCaptureBoundary() {
     wchar_t openLabel[] = L"Open";
     wchar_t saveLabel[] = L"Save";
     wchar_t hiddenLabel[] = L"Hidden";
-    TBBUTTON buttons[4]{};
+    wchar_t latchLabel[] = L"Latch";
+    TBBUTTON buttons[5]{};
     buttons[0].iBitmap = 0;
     buttons[0].idCommand = 100;
-    buttons[0].fsState = TBSTATE_ENABLED;
+    // TBSTATE_PRESSED is the transient look of a button under the pointer and
+    // TBSTATE_MARKED an application highlight the control paints; neither changes what
+    // the button does, so neither may refuse the window.
+    buttons[0].fsState = TBSTATE_ENABLED | TBSTATE_PRESSED | TBSTATE_MARKED;
     buttons[0].fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
     buttons[0].iString = reinterpret_cast<INT_PTR>(openLabel);
     buttons[1].iBitmap = 8;
@@ -2189,7 +2630,14 @@ void TestToolbarCaptureBoundary() {
     buttons[3].fsState = TBSTATE_ENABLED | TBSTATE_HIDDEN;
     buttons[3].fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE;
     buttons[3].iString = reinterpret_cast<INT_PTR>(hiddenLabel);
-    Check(SendMessageW(toolbar, TB_ADDBUTTONSW, 4, reinterpret_cast<LPARAM>(buttons)) != FALSE,
+    // A latched button whose image index the list does not own: the control draws that
+    // face itself, so the projection reproduces the pixels it drew.
+    buttons[4].iBitmap = 9;
+    buttons[4].idCommand = 103;
+    buttons[4].fsState = TBSTATE_ENABLED | TBSTATE_CHECKED;
+    buttons[4].fsStyle = BTNS_CHECK | BTNS_AUTOSIZE;
+    buttons[4].iString = reinterpret_cast<INT_PTR>(latchLabel);
+    Check(SendMessageW(toolbar, TB_ADDBUTTONSW, 5, reinterpret_cast<LPARAM>(buttons)) != FALSE,
         "ToolbarWindow32 buttons were not added");
     SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
     ShowWindow(window, SW_SHOWNOACTIVATE);
@@ -2201,17 +2649,27 @@ void TestToolbarCaptureBoundary() {
     Translation::WindowSnapshot snapshot;
     std::wstring error;
     const bool captured = Translation::CaptureWindow(window, context, snapshot, error);
+    if (!captured) std::wcerr << L"toolbar capture rejection: " << error << L'\n';
     Check(captured, "bounded ToolbarWindow32 was rejected");
     const auto found = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
         [](const Translation::ControlNode& node) { return node.kind == Translation::ControlKind::Toolbar; });
     Check(found != snapshot.nodes.end(), "ToolbarWindow32 node was not captured");
     if (found != snapshot.nodes.end()) {
-        Check(found->toolbarItems.size() == 4 &&
+        Check(found->toolbarItems.size() == 5 &&
               found->toolbarItems[0].text == L"Open" &&
               !found->toolbarItems[2].enabled && found->toolbarItems[3].hidden &&
               found->toolbarItems[0].imageFormat == L"bgra8-premultiplied" &&
               !found->toolbarItems[0].imageData.empty(),
             "ToolbarWindow32 typed items were not captured");
+        // The latched button keeps the state the control owns.  Its image index is not
+        // in the list, but it carries its own label, so the label is its face and no
+        // cropped bitmap of that text travels with it.
+        Check(found->toolbarItems[4].kind == Translation::ToolbarItemKind::ToggleButton &&
+              found->toolbarItems[4].checked &&
+              found->toolbarItems[4].text == L"Latch" &&
+              !found->toolbarItems[4].paintedFace &&
+              found->toolbarItems[4].imageData.empty(),
+            "ToolbarWindow32 latched button state or its label-only face was not captured");
         Translation::ActionRequest action;
         action.action = L"toolbarCommand";
         action.nodeId = found->nodeId;
@@ -2236,6 +2694,433 @@ void TestToolbarCaptureBoundary() {
     if (images) ImageList_Destroy(images);
 }
 
+HTREEITEM InsertTreeItem(HWND tree, HTREEITEM parent, const wchar_t* text) {
+    TVINSERTSTRUCTW insert{};
+    insert.hParent = parent;
+    insert.hInsertAfter = TVI_LAST;
+    insert.item.mask = TVIF_TEXT;
+    insert.item.pszText = const_cast<LPWSTR>(text);
+    return reinterpret_cast<HTREEITEM>(
+        SendMessageW(tree, TVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&insert)));
+}
+
+void TestTreeViewCaptureAndExpansion() {
+    HWND window = CreateWindowExW(0, L"Static", L"tree-view", WS_OVERLAPPEDWINDOW,
+        20, 20, 420, 320, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    constexpr DWORD treeStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_EDITLABELS;
+    HWND tree = window ? CreateWindowExW(0, WC_TREEVIEWW, L"", treeStyle,
+        10, 10, 380, 260, window, reinterpret_cast<HMENU>(460),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(window && tree, "TreeView capture controls were not created");
+    if (!window || !tree) {
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SetWindowSubclass(window, ListViewNotificationSubclass, 4, 0);
+    // A two-icon image list proves per-item imagery survives the boundary and that
+    // the selected-state index is captured separately.
+    HIMAGELIST icons = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 2, 0);
+    if (icons) {
+        if (HICON app = LoadIconW(nullptr, IDI_APPLICATION)) ImageList_AddIcon(icons, app);
+        if (HICON info = LoadIconW(nullptr, IDI_INFORMATION)) ImageList_AddIcon(icons, info);
+        SendMessageW(tree, TVM_SETIMAGELIST, TVSIL_NORMAL, reinterpret_cast<LPARAM>(icons));
+    }
+
+    // Console Root > (Services > Local, Event Viewer): one collapsed parent, one
+    // expanded parent, and two leaves, so depth, expansion, and child evidence
+    // are all exercised by one flattened order.
+    const HTREEITEM root = InsertTreeItem(tree, TVI_ROOT, L"Console Root");
+    const HTREEITEM services = InsertTreeItem(tree, root, L"Services");
+    const HTREEITEM local = InsertTreeItem(tree, services, L"Local");
+    const HTREEITEM events = InsertTreeItem(tree, root, L"Event Viewer");
+    Check(root && services && local && events, "TreeView items were not inserted");
+    // Assign the selected-state icon after insertion too: that is the common
+    // application pattern, and the capture must read the stored value rather than
+    // whatever was passed to TVM_INSERTITEM.
+    for (const HTREEITEM item : { root, services, local, events }) {
+        if (!item) continue;
+        TVITEMW selectedImage{};
+        selectedImage.mask = TVIF_HANDLE | TVIF_SELECTEDIMAGE;
+        selectedImage.hItem = item;
+        selectedImage.iSelectedImage = 1;
+        SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&selectedImage));
+    }
+    SendMessageW(tree, TVM_EXPAND, TVE_EXPAND, reinterpret_cast<LPARAM>(root));
+    SendMessageW(tree, TVM_SELECTITEM, TVGN_CARET, reinterpret_cast<LPARAM>(services));
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"77777777-7777-7777-7777-666666666666";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(window, context, snapshot, error);
+    if (!captured) std::wcerr << L"TreeView capture rejection: " << error << L'\n';
+    Check(captured, "bounded textual TreeView was rejected");
+    const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& candidate) {
+            return candidate.kind == Translation::ControlKind::TreeView;
+        });
+    Check(node != snapshot.nodes.end(), "TreeView node was not captured");
+    if (node != snapshot.nodes.end()) {
+        const std::vector<std::wstring> expectedItems{
+            L"Console Root", L"Services", L"Local", L"Event Viewer" };
+        Check(node->items == expectedItems,
+            "TreeView items were not flattened in native depth-first order");
+        Check(node->itemDepths == std::vector<int>{ 0, 1, 2, 1 },
+            "TreeView item depths do not describe the native hierarchy");
+        Check(node->itemExpanded == std::vector<bool>{ true, false, false, false },
+            "TreeView expansion state was not captured");
+        Check(node->itemHasChildren == std::vector<bool>{ true, true, false, false },
+            "TreeView child evidence was not captured");
+        Check(node->imageList.size() == 2 &&
+              node->imageList[0].imageWidth == 16 && node->imageList[0].imageHeight == 16 &&
+              node->imageList[0].imageFormat == L"bgra8-premultiplied" &&
+              node->imageList[0].imageData.size() == 16 * 16 * 4,
+            "TreeView image list was not captured as bounded owned pixels");
+        Check(node->itemImages == std::vector<int>{ 0, 0, 0, 0 } &&
+              node->itemSelectedImages == std::vector<int>{ 1, 1, 1, 1 },
+            "TreeView per-item image indexes were not captured");
+        if (node->itemImages != std::vector<int>{ 0, 0, 0, 0 } ||
+            node->itemSelectedImages != std::vector<int>{ 1, 1, 1, 1 }) {
+            std::wcerr << L"actual tree item images:";
+            for (size_t index = 0; index < node->itemImages.size(); ++index) {
+                std::wcerr << L' ' << node->itemImages[index] << L'/'
+                    << (index < node->itemSelectedImages.size()
+                        ? node->itemSelectedImages[index] : -99);
+            }
+            std::wcerr << L" imageList=" << node->imageList.size() << L'\n';
+        }
+        Check(node->editableLabels && node->editingIndex == -1,
+            "TreeView label editing state was not captured");
+        Check(node->selectedIndex == 1 && !node->multiSelect,
+            "TreeView selection was not captured as a single flattened index");
+        Check(node->text.empty() && node->automationName.empty(),
+            "TreeView duplicated its items in the window text");
+        const auto json = Translation::SerializeWindowOpen(
+            L"00112233445566778899aabbccddeeff", snapshot);
+        Check(json.find("\"kind\":\"treeView\"") != std::string::npos &&
+              json.find("\"itemDepths\":[0,1,2,1]") != std::string::npos &&
+              json.find("\"itemHasChildren\":[") != std::string::npos,
+            "TreeView hierarchy was not serialized");
+        const auto fingerprint = Translation::SnapshotFingerprint(snapshot);
+        const auto index = static_cast<size_t>(node - snapshot.nodes.begin());
+        snapshot.nodes[index].itemHasChildren[2] = true;
+        Check(fingerprint != Translation::SnapshotFingerprint(snapshot),
+            "TreeView child evidence was omitted from the fingerprint");
+    }
+
+    // Every index-addressed action resolves through the same flattened order.
+    Check(Translation::SelectTreeViewItem(tree, 3) &&
+          reinterpret_cast<HTREEITEM>(
+              SendMessageW(tree, TVM_GETNEXTITEM, TVGN_CARET, 0)) == events,
+        "TreeView selection did not follow the flattened index");
+    Check(!Translation::SelectTreeViewItem(tree, 4),
+        "TreeView selection accepted an index outside its items");
+    Check(Translation::SetTreeViewItemExpanded(tree, 1, true),
+        "TreeView parent expansion was rejected");
+    Check(Translation::SetTreeViewItemExpanded(tree, 1, false),
+        "TreeView parent collapse was rejected");
+    Check(!Translation::SetTreeViewItemExpanded(tree, 2, true),
+        "TreeView leaf reported a successful expansion");
+
+    // A rename runs the control's own label session, so the application decides
+    // whether the new text is kept.
+    g_labelEditsBegun = g_labelEditsEnded = 0;
+    g_acceptLabelEdit = true;
+    Check(Translation::RenameTreeViewItem(tree, 3, L"Renamed leaf") &&
+          g_labelEditsBegun == 1 && g_labelEditsEnded == 1,
+        "an accepted TreeView rename did not run the native label session");
+    g_acceptLabelEdit = false;
+    Check(!Translation::RenameTreeViewItem(tree, 3, L"Refused leaf") &&
+          g_labelEditsBegun == 2 && g_labelEditsEnded == 2,
+        "a refused TreeView rename was reported as applied");
+    g_acceptLabelEdit = true;
+    Check(!Translation::RenameTreeViewItem(tree, 9, L"Out of range"),
+        "a rename outside the item range was accepted");
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    HIMAGELIST states = ImageList_Create(16, 16, ILC_COLOR32, 1, 1);
+    SendMessageW(tree, TVM_SETIMAGELIST, TVSIL_STATE,
+        reinterpret_cast<LPARAM>(states));
+    reason.clear();
+    Check(states && !Translation::ClassifyControl(tree, kind, reason) &&
+          reason.find(L"state image list") != std::wstring::npos,
+        "a TreeView state image list was accepted");
+    SendMessageW(tree, TVM_SETIMAGELIST, TVSIL_STATE, 0);
+    if (states) ImageList_Destroy(states);
+    reason.clear();
+    Check(Translation::ClassifyControl(tree, kind, reason) &&
+          kind == Translation::ControlKind::TreeView,
+        "an icon-bearing TreeView was rejected");
+
+    SetWindowLongPtrW(tree, GWL_STYLE, treeStyle | TVS_TRACKSELECT);
+    reason.clear();
+    Check(!Translation::ClassifyControl(tree, kind, reason) &&
+          reason.find(L"TVS_TRACKSELECT") != std::wstring::npos &&
+          reason.find(L"0x") != std::wstring::npos,
+        "unsupported TreeView style lacked exact named diagnostics");
+    SetWindowLongPtrW(tree, GWL_STYLE, treeStyle);
+
+    Translation::ControlNode detail;
+    detail.kind = Translation::ControlKind::TreeView;
+    detail.style = treeStyle;
+    reason.clear();
+    Check(Translation::CaptureControlDetail(tree, detail, reason),
+        "TreeView detail capture was rejected");
+    TVITEMW blank{};
+    blank.mask = TVIF_HANDLE | TVIF_TEXT;
+    blank.hItem = local;
+    blank.pszText = const_cast<LPWSTR>(L"");
+    SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&blank));
+    reason.clear();
+    Check(!Translation::CaptureControlDetail(tree, detail, reason) &&
+          reason.find(L"nonempty") != std::wstring::npos,
+        "TreeView accepted an item with no label");
+    DestroyWindow(window);
+    if (icons) ImageList_Destroy(icons);
+}
+
+void TestTrackbarCaptureAndValue() {
+    HWND window = CreateWindowExW(0, L"Static", L"trackbar", WS_OVERLAPPEDWINDOW,
+        20, 20, 360, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    constexpr DWORD trackbarStyle = WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_AUTOTICKS;
+    HWND trackbar = window ? CreateWindowExW(0, TRACKBAR_CLASSW, L"", trackbarStyle,
+        10, 10, 300, 40, window, reinterpret_cast<HMENU>(470),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(window && trackbar, "Trackbar capture controls were not created");
+    if (!window || !trackbar) {
+        if (window) DestroyWindow(window);
+        return;
+    }
+    SetWindowSubclass(window, ListViewNotificationSubclass, 3, 0);
+    SendMessageW(trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(0, 20));
+    SendMessageW(trackbar, TBM_SETLINESIZE, 0, 2);
+    SendMessageW(trackbar, TBM_SETPAGESIZE, 0, 5);
+    SendMessageW(trackbar, TBM_SETPOS, TRUE, 7);
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"77777777-7777-7777-7777-777777777777";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(window, context, snapshot, error);
+    if (!captured) std::wcerr << L"Trackbar capture rejection: " << error << L'\n';
+    Check(captured, "bounded Trackbar was rejected");
+    const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& candidate) {
+            return candidate.kind == Translation::ControlKind::Slider;
+        });
+    Check(node != snapshot.nodes.end(), "Trackbar node was not captured");
+    if (node != snapshot.nodes.end()) {
+        Check(node->minimum == 0 && node->maximum == 20 && node->position == 7,
+            "Trackbar range or position was not captured");
+        Check(node->smallChange == 2 && node->largeChange == 5,
+            "Trackbar line or page size was not captured");
+        Check(!node->vertical && !node->reversed,
+            "horizontal Trackbar reported vertical or reversed geometry");
+        const auto json = Translation::SerializeWindowOpen(
+            L"00112233445566778899aabbccddeeff", snapshot);
+        Check(json.find("\"kind\":\"slider\"") != std::string::npos &&
+              json.find("\"smallChange\":2") != std::string::npos &&
+              json.find("\"largeChange\":5") != std::string::npos,
+            "Trackbar state was not serialized");
+        const auto fingerprint = Translation::SnapshotFingerprint(snapshot);
+        snapshot.nodes[static_cast<size_t>(node - snapshot.nodes.begin())].position = 8;
+        Check(fingerprint != Translation::SnapshotFingerprint(snapshot),
+            "Trackbar position was omitted from the fingerprint");
+    }
+
+    // The application observes a projected move exactly as it observes a drag:
+    // through the trackbar's own WM_HSCROLL to its parent.
+    g_scrollNotifications.clear();
+    Check(Translation::SetTrackbarPosition(window, trackbar, false, 12) &&
+          static_cast<int>(SendMessageW(trackbar, TBM_GETPOS, 0, 0)) == 12 &&
+          !g_scrollNotifications.empty(),
+        "Trackbar move did not reach the parent as a scroll notification");
+    g_scrollNotifications.clear();
+    Check(Translation::SetTrackbarPosition(window, trackbar, false, 12) &&
+          g_scrollNotifications.empty(),
+        "Trackbar re-notified the parent for an unchanged position");
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    SetWindowLongPtrW(trackbar, GWL_STYLE, trackbarStyle | TBS_ENABLESELRANGE);
+    reason.clear();
+    Check(!Translation::ClassifyControl(trackbar, kind, reason) &&
+          reason.find(L"TBS_ENABLESELRANGE") != std::wstring::npos &&
+          reason.find(L"0x") != std::wstring::npos,
+        "unsupported Trackbar style lacked exact named diagnostics");
+    SetWindowLongPtrW(trackbar, GWL_STYLE, trackbarStyle);
+
+    Translation::ControlNode detail;
+    detail.kind = Translation::ControlKind::Slider;
+    detail.style = trackbarStyle;
+    SendMessageW(trackbar, TBM_SETRANGE, TRUE, MAKELPARAM(5, 5));
+    reason.clear();
+    Check(!Translation::CaptureControlDetail(trackbar, detail, reason) &&
+          reason.find(L"invalid native range") != std::wstring::npos,
+        "Trackbar with an empty range was accepted");
+    DestroyWindow(window);
+}
+
+LRESULT CALLBACK TestMdiChildProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    return DefMDIChildProc(window, message, wParam, lParam);
+}
+
+HWND g_testMdiClient = nullptr;
+
+LRESULT CALLBACK TestMdiFrameProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (message == WM_SIZE && g_testMdiClient) {
+        RECT client{};
+        GetClientRect(window, &client);
+        MoveWindow(g_testMdiClient, 0, 0, client.right, client.bottom, TRUE);
+        return 0;
+    }
+    return DefFrameProcW(window, g_testMdiClient, message, wParam, lParam);
+}
+
+void TestMdiFrameCaptureAndCommands() {
+    WNDCLASSEXW childClass{ sizeof(childClass) };
+    childClass.lpfnWndProc = TestMdiChildProc;
+    childClass.hInstance = GetModuleHandleW(nullptr);
+    childClass.lpszClassName = L"FluentShell.Test.MdiChild";
+    RegisterClassExW(&childClass);
+    WNDCLASSEXW frameClass{ sizeof(frameClass) };
+    frameClass.lpfnWndProc = TestMdiFrameProc;
+    frameClass.hInstance = GetModuleHandleW(nullptr);
+    frameClass.lpszClassName = L"FluentShell.Test.MdiFrame";
+    RegisterClassExW(&frameClass);
+
+    HWND frame = CreateWindowExW(0, frameClass.lpszClassName, L"mdi-frame",
+        WS_OVERLAPPEDWINDOW, 20, 20, 640, 480, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    Check(frame != nullptr, "MDI frame was not created");
+    if (!frame) return;
+    CLIENTCREATESTRUCT clientCreate{};
+    clientCreate.idFirstChild = 40000;
+    g_testMdiClient = CreateWindowExW(0, L"MDIClient", nullptr,
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 620, 440, frame,
+        reinterpret_cast<HMENU>(0xC0C), GetModuleHandleW(nullptr), &clientCreate);
+    Check(g_testMdiClient != nullptr, "MDI client was not created");
+    if (!g_testMdiClient) {
+        DestroyWindow(frame);
+        return;
+    }
+    const auto createChild = [](const wchar_t* title, int offset) {
+        MDICREATESTRUCTW create{};
+        create.szClass = L"FluentShell.Test.MdiChild";
+        create.szTitle = title;
+        create.hOwner = GetModuleHandleW(nullptr);
+        create.x = 10 + offset;
+        create.y = 10 + offset;
+        create.cx = 280;
+        create.cy = 160;
+        return reinterpret_cast<HWND>(SendMessageW(
+            g_testMdiClient, WM_MDICREATE, 0, reinterpret_cast<LPARAM>(&create)));
+    };
+    const HWND first = createChild(L"Document 1", 0);
+    const HWND second = createChild(L"Document 2", 30);
+    Check(first && second, "MDI children were not created");
+    ShowWindow(frame, SW_SHOWNOACTIVATE);
+
+    using Translation::ControlKind;
+    ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(g_testMdiClient, kind, reason) &&
+          kind == ControlKind::MdiClient,
+        "MDIClient was not classified as a projected container");
+    kind = ControlKind::Count;
+    reason.clear();
+    // The MDI child's class is the application's; its role is the frame's.
+    Check(second && Translation::ClassifyControl(second, kind, reason) &&
+          kind == ControlKind::MdiChild,
+        "WS_EX_MDICHILD frame was not classified by its window-manager role");
+
+    Translation::CaptureContext context;
+    context.surfaceId = L"77777777-7777-7777-7777-888888888888";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(frame, context, snapshot, error);
+    if (!captured) std::wcerr << L"MDI capture rejection: " << error << L'\n';
+    Check(captured, "MDI frame was rejected");
+    const auto clientNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& node) {
+            return node.kind == ControlKind::MdiClient;
+        });
+    Check(clientNode != snapshot.nodes.end() && !clientNode->parentNodeId,
+        "MDI client node is missing or nested");
+    std::vector<const Translation::ControlNode*> children;
+    for (const auto& node : snapshot.nodes) {
+        if (node.kind == ControlKind::MdiChild) children.push_back(&node);
+    }
+    Check(children.size() == 2, "both MDI child frames were not captured");
+    if (clientNode != snapshot.nodes.end() && children.size() == 2) {
+        for (const auto* child : children) {
+            Check(child->parentNodeId && *child->parentNodeId == clientNode->nodeId,
+                "MDI child is not owned by the MDI client");
+            Check(child->windowState == L"normal",
+                "MDI child state was not captured as normal");
+            Check(child->clientRect.left >= 0 && child->clientRect.top > 0 &&
+                  child->clientRect.right - child->clientRect.left <=
+                      child->rect.right - child->rect.left &&
+                  child->clientRect.bottom - child->clientRect.top <=
+                      child->rect.bottom - child->rect.top,
+                "MDI child client band is not inside its frame");
+        }
+        const auto activeCount = std::count_if(children.begin(), children.end(),
+            [](const Translation::ControlNode* child) { return child->active; });
+        Check(activeCount == 1, "exactly one MDI child must report activation");
+        const auto json = Translation::SerializeWindowOpen(
+            L"00112233445566778899aabbccddeeff", snapshot);
+        Check(json.find("\"kind\":\"mdiClient\"") != std::string::npos &&
+              json.find("\"kind\":\"mdiChild\"") != std::string::npos &&
+              json.find("\"windowState\":\"normal\"") != std::string::npos &&
+              json.find("\"clientRect\"") != std::string::npos,
+            "MDI frame state was not serialized");
+        const auto fingerprint = Translation::SnapshotFingerprint(snapshot);
+        const auto index = static_cast<size_t>(children[0] - snapshot.nodes.data());
+        snapshot.nodes[index].active = !snapshot.nodes[index].active;
+        Check(fingerprint != Translation::SnapshotFingerprint(snapshot),
+            "MDI activation was omitted from the fingerprint");
+        snapshot.nodes[index].active = !snapshot.nodes[index].active;
+
+        // Every caption verb is admitted only against the child's own style and
+        // state, so the projection can never offer one the frame would refuse.
+        Translation::ActionRequest action;
+        action.action = L"mdiCommand";
+        action.nodeId = children[0]->nodeId;
+        action.text = L"restore";
+        Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+            "restore was accepted for an already restored MDI child");
+        action.text = L"maximize";
+        Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
+            "maximize was rejected for a maximizable MDI child");
+        action.text = L"activate";
+        const bool firstIsActive = children[0]->active;
+        Check(Translation::ValidateActionForSnapshot(action, snapshot, error) != firstIsActive,
+            "activate must be refused only for the already active MDI child");
+        action.text = L"teleport";
+        Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+            "an unknown MDI verb was accepted");
+        action.nodeId = clientNode->nodeId;
+        action.text = L"close";
+        Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+            "mdiCommand was accepted for the MDI client");
+    }
+    Check(Translation::IsRequestSemanticAction(L"mdiCommand"),
+        "an MDI caption command must be rebased like other pointer requests");
+    DestroyWindow(frame);
+    g_testMdiClient = nullptr;
+}
+
 } // namespace
 
 int wmain() {
@@ -2244,7 +3129,7 @@ int wmain() {
     TestDirectUiInPlaceRoutes();
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     INITCOMMONCONTROLSEX controls{ sizeof(controls),
-        ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
+        ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
     Check(InitCommonControlsEx(&controls) != FALSE,
         "common-control classes were not initialized");
     TestHeaderValidation();
@@ -2266,9 +3151,15 @@ int wmain() {
     TestStructuredCommonControlCapture();
     TestListViewCheckNotificationSemantics();
     TestTabControlCaptureAndSelection();
+    TestTreeViewCaptureAndExpansion();
+    TestTrackbarCaptureAndValue();
+    TestMdiFrameCaptureAndCommands();
     TestStandardMenuCapture();
     TestMenuActionValidationAndSerialization();
     TestToolbarCaptureBoundary();
+    TestVirtualDialogSnapshots();
+    TestPaneContainerCaptureAndSplit();
+    TestAccessibleIslandBoundary();
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";
         return 1;

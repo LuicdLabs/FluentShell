@@ -153,16 +153,58 @@ by both sides' tests. A 32-byte little-endian `FLSH` frame header wraps a JSON p
   SID, and a 128-bit nonce.
 - Revisions, generations, and IDs travel as **canonical decimal strings** and HWNDs as `0x`-prefixed
   hex, so a JSON reader can never round them through a double.
-- Property actions carry an expected revision and are rejected `stale` on mismatch. Request-semantic
-  actions — `invoke`, `close`, `move`, `resize` (`IsRequestSemanticAction`) — are rebased onto the
-  current revision instead, because the pointer, not a snapshot, decides whether a drag still
-  applies.
+- A translated MessageBox/TaskDialog is a **virtual surface**: the Bridge answers the API call itself,
+  so no native dialog HWND exists and every node on a `messageBox`/`taskDialog` surface carries
+  `nativeHwnd: null`. On a `window` surface the opposite holds -- every node must be HWND-backed.
+  Both directions are enforced by `ProtocolValidator.ValidateApplicationAdapter` and by the schema's
+  `surfaceKind` conditional. Node z-index must be unique per surface, which is why the dialog
+  builders in `src/Bridge/Translation/DialogSnapshots.cpp` assign it from paint order.
+- Property actions carry an expected revision and are rejected `stale` on mismatch. The renderer
+  re-sends such an action once, and only when it carries the absolute state the user asked for
+  (`NodeActionReplayPolicy` in `src/Renderer/Windows/NodeActionReplay.cs`): a revision race is a
+  statement about the snapshot, not a refusal. The replay waits for the patch that carries the new
+  revision, because the rejection arrives first. Request-semantic
+  actions — `invoke`, `close`, `move`, `resize`, `setValue` (`IsRequestSemanticAction`) — are rebased
+  onto the current revision instead, because the pointer, not a snapshot, decides whether a drag
+  still applies.
+- An application that runs a native operation and declines it (`ActionOutcome::refused`, e.g. a
+  vetoed `setItemText`) yields a `rejected` action result plus a canonical patch and keeps the
+  surface projected. Only an operation that could not be carried out restores the whole window.
 - A protocol violation naming one surface faults only that surface
   (`WindowRegistry.SurfaceScopeOf` → non-fatal `error` frame → Bridge rolls that window back).
   A session-scoped violation faults the session.
 
 Changing the wire format means updating the schema, both codecs, the fixtures, and
 `kProtocolMinor`/`kProtocolMajor` in `src/Bridge/Ipc/Protocol.h`.
+
+### Menus an application draws with a toolbar
+
+Some applications (MMC) draw their menu bar with a `ToolbarWindow32` and open each popup
+from the click itself, so a posted `WM_COMMAND` does nothing. Such a bar is projected as a
+real menu, never as a native popup over the projection and never by refusing the window.
+`src/Bridge/Translation/MenuBarCapture.cpp` holds the two halves: `IsMenuBarToolbar` asks
+the control for its own accessibility role (a bar whose every button is a menu item), and
+the click is performed through `accDoDefaultAction` so comctl32 does what a real click
+does. `TrackPopupMenu`/`TrackPopupMenuEx` are Detours-hooked in `dllmain.cpp`: while
+`PopupInterceptionArmed()` is true for the calling thread, the hook records the HMENU and
+answers as if the menu had been dismissed, so nothing native reaches the screen. The
+recorded handle is captured with `CaptureMenuHandle` into the same `menu` field a window's
+own HMENU menu bar uses, which the renderer already projects as a real XAML menu.
+
+The read must not run inside a capture pass: the application opens its popup from its
+message loop, and driving a button while the native window owns the foreground costs the
+proxy the foreground slot the committed gate requires. It is a staged source-thread
+sequence (`SourceThreadAgent::ReadMenuBarToolbar`) that reconcile runs once per surface
+after the commit and cloak. Three things make it work: the wait is a bounded *pump* of the
+application's own queue rather than a delay (Bridge commands arriving during the pump are
+requeued, `DeferringCommands`); the cloaked native window is made active for the length of
+one popup because comctl32 will not enter menu mode otherwise, then the foreground is handed
+straight back; and the popup is captured *inside* the hook, because the application frees
+the menu as soon as the tracking call answers. A leading document-icon button opens the
+window's system menu, whose `SC_*` commands the projected caption already offers, so that
+button is skipped. A top-level menu the application opens nothing for is projected with its
+title and disabled -- `ProtocolValidator` admits an empty popup only while it is disabled.
+If the bar cannot be read at all it keeps its toolbar node and the window still projects.
 
 ### Where the support boundary is defined
 
@@ -172,8 +214,35 @@ Changing the wire format means updating the schema, both codecs, the fixtures, a
   names the `ControlKind` or rejects with a specific reason.
 - `kCaptureTable` — `ControlKind` → the typed-state reader for that kind (null when the kind adds
   nothing beyond the common facets). Indexed by enum value, sized from the last `ControlKind`
-  enumerator; a kind declared past `StatusBar` falls outside and is rejected rather than silently
-  capturing nothing.
+  enumerator; a kind declared past the last table row falls outside and is rejected rather than
+  silently capturing nothing.
+
+A class the registry does not know still gets one geometric chance: `ProbePaneContainer` admits it
+as a `paneContainer` when its visible children tile its client area, every strip that divides it
+becomes a projected splitter driven by `setSplit`, and every thicker leftover rectangle travels as a
+bounded `chromeRegion` carrying the pixels the container painted there. The pane surface counts only
+the children capture keeps, so a seam is never offered between windows the projection does not draw.
+`PaintedClientSurface` renders each band twice, over black and over white, and recovers alpha from the
+difference: GDI carries no alpha, and one render cannot tell a black pixel from an unpainted one. A split the user moved is
+remembered against the extent it was measured on and re-asserted when reconcile observes the
+container at a different extent (`ReassertRememberedSplits`), because a container's own proportion is
+private data no message writes; it is never asserted at an unchanged extent, so a layout decision the
+application or the user made stands. A `Static` that owns visible
+children is reclassified the same way, because a control framing other windows is not drawing its
+own content there. A host window whose content owns no HWND at all is admitted as an
+`accessibleIsland` instead: `src/Bridge/Translation/AccessibleIsland.cpp` reads its elements through
+MSAA (`AccessibleObjectFromWindow`/`accDefaultAction`) rather than UIA, because DirectUI's menu rows
+expose no actionable UIA pattern, and MSAA is answered inline on the window's own thread. Those
+elements travel as typed `islandItems` on the island's HWND-backed node, so no node on a generic
+surface ever becomes virtual. Only a container kind may be named as a node's parent
+(`IsProjectedContainerKind`, mirrored by `ProtocolValidator`); a control nested inside anything else
+is refused at capture with the parent's kind in the evidence, rather than becoming a snapshot the
+renderer must fault. Capture logs every rejection in the tree, not just the first.
+
+A projected node that owns a layout slot reports its UIA bounding rectangle through
+`ControlFactory.PhysicalLayoutBounds`, which converts the slot with `XamlRoot.RasterizationScale`.
+The committed gate compares physical HWND rectangles, and WinUI's default peer can report a
+ContentControl's visual in DIPs while leaving the origin in physical pixels.
 
 Adding a control means adding one registry row plus its probe and capture functions — never editing
 a chain of class or kind comparisons. `WindowCapture.cpp` orchestrates

@@ -1,6 +1,7 @@
 #include "../Common/FluentShell.h"
 #include "../Common/ProcessPolicy.h"
 #include "Translation/DialogTranslator.h"
+#include "Translation/MenuBarCapture.h"
 #include "Translation/RendererSession.h"
 
 #include "../../third_party/detours/src/detours.h"
@@ -22,10 +23,14 @@ namespace {
 using MessageBoxW_t = int(WINAPI*)(HWND, LPCWSTR, LPCWSTR, UINT);
 using MessageBoxExW_t = int(WINAPI*)(HWND, LPCWSTR, LPCWSTR, UINT, WORD);
 using TaskDialogIndirect_t = HRESULT(WINAPI*)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+using TrackPopupMenu_t = BOOL(WINAPI*)(HMENU, UINT, int, int, int, HWND, const RECT*);
+using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
 
 MessageBoxW_t TrueMessageBoxW = nullptr;
 MessageBoxExW_t TrueMessageBoxExW = nullptr;
 TaskDialogIndirect_t TrueTaskDialogIndirect = nullptr;
+TrackPopupMenu_t TrueTrackPopupMenu = nullptr;
+TrackPopupMenuEx_t TrueTrackPopupMenuEx = nullptr;
 std::atomic<bool> g_hooksInstalled{ false };
 std::atomic<bool> g_workerRunning{ false };
 HMODULE g_self = nullptr;
@@ -141,6 +146,46 @@ HRESULT WINAPI HookTaskDialogIndirect(
     return TrueTaskDialogIndirect(config, button, radioButton, verificationChecked);
 }
 
+// A menu-bar toolbar opens its popup from the click itself, so the projection performs
+// that click through the control's own accessible default action and records the HMENU
+// here instead of letting the application's popup reach the screen.  Interception is
+// armed only around that one call, on that one thread: every other popup goes to the
+// real API untouched.
+BOOL WINAPI HookTrackPopupMenu(
+    HMENU menu,
+    UINT flags,
+    int x,
+    int y,
+    int reserved,
+    HWND owner,
+    const RECT* rect) {
+    if (FluentShell::Bridge::Translation::PopupSuppressionActive()) {
+        FluentShell::Bridge::Translation::RecordInterceptedPopup(menu);
+        // Zero is what the real function answers when the user dismissed the menu
+        // without choosing anything, which is exactly what the application should
+        // believe happened.  Suppression is process-wide for the length of a menu-bar
+        // read, so a popup that arrives late still never reaches the screen.
+        return FALSE;
+    }
+    if (!TrueTrackPopupMenu) return FALSE;
+    return TrueTrackPopupMenu(menu, flags, x, y, reserved, owner, rect);
+}
+
+BOOL WINAPI HookTrackPopupMenuEx(
+    HMENU menu,
+    UINT flags,
+    int x,
+    int y,
+    HWND owner,
+    LPTPMPARAMS params) {
+    if (FluentShell::Bridge::Translation::PopupSuppressionActive()) {
+        FluentShell::Bridge::Translation::RecordInterceptedPopup(menu);
+        return FALSE;
+    }
+    if (!TrueTrackPopupMenuEx) return FALSE;
+    return TrueTrackPopupMenuEx(menu, flags, x, y, owner, params);
+}
+
 bool InstallHooks() {
     if (g_hooksInstalled.exchange(true)) return true;
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
@@ -153,6 +198,10 @@ bool InstallHooks() {
         GetProcAddress(user32, "MessageBoxW"));
     TrueMessageBoxExW = reinterpret_cast<MessageBoxExW_t>(
         GetProcAddress(user32, "MessageBoxExW"));
+    TrueTrackPopupMenu = reinterpret_cast<TrackPopupMenu_t>(
+        GetProcAddress(user32, "TrackPopupMenu"));
+    TrueTrackPopupMenuEx = reinterpret_cast<TrackPopupMenuEx_t>(
+        GetProcAddress(user32, "TrackPopupMenuEx"));
     if (comctl) {
         TrueTaskDialogIndirect = reinterpret_cast<TaskDialogIndirect_t>(
             GetProcAddress(comctl, "TaskDialogIndirect"));
@@ -182,6 +231,10 @@ bool InstallHooks() {
         reinterpret_cast<PVOID>(HookMessageBoxExW), L"MessageBoxExW");
     attach(reinterpret_cast<PVOID*>(&TrueTaskDialogIndirect),
         reinterpret_cast<PVOID>(HookTaskDialogIndirect), L"TaskDialogIndirect");
+    attach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenu),
+        reinterpret_cast<PVOID>(HookTrackPopupMenu), L"TrackPopupMenu");
+    attach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenuEx),
+        reinterpret_cast<PVOID>(HookTrackPopupMenuEx), L"TrackPopupMenuEx");
     if (!attached || DetourTransactionCommit() != NO_ERROR) {
         DetourTransactionAbort();
         CloseDetourThreadHandles(detourThreads);
@@ -189,7 +242,7 @@ bool InstallHooks() {
         return false;
     }
     CloseDetourThreadHandles(detourThreads);
-    FluentShell::Log(L"MessageBox/TaskDialog translation hooks installed");
+    FluentShell::Log(L"MessageBox/TaskDialog/menu translation hooks installed");
     return true;
 }
 
@@ -211,6 +264,12 @@ void UninstallHooks() noexcept {
         }
         if (TrueTaskDialogIndirect) {
             DetourDetach(reinterpret_cast<PVOID*>(&TrueTaskDialogIndirect), HookTaskDialogIndirect);
+        }
+        if (TrueTrackPopupMenu) {
+            DetourDetach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenu), HookTrackPopupMenu);
+        }
+        if (TrueTrackPopupMenuEx) {
+            DetourDetach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenuEx), HookTrackPopupMenuEx);
         }
         if (DetourTransactionCommit() == NO_ERROR) g_hooksInstalled = false;
         CloseDetourThreadHandles(detourThreads);
@@ -261,6 +320,12 @@ DWORD WINAPI BridgeWorker(LPVOID) noexcept {
             return 0;
         }
 
+        // The hooks go in before the session starts: the very first capture reads a
+        // menu-bar toolbar by opening the application's own menus with the popup
+        // interception armed, and that interception *is* one of these hooks.
+        if (!InstallHooks()) {
+            FluentShell::Log(L"Translation hook installation failed; whole-window projection remains active");
+        }
         reset.session = std::make_shared<
             FluentShell::Bridge::Translation::RendererSession>(g_self);
         FluentShell::Bridge::Translation::SetActiveRendererSession(reset.session);
@@ -268,9 +333,6 @@ DWORD WINAPI BridgeWorker(LPVOID) noexcept {
         if (!reset.session->Start()) {
             FluentShell::Log(L"Renderer unavailable; native UI remains authoritative");
             return 0;
-        }
-        if (!InstallHooks()) {
-            FluentShell::Log(L"Dialog hook installation failed; whole-window projection remains active");
         }
         reset.session->RunSupervisor();
     } catch (const std::exception& exception) {

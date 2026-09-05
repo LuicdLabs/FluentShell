@@ -124,6 +124,38 @@ public sealed class ControlFactoryTests
         Assert.Equal("checkedIndices", TranslatedWindow.PropertyForNodeAction("setItemCheck"));
     }
 
+    [Fact]
+    public void OnlyAbsoluteStateActionsAreReplayedAfterARevisionRace()
+    {
+        // A `stale` refusal says the snapshot the request named is no longer current,
+        // not that the application declined it.  An action that carries the absolute
+        // state the user asked for converges when it is re-sent against the newer
+        // revision, which is what keeps a tree expansion from being lost to the
+        // roughly one-per-second reconcile.
+        foreach (var property in new[]
+        {
+            "itemExpanded", "checked", "selectedIndex", "selectedIndices", "checkedIndices",
+        })
+        {
+            Assert.True(NodeActionReplayPolicy.IsReplayableAfterStale(property));
+        }
+
+        // A one-shot command would be performed twice, and text would overwrite the
+        // normalization the application owns, so neither is ever re-sent.  Geometry is
+        // absent for a different reason: the Bridge rebases request-semantic actions
+        // and never reports them stale.
+        foreach (var property in new[]
+        {
+            "invoke", "close", "text", "items", "position", "splits", "columnOrder",
+            "islandItems", "state", "bounds", "menu:101",
+        })
+        {
+            Assert.False(NodeActionReplayPolicy.IsReplayableAfterStale(property));
+        }
+
+        Assert.Equal(1, NodeActionReplayPolicy.MaxStaleRetries);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -168,8 +200,90 @@ public sealed class ControlFactoryTests
         Assert.Equal(AutomationControlType.ToolBar, ControlFactory.AutomationControlTypeFor("toolbar"));
         Assert.Equal(AutomationControlType.Pane, ControlFactory.AutomationControlTypeFor("dialogContainer"));
         Assert.Equal(AutomationControlType.Tab, ControlFactory.AutomationControlTypeFor("tabControl"));
+        Assert.Equal(AutomationControlType.Tree, ControlFactory.AutomationControlTypeFor("treeView"));
+        Assert.Equal(AutomationControlType.Slider, ControlFactory.AutomationControlTypeFor("slider"));
+        Assert.Equal(AutomationControlType.Pane, ControlFactory.AutomationControlTypeFor("mdiClient"));
+        // A native MDI child is a window inside a window and keeps that UIA role.
+        Assert.Equal(AutomationControlType.Window, ControlFactory.AutomationControlTypeFor("mdiChild"));
+        Assert.Equal("mdiCommand", TranslatedWindow.PropertyForNodeAction("mdiCommand"));
+        Assert.Equal(["activate", "close", "minimize", "maximize", "restore"], MdiCommands.All);
         Assert.Equal(AutomationControlType.TabItem, ControlFactory.TabItemAutomationControlType());
     }
+
+    [Fact]
+    public void TreeViewProjectionNeedsOneCompleteHierarchy()
+    {
+        var node = ControlNodeViewModel.FromSnapshot(TreeNode());
+        Assert.True(ControlFactory.HasRenderableTreeShape(node));
+        Assert.Equal("selectedIndex", TranslatedWindow.PropertyForNodeAction("select"));
+        Assert.Equal("itemExpanded", TranslatedWindow.PropertyForNodeAction("setExpand"));
+        Assert.Equal("position", TranslatedWindow.PropertyForNodeAction("setValue"));
+
+        // A tree whose arrays disagree describes no hierarchy, so the projection
+        // waits for the next canonical revision instead of rendering a partial one.
+        var mismatched = ControlNodeViewModel.FromSnapshot(TreeNode() with { ItemExpanded = [true] });
+        Assert.False(ControlFactory.HasRenderableTreeShape(mismatched));
+        var rootless = ControlNodeViewModel.FromSnapshot(TreeNode() with { ItemDepths = [1, 1] });
+        Assert.False(ControlFactory.HasRenderableTreeShape(rootless));
+    }
+
+    [Fact]
+    public void ProjectedItemIconFollowsTheNativeSelectedStateIndex()
+    {
+        var node = ControlNodeViewModel.FromSnapshot(TreeNode() with
+        {
+            ImageList = [Icon(), Icon()],
+            ItemImages = [0, 0],
+            ItemSelectedImages = [1, 1],
+            SelectedIndex = 1,
+        });
+        // The unselected item keeps its normal icon while the selected one swaps to
+        // the selected-state icon, exactly as the native tree draws them.
+        Assert.Equal(0, ControlFactory.ImageIndexForItem(node, 0, node.SelectedIndex));
+        Assert.Equal(1, ControlFactory.ImageIndexForItem(node, 1, node.SelectedIndex));
+
+        // An item that declares no icon draws none even when the control has an
+        // image list, and a control without a selected-state list keeps the normal
+        // icon under selection.
+        var partial = ControlNodeViewModel.FromSnapshot(TreeNode() with
+        {
+            ImageList = [Icon()],
+            ItemImages = [-1, 0],
+            SelectedIndex = 1,
+        });
+        Assert.Equal(-1, ControlFactory.ImageIndexForItem(partial, 0, partial.SelectedIndex));
+        Assert.Equal(0, ControlFactory.ImageIndexForItem(partial, 1, partial.SelectedIndex));
+
+        // Items outside the captured imagery draw nothing rather than throwing.
+        Assert.Equal(-1, ControlFactory.ImageIndexForItem(partial, 5, 5));
+        Assert.Equal(-1, ControlFactory.ImageIndexForItem(
+            ControlNodeViewModel.FromSnapshot(TreeNode()), 0, 0));
+    }
+
+    // A 1x1 opaque pixel: the smallest entry the validator accepts.
+    private static ImageListEntry Icon() => new()
+    {
+        ImageWidth = 1,
+        ImageHeight = 1,
+        ImageFormat = "bgra8-premultiplied",
+        ImageData = Convert.ToBase64String(new byte[] { 0x20, 0x40, 0x60, 0xFF }),
+    };
+
+    private static ControlNode TreeNode() => new()
+    {
+        NodeId = "1",
+        Generation = "1",
+        NativeHwnd = "0x1",
+        Kind = "treeView",
+        Rect = new PixelRect(),
+        Visible = true,
+        Enabled = true,
+        Items = ["Console Root", "Services"],
+        ItemDepths = [0, 1],
+        ItemExpanded = [true, false],
+        ItemHasChildren = [true, false],
+        SelectedIndex = 1,
+    };
 
     [Fact]
     public void TabControlFactoryPreservesCanonicalHeaderShape()

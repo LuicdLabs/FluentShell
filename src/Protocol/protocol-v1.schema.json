@@ -89,7 +89,33 @@
         },
         {
           "if": { "properties": { "kind": { "const": "slider" } }, "required": ["kind"] },
-          "then": { "required": ["minimum", "maximum", "position"] }
+          "then": { "required": ["minimum", "maximum", "position", "smallChange", "largeChange"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "treeView" } }, "required": ["kind"] },
+          "then": { "required": ["selectedIndex", "items", "itemDepths", "itemExpanded", "itemHasChildren", "itemSelectedImages"] },
+          "else": {
+            "properties": {
+              "itemDepths": { "maxItems": 0 },
+              "itemExpanded": { "maxItems": 0 },
+              "itemHasChildren": { "maxItems": 0 }
+            },
+            "not": { "required": ["itemSelectedImages"] }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["treeView", "listView"] } }, "required": ["kind"] },
+          "then": { "required": ["imageList", "itemImages", "editableLabels", "editingIndex"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["imageList"] },
+                { "required": ["itemImages"] },
+                { "required": ["editableLabels"] },
+                { "required": ["editingIndex"] }
+              ]
+            }
+          }
         },
         {
           "if": { "properties": { "kind": { "const": "comboBox" } }, "required": ["kind"] },
@@ -141,13 +167,14 @@
         },
         {
           "if": { "properties": { "kind": { "const": "listView" } }, "required": ["kind"] },
-          "then": { "required": ["columnHeadersVisible", "checkBoxes", "checkedIndices"] },
+          "then": { "required": ["columnHeadersVisible", "checkBoxes", "checkedIndices", "columnOrder"] },
           "else": {
             "not": {
               "anyOf": [
                 { "required": ["columnHeadersVisible"] },
                 { "required": ["checkBoxes"] },
-                { "required": ["checkedIndices"] }
+                { "required": ["checkedIndices"] },
+                { "required": ["columnOrder"] }
               ]
             }
           }
@@ -158,9 +185,34 @@
           "else": { "not": { "required": ["itemRects"] } }
         },
         {
+          "if": { "properties": { "kind": { "const": "mdiChild" } }, "required": ["kind"] },
+          "then": { "required": ["active", "windowState", "clientRect", "style", "exStyle"] },
+          "else": {
+            "not": {
+              "anyOf": [
+                { "required": ["active"] },
+                { "required": ["windowState"] },
+                { "required": ["clientRect"] }
+              ]
+            }
+          }
+        },
+        {
           "if": { "properties": { "kind": { "const": "toolbar" } }, "required": ["kind"] },
           "then": { "required": ["toolbarItems"] },
           "else": { "not": { "required": ["toolbarItems"] } }
+        },
+        {
+          "$comment": "A container pane is admitted geometrically: its children tile it and every strip that divides it is a real splitter.",
+          "if": { "properties": { "kind": { "const": "paneContainer" } }, "required": ["kind"] },
+          "then": { "required": ["splits", "chromeRegions"] },
+          "else": { "not": { "anyOf": [{ "required": ["splits"] }, { "required": ["chromeRegions"] }] } }
+        },
+        {
+          "$comment": "An accessible island's elements own no HWND, so they travel as typed items on the island's own node rather than as virtual nodes.",
+          "if": { "properties": { "kind": { "const": "accessibleIsland" } }, "required": ["kind"] },
+          "then": { "required": ["islandItems"] },
+          "else": { "not": { "required": ["islandItems"] } }
         }
       ],
       "properties": {
@@ -168,7 +220,7 @@
         "generation": { "$ref": "#/$defs/u64String" },
         "nativeHwnd": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hwndString" }] },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "staticIcon", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "tabControl", "dialogContainer", "statusBar", "toolbar"] },
+        "kind": { "enum": ["static", "staticIcon", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland"] },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -193,12 +245,15 @@
         "editable": { "type": "boolean" },
         "isDefault": { "type": "boolean" },
         "groupStart": { "type": "boolean" },
+        "active": { "type": "boolean" },
+        "windowState": { "enum": ["normal", "minimized", "maximized"] },
+        "clientRect": { "$ref": "#/$defs/rect" },
         "minimum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "maximum": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "position": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "indeterminate": { "type": "boolean" },
-        "smallChange": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
-        "largeChange": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "smallChange": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "largeChange": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "vertical": { "type": "boolean" },
         "reversed": { "type": "boolean" },
         "items": {
@@ -209,12 +264,31 @@
         "itemRects": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/rect" } },
         "columns": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } },
         "columnWidths": { "type": "array", "maxItems": 64, "items": { "type": "integer", "minimum": 0, "maximum": 2147483647 } },
+        "columnOrder": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 63 } },
         "rows": { "type": "array", "maxItems": 4096, "items": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } } },
         "columnHeadersVisible": { "type": "boolean" },
         "checkBoxes": { "type": "boolean" },
         "checkedIndices": { "type": "array", "maxItems": 4096, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 4095 } },
         "itemDepths": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 31 } },
         "itemExpanded": { "type": "array", "maxItems": 4096, "items": { "type": "boolean" } },
+        "itemHasChildren": { "type": "array", "maxItems": 4096, "items": { "type": "boolean" } },
+        "itemImages": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": -1, "maximum": 63 } },
+        "itemSelectedImages": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": -1, "maximum": 63 } },
+        "editableLabels": { "type": "boolean" },
+        "editingIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
+        "imageList": {
+          "type": "array", "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"],
+            "properties": {
+              "imageWidth": { "type": "integer", "minimum": 1, "maximum": 64 },
+              "imageHeight": { "type": "integer", "minimum": 1, "maximum": 64 },
+              "imageFormat": { "const": "bgra8-premultiplied" },
+              "imageData": { "type": "string", "minLength": 8, "maxLength": 21848, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            }
+          }
+        },
         "imageWidth": { "type": "integer", "minimum": 1, "maximum": 1024 },
         "imageHeight": { "type": "integer", "minimum": 1, "maximum": 1024 },
         "imageFormat": { "const": "bgra8-premultiplied" },
@@ -224,7 +298,7 @@
         "semanticKey": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:-]+$" },
         "sourceKind": { "enum": ["uiaVirtual", "nativeBacking"] },
           "presentationVariant": { "enum": ["mainIcon", "instruction", "content", "commandLink", "standard", "wizardTitle", "header", "bitmapDisplay", "bitmapSwitch", "monitorPalette"] },
-        "supportedActions": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "toolbarCommand"] } },
+        "supportedActions": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "setItemText", "setValue", "setExpand", "toolbarCommand", "mdiCommand"] } },
         "helpText": { "$ref": "#/$defs/text" },
         "accessKey": { "$ref": "#/$defs/text" },
         "toolbarItems": {
@@ -233,16 +307,63 @@
             "type": "object",
             "required": ["kind", "commandId", "rect", "text", "enabled", "hidden"],
             "properties": {
-              "kind": { "enum": ["pushButton", "separator"] },
+              "kind": { "enum": ["pushButton", "toggleButton", "separator"] },
               "commandId": { "type": "integer", "minimum": 0, "maximum": 65535 },
               "rect": { "$ref": "#/$defs/rect" },
               "text": { "$ref": "#/$defs/text" },
               "enabled": { "type": "boolean" },
               "hidden": { "type": "boolean" },
+              "checked": { "type": "boolean" },
+              "dropDown": { "type": "boolean" },
+              "wholeDropDown": { "type": "boolean" },
               "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
               "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
               "imageFormat": { "const": "bgra8-premultiplied" },
               "imageData": { "type": "string", "minLength": 8, "maxLength": 49152, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            }
+          }
+        },
+        "splits": {
+          "type": "array", "maxItems": 8,
+          "items": {
+            "type": "object",
+            "required": ["vertical", "position", "thickness", "minimum", "maximum"],
+            "properties": {
+              "vertical": { "type": "boolean" },
+              "position": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "thickness": { "type": "integer", "minimum": 1, "maximum": 64 },
+              "minimum": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "maximum": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            }
+          }
+        },
+        "chromeRegions": {
+          "type": "array", "maxItems": 4,
+          "items": {
+            "type": "object",
+            "required": ["rect", "imageWidth", "imageHeight", "imageFormat", "imageData"],
+            "properties": {
+              "rect": { "$ref": "#/$defs/rect" },
+              "imageWidth": { "type": "integer", "minimum": 1, "maximum": 1024 },
+              "imageHeight": { "type": "integer", "minimum": 1, "maximum": 1024 },
+              "imageFormat": { "const": "bgra8-premultiplied" },
+              "imageData": { "type": "string", "minLength": 8, "maxLength": 1398104, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            }
+          }
+        },
+        "islandItems": {
+          "type": "array", "minItems": 1, "maxItems": 32,
+          "items": {
+            "type": "object",
+            "required": ["kind", "rect", "name", "description", "actionName", "enabled", "dropDown"],
+            "properties": {
+              "kind": { "enum": ["text", "button", "link"] },
+              "rect": { "$ref": "#/$defs/rect" },
+              "name": { "$ref": "#/$defs/text" },
+              "description": { "$ref": "#/$defs/text" },
+              "actionName": { "$ref": "#/$defs/text" },
+              "enabled": { "type": "boolean" },
+              "dropDown": { "type": "boolean" }
             }
           }
         }
@@ -284,7 +405,18 @@
           "maxItems": 512,
           "items": { "$ref": "#/$defs/controlNode" }
         }
-      }
+      },
+      "allOf": [
+        {
+          "$comment": "A translated MessageBox or TaskDialog is answered by the Bridge itself, so no native dialog HWND tree exists and every node on it is virtual.",
+          "if": {
+            "properties": { "surfaceKind": { "enum": ["messageBox", "taskDialog"] } },
+            "required": ["surfaceKind"]
+          },
+          "then": { "properties": { "nodes": { "items": { "properties": { "nativeHwnd": { "type": "null" } } } } } },
+          "else": { "properties": { "nodes": { "items": { "properties": { "nativeHwnd": { "$ref": "#/$defs/hwndString" } } } } } }
+        }
+      ]
     },
     "menuItem": {
       "type": "object",
@@ -354,6 +486,78 @@
               }
             }
           }
+        },
+        {
+          "if": { "properties": { "action": { "const": "setExpand" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "expanded"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0, "maximum": 4095 },
+                  "expanded": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "action": { "const": "setItemText" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "text"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0, "maximum": 4095 },
+                  "text": { "$ref": "#/$defs/text" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "action": { "const": "setColumnOrder" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 63 } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "action": { "const": "islandInvoke" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": { "type": "integer", "minimum": 0, "maximum": 31 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "action": { "const": "setSplit" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "position"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0, "maximum": 7 },
+                  "position": { "type": "integer", "minimum": 0, "maximum": 65535 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "action": { "const": "mdiCommand" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": { "enum": ["activate", "close", "minimize", "maximize", "restore"] }
+            }
+          }
         }
       ],
       "properties": {
@@ -363,7 +567,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "toolbarCommand", "menuCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "islandInvoke", "toolbarCommand", "menuCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

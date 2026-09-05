@@ -16,7 +16,8 @@ public class ProtocolValidatorTests
     [
         "static", "staticIcon", "separator", "button", "checkBox", "threeState", "radioButton",
         "edit", "password", "comboBox", "listBox", "groupBox", "progressBar",
-        "sysLink", "listView", "tabControl", "dialogContainer", "statusBar", "toolbar",
+        "sysLink", "listView", "treeView", "tabControl", "slider", "dialogContainer",
+        "mdiClient", "statusBar", "toolbar", "paneContainer", "accessibleIsland",
     ];
 
     [Theory]
@@ -29,10 +30,153 @@ public class ProtocolValidatorTests
     }
 
     [Fact]
+    public void TranslatedDialogSurfacesAreVirtualAndWindowSurfacesAreHwndBacked()
+    {
+        // The Bridge answers MessageBox/TaskDialog calls itself, so a translated
+        // dialog has no native dialog HWND tree and its nodes carry no HWND.  This
+        // is the rule that decides whether a MessageBox projects at all: requiring
+        // a per-node HWND here faulted every translated dialog the moment it opened.
+        var dialog = TestData.DialogSnapshot();
+        ProtocolValidator.ValidateSnapshot(dialog);
+
+        // Still closed the other way: a dialog node that claims a native HWND is
+        // mixing the two lanes, and an HWND-tree surface must not carry a virtual
+        // node.
+        var hwndBackedDialog = TestData.DialogSnapshot();
+        hwndBackedDialog.Nodes[0] = hwndBackedDialog.Nodes[0] with { NativeHwnd = "0x5678" };
+        Assert.Contains("nativeHwnd", Assert.Throws<ProtocolException>(
+            () => ProtocolValidator.ValidateSnapshot(hwndBackedDialog)).Message);
+
+        var virtualWindowNode = TestData.Snapshot();
+        virtualWindowNode.Nodes[0] = virtualWindowNode.Nodes[0] with { NativeHwnd = null };
+        Assert.Contains("nativeHwnd (missing)", Assert.Throws<ProtocolException>(
+            () => ProtocolValidator.ValidateSnapshot(virtualWindowNode)).Message);
+
+        // Application-adapter fields stay refused on both, and the rejection names
+        // the node and the field so the log alone explains it.
+        var adapterField = TestData.DialogSnapshot();
+        adapterField.Nodes[1] = adapterField.Nodes[1] with { SemanticKey = "okbutton" };
+        var message = Assert.Throws<ProtocolException>(
+            () => ProtocolValidator.ValidateSnapshot(adapterField)).Message;
+        Assert.Contains("node 2", message);
+        Assert.Contains("semanticKey", message);
+    }
+
+    [Fact]
+    public void AnEmptyTopLevelMenuIsAdmissibleOnlyWhileItIsDisabled()
+    {
+        // A menu bar an application draws with a toolbar can offer a top-level menu it
+        // currently has nothing to show for -- MMC's Window slot on a console with no
+        // snap-in windows.  The native bar still shows the title, so the projection shows
+        // the title and leaves it unopenable, which is what a disabled menu is.
+        var snapshot = TestData.Snapshot();
+        var empty = new MenuItemSnapshot
+        {
+            ItemId = "0",
+            Kind = "popup",
+            Text = "Window",
+            CommandId = 0,
+            Enabled = false,
+            Items = [],
+        };
+        snapshot.Menu.Clear();
+        snapshot.Menu.Add(empty);
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // An enabled popup still has to have something in it: a menu the user can open
+        // onto nothing is a projection that lost the application's content.
+        snapshot.Menu[0] = empty with { Enabled = true };
+        Assert.Contains("Popup menu shape", Assert.Throws<ProtocolException>(
+            () => ProtocolValidator.ValidateSnapshot(snapshot)).Message);
+    }
+
+    [Fact]
+    public void ContainerPanesOwnChildNodesAndOtherKindsDoNot()
+    {
+        // A private container pane frames other windows, so the projected graph has to
+        // let a node name it as its parent -- that is how MMC's view window owns its
+        // tree, list, and Actions pane.  Anything that is not a container still may
+        // not own nodes, and the rejection names both sides.
+        var snapshot = TestData.Snapshot();
+        var pane = NodeOfKind("paneContainer") with
+        {
+            NodeId = "40",
+            ZIndex = 40,
+            Rect = new PixelRect { X = 0, Y = 0, Width = 300, Height = 200 },
+        };
+        var child = NodeOfKind("static") with
+        {
+            NodeId = "41",
+            ZIndex = 41,
+            ParentNodeId = "40",
+            Rect = new PixelRect { X = 0, Y = 0, Width = 100, Height = 20 },
+        };
+        snapshot.Nodes[0] = pane;
+        snapshot.Nodes.Insert(1, child);
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        snapshot.Nodes[0] = pane with { Kind = "statusBar", Splits = null, ChromeRegions = null };
+        var message = Assert.Throws<ProtocolException>(
+            () => ProtocolValidator.ValidateSnapshot(snapshot)).Message;
+        Assert.Contains("node 41", message);
+        Assert.Contains("statusBar", message);
+    }
+
+    [Fact]
+    public void ToolbarEvidenceCoversTheStylesAndFacesTheBridgeAdmits()
+    {
+        // MMC's own toolbars carry CCS_NORESIZE|CCS_NODIVIDER|TBSTYLE_LIST and
+        // WS_EX_TOOLWINDOW|WS_EX_NOPARENTNOTIFY.  None of them changes what the
+        // control paints or what a button does, so refusing them would keep the whole
+        // window native for evidence the projection reproduces exactly.
+        var snapshot = TestData.Snapshot();
+        var toolbar = NodeOfKind("toolbar");
+        snapshot.Nodes[0] = toolbar with { Style = "0x56009845", ExStyle = "0x84" };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // A button whose face the control draws itself, or which has no icon at all,
+        // travels without image metadata: an icon-only button names itself from the
+        // accessible name the control publishes.
+        snapshot.Nodes[0] = toolbar with
+        {
+            ToolbarItems =
+            [
+                toolbar.ToolbarItems![0] with
+                {
+                    ImageWidth = null,
+                    ImageHeight = null,
+                    ImageFormat = null,
+                    ImageData = null,
+                },
+                toolbar.ToolbarItems![1],
+            ],
+        };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // Still closed: an owner-draw or multi-row style bit, and half-declared image
+        // metadata, are both refused.
+        foreach (var broken in new[]
+        {
+            toolbar with { Style = "0x5600984D" },
+            toolbar with { ExStyle = "0x100" },
+            toolbar with
+            {
+                ToolbarItems = [toolbar.ToolbarItems![0] with { ImageData = null }, toolbar.ToolbarItems![1]],
+            },
+        })
+        {
+            snapshot.Nodes[0] = broken;
+            Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        }
+    }
+
+    [Fact]
     public void UnregisteredKindIsRejected()
     {
         var snapshot = TestData.Snapshot();
-        snapshot.Nodes[0] = NodeOfKind("treeView");
+        // RichEdit is a named Tranche D target with no adapter, so it stands in for
+        // any kind the Bridge cannot produce yet.
+        snapshot.Nodes[0] = NodeOfKind("richEdit");
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
     }
 
@@ -350,12 +494,25 @@ public class ProtocolValidatorTests
     [InlineData("setSelection", "[2,0]", false)]
     [InlineData("setSelection", "[0,0]", false)]
     [InlineData("setItemCheck", "{\"index\":1,\"checked\":true}", true)]
+    [InlineData("setItemText", "{\"index\":1,\"text\":\"Renamed\"}", true)]
+    [InlineData("setItemText", "{\"index\":1,\"text\":\"\"}", false)]
+    [InlineData("setItemText", "{\"index\":-1,\"text\":\"Renamed\"}", false)]
+    [InlineData("setItemText", "\"Renamed\"", false)]
     [InlineData("setItemCheck", "{\"index\":-1,\"checked\":true}", false)]
     [InlineData("setItemCheck", "{\"index\":4096,\"checked\":true}", false)]
     [InlineData("setItemCheck", "{\"index\":1,\"checked\":1}", false)]
     [InlineData("setItemCheck", "{\"index\":1,\"checked\":true,\"extra\":0}", false)]
     [InlineData("toolbarCommand", "101", true)]
     [InlineData("toolbarCommand", "0", false)]
+    [InlineData("setValue", "25", true)]
+    [InlineData("setValue", "\"25\"", false)]
+    [InlineData("setExpand", "{\"index\":1,\"expanded\":true}", true)]
+    [InlineData("setExpand", "{\"index\":-1,\"expanded\":true}", false)]
+    [InlineData("setExpand", "{\"index\":1,\"checked\":true}", false)]
+    [InlineData("setExpand", "{\"index\":1,\"expanded\":1}", false)]
+    [InlineData("mdiCommand", "\"maximize\"", true)]
+    [InlineData("mdiCommand", "\"teleport\"", false)]
+    [InlineData("mdiCommand", "3", false)]
     [InlineData("invoke", "null", true)]
     [InlineData("invoke", "1", false)]
     public void NodeActionValueShapeIsEnforced(string action, string value, bool valid)
@@ -409,6 +566,128 @@ public class ProtocolValidatorTests
         Value = JsonDocument.Parse(value).RootElement.Clone(),
     };
 
+    [Fact]
+    public void ContainerPaneAdmitsItsSplitsAndItsOwnPaintedBands()
+    {
+        var pane = NodeOfKind("paneContainer") with
+        {
+            Rect = new PixelRect { X = 0, Y = 0, Width = 300, Height = 200 },
+            Splits = [new PaneSplit
+            {
+                Vertical = true, Position = 148, Thickness = 3, Minimum = 24, Maximum = 273,
+            }],
+            ChromeRegions = [Band(300, 30)],
+        };
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = pane;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // A split has to name a real range inside the pane, and its position has to sit
+        // inside that range: anything else would offer a drag the native panes cannot
+        // follow.
+        foreach (var broken in new[]
+        {
+            pane with { Splits = [pane.Splits![0] with { Position = 10 }] },
+            pane with { Splits = [pane.Splits![0] with { Maximum = 10 }] },
+            pane with { Splits = [pane.Splits![0] with { Position = 298, Maximum = 298 }] },
+            pane with { Splits = [pane.Splits![0] with { Thickness = 0 }] },
+        })
+        {
+            snapshot.Nodes[0] = broken;
+            Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        }
+
+        // A band's pixels have to describe exactly its rectangle, and the rectangle has
+        // to sit inside the pane: otherwise the projection would paint something the
+        // native window never drew.
+        foreach (var broken in new[]
+        {
+            pane with { ChromeRegions = [Band(300, 30) with { ImageWidth = 299 }] },
+            pane with { ChromeRegions = [Band(300, 30) with
+            {
+                Rect = new PixelRect { X = 0, Y = 190, Width = 300, Height = 30 },
+            }] },
+            pane with { ChromeRegions = [Band(300, 30) with { ImageFormat = "bgra8" }] },
+            pane with { ChromeRegions = [Band(300, 30) with { ImageData = "not base64!" }] },
+        })
+        {
+            snapshot.Nodes[0] = broken;
+            Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        }
+
+        // Container-only state stays out of every other kind.
+        snapshot.Nodes[0] = NodeOfKind("button") with { Splits = [] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = NodeOfKind("button") with { ChromeRegions = [] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+    }
+
+    [Fact]
+    public void AccessibleIslandItemsMustMatchHowTheyWouldBeDrawn()
+    {
+        var island = NodeOfKind("accessibleIsland") with
+        {
+            IslandItems =
+            [
+                IslandItem("text", "Actions", string.Empty),
+                IslandItem("button", "Computer Management (Local)", "Computer Management (Local)"),
+                IslandItem("button", "More Actions", "More Actions") with { DropDown = true },
+            ],
+        };
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = island;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // The provider's own default action is the whole contract for driving an
+        // element, so an element the projection would draw as actionable has to carry
+        // one, and an element that carries one may not be drawn as inert text.
+        foreach (var broken in new[]
+        {
+            island with { IslandItems = [IslandItem("button", "No action", string.Empty)] },
+            island with { IslandItems = [IslandItem("text", "Acts anyway", "Do it")] },
+            island with { IslandItems = [IslandItem("text", "Menu", string.Empty) with { DropDown = true }] },
+            island with { IslandItems = [IslandItem("button", string.Empty, "Unnamed")] },
+            island with { IslandItems = [IslandItem("combo", "Wrong kind", "Act")] },
+            island with { IslandItems = [] },
+            island with { TabStop = true, TabIndex = 0 },
+        })
+        {
+            snapshot.Nodes[0] = broken;
+            Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        }
+
+        // Island state stays out of every other kind, and the route only names an
+        // island item index.
+        snapshot.Nodes[0] = NodeOfKind("button") with { IslandItems = [] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        Validate(NodeAction("islandInvoke", "2"), valid: true);
+        Validate(NodeAction("islandInvoke", "32"), valid: false);
+        Validate(NodeAction("islandInvoke", "\"two\""), valid: false);
+    }
+
+    private static AccessibleIslandItem IslandItem(string kind, string name, string action) => new()
+    {
+        Kind = kind,
+        Rect = new PixelRect { X = 0, Y = 0, Width = 200, Height = 32 },
+        Name = name,
+        Description = string.Empty,
+        ActionName = action,
+        Enabled = true,
+    };
+
+    // An opaque band of the requested size: the shape a container's own paint arrives
+    // in.
+    private static ChromeRegion Band(int width, int height) => new()
+    {
+        Rect = new PixelRect { X = 0, Y = 0, Width = width, Height = height },
+        ImageWidth = width,
+        ImageHeight = height,
+        ImageFormat = "bgra8-premultiplied",
+        ImageData = Convert.ToBase64String(
+            Enumerable.Repeat<byte>(0x40, width * height * 4)
+                .Select((value, index) => index % 4 == 3 ? (byte)0xFF : value).ToArray()),
+    };
+
     // A node that satisfies every rule its kind adds, so a failure can only come
     // from the kind itself being unknown to the table.
     private static ControlNode NodeOfKind(string kind)
@@ -449,6 +728,7 @@ public class ProtocolValidatorTests
             {
                 Columns = ["Drive", "Status"],
                 ColumnWidths = [180, 260],
+                ColumnOrder = [0, 1],
                 Rows = [["C:", "OK"]],
                 SelectedIndices = [0],
                 FocusedIndex = 0,
@@ -456,6 +736,10 @@ public class ProtocolValidatorTests
                 ColumnHeadersVisible = true,
                 CheckBoxes = true,
                 CheckedIndices = [0],
+                ImageList = [],
+                ItemImages = [-1],
+                EditableLabels = false,
+                EditingIndex = -1,
             },
             "tabControl" => node with
             {
@@ -476,7 +760,52 @@ public class ProtocolValidatorTests
                 Text = string.Empty,
                 AutomationName = string.Empty,
             },
+            "mdiClient" => node with { Text = string.Empty, AutomationName = string.Empty },
+            "paneContainer" => node with
+            {
+                Text = string.Empty,
+                AutomationName = string.Empty,
+                Splits = [],
+                ChromeRegions = [],
+            },
+            "accessibleIsland" => node with
+            {
+                Text = string.Empty,
+                AutomationName = string.Empty,
+                IslandItems = [IslandItem("button", "More Actions", "More Actions")],
+            },
             "statusBar" => node with { Items = ["Ln 1", "100%"], ColumnWidths = [200, 80] },
+            "treeView" => node with
+            {
+                Text = string.Empty,
+                AutomationName = string.Empty,
+                Items = ["Console Root", "Services", "Local"],
+                ItemDepths = [0, 1, 2],
+                ItemExpanded = [true, true, false],
+                ItemHasChildren = [true, true, false],
+                SelectedIndex = 1,
+                ImageList =
+                [
+                    new ImageListEntry
+                    {
+                        ImageWidth = 1, ImageHeight = 1,
+                        ImageFormat = "bgra8-premultiplied",
+                        ImageData = Convert.ToBase64String([0x10, 0x20, 0x30, 0x40]),
+                    },
+                ],
+                ItemImages = [0, 0, -1],
+                ItemSelectedImages = [0, -1, -1],
+                EditableLabels = true,
+                EditingIndex = -1,
+            },
+            "slider" => node with
+            {
+                Minimum = 0,
+                Maximum = 10,
+                Position = 4,
+                SmallChange = 1,
+                LargeChange = 2,
+            },
             "toolbar" => node with
             {
                 Style = "0x50008B01",
@@ -543,4 +872,119 @@ public class ProtocolValidatorTests
         snapshot.Nodes[0] = valid with { Style = "0x54030640" };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
     }
+
+    [Fact]
+    public void TreeViewHierarchyAndSelectionFailClosed()
+    {
+        var snapshot = TestData.Snapshot();
+        var valid = NodeOfKind("treeView");
+        snapshot.Nodes[0] = valid;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // A depth that jumps two levels, a tree that does not start at a root, a
+        // parent that denies the child it carries, an array that disagrees with the
+        // labels, an empty label, and a selection outside the items.
+        snapshot.Nodes[0] = valid with { ItemDepths = [0, 1, 3] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { ItemDepths = [1, 1, 2] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { ItemHasChildren = [true, false, false] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { ItemExpanded = [true, true] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { Items = ["Console Root", string.Empty, "Local"] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { SelectedIndex = 3 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { MultiSelect = true };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+
+        // Only a tree may carry per-item hierarchy state.
+        snapshot.Nodes[0] = NodeOfKind("listBox") with { ItemDepths = [0] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+    }
+
+    [Fact]
+    public void SliderRangeFailsClosed()
+    {
+        var snapshot = TestData.Snapshot();
+        var valid = NodeOfKind("slider");
+        snapshot.Nodes[0] = valid;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        snapshot.Nodes[0] = valid with { Maximum = 0 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { Position = 11 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { SmallChange = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { LargeChange = -1 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        // A step of zero is the native "no keyboard step" value and stays admissible.
+        snapshot.Nodes[0] = valid with { SmallChange = 0, LargeChange = 0 };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+    }
+
+    [Fact]
+    public void MdiFrameGraphIsClosedToNonContainerParents()
+    {
+        var snapshot = TestData.Snapshot() with { SurfaceKind = "window", Nodes = [] };
+        var client = NodeOfKind("mdiClient") with { NodeId = "20", ZIndex = 0, TabIndex = -1 };
+        var child = MdiChild() with { ParentNodeId = client.NodeId };
+        var control = NodeOfKind("button") with
+        {
+            NodeId = "22", ZIndex = 2, TabIndex = -1, ParentNodeId = child.NodeId,
+        };
+        snapshot.Nodes.AddRange([client, child, control]);
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // An MDI child needs an MDI client as its parent, and no other kind may
+        // own one.
+        snapshot.Nodes[1] = child with { ParentNodeId = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[1] = child with { ParentNodeId = "22" };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+
+        // Caption state is required, bounded, and inside the frame.
+        snapshot.Nodes[1] = child with { WindowState = "floating" };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[1] = child with { Active = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[1] = child with
+        {
+            ClientRect = new PixelRect { X = 4, Y = 24, Width = 400, Height = 400 },
+        };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[1] = child with { ExStyle = "0x00000100" };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+
+        // Only an MDI child carries caption state at all.
+        snapshot.Nodes[1] = child;
+        snapshot.Nodes[2] = control with { Active = true };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+    }
+
+    private static ControlNode MdiChild() => new()
+    {
+        NodeId = "21",
+        Generation = "1",
+        NativeHwnd = "0x9abc",
+        Kind = "mdiChild",
+        ControlId = 0,
+        ZIndex = 1,
+        TabIndex = -1,
+        Rect = new PixelRect { X = 20, Y = 20, Width = 340, Height = 200 },
+        Style = "0x54CF0000",
+        ExStyle = "0x00000140",
+        Visible = true,
+        Enabled = true,
+        TabStop = false,
+        DialogCode = 0,
+        Text = "Document 1",
+        AutomationName = "Document 1",
+        Items = [],
+        Active = true,
+        WindowState = "normal",
+        ClientRect = new PixelRect { X = 4, Y = 24, Width = 332, Height = 172 },
+    };
 }

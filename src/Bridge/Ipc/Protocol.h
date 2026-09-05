@@ -35,17 +35,52 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // DirectUI bitmap-display and bitmap-switch pixels. Minor 14 admits every UIA
 // control type the Win32 adapter registry can back on a capability-derived
 // DirectUI surface, and lets one projected node advertise two in-place routes.
+// Minor 15 adds the bounded textual SysTreeView32 and msctls_trackbar32
+// adapters: treeView/slider kinds, per-item depth/expansion/child evidence, and
+// the setValue and setExpand routes. Minor 16 adds projected MDI frames: the
+// mdiClient and mdiChild container kinds, per-child caption state and client
+// geometry, and the mdiCommand route. Minor 17 adds per-item icons through a
+// bounded shared image list, and in-place item renaming through the native
+// control's own label-edit session.
 // A Bridge
 // Must not pair with a minor-0 renderer because that peer would treat the
 // pre-UIA provisional commit as interactive.
-inline constexpr uint16_t kProtocolMinor = 14;
+inline constexpr uint16_t kProtocolMinor = 19;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
 inline constexpr size_t kMaxNodes = 512;
 inline constexpr size_t kMaxListItems = 4096;
 inline constexpr size_t kMaxTabItems = 128;
+// itemDepths carries the nesting level of a projected TreeView item, so the
+// deepest admissible level is one less than the level count.
+inline constexpr int kMaxTreeDepth = 31;
 inline constexpr size_t kMaxToolbarItems = 64;
+// A report ListView carries at most this many columns, which also bounds the
+// display-order permutation a projected header reorder can request.
+inline constexpr size_t kMaxColumns = 64;
+// A container pane reproduces the bands it paints itself as bounded BGRA pixels.
+// The caps keep a caption strip or separator rule reproducible while refusing a
+// window that is really a custom-drawn control wearing a container's shape.
+inline constexpr size_t kMaxChromeRegions = 4;
+inline constexpr uint32_t kMaxChromeRegionDimension = 1024;
+inline constexpr size_t kMaxChromeRegionBytes = 1024 * 1024;
+// An accessible island publishes its HWND-less elements as typed items on its own
+// node, the way a Toolbar publishes its buttons.  A window with more elements than
+// this is not a bounded island the projection can describe.
+inline constexpr size_t kMaxIslandItems = 32;
+// A container pane carries one entry per splitter between its child panes.  A
+// window with more than a handful of independently sized panes is not a frame the
+// projection can describe, so the cap is deliberately small.
+inline constexpr size_t kMaxPaneSplits = 8;
+// Split positions are client coordinates, bounded by the same limit the protocol
+// already applies to window and control geometry.
+inline constexpr int kMaxCoordinate = 65535;
+// A control's own image list travels once per node and every item indexes into
+// it.  Both caps are deliberate: sixty-four icons at 64x64 is a megabyte of
+// pixels, which leaves the rest of the 4 MiB frame to the items themselves.
+inline constexpr size_t kMaxImageListImages = 64;
+inline constexpr uint32_t kMaxImageListDimension = 64;
 inline constexpr uint32_t kMaxImageDimension = 96;
 inline constexpr size_t kMaxImageBytes =
     static_cast<size_t>(kMaxImageDimension) * kMaxImageDimension * 4;

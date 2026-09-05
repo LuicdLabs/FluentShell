@@ -42,7 +42,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
-      <AdditionalDependencies>bcrypt.lib;ole32.lib;runtimeobject.lib;comctl32.lib;dwmapi.lib;uiautomationcore.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>bcrypt.lib;ole32.lib;oleacc.lib;oleaut32.lib;runtimeobject.lib;comctl32.lib;dwmapi.lib;uiautomationcore.lib;version.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -58,6 +58,9 @@
     <ClCompile Include="..\..\src\Bridge\Translation\WindowSnapshot.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\WindowCapture.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\ControlAdapters.cpp" />
+    <ClCompile Include="..\..\src\Bridge\Translation\AccessibleIsland.cpp" />
+    <ClCompile Include="..\..\src\Bridge\Translation\MenuBarCapture.cpp" />
+    <ClCompile Include="..\..\src\Bridge\Translation\DialogSnapshots.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\DirectUiEngine.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\DirectUiProfiles.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\SourceThreadAgent.cpp" />

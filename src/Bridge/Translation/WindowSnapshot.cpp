@@ -152,6 +152,11 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"editable", JsonValue::CreateBooleanValue(node.editable));
     result.Insert(L"isDefault", JsonValue::CreateBooleanValue(node.isDefault));
     result.Insert(L"groupStart", JsonValue::CreateBooleanValue(node.groupStart));
+    if (node.kind == ControlKind::MdiChild) {
+        result.Insert(L"active", JsonValue::CreateBooleanValue(node.active));
+        result.Insert(L"windowState", JsonValue::CreateStringValue(node.windowState));
+        result.Insert(L"clientRect", RectToJson(node.clientRect));
+    }
     result.Insert(L"minimum", JsonValue::CreateNumberValue(node.minimum));
     result.Insert(L"maximum", JsonValue::CreateNumberValue(node.maximum));
     result.Insert(L"position", JsonValue::CreateNumberValue(node.position));
@@ -190,6 +195,11 @@ JsonObject NodeToJson(const ControlNode& node) {
     }
     result.Insert(L"rows", rows);
     if (node.kind == ControlKind::ListView) {
+        JsonArray columnOrder;
+        for (const int logical : node.columnOrder) {
+            columnOrder.Append(JsonValue::CreateNumberValue(logical));
+        }
+        result.Insert(L"columnOrder", columnOrder);
         result.Insert(L"columnHeadersVisible",
             JsonValue::CreateBooleanValue(node.columnHeadersVisible));
         result.Insert(L"checkBoxes", JsonValue::CreateBooleanValue(node.checkBoxes));
@@ -199,16 +209,48 @@ JsonObject NodeToJson(const ControlNode& node) {
         }
         result.Insert(L"checkedIndices", checkedIndices);
     }
-    JsonArray itemDepths;
-    for (const int depth : node.itemDepths) {
-        itemDepths.Append(JsonValue::CreateNumberValue(depth));
+    if (node.kind == ControlKind::TreeView) {
+        JsonArray itemDepths;
+        for (const int depth : node.itemDepths) {
+            itemDepths.Append(JsonValue::CreateNumberValue(depth));
+        }
+        result.Insert(L"itemDepths", itemDepths);
+        JsonArray itemExpanded;
+        for (const bool expanded : node.itemExpanded) {
+            itemExpanded.Append(JsonValue::CreateBooleanValue(expanded));
+        }
+        result.Insert(L"itemExpanded", itemExpanded);
+        JsonArray itemHasChildren;
+        for (const bool hasChildren : node.itemHasChildren) {
+            itemHasChildren.Append(JsonValue::CreateBooleanValue(hasChildren));
+        }
+        result.Insert(L"itemHasChildren", itemHasChildren);
+        JsonArray itemSelectedImages;
+        for (const int image : node.itemSelectedImages) {
+            itemSelectedImages.Append(JsonValue::CreateNumberValue(image));
+        }
+        result.Insert(L"itemSelectedImages", itemSelectedImages);
     }
-    result.Insert(L"itemDepths", itemDepths);
-    JsonArray itemExpanded;
-    for (const bool expanded : node.itemExpanded) {
-        itemExpanded.Append(JsonValue::CreateBooleanValue(expanded));
+    if (node.kind == ControlKind::TreeView || node.kind == ControlKind::ListView) {
+        JsonArray imageList;
+        for (const auto& entry : node.imageList) {
+            JsonObject image;
+            image.Insert(L"imageWidth", JsonValue::CreateNumberValue(entry.imageWidth));
+            image.Insert(L"imageHeight", JsonValue::CreateNumberValue(entry.imageHeight));
+            image.Insert(L"imageFormat", JsonValue::CreateStringValue(entry.imageFormat));
+            image.Insert(L"imageData",
+                JsonValue::CreateStringValue(Base64Encode(entry.imageData)));
+            imageList.Append(image);
+        }
+        result.Insert(L"imageList", imageList);
+        JsonArray itemImages;
+        for (const int image : node.itemImages) {
+            itemImages.Append(JsonValue::CreateNumberValue(image));
+        }
+        result.Insert(L"itemImages", itemImages);
+        result.Insert(L"editableLabels", JsonValue::CreateBooleanValue(node.editableLabels));
+        result.Insert(L"editingIndex", JsonValue::CreateNumberValue(node.editingIndex));
     }
-    result.Insert(L"itemExpanded", itemExpanded);
     if (node.kind == ControlKind::StaticIcon ||
         (node.kind == ControlKind::RadioButton && !node.imageData.empty())) {
         result.Insert(L"imageWidth", JsonValue::CreateNumberValue(node.imageWidth));
@@ -221,13 +263,19 @@ JsonObject NodeToJson(const ControlNode& node) {
         for (const auto& item : node.toolbarItems) {
             JsonObject value;
             value.Insert(L"kind", JsonValue::CreateStringValue(
-                item.kind == ToolbarItemKind::PushButton ? L"pushButton" : L"separator"));
+                item.kind == ToolbarItemKind::PushButton ? L"pushButton"
+                : item.kind == ToolbarItemKind::ToggleButton ? L"toggleButton" : L"separator"));
             value.Insert(L"commandId", JsonValue::CreateNumberValue(item.commandId));
             value.Insert(L"rect", RectToJson(item.rect));
             value.Insert(L"text", JsonValue::CreateStringValue(item.text));
             value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
             value.Insert(L"hidden", JsonValue::CreateBooleanValue(item.hidden));
-            if (item.kind == ToolbarItemKind::PushButton) {
+            value.Insert(L"checked", JsonValue::CreateBooleanValue(item.checked));
+            value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
+            value.Insert(L"wholeDropDown", JsonValue::CreateBooleanValue(item.wholeDropDown));
+            // The icon fields travel only when the control actually draws one: a
+            // text-only button owns no image list entry and no painted face.
+            if (!item.imageData.empty()) {
                 value.Insert(L"imageWidth", JsonValue::CreateNumberValue(item.imageWidth));
                 value.Insert(L"imageHeight", JsonValue::CreateNumberValue(item.imageHeight));
                 value.Insert(L"imageFormat", JsonValue::CreateStringValue(item.imageFormat));
@@ -236,6 +284,46 @@ JsonObject NodeToJson(const ControlNode& node) {
             toolbarItems.Append(value);
         }
         result.Insert(L"toolbarItems", toolbarItems);
+    }
+    if (node.kind == ControlKind::PaneContainer) {
+        JsonArray splits;
+        for (const auto& split : node.splits) {
+            JsonObject value;
+            value.Insert(L"vertical", JsonValue::CreateBooleanValue(split.vertical));
+            value.Insert(L"position", JsonValue::CreateNumberValue(split.position));
+            value.Insert(L"thickness", JsonValue::CreateNumberValue(split.thickness));
+            value.Insert(L"minimum", JsonValue::CreateNumberValue(split.minimum));
+            value.Insert(L"maximum", JsonValue::CreateNumberValue(split.maximum));
+            splits.Append(value);
+        }
+        result.Insert(L"splits", splits);
+        JsonArray chromeRegions;
+        for (const auto& region : node.chromeRegions) {
+            JsonObject value;
+            value.Insert(L"rect", RectToJson(region.rect));
+            value.Insert(L"imageWidth", JsonValue::CreateNumberValue(region.imageWidth));
+            value.Insert(L"imageHeight", JsonValue::CreateNumberValue(region.imageHeight));
+            value.Insert(L"imageFormat", JsonValue::CreateStringValue(region.imageFormat));
+            value.Insert(L"imageData",
+                JsonValue::CreateStringValue(Base64Encode(region.imageData)));
+            chromeRegions.Append(value);
+        }
+        result.Insert(L"chromeRegions", chromeRegions);
+    }
+    if (node.kind == ControlKind::AccessibleIsland) {
+        JsonArray islandItems;
+        for (const auto& item : node.islandItems) {
+            JsonObject value;
+            value.Insert(L"kind", JsonValue::CreateStringValue(item.kind));
+            value.Insert(L"rect", RectToJson(item.rect));
+            value.Insert(L"name", JsonValue::CreateStringValue(item.name));
+            value.Insert(L"description", JsonValue::CreateStringValue(item.description));
+            value.Insert(L"actionName", JsonValue::CreateStringValue(item.actionName));
+            value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
+            value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
+            islandItems.Append(value);
+        }
+        result.Insert(L"islandItems", islandItems);
     }
     if (!node.adapterId.empty()) {
         result.Insert(L"adapterId", JsonValue::CreateStringValue(node.adapterId));
@@ -404,9 +492,10 @@ bool ParseActionValue(
         return true;
     }
     if (action.action == L"setCheck" || action.action == L"select" ||
-        action.action == L"menuCommand" || action.action == L"toolbarCommand") {
+        action.action == L"setValue" || action.action == L"menuCommand" ||
+        action.action == L"toolbarCommand") {
         if (value.ValueType() != JsonValueType::Number) {
-            error = L"setCheck/select/menuCommand/toolbarCommand requires an integer value";
+            error = L"setCheck/select/setValue/menuCommand/toolbarCommand requires an integer value";
             return false;
         }
         const double number = value.GetNumber();
@@ -423,6 +512,21 @@ bool ParseActionValue(
                 return false;
             }
             action.menuCommandId = static_cast<uint32_t>(action.integerValue);
+        }
+        return true;
+    }
+    if (action.action == L"mdiCommand") {
+        if (value.ValueType() != JsonValueType::String) {
+            error = L"mdiCommand requires a string verb";
+            return false;
+        }
+        action.text = value.GetString();
+        static constexpr std::wstring_view kVerbs[] = {
+            L"activate", L"close", L"minimize", L"maximize", L"restore"
+        };
+        if (std::find(std::begin(kVerbs), std::end(kVerbs), action.text) == std::end(kVerbs)) {
+            error = L"mdiCommand verb is outside the admitted set";
+            return false;
         }
         return true;
     }
@@ -458,25 +562,127 @@ bool ParseActionValue(
         }
         return true;
     }
-    if (action.action == L"setItemCheck") {
+    if (action.action == L"setItemText") {
         if (value.ValueType() != JsonValueType::Object) {
-            error = L"setItemCheck requires an object value";
+            error = L"setItemText requires an object value";
             return false;
         }
         const auto object = value.GetObject();
-        if (object.Size() != 2 || !object.HasKey(L"index") || !object.HasKey(L"checked") ||
-            object.GetNamedValue(L"checked").ValueType() != JsonValueType::Boolean) {
-            error = L"setItemCheck requires exactly integer index and boolean checked";
+        if (object.Size() != 2 || !object.HasKey(L"index") || !object.HasKey(L"text") ||
+            object.GetNamedValue(L"text").ValueType() != JsonValueType::String) {
+            error = L"setItemText requires exactly an integer index and string text";
             return false;
         }
         LONG index = -1;
         if (!JsonInteger(object, L"index", index) || index < 0 ||
             static_cast<size_t>(index) >= Ipc::kMaxListItems) {
-            error = L"setItemCheck index is outside range";
+            error = L"setItemText index is outside range";
             return false;
         }
         action.itemIndex = index;
-        action.booleanValue = object.GetNamedBoolean(L"checked");
+        action.text = object.GetNamedString(L"text");
+        if (action.text.size() > Ipc::kMaxStringChars) {
+            error = L"setItemText value exceeds limit";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"islandInvoke") {
+        if (value.ValueType() != JsonValueType::Number) {
+            error = L"islandInvoke requires an integer item index";
+            return false;
+        }
+        const double raw = value.GetNumber();
+        const int index = static_cast<int>(raw);
+        if (static_cast<double>(index) != raw || index < 0 ||
+            static_cast<size_t>(index) >= Ipc::kMaxIslandItems) {
+            error = L"islandInvoke index is outside range";
+            return false;
+        }
+        action.itemIndex = index;
+        return true;
+    }
+    if (action.action == L"setColumnOrder") {
+        if (value.ValueType() != JsonValueType::Array) {
+            error = L"setColumnOrder requires an array value";
+            return false;
+        }
+        const auto array = value.GetArray();
+        if (array.Size() == 0 || array.Size() > Ipc::kMaxColumns) {
+            error = L"setColumnOrder size is outside range";
+            return false;
+        }
+        action.integerValues.clear();
+        action.integerValues.reserve(array.Size());
+        for (uint32_t index = 0; index < array.Size(); ++index) {
+            const auto entry = array.GetAt(index);
+            if (entry.ValueType() != JsonValueType::Number) {
+                error = L"setColumnOrder entries must be integers";
+                return false;
+            }
+            const double raw = entry.GetNumber();
+            const int logical = static_cast<int>(raw);
+            if (static_cast<double>(logical) != raw || logical < 0 ||
+                static_cast<size_t>(logical) >= array.Size()) {
+                error = L"setColumnOrder entries must name columns";
+                return false;
+            }
+            if (std::find(action.integerValues.begin(), action.integerValues.end(), logical) !=
+                action.integerValues.end()) {
+                error = L"setColumnOrder must be a permutation";
+                return false;
+            }
+            action.integerValues.push_back(logical);
+        }
+        return true;
+    }
+    if (action.action == L"setSplit") {
+        if (value.ValueType() != JsonValueType::Object) {
+            error = L"setSplit requires an object value";
+            return false;
+        }
+        const auto object = value.GetObject();
+        if (object.Size() != 2 || !object.HasKey(L"index") || !object.HasKey(L"position")) {
+            error = L"setSplit requires exactly an integer index and position";
+            return false;
+        }
+        LONG index = -1;
+        LONG position = 0;
+        if (!JsonInteger(object, L"index", index) || index < 0 ||
+            static_cast<size_t>(index) >= Ipc::kMaxPaneSplits) {
+            error = L"setSplit index is outside range";
+            return false;
+        }
+        if (!JsonInteger(object, L"position", position) ||
+            position < 0 || position > Ipc::kMaxCoordinate) {
+            error = L"setSplit position is outside range";
+            return false;
+        }
+        action.itemIndex = index;
+        action.integerValue = position;
+        return true;
+    }
+    if (action.action == L"setItemCheck" || action.action == L"setExpand") {
+        const wchar_t* const flagName =
+            action.action == L"setExpand" ? L"expanded" : L"checked";
+        if (value.ValueType() != JsonValueType::Object) {
+            error = action.action + L" requires an object value";
+            return false;
+        }
+        const auto object = value.GetObject();
+        if (object.Size() != 2 || !object.HasKey(L"index") || !object.HasKey(flagName) ||
+            object.GetNamedValue(flagName).ValueType() != JsonValueType::Boolean) {
+            error = action.action + L" requires exactly an integer index and its boolean flag";
+            return false;
+        }
+        LONG index = -1;
+        if (!JsonInteger(object, L"index", index) || index < 0 ||
+            static_cast<size_t>(index) >= Ipc::kMaxListItems) {
+            error = action.action + L" index is outside range";
+            return false;
+        }
+        action.itemIndex = index;
+        action.booleanValue = object.GetNamedBoolean(flagName);
         return true;
     }
     if (action.action == L"move" || action.action == L"resize") {
@@ -522,10 +728,30 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::TabControl: return L"tabControl";
     case ControlKind::Slider: return L"slider";
     case ControlKind::DialogContainer: return L"dialogContainer";
+    case ControlKind::MdiClient: return L"mdiClient";
+    case ControlKind::MdiChild: return L"mdiChild";
     case ControlKind::StatusBar: return L"statusBar";
     case ControlKind::Toolbar: return L"toolbar";
+    case ControlKind::PaneContainer: return L"paneContainer";
+    case ControlKind::AccessibleIsland: return L"accessibleIsland";
     }
     return L"static";
+}
+
+// Mirrors the parent rule the renderer's ProtocolValidator enforces: a dialog
+// navigation container, an MDI frame or child, and a private container pane frame
+// other nodes.  Every other kind draws its own content, so nothing may be nested
+// inside it.
+bool IsProjectedContainerKind(ControlKind kind) noexcept {
+    switch (kind) {
+    case ControlKind::DialogContainer:
+    case ControlKind::MdiClient:
+    case ControlKind::MdiChild:
+    case ControlKind::PaneContainer:
+        return true;
+    default:
+        return false;
+    }
 }
 
 const wchar_t* SurfaceKindName(SurfaceKind kind) noexcept {
@@ -765,7 +991,9 @@ bool ParseActionInvoke(
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
-            L"setSelection", L"setItemCheck", L"menuCommand", L"toolbarCommand",
+            L"setSelection", L"setItemCheck", L"setItemText", L"setValue", L"setExpand",
+            L"setSplit", L"setColumnOrder", L"islandInvoke",
+            L"menuCommand", L"toolbarCommand", L"mdiCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -775,7 +1003,12 @@ bool ParseActionInvoke(
         const bool requiresNode = action.action == L"invoke" || action.action == L"setText" ||
             action.action == L"setCheck" || action.action == L"select" ||
             action.action == L"setSelection" || action.action == L"setItemCheck" ||
-            action.action == L"toolbarCommand";
+            action.action == L"setItemText" ||
+            action.action == L"setValue" || action.action == L"setExpand" ||
+            action.action == L"setSplit" ||
+            action.action == L"setColumnOrder" ||
+            action.action == L"islandInvoke" ||
+            action.action == L"toolbarCommand" || action.action == L"mdiCommand";
         if (requiresNode != action.nodeId.has_value()) {
             error = L"action.invoke nodeId does not match action semantics";
             return false;
@@ -956,15 +1189,49 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"select") {
-        const bool tab = node.kind == ControlKind::TabControl;
+        // A tab control and a tree always have a current item; a list or combo box
+        // can legitimately have none, so only those accept -1.
+        const bool requiresItem = node.kind == ControlKind::TabControl ||
+            node.kind == ControlKind::TreeView;
         const bool selectable = node.kind == ControlKind::ComboBox ||
-            node.kind == ControlKind::ListBox || tab;
-        const bool inRange = action.integerValue >= (tab ? 0 : -1) &&
+            node.kind == ControlKind::ListBox || requiresItem;
+        const bool inRange = action.integerValue >= (requiresItem ? 0 : -1) &&
             (action.integerValue == -1 ||
                 static_cast<size_t>(action.integerValue) < node.items.size());
         if (selectable && inRange) return true;
         error = L"select value is invalid for the node";
         return false;
+    }
+    if (action.action == L"setValue") {
+        if (node.kind != ControlKind::Slider) {
+            error = L"setValue requires a Trackbar node";
+            return false;
+        }
+        if (action.integerValue < node.minimum || action.integerValue > node.maximum) {
+            error = L"setValue is outside the Trackbar range";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setExpand") {
+        if (node.kind != ControlKind::TreeView) {
+            error = L"setExpand requires a TreeView node";
+            return false;
+        }
+        if (action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= node.items.size() ||
+            node.itemHasChildren.size() != node.items.size()) {
+            error = L"setExpand index is outside the TreeView";
+            return false;
+        }
+        // Only a parent can change expansion state.  A lazily populated tree
+        // reports children it has not inserted yet, so this is the item's own
+        // evidence rather than a count of captured descendants.
+        if (!node.itemHasChildren[static_cast<size_t>(action.itemIndex)]) {
+            error = L"setExpand references a TreeView leaf";
+            return false;
+        }
+        return true;
     }
     if (action.action == L"setSelection") {
         if (node.kind != ControlKind::ListView ||
@@ -976,6 +1243,72 @@ bool ValidateActionForSnapshot(
                 [&](int index) { return index < 0 ||
                     static_cast<size_t>(index) >= node.rows.size(); })) {
             error = L"setSelection index is outside the ListView";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setItemText") {
+        const bool renamable = (node.kind == ControlKind::TreeView ||
+            node.kind == ControlKind::ListView) && node.editableLabels;
+        if (!renamable) {
+            error = L"setItemText requires a label-editable TreeView or ListView node";
+            return false;
+        }
+        const size_t itemCount = node.kind == ControlKind::TreeView
+            ? node.items.size() : node.rows.size();
+        if (action.itemIndex < 0 || static_cast<size_t>(action.itemIndex) >= itemCount) {
+            error = L"setItemText index is outside the item range";
+            return false;
+        }
+        if (action.text.empty()) {
+            // Native in-place editing treats an empty label as a cancel, so an
+            // empty rename is refused rather than silently doing nothing.
+            error = L"setItemText requires a nonempty label";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"islandInvoke") {
+        if (node.kind != ControlKind::AccessibleIsland) {
+            error = L"islandInvoke requires an accessible island node";
+            return false;
+        }
+        if (action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= node.islandItems.size()) {
+            error = L"islandInvoke index is outside the island's items";
+            return false;
+        }
+        const auto& item = node.islandItems[static_cast<size_t>(action.itemIndex)];
+        if (item.actionName.empty() || !item.enabled) {
+            error = L"islandInvoke references a disabled or actionless element";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setColumnOrder") {
+        if (node.kind != ControlKind::ListView) {
+            error = L"setColumnOrder requires a report ListView node";
+            return false;
+        }
+        if (action.integerValues.size() != node.columns.size()) {
+            error = L"setColumnOrder must name every column exactly once";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setSplit") {
+        if (node.kind != ControlKind::PaneContainer) {
+            error = L"setSplit requires a container pane node";
+            return false;
+        }
+        if (action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= node.splits.size()) {
+            error = L"setSplit index is outside the container's splits";
+            return false;
+        }
+        const auto& split = node.splits[static_cast<size_t>(action.itemIndex)];
+        if (action.integerValue < split.minimum || action.integerValue > split.maximum) {
+            error = L"setSplit position is outside the split's range";
             return false;
         }
         return true;
@@ -999,7 +1332,8 @@ bool ValidateActionForSnapshot(
         }
         const auto item = std::find_if(node.toolbarItems.begin(), node.toolbarItems.end(),
             [&](const ToolbarItemSnapshot& candidate) {
-                return candidate.kind == ToolbarItemKind::PushButton &&
+                return (candidate.kind == ToolbarItemKind::PushButton ||
+                        candidate.kind == ToolbarItemKind::ToggleButton) &&
                     candidate.commandId == action.menuCommandId;
             });
         if (item == node.toolbarItems.end() || !item->enabled || item->hidden) {
@@ -1008,18 +1342,69 @@ bool ValidateActionForSnapshot(
         }
         return true;
     }
+    if (action.action == L"mdiCommand") {
+        if (node.kind != ControlKind::MdiChild) {
+            error = L"mdiCommand requires an MDI child node";
+            return false;
+        }
+        const auto style = static_cast<DWORD>(node.style);
+        const bool minimized = node.windowState == L"minimized";
+        const bool maximized = node.windowState == L"maximized";
+        if (action.text == L"activate") {
+            if (node.active) {
+                error = L"mdiCommand activate targets the already active child";
+                return false;
+            }
+            return true;
+        }
+        if (action.text == L"close") {
+            if ((style & WS_SYSMENU) == 0) {
+                error = L"MDI child has no system menu to close through";
+                return false;
+            }
+            return true;
+        }
+        if (action.text == L"minimize") {
+            if ((style & WS_MINIMIZEBOX) == 0 || minimized) {
+                error = L"MDI child cannot be minimized in its current state";
+                return false;
+            }
+            return true;
+        }
+        if (action.text == L"maximize") {
+            if ((style & WS_MAXIMIZEBOX) == 0 || maximized) {
+                error = L"MDI child cannot be maximized in its current state";
+                return false;
+            }
+            return true;
+        }
+        if (action.text == L"restore") {
+            if (!minimized && !maximized) {
+                error = L"MDI child is already restored";
+                return false;
+            }
+            return true;
+        }
+        error = L"mdiCommand verb is outside the admitted set";
+        return false;
+    }
     error = L"nodeId is not valid for this action";
     return false;
 }
 
 bool IsRequestSemanticAction(std::wstring_view action) noexcept {
-    // Geometry is latest-wins: the pointer, not a snapshot revision, is the truth
-    // for where the window is.  Revision-gating move/resize turns every frame of a
-    // drag that raced a reconcile capture into a stale rejection plus a full
-    // resync, so these carry the same request semantics as invoke/close and are
-    // rebased onto the current revision by HandleNativeAction.
+    // Geometry actions and a Trackbar drag are latest-wins: the pointer, not a
+    // snapshot revision, is the truth for where the window or the thumb is.
+    // Revision-gating them turns every frame of a drag that raced a reconcile
+    // capture into a stale rejection plus a full resync, so they carry the same
+    // request semantics as invoke/close and are rebased onto the current revision
+    // by HandleNativeAction.
     return action == L"invoke" || action == L"toolbarCommand" || action == L"close" ||
-        action == L"move" || action == L"resize";
+        action == L"move" || action == L"resize" || action == L"setValue" ||
+        action == L"setSplit" ||
+        action == L"setColumnOrder" ||
+        action == L"islandInvoke" ||
+        action == L"mdiCommand";
 }
 
 } // namespace FluentShell::Bridge::Translation

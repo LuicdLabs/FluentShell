@@ -41,14 +41,35 @@ meet only through the versioned `FLSH` frame and the JSON schema in
 The current control boundary is bounded textual HMENU command bars, standard
 Static text and icons, Button/check/three-state/radio/GroupBox, Edit and
 password Edit, dropdown-list/editable dropdown ComboBox, ListBox, SysLink,
-report-mode SysListView32, textual top-tab SysTabControl32, one-row
-ToolbarWindow32, textual status bars, and determinate or marquee horizontal
-ProgressBar controls plus supported MessageBox and static TaskDialog shapes.
-Owner-draw, custom HWND classes, RichEdit, TreeView, Trackbar, uncontracted
-virtual controls, embedded browser/XAML, layered/nonrectangular windows, and
-custom non-client rendering remain native. The staged adapter expansion is
-documented in
+report-mode SysListView32, SysTreeView32 with its hierarchy, textual top-tab
+SysTabControl32, msctls_trackbar32, one-row ToolbarWindow32, textual status bars,
+MDI frames with their client area and child frames, and determinate or marquee
+horizontal ProgressBar controls plus supported MessageBox and static TaskDialog
+shapes. A private container class is admitted geometrically rather than by name:
+when its visible children tile its client area, every strip that divides it becomes
+a real Fluent splitter that resizes the two native panes it separates, and every
+band the container paints itself is reproduced from the pixels it drew. A host window
+whose content owns no HWND at all -- DirectUI is the common one -- is projected as an
+accessible island: its elements are read through the accessibility contract the window
+answers and driven by asking the provider to perform each element's own default
+action. Toolbars carry icon-only, latched, dropdown, callback-image, and
+custom-drawn buttons, naming an unlabelled button from the accessible name the control
+itself publishes. Tree and list
+items carry their real per-item icons, a report list carries its column display
+order and can be reordered by dragging a projected header, and where the native
+control admits `TVS_EDITLABELS`/`LVS_EDITLABELS` the projection renames in place
+through the control's own label session, so the application's own veto and text
+normalization still decide the result.
+Owner-draw, custom HWND classes, RichEdit, checkbox or state-image trees,
+uncontracted virtual controls, embedded browser/XAML, layered/nonrectangular
+windows, and custom non-client rendering remain native. The staged adapter
+expansion is documented in
 `docs/goals/win32-to-winui-translation/CONTROL-ADAPTER-ROADMAP.md`.
+
+An MDI child frame is projected as a real nested surface: a Fluent caption over
+the native frame inset, the child's own controls in the native client band, and
+caption commands routed as the `WM_SYSCOMMAND` the native caption button posts.
+`LegacyDialogHost.exe --mdi` is the acceptance oracle for that shape.
 
 Built-in DirectUI surfaces such as MdSched, RecoveryDrive, and the ClearType
 Text Tuner are admitted by a separate profile-driven engine. Two pinned

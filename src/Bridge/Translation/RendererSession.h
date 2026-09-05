@@ -54,6 +54,26 @@ public:
 
 private:
     struct Surface;
+    // One split the user moved through the projection.  A container's own stored
+    // proportion lives in the application's private data, and there is no message
+    // that writes it, so a later re-layout would silently undo the request.  The
+    // position is remembered against the extent it was measured on so it can be
+    // re-asserted proportionally, and only ever when the extent itself changed --
+    // a split the application or the user moved at an unchanged size is a real
+    // decision the projection does not fight.
+    struct PaneSplitIntent final {
+        uint64_t nodeId = 0;
+        uint64_t generation = 0;
+        int index = 0;
+        bool vertical = true;
+        // The split position and the container extent it was measured against, both
+        // in the container's own client pixels.
+        int position = 0;
+        int extent = 0;
+        // Consecutive re-assertions that did not take effect.  A container that
+        // refuses the proportion twice owns its layout and the intent is dropped.
+        unsigned failures = 0;
+    };
     // One projection attempt.  Groups the values every gate stage reads so the
     // gate can be a sequence of named stages instead of one long function.
     struct ProjectionAttempt;
@@ -149,6 +169,18 @@ private:
     // lock choreography out of the reconcile logic: the caller restores only
     // after every lock this pass took has been released.
     const wchar_t* ReconcileSurface(const std::shared_ptr<Surface>& surface);
+    // Re-asserts the splits the user moved through the projection when the
+    // application has re-laid the container out at a new size.  Runs with the
+    // surface canonical barrier held, on the freshly captured snapshot, and may
+    // replace it with the one the re-assertion produced.
+    void ReassertRememberedSplits(ReconcilePass& pass);
+    // Reads a menu bar the application draws with a toolbar, once per surface, after the
+    // projection is committed and the native window is cloaked.
+    void ReadMenuBarToolbarOnce(ReconcilePass& pass);
+    // Records the split a completed setSplit produced, or forgets it when the
+    // container no longer describes one.  Requires surface->mutex.
+    static void RememberSplitIntent(
+        const std::shared_ptr<Surface>& surface, const ActionRequest& action);
     const wchar_t* PublishReconciledSnapshot(ReconcilePass& pass);
     // In-place DirectUI page swap.  A handoff-declared route that only replaces
     // the page inside the same top-level window keeps its projection: the proxy
@@ -191,22 +223,6 @@ private:
         const std::shared_ptr<Surface>& surface,
         HWND owner,
         bool ownerWasEnabled);
-    WindowSnapshot BuildMessageBoxSnapshot(
-        HWND owner,
-        std::wstring_view text,
-        std::wstring_view caption,
-        UINT type,
-        std::unordered_map<uint64_t, int>& results);
-    WindowSnapshot BuildTaskDialogSnapshot(
-        const TASKDIALOGCONFIG& config,
-        const std::vector<std::pair<int, std::wstring>>& buttons,
-        std::wstring_view title,
-        std::wstring_view instruction,
-        std::wstring_view content,
-        std::wstring_view footer,
-        std::wstring_view verification,
-        std::unordered_map<uint64_t, int>& results,
-        std::optional<uint64_t>& verificationNode);
     std::wstring RendererPath() const;
     bool VerifyRendererClient() const noexcept;
     bool HasRendererExited() noexcept;

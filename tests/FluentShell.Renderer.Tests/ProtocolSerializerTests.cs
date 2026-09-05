@@ -13,7 +13,7 @@ public sealed class ProtocolSerializerTests
         var payload = ProtocolSerializer.Serialize(new WindowOpenMessage
         {
             SessionNonce = TestData.Nonce,
-            Window = TestData.Snapshot(),
+            Window = TestData.DialogSnapshot(),
         });
         var json = Encoding.UTF8.GetString(payload);
         json = json[..^1];
@@ -21,9 +21,12 @@ public sealed class ProtocolSerializerTests
 
         var message = Assert.IsType<WindowOpenMessage>(ProtocolSerializer.Deserialize(FrameMessageType.WindowOpen, payload));
 
+        // A translated MessageBox round trips as a virtual surface: its nodes carry
+        // no native HWND because no native dialog was ever created.
         Assert.Equal("messageBox", message.Window.SurfaceKind);
         Assert.Equal("warning", message.Window.Icon);
-        Assert.Single(message.Window.Nodes);
+        Assert.All(message.Window.Nodes, node => Assert.Null(node.NativeHwnd));
+        Assert.Equal(2, message.Window.Nodes.Count);
     }
 
     [Fact]
@@ -633,6 +636,71 @@ public sealed class ProtocolSerializerTests
         AssertSnapshotRejected(snapshot);
     }
 
+    [Fact]
+    public void PreservesTreeHierarchyAndTrackbarStateAcrossTheWire()
+    {
+        // Round-tripping matters here beyond the typed rules: source-generated
+        // binding leaves an omitted collection null, so a node that carries no
+        // hierarchy must still be admissible next to one that does.
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = snapshot.Nodes[0] with
+        {
+            Kind = "treeView",
+            Text = string.Empty,
+            AutomationName = string.Empty,
+            Items = ["Console Root", "Services", "Local"],
+            ItemDepths = [0, 1, 2],
+            ItemExpanded = [true, false, false],
+            ItemHasChildren = [true, true, false],
+            SelectedIndex = 2,
+            ImageList = [],
+            ItemImages = [-1, -1, -1],
+            ItemSelectedImages = [-1, -1, -1],
+            EditableLabels = false,
+            EditingIndex = -1,
+        };
+        snapshot.Nodes.Add(snapshot.Nodes[0] with
+        {
+            NodeId = "11",
+            Kind = "slider",
+            ZIndex = 1,
+            TabIndex = 1,
+            Items = [],
+            ItemDepths = null,
+            ItemExpanded = null,
+            ItemHasChildren = null,
+            ItemSelectedImages = null,
+            ImageList = null,
+            ItemImages = null,
+            EditableLabels = null,
+            EditingIndex = null,
+            SelectedIndex = -1,
+            Minimum = 0,
+            Maximum = 20,
+            Position = 7,
+            SmallChange = 1,
+            LargeChange = 5,
+        });
+
+        var decoded = Assert.IsType<WindowOpenMessage>(ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen,
+            ProtocolSerializer.Serialize(new WindowOpenMessage
+            {
+                SessionNonce = TestData.Nonce,
+                Window = snapshot,
+            })));
+
+        var tree = decoded.Window.Nodes[0];
+        Assert.Equal([0, 1, 2], tree.ItemDepths);
+        Assert.Equal([true, false, false], tree.ItemExpanded);
+        Assert.Equal([true, true, false], tree.ItemHasChildren);
+        Assert.Equal(2, tree.SelectedIndex);
+        var slider = decoded.Window.Nodes[1];
+        Assert.Equal(20, slider.Maximum);
+        Assert.Equal(7, slider.Position);
+        Assert.Equal(5, slider.LargeChange);
+    }
+
     private static ControlNode BoundedListView(ControlNode source) => source with
     {
         Kind = "listView",
@@ -640,6 +708,7 @@ public sealed class ProtocolSerializerTests
         Items = ["Drive C", "Drive D"],
         Columns = ["Name", "Status"],
         ColumnWidths = [160, 80],
+        ColumnOrder = [0, 1],
         Rows = [["Drive C", "Ready"], ["Drive D", "Running"]],
         SelectedIndices = [1],
         FocusedIndex = 1,
@@ -647,6 +716,10 @@ public sealed class ProtocolSerializerTests
         ColumnHeadersVisible = false,
         CheckBoxes = true,
         CheckedIndices = [0],
+        ImageList = [],
+        ItemImages = [-1, -1],
+        EditableLabels = false,
+        EditingIndex = -1,
     };
 
     private static void AssertSnapshotRejected(WindowSnapshot snapshot) =>

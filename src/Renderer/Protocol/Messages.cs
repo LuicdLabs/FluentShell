@@ -25,10 +25,60 @@ public sealed record ToolbarItemSnapshot
     public string Text { get; init; } = string.Empty;
     public bool Enabled { get; init; }
     public bool Hidden { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Checked { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? DropDown { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? WholeDropDown { get; init; }
     public int? ImageWidth { get; init; }
     public int? ImageHeight { get; init; }
     public string? ImageFormat { get; init; }
     public string? ImageData { get; init; }
+}
+
+public sealed record ImageListEntry
+{
+    public int ImageWidth { get; init; }
+    public int ImageHeight { get; init; }
+    public string ImageFormat { get; init; } = string.Empty;
+    public string ImageData { get; init; } = string.Empty;
+}
+
+// One splitter between two panes of a container.  `position` is the gap's leading
+// edge in the container's own client coordinates.
+public sealed record PaneSplit
+{
+    public bool Vertical { get; init; }
+    public int Position { get; init; }
+    public int Thickness { get; init; }
+    public int Minimum { get; init; }
+    public int Maximum { get; init; }
+}
+
+// One band a container paints itself, reproduced from the pixels the native window
+// drew.  `Rect` is in the container's own client coordinates.
+public sealed record ChromeRegion
+{
+    public PixelRect Rect { get; init; } = new();
+    public int ImageWidth { get; init; }
+    public int ImageHeight { get; init; }
+    public string ImageFormat { get; init; } = string.Empty;
+    public string ImageData { get; init; } = string.Empty;
+}
+
+// One element of an accessible island: content its host window owns without giving it
+// an HWND.  `ActionName` is the provider's own accDefaultAction string, which is both
+// the label of the action and the contract the projection drives it by.
+public sealed record AccessibleIslandItem
+{
+    public string Kind { get; init; } = string.Empty;
+    public PixelRect Rect { get; init; } = new();
+    public string Name { get; init; } = string.Empty;
+    public string Description { get; init; } = string.Empty;
+    public string ActionName { get; init; } = string.Empty;
+    public bool Enabled { get; init; }
+    public bool DropDown { get; init; }
 }
 
 public sealed record ControlNode
@@ -64,6 +114,12 @@ public sealed record ControlNode
     public bool Editable { get; init; }
     public bool? IsDefault { get; init; }
     public bool? GroupStart { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Active { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? WindowState { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PixelRect? ClientRect { get; init; }
     public int? Minimum { get; init; }
     public int? Maximum { get; init; }
     public int? Position { get; init; }
@@ -78,6 +134,8 @@ public sealed record ControlNode
     public List<PixelRect>? ItemRects { get; init; }
     public List<string> Columns { get; init; } = [];
     public List<int> ColumnWidths { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? ColumnOrder { get; init; }
     public List<List<string>> Rows { get; init; } = [];
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ColumnHeadersVisible { get; init; }
@@ -85,8 +143,22 @@ public sealed record ControlNode
     public bool? CheckBoxes { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<int>? CheckedIndices { get; init; }
-    public List<int> ItemDepths { get; init; } = [];
-    public List<bool> ItemExpanded { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? ItemDepths { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<bool>? ItemExpanded { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<bool>? ItemHasChildren { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ImageListEntry>? ImageList { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? ItemImages { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? ItemSelectedImages { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? EditableLabels { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? EditingIndex { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? ImageWidth { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -97,6 +169,12 @@ public sealed record ControlNode
     public string? ImageData { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<ToolbarItemSnapshot>? ToolbarItems { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<PaneSplit>? Splits { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ChromeRegion>? ChromeRegions { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<AccessibleIslandItem>? IslandItems { get; init; }
     public string? AdapterId { get; init; }
     public string? PageId { get; init; }
     public string? SemanticKey { get; init; }
@@ -113,6 +191,45 @@ public sealed record ListViewCheckActionValue
     public int Index { get; init; }
     [JsonPropertyName("checked")]
     public bool Checked { get; init; }
+}
+
+public sealed record TreeExpandActionValue
+{
+    [JsonPropertyName("index")]
+    public int Index { get; init; }
+    [JsonPropertyName("expanded")]
+    public bool Expanded { get; init; }
+}
+
+public sealed record ItemTextActionValue
+{
+    [JsonPropertyName("index")]
+    public int Index { get; init; }
+    [JsonPropertyName("text")]
+    public string Text { get; init; } = string.Empty;
+}
+
+// A projected splitter drag: which split of the container moved, and where its
+// leading edge now sits in the container's own client coordinates.
+public sealed record SplitActionValue
+{
+    [JsonPropertyName("index")]
+    public int Index { get; init; }
+    [JsonPropertyName("position")]
+    public int Position { get; init; }
+}
+
+// The five caption verbs a projected MDI child can route back to its native
+// frame.  They travel as names rather than codes so the wire stays readable.
+public static class MdiCommands
+{
+    public const string Activate = "activate";
+    public const string Close = "close";
+    public const string Minimize = "minimize";
+    public const string Maximize = "maximize";
+    public const string Restore = "restore";
+
+    public static readonly string[] All = [Activate, Close, Minimize, Maximize, Restore];
 }
 
 public sealed record MenuItemSnapshot

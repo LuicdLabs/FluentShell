@@ -3,6 +3,17 @@
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
   <Application.Resources>
-    <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+      </ResourceDictionary.MergedDictionaries>
+      <!-- A projected tree item is built in code as a real element: its icon, its
+           label, and the in-place editor a rename opens. TreeView binds items as
+           data, so this template is what hands that element back to the item
+           container instead of stringifying it. -->
+      <DataTemplate x:Key="ProjectedItemTemplate">
+        <ContentPresenter Content="{Binding Content}" />
+      </DataTemplate>
+    </ResourceDictionary>
   </Application.Resources>
 </Application>

@@ -1,6 +1,8 @@
 #include "UiAutomationValidator.h"
 #include "UiAutomationGeometry.h"
 
+#include "../../Common/FluentShell.h"
+
 #include <combaseapi.h>
 #include <UIAutomation.h>
 #include <dwmapi.h>
@@ -95,6 +97,37 @@ bool FailHr(std::wstring& error, std::wstring_view reason, HRESULT result) noexc
     return false;
 }
 
+// Every property ElementInfo carries, so one enumeration can fetch them all in a
+// single cross-process round trip.  Reading them per element costs sixteen calls,
+// and a projected tree or list multiplies the element count while the whole
+// validation pass shares one deadline.
+constexpr PROPERTYID kElementProperties[] = {
+    UIA_ProcessIdPropertyId,
+    UIA_ControlTypePropertyId,
+    UIA_BoundingRectanglePropertyId,
+    UIA_IsControlElementPropertyId,
+    UIA_IsEnabledPropertyId,
+    UIA_IsKeyboardFocusablePropertyId,
+    UIA_NamePropertyId,
+    UIA_FrameworkIdPropertyId,
+    UIA_AutomationIdPropertyId,
+    UIA_HelpTextPropertyId,
+    UIA_AccessKeyPropertyId,
+    UIA_IsInvokePatternAvailablePropertyId,
+    UIA_IsTogglePatternAvailablePropertyId,
+    UIA_IsExpandCollapsePatternAvailablePropertyId,
+    UIA_IsSelectionItemPatternAvailablePropertyId,
+    UIA_IsValuePatternAvailablePropertyId,
+};
+
+constexpr PROPERTYID kActionProperties[] = {
+    UIA_IsInvokePatternAvailablePropertyId,
+    UIA_IsTogglePatternAvailablePropertyId,
+    UIA_IsExpandCollapsePatternAvailablePropertyId,
+    UIA_IsSelectionItemPatternAvailablePropertyId,
+    UIA_IsValuePatternAvailablePropertyId,
+};
+
 bool ReadElementInfo(IUIAutomationElement* element, ElementInfo& info, std::wstring& error) noexcept {
     info.element = element;
     if (FAILED(element->get_CurrentProcessId(&info.processId)) ||
@@ -134,14 +167,7 @@ bool ReadElementInfo(IUIAutomationElement* element, ElementInfo& info, std::wstr
     if (automationId) SysFreeString(automationId);
     if (helpText) SysFreeString(helpText);
     if (accessKey) SysFreeString(accessKey);
-    constexpr PROPERTYID actionProperties[] = {
-        UIA_IsInvokePatternAvailablePropertyId,
-        UIA_IsTogglePatternAvailablePropertyId,
-        UIA_IsExpandCollapsePatternAvailablePropertyId,
-        UIA_IsSelectionItemPatternAvailablePropertyId,
-        UIA_IsValuePatternAvailablePropertyId,
-    };
-    for (const PROPERTYID property : actionProperties) {
+    for (const PROPERTYID property : kActionProperties) {
         VARIANT value{};
         VariantInit(&value);
         if (FAILED(element->GetCurrentPropertyValue(property, &value)) || value.vt != VT_BOOL) {
@@ -150,6 +176,115 @@ bool ReadElementInfo(IUIAutomationElement* element, ElementInfo& info, std::wstr
         }
         info.actionable = info.actionable || value.boolVal == VARIANT_TRUE;
         VariantClear(&value);
+    }
+    return true;
+}
+
+// The cached mirror of ReadElementInfo.  AutomationElementMode_Full keeps the
+// live element alongside the cache, so pattern objects can still be fetched from
+// a matched node afterwards.
+bool ReadCachedElementInfo(
+    IUIAutomationElement* element, ElementInfo& info, std::wstring& error) noexcept {
+    info.element = element;
+    if (FAILED(element->get_CachedProcessId(&info.processId)) ||
+        FAILED(element->get_CachedControlType(&info.controlType)) ||
+        FAILED(element->get_CachedBoundingRectangle(&info.bounds)) ||
+        FAILED(element->get_CachedIsControlElement(&info.isControl)) ||
+        FAILED(element->get_CachedIsEnabled(&info.isEnabled)) ||
+        FAILED(element->get_CachedIsKeyboardFocusable(&info.isKeyboardFocusable))) {
+        return Fail(error, L"cached UIA property read failed");
+    }
+    struct CachedString final {
+        HRESULT (STDMETHODCALLTYPE IUIAutomationElement::*read)(BSTR*);
+        std::wstring* target;
+    };
+    const CachedString strings[] = {
+        { &IUIAutomationElement::get_CachedName, &info.name },
+        { &IUIAutomationElement::get_CachedFrameworkId, &info.framework },
+        { &IUIAutomationElement::get_CachedAutomationId, &info.automationId },
+        { &IUIAutomationElement::get_CachedHelpText, &info.helpText },
+        { &IUIAutomationElement::get_CachedAccessKey, &info.accessKey },
+    };
+    for (const auto& entry : strings) {
+        BSTR value = nullptr;
+        const HRESULT result = (element->*entry.read)(&value);
+        if (FAILED(result)) {
+            if (value) SysFreeString(value);
+            return Fail(error, L"cached UIA string property read failed");
+        }
+        entry.target->assign(value ? value : L"");
+        if (value) SysFreeString(value);
+    }
+    for (const PROPERTYID property : kActionProperties) {
+        VARIANT value{};
+        VariantInit(&value);
+        if (FAILED(element->GetCachedPropertyValue(property, &value)) || value.vt != VT_BOOL) {
+            VariantClear(&value);
+            return Fail(error, L"cached UIA action property read failed");
+        }
+        info.actionable = info.actionable || value.boolVal == VARIANT_TRUE;
+        VariantClear(&value);
+    }
+    return true;
+}
+
+bool BuildElementCacheRequest(
+    IUIAutomation* automation,
+    ComPtr<IUIAutomationCacheRequest>& request,
+    std::wstring& error) noexcept {
+    HRESULT result = automation->CreateCacheRequest(&request);
+    if (FAILED(result) || !request)
+        return FailHr(error, L"UIA cache request creation failed", result);
+    for (const PROPERTYID property : kElementProperties) {
+        result = request->AddProperty(property);
+        if (FAILED(result))
+            return FailHr(error, L"UIA cache property registration failed", result);
+    }
+    result = request->put_AutomationElementMode(AutomationElementMode_Full);
+    if (FAILED(result))
+        return FailHr(error, L"UIA cache element mode is unavailable", result);
+    return true;
+}
+
+// One cached enumeration of a subtree.  The caller supplies the diagnostics so a
+// failure still names which enumeration refused, exactly as the two separate
+// loops did before they shared this walk.
+bool CollectCachedElements(
+    IUIAutomationElement* scopeRoot,
+    IUIAutomationCondition* condition,
+    IUIAutomationCacheRequest* cache,
+    DWORD rendererProcessId,
+    const wchar_t* enumerationFailure,
+    const wchar_t* countFailure,
+    const wchar_t* foreignFailure,
+    std::vector<ElementInfo>& elements,
+    std::wstring& error) noexcept {
+    ComPtr<IUIAutomationElementArray> array;
+    const auto startedAt = GetTickCount64();
+    const HRESULT result = scopeRoot->FindAllBuildCache(
+        TreeScope_Descendants, condition, cache, &array);
+    if (FAILED(result) || !array) return FailHr(error, enumerationFailure, result);
+    int length = 0;
+    if (FAILED(array->get_Length(&length)) || length < 0 || length > 8192)
+        return Fail(error, countFailure);
+    // The whole validation pass shares one bounded deadline, so an enumeration
+    // that costs a large part of it is the first thing worth knowing about.
+    if (const auto elapsed = GetTickCount64() - startedAt; elapsed > 250) {
+        FluentShell::Log(L"slow proxy UIA enumeration: " + std::to_wstring(length) +
+            L" elements in " + std::to_wstring(elapsed) + L" ms");
+    }
+    elements.clear();
+    elements.reserve(static_cast<size_t>(length));
+    for (int index = 0; index < length; ++index) {
+        ComPtr<IUIAutomationElement> element;
+        const HRESULT elementResult = array->GetElement(index, &element);
+        if (FAILED(elementResult) || !element)
+            return FailHr(error, enumerationFailure, elementResult);
+        ElementInfo info;
+        if (!ReadCachedElementInfo(element.Get(), info, error)) return false;
+        if (info.processId != 0 && info.processId != static_cast<int>(rendererProcessId))
+            return Fail(error, foreignFailure);
+        elements.push_back(std::move(info));
     }
     return true;
 }
@@ -209,7 +344,19 @@ int ExpectedControlType(ControlKind kind) noexcept {
     case ControlKind::ProgressBar: return UIA_ProgressBarControlTypeId;
     case ControlKind::SysLink: return UIA_PaneControlTypeId;
     case ControlKind::ListView: return UIA_ListControlTypeId;
+    case ControlKind::TreeView: return UIA_TreeControlTypeId;
+    case ControlKind::Slider: return UIA_SliderControlTypeId;
     case ControlKind::DialogContainer: return UIA_PaneControlTypeId;
+    case ControlKind::MdiClient: return UIA_PaneControlTypeId;
+    // A private container is a frame around other windows, which is exactly what a
+    // UIA pane is.
+    case ControlKind::PaneContainer: return UIA_PaneControlTypeId;
+    // An accessible island frames a set of elements the projection renders itself, so
+    // it reports the role a set of related controls has.
+    case ControlKind::AccessibleIsland: return UIA_GroupControlTypeId;
+    // A native MDI child is a window inside a window and UIA reports it as one,
+    // so the projection keeps that role rather than inventing a pane.
+    case ControlKind::MdiChild: return UIA_WindowControlTypeId;
     case ControlKind::TabControl: return UIA_TabControlTypeId;
     case ControlKind::StatusBar: return UIA_StatusBarControlTypeId;
     case ControlKind::Toolbar: return UIA_ToolBarControlTypeId;
@@ -228,6 +375,8 @@ RequiredPattern PatternFor(const ControlNode& node) noexcept {
     case ControlKind::ComboBox: return RequiredPattern::Selection;
     case ControlKind::ListBox: return RequiredPattern::Selection;
     case ControlKind::ListView: return RequiredPattern::Selection;
+    case ControlKind::TreeView: return RequiredPattern::Selection;
+    case ControlKind::Slider: return RequiredPattern::RangeValue;
     case ControlKind::TabControl: return RequiredPattern::Selection;
     case ControlKind::ProgressBar:
         return node.indeterminate ? RequiredPattern::None : RequiredPattern::RangeValue;
@@ -339,6 +488,37 @@ bool ValidateSysLinkDescendant(
         return Fail(error, L"SysLink hyperlink role, name, process, enabled, or focus state is incorrect");
     }
     return HasPattern(link.Get(), RequiredPattern::Invoke, error);
+}
+
+bool ValidateSliderRangeValue(
+    IUIAutomationElement* element,
+    const ControlNode& node,
+    std::wstring& error) noexcept {
+    if (!element) return Fail(error, L"Trackbar UIA element is unavailable");
+    ComPtr<IUIAutomationRangeValuePattern> range;
+    const HRESULT patternResult = element->GetCurrentPatternAs(
+        UIA_RangeValuePatternId, IID_IUIAutomationRangeValuePattern,
+        reinterpret_cast<void**>(range.GetAddressOf()));
+    if (FAILED(patternResult) || !range)
+        return FailHr(error, L"Trackbar RangeValue pattern read failed", patternResult);
+    double minimum = 0;
+    double maximum = 0;
+    double value = 0;
+    BOOL readOnly = TRUE;
+    if (FAILED(range->get_CurrentMinimum(&minimum)) ||
+        FAILED(range->get_CurrentMaximum(&maximum)) ||
+        FAILED(range->get_CurrentValue(&value)) ||
+        FAILED(range->get_CurrentIsReadOnly(&readOnly)))
+        return Fail(error, L"Trackbar RangeValue state read failed");
+    if (static_cast<int>(minimum) != node.minimum ||
+        static_cast<int>(maximum) != node.maximum ||
+        static_cast<int>(value) != node.position)
+        return Fail(error, L"projected Trackbar range or value does not match native state");
+    // A native trackbar the user can move must not project as a read-only range;
+    // a disabled one is already excluded by the enabled-state comparison above.
+    if (node.enabled && readOnly)
+        return Fail(error, L"enabled Trackbar projects a read-only RangeValue");
+    return true;
 }
 
 bool ValidateListViewSelectionCapability(
@@ -473,8 +653,31 @@ bool ValidateToolbarItems(
     const auto visibleCount = static_cast<int>(std::count_if(
         node.toolbarItems.begin(), node.toolbarItems.end(),
         [](const ToolbarItemSnapshot& item) { return !item.hidden; }));
-    if (FAILED(result) || !children || FAILED(children->get_Length(&count)) || count != visibleCount)
-        return Fail(error, L"Toolbar UIA child count does not match visible native items");
+    if (FAILED(result) || !children || FAILED(children->get_Length(&count)) || count != visibleCount) {
+        // Name what the two sides actually hold: a count on its own cannot say which
+        // item the projection dropped.
+        error = L"Toolbar UIA child count does not match visible native items: expected " +
+            std::to_wstring(visibleCount) + L" actual " + std::to_wstring(count) + L" native=";
+        for (const auto& item : node.toolbarItems) {
+            if (item.hidden) continue;
+            error += L"[" + std::wstring(item.kind == ToolbarItemKind::Separator
+                    ? L"sep" : item.kind == ToolbarItemKind::ToggleButton ? L"toggle" : L"push") +
+                L" '" + DiagnosticText(DisplayText(item.text)) + L"']";
+        }
+        error += L" proxy=";
+        for (int index = 0; children && index < count; ++index) {
+            ComPtr<IUIAutomationElement> child;
+            if (FAILED(children->GetElement(index, &child)) || !child) continue;
+            CONTROLTYPEID type = 0;
+            child->get_CurrentControlType(&type);
+            BSTR rawName = nullptr;
+            child->get_CurrentName(&rawName);
+            error += L"[" + std::to_wstring(type) + L" '" +
+                DiagnosticText(rawName ? rawName : L"") + L"']";
+            if (rawName) SysFreeString(rawName);
+        }
+        return false;
+    }
     int childIndex = 0;
     for (const auto& expected : node.toolbarItems) {
         if (expected.hidden) continue;
@@ -482,9 +685,12 @@ bool ValidateToolbarItems(
         if (FAILED(children->GetElement(childIndex++, &child)) || !child)
             return Fail(error, L"Toolbar UIA child is unavailable");
         CONTROLTYPEID type = 0;
-        if (FAILED(child->get_CurrentControlType(&type)) ||
-            type != (expected.kind == ToolbarItemKind::PushButton
-                ? UIA_ButtonControlTypeId : UIA_SeparatorControlTypeId))
+        // A latched button is a XAML ToggleButton, which publishes the Button control
+        // type and the Toggle pattern rather than Invoke.
+        const CONTROLTYPEID expectedType =
+            expected.kind == ToolbarItemKind::Separator
+                ? UIA_SeparatorControlTypeId : UIA_ButtonControlTypeId;
+        if (FAILED(child->get_CurrentControlType(&type)) || type != expectedType)
             return Fail(error, L"Toolbar UIA child type does not match native item kind");
         if (expected.kind == ToolbarItemKind::Separator) continue;
         BSTR rawName = nullptr;
@@ -495,7 +701,12 @@ bool ValidateToolbarItems(
         if (FAILED(nameResult) || name != DisplayText(expected.text) ||
             FAILED(child->get_CurrentIsEnabled(&enabled)) || enabled != (expected.enabled ? TRUE : FALSE))
             return Fail(error, L"Toolbar UIA button name or enabled state does not match native state");
-        if (!HasPattern(child.Get(), RequiredPattern::Invoke, error)) return false;
+        // A latched button owns Toggle; a command button owns Invoke.  The projection
+        // draws whichever the control's own style declares.
+        const bool latched = expected.kind == ToolbarItemKind::ToggleButton || expected.checked;
+        if (!HasPattern(child.Get(),
+                latched ? RequiredPattern::Toggle : RequiredPattern::Invoke, error))
+            return false;
     }
     return true;
 }
@@ -516,6 +727,49 @@ bool VerifyProcessIdentity(DWORD processId, uint64_t created) noexcept {
     const uint64_t actual = Ipc::ProcessCreationTime(process);
     CloseHandle(process);
     return actual != 0 && actual == created;
+}
+
+// The AutomationIds of every control-view descendant of one element, fetched in
+// a single cached enumeration.  Verifying nesting by walking each child's
+// ancestors costs a cross-process call per level per child, which is the
+// difference between fitting the validation deadline and blowing it on a nested
+// surface like an MDI frame.
+bool CollectDescendantAutomationIds(
+    IUIAutomation* automation,
+    IUIAutomationElement* element,
+    IUIAutomationCondition* condition,
+    std::unordered_set<std::wstring>& identifiers,
+    std::wstring& error) noexcept {
+    identifiers.clear();
+    ComPtr<IUIAutomationCacheRequest> request;
+    HRESULT result = automation->CreateCacheRequest(&request);
+    if (FAILED(result) || !request)
+        return FailHr(error, L"UIA nesting cache request creation failed", result);
+    result = request->AddProperty(UIA_AutomationIdPropertyId);
+    if (FAILED(result))
+        return FailHr(error, L"UIA nesting cache property registration failed", result);
+    result = request->put_AutomationElementMode(AutomationElementMode_None);
+    if (FAILED(result))
+        return FailHr(error, L"UIA nesting cache element mode is unavailable", result);
+    ComPtr<IUIAutomationElementArray> array;
+    result = element->FindAllBuildCache(
+        TreeScope_Descendants, condition, request.Get(), &array);
+    if (FAILED(result) || !array)
+        return FailHr(error, L"UIA nesting enumeration failed", result);
+    int length = 0;
+    if (FAILED(array->get_Length(&length)) || length < 0 || length > 8192)
+        return Fail(error, L"UIA nesting descendant count is invalid");
+    for (int index = 0; index < length; ++index) {
+        ComPtr<IUIAutomationElement> descendant;
+        if (FAILED(array->GetElement(index, &descendant)) || !descendant) continue;
+        BSTR identifier = nullptr;
+        if (FAILED(descendant->get_CachedAutomationId(&identifier))) continue;
+        if (identifier) {
+            identifiers.emplace(identifier);
+            SysFreeString(identifier);
+        }
+    }
+    return true;
 }
 
 bool IsDescendant(
@@ -718,24 +972,16 @@ bool ValidateOnMta(
     ComPtr<IUIAutomationCondition> controlViewCondition;
     if (FAILED(automation->get_ControlViewCondition(&controlViewCondition)))
         return Fail(error, L"UIA control-view condition creation failed");
-    ComPtr<IUIAutomationElementArray> array;
-    result = root->FindAll(TreeScope_Descendants, controlViewCondition.Get(), &array);
-    if (FAILED(result) || !array) return FailHr(error, L"proxy UIA descendant enumeration failed", result);
-    int length = 0;
-    if (FAILED(array->get_Length(&length)) || length < 0 || length > 8192)
-        return Fail(error, L"proxy UIA descendant count is invalid");
+    ComPtr<IUIAutomationCacheRequest> elementCache;
+    if (!BuildElementCacheRequest(automation.Get(), elementCache, error)) return false;
     std::vector<ElementInfo> elements;
-    elements.reserve(static_cast<size_t>(length));
-    for (int index = 0; index < length; ++index) {
-        ComPtr<IUIAutomationElement> element;
-        const HRESULT elementResult = array->GetElement(index, &element);
-        if (FAILED(elementResult) || !element)
-            return FailHr(error, L"proxy UIA descendant element read failed", elementResult);
-        ElementInfo info;
-        if (!ReadElementInfo(element.Get(), info, error)) return false;
-        if (info.processId != 0 && info.processId != static_cast<int>(options.rendererProcessId))
-            return Fail(error, L"proxy UIA subtree contains a foreign process");
-        elements.push_back(std::move(info));
+    if (!CollectCachedElements(root.Get(), controlViewCondition.Get(), elementCache.Get(),
+            options.rendererProcessId,
+            L"proxy UIA descendant enumeration failed",
+            L"proxy UIA descendant count is invalid",
+            L"proxy UIA subtree contains a foreign process",
+            elements, error)) {
+        return false;
     }
 
     ComPtr<IUIAutomationElement> projectionRoot = root;
@@ -756,27 +1002,13 @@ bool ValidateOnMta(
         if (candidate == elements.end())
             return Fail(error, L"Win32 host has no XAML UIA projection descendant");
         projectionRoot = candidate->element;
-        ComPtr<IUIAutomationElementArray> projectionArray;
-        result = projectionRoot->FindAll(
-            TreeScope_Descendants, controlViewCondition.Get(), &projectionArray);
-        if (FAILED(result) || !projectionArray)
-            return FailHr(error, L"XAML projection descendant enumeration failed", result);
-        int projectionLength = 0;
-        if (FAILED(projectionArray->get_Length(&projectionLength)) || projectionLength < 0 ||
-            projectionLength > 8192)
-            return Fail(error, L"XAML projection descendant count is invalid");
-        elements.clear();
-        elements.reserve(static_cast<size_t>(projectionLength));
-        for (int index = 0; index < projectionLength; ++index) {
-            ComPtr<IUIAutomationElement> element;
-            const HRESULT elementResult = projectionArray->GetElement(index, &element);
-            if (FAILED(elementResult) || !element)
-                return FailHr(error, L"XAML projection element read failed", elementResult);
-            ElementInfo info;
-            if (!ReadElementInfo(element.Get(), info, error)) return false;
-            if (info.processId != 0 && info.processId != static_cast<int>(options.rendererProcessId))
-                return Fail(error, L"XAML projection contains a foreign process");
-            elements.push_back(std::move(info));
+        if (!CollectCachedElements(projectionRoot.Get(), controlViewCondition.Get(),
+                elementCache.Get(), options.rendererProcessId,
+                L"XAML projection descendant enumeration failed",
+                L"XAML projection descendant count is invalid",
+                L"XAML projection contains a foreign process",
+                elements, error)) {
+            return false;
         }
     }
 
@@ -800,6 +1032,7 @@ bool ValidateOnMta(
     std::vector<bool> used(elements.size(), false);
     std::unordered_set<std::wstring> expectedAutomationIds;
     std::unordered_map<uint64_t, ComPtr<IUIAutomationElement>> matchedNodes;
+    std::unordered_map<uint64_t, std::unordered_set<std::wstring>> containerDescendants;
     std::unordered_map<uint64_t, RECT> expectedNodeBounds;
     for (const auto& node : snapshot.nodes) {
         const auto expectedId = L"FluentShell.Node." + std::to_wstring(node.nodeId) +
@@ -867,8 +1100,19 @@ bool ValidateOnMta(
         const auto& matched = elements[match];
         if (node.parentNodeId) {
             const auto parent = matchedNodes.find(*node.parentNodeId);
-            if (parent == matchedNodes.end() ||
-                !IsDescendant(automation.Get(), parent->second.Get(), matched.element.Get()))
+            if (parent == matchedNodes.end())
+                return Fail(error, L"proxy UIA node has no matched native parent");
+            // One cached enumeration per container answers nesting for every child
+            // it owns, instead of walking each child's ancestors one call at a time.
+            auto nested = containerDescendants.find(*node.parentNodeId);
+            if (nested == containerDescendants.end()) {
+                std::unordered_set<std::wstring> identifiers;
+                if (!CollectDescendantAutomationIds(automation.Get(), parent->second.Get(),
+                        controlViewCondition.Get(), identifiers, error)) return false;
+                nested = containerDescendants.emplace(
+                    *node.parentNodeId, std::move(identifiers)).first;
+            }
+            if (!nested->second.contains(expectedId))
                 return Fail(error, L"proxy UIA node is not nested under its native parent");
         }
         matchedNodes.emplace(node.nodeId, matched.element);
@@ -897,6 +1141,8 @@ bool ValidateOnMta(
                 options.rendererProcessId, error)) return false;
         if (node.kind == ControlKind::ListView &&
             !ValidateListViewSelectionCapability(matched.element.Get(), node, error)) return false;
+        if (node.kind == ControlKind::Slider &&
+            !ValidateSliderRangeValue(matched.element.Get(), node, error)) return false;
         if (node.kind == ControlKind::ListView &&
             !ValidateListViewCheckboxes(
                 automation.Get(), matched.element.Get(), node, error)) return false;
@@ -1074,7 +1320,11 @@ bool ValidateProjectedSurface(
             }
             try { result->set_value(std::move(value)); } catch (...) {}
         });
-        if (future.wait_for(std::chrono::milliseconds(1800)) != std::future_status::ready) {
+        // A projected surface is validated cross-process while it is rasterizing
+        // for the first time, so the budget has to cover a provider that is still
+        // warming up.  It stays bounded: an abandoned worker still poisons UIA for
+        // the session rather than being joined.
+        if (future.wait_for(std::chrono::milliseconds(5000)) != std::future_status::ready) {
             g_projectedUiaWorkerPoisoned.store(true, std::memory_order_release);
             worker.detach();
             return Fail(error,

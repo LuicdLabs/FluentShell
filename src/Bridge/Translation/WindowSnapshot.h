@@ -35,14 +35,57 @@ enum class ControlKind {
     TabControl,
     Slider,
     DialogContainer,
+    MdiClient,
+    MdiChild,
     StatusBar,
     Toolbar,
+    PaneContainer,
+    AccessibleIsland,
     Count,
 };
 
 enum class ToolbarItemKind {
     PushButton,
     Separator,
+    // A BTNS_CHECK button keeps its pressed look between clicks, so the projection
+    // draws a toggle and carries the state the control owns.
+    ToggleButton,
+};
+
+// One gap between two panes of a container, which the projection renders as a real
+// splitter.  `position` is the gap's leading edge in the container's own client
+// coordinates, and `minimum`/`maximum` bound where the split may be moved before a
+// pane would collapse.
+struct PaneSplitSnapshot final {
+    bool vertical = false;
+    int position = 0;
+    int thickness = 0;
+    int minimum = 0;
+    int maximum = 0;
+};
+
+// One rectangle of a container's client area that no child covers and that is too
+// thick to be a splitter gap: a band the container paints itself.  The pixels travel
+// with it so the projection reproduces exactly what the native window drew, and they
+// are part of the snapshot fingerprint so a repaint reaches the renderer as a patch.
+struct ChromeRegionSnapshot final {
+    RECT rect{};
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
+};
+
+// One element of an accessible island: content the host window owns without giving it
+// an HWND, read through the accessibility contract the window answers.
+struct AccessibleIslandItemSnapshot final {
+    std::wstring kind;
+    RECT rect{};
+    std::wstring name;
+    std::wstring description;
+    std::wstring actionName;
+    bool enabled = true;
+    bool dropDown = false;
 };
 
 struct ToolbarItemSnapshot final {
@@ -52,6 +95,26 @@ struct ToolbarItemSnapshot final {
     std::wstring text;
     bool enabled = true;
     bool hidden = false;
+    bool checked = false;
+    // BTNS_DROPDOWN: the button carries an arrow that asks its owner for a menu
+    // through TBN_DROPDOWN.  With BTNS_WHOLEDROPDOWN the whole button does that and
+    // there is no separate command click at all.
+    bool dropDown = false;
+    bool wholeDropDown = false;
+    // The control draws this button's face itself, so the projection carries the pixels
+    // it drew rather than an image-list icon it does not own.
+    bool paintedFace = false;
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
+};
+
+// One icon of a control's own image list.  Item-bearing controls share a bounded
+// list and address it by index, exactly as Win32 does: a tree or list with two
+// hundred rows normally draws a handful of distinct icons, so embedding pixels
+// per item would multiply the same bytes across the payload.
+struct ImageListEntry final {
     uint32_t imageWidth = 0;
     uint32_t imageHeight = 0;
     std::wstring imageFormat;
@@ -92,6 +155,15 @@ struct ControlNode final {
     bool editable = false;
     bool isDefault = false;
     bool groupStart = false;
+    // MDI child frames only: whether this is the MDI client's active child and
+    // which caption state it is in.  A projected MDI child is a window inside a
+    // window, so it carries the same three states a top-level surface does.
+    bool active = false;
+    std::wstring windowState;
+    // MDI child frames only: the client area in the child's own window-relative
+    // coordinates, so a projected caption can occupy exactly the band the native
+    // frame occupies and the child's controls keep their native offsets.
+    RECT clientRect{};
     int minimum = 0;
     int maximum = 100;
     int position = 0;
@@ -105,17 +177,42 @@ struct ControlNode final {
     std::vector<RECT> itemRects;
     std::vector<std::wstring> columns;
     std::vector<int> columnWidths;
+    // Report ListView only: the display order of the columns as a permutation of
+    // their logical indexes.  Columns, widths, and cells all travel in logical
+    // order, so nothing on the wire changes meaning when the user reorders them.
+    std::vector<int> columnOrder;
     std::vector<std::vector<std::wstring>> rows;
     bool columnHeadersVisible = false;
     bool checkBoxes = false;
     std::vector<int> checkedIndices;
     std::vector<int> itemDepths;
     std::vector<bool> itemExpanded;
+    // Whether a TreeView item owns children at all.  A lazily populated tree
+    // reports this before its children exist, which is what lets a projected
+    // expander reach a subtree the application has not inserted yet.
+    std::vector<bool> itemHasChildren;
+    // The control's own image list and the per-item indexes into it.  -1 means the
+    // item draws no icon.  itemSelectedImages is the tree's separate selected-state
+    // index, which is how a folder opens and closes natively.
+    std::vector<ImageListEntry> imageList;
+    std::vector<int> itemImages;
+    std::vector<int> itemSelectedImages;
+    // The control advertises in-place label editing, so the projection offers a
+    // rename that runs through the native control's own edit session.
+    bool editableLabels = false;
+    // The item whose native label-edit session is open, or -1.
+    int editingIndex = -1;
     uint32_t imageWidth = 0;
     uint32_t imageHeight = 0;
     std::wstring imageFormat;
     std::vector<uint8_t> imageData;
     std::vector<ToolbarItemSnapshot> toolbarItems;
+    // Container panes only: the splitters between its child panes, and the bands the
+    // container paints itself.
+    std::vector<PaneSplitSnapshot> splits;
+    std::vector<ChromeRegionSnapshot> chromeRegions;
+    // Accessible islands only: the HWND-less elements the host window exposes.
+    std::vector<AccessibleIslandItemSnapshot> islandItems;
     std::wstring adapterId;
     std::wstring pageId;
     std::wstring semanticKey;
@@ -274,6 +371,10 @@ bool ValidateActionForSnapshot(
 bool IsRequestSemanticAction(std::wstring_view action) noexcept;
 
 const wchar_t* ControlKindName(ControlKind kind) noexcept;
+// A kind whose projected element frames other nodes.  Only these may be named as a
+// node's parent: the renderer places a child inside its parent's own element, and
+// every other kind draws its content itself.
+bool IsProjectedContainerKind(ControlKind kind) noexcept;
 const wchar_t* SurfaceKindName(SurfaceKind kind) noexcept;
 const wchar_t* MenuItemKindName(MenuItemKind kind) noexcept;
 

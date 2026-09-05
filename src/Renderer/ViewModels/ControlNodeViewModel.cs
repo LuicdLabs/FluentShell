@@ -22,8 +22,17 @@ public sealed class ControlNodeViewModel : ObservableObject
     private int _minimum;
     private int _maximum = 100;
     private int _position;
+    private int _smallChange = 1;
+    private int _largeChange = 10;
+    private bool _vertical;
+    private bool _reversed;
     private bool _indeterminate;
     private bool _editable;
+    private bool _active;
+    private string _windowState = "normal";
+    private PixelRect _clientRect = new();
+    private bool _editableLabels;
+    private int _editingIndex = -1;
     private PixelRect _rect = new();
     private int _imageWidth;
     private int _imageHeight;
@@ -46,6 +55,13 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool Editable { get => _editable; private set => SetProperty(ref _editable, value); }
     public bool IsDefault { get; private set; }
     public bool GroupStart { get; private set; }
+    // Native window style bits, already validated as canonical hex on admission.
+    // The projection needs them where the native shape decides what a control
+    // offers -- an MDI child's caption buttons are style bits, not content.
+    public ulong Style { get; private set; }
+    public bool Active { get => _active; private set => SetProperty(ref _active, value); }
+    public string WindowState { get => _windowState; private set => SetProperty(ref _windowState, value); }
+    public PixelRect ClientRect { get => _clientRect; private set => SetProperty(ref _clientRect, value); }
     public string Text { get => _text; private set => SetProperty(ref _text, value); }
     public string DraftText { get => _draftText; set => SetProperty(ref _draftText, value); }
     public string AutomationName { get => _automationName; private set => SetProperty(ref _automationName, value); }
@@ -62,6 +78,10 @@ public sealed class ControlNodeViewModel : ObservableObject
     public int Minimum { get => _minimum; private set => SetProperty(ref _minimum, value); }
     public int Maximum { get => _maximum; private set => SetProperty(ref _maximum, value); }
     public int Position { get => _position; private set => SetProperty(ref _position, value); }
+    public int SmallChange { get => _smallChange; private set => SetProperty(ref _smallChange, value); }
+    public int LargeChange { get => _largeChange; private set => SetProperty(ref _largeChange, value); }
+    public bool Vertical { get => _vertical; private set => SetProperty(ref _vertical, value); }
+    public bool Reversed { get => _reversed; private set => SetProperty(ref _reversed, value); }
     public bool Indeterminate { get => _indeterminate; private set => SetProperty(ref _indeterminate, value); }
     public PixelRect Rect { get => _rect; private set => SetProperty(ref _rect, value); }
     public int ImageWidth { get => _imageWidth; private set => SetProperty(ref _imageWidth, value); }
@@ -74,8 +94,20 @@ public sealed class ControlNodeViewModel : ObservableObject
     public ObservableCollection<int> CheckedIndices { get; } = [];
     public ObservableCollection<string> Columns { get; } = [];
     public ObservableCollection<int> ColumnWidths { get; } = [];
+    public ObservableCollection<int> ColumnOrder { get; } = [];
+    public ObservableCollection<int> ItemDepths { get; } = [];
+    public ObservableCollection<bool> ItemExpanded { get; } = [];
+    public ObservableCollection<bool> ItemHasChildren { get; } = [];
+    public ObservableCollection<ImageListEntry> ImageList { get; } = [];
+    public ObservableCollection<int> ItemImages { get; } = [];
+    public ObservableCollection<int> ItemSelectedImages { get; } = [];
+    public bool EditableLabels { get => _editableLabels; private set => SetProperty(ref _editableLabels, value); }
+    public int EditingIndex { get => _editingIndex; private set => SetProperty(ref _editingIndex, value); }
     public ObservableCollection<IReadOnlyList<string>> Rows { get; } = [];
     public ObservableCollection<ToolbarItemSnapshot> ToolbarItems { get; } = [];
+    public ObservableCollection<PaneSplit> Splits { get; } = [];
+    public ObservableCollection<ChromeRegion> ChromeRegions { get; } = [];
+    public ObservableCollection<AccessibleIslandItem> IslandItems { get; } = [];
     public string AdapterId { get; private set; } = string.Empty;
     public string PageId { get; private set; } = string.Empty;
     public string SemanticKey { get; private set; } = string.Empty;
@@ -137,16 +169,33 @@ public sealed class ControlNodeViewModel : ObservableObject
         Editable = node.Editable;
         IsDefault = node.IsDefault ?? false;
         GroupStart = node.GroupStart ?? false;
+        Style = ParseStyle(node.Style);
+        Active = node.Active ?? false;
+        WindowState = node.WindowState ?? "normal";
+        ClientRect = node.ClientRect ?? new PixelRect();
         ApplyProgressState(node.Minimum ?? 0, node.Maximum ?? 100, node.Position ?? 0);
+        SmallChange = node.SmallChange ?? 1;
+        LargeChange = node.LargeChange ?? 10;
+        Vertical = node.Vertical;
+        Reversed = node.Reversed;
         Indeterminate = node.Indeterminate ?? false;
         ReplaceItems(node.Items);
+        ReplaceTreeState(node.ItemDepths ?? [], node.ItemExpanded ?? [], node.ItemHasChildren ?? []);
+        ReplaceItemImagery(
+            node.ImageList ?? [], node.ItemImages ?? [], node.ItemSelectedImages ?? []);
+        EditableLabels = node.EditableLabels ?? false;
+        EditingIndex = node.EditingIndex ?? -1;
         ReplaceItemRects(node.ItemRects ?? []);
         ReplaceSelectedIndices(node.SelectedIndices);
         ReplaceCheckedIndices(node.CheckedIndices ?? []);
         ReplaceColumns(node.Columns);
         ReplaceColumnWidths(node.ColumnWidths);
+        ReplaceColumnOrder(node.ColumnOrder ?? []);
         ReplaceRows(node.Rows);
         ReplaceToolbarItems(node.ToolbarItems ?? []);
+        ReplaceSplits(node.Splits ?? []);
+        ReplaceChromeRegions(node.ChromeRegions ?? []);
+        ReplaceIslandItems(node.IslandItems ?? []);
         ApplyImageState(
             node.ImageWidth ?? 0,
             node.ImageHeight ?? 0,
@@ -177,6 +226,11 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (property == "text") DraftText = Text;
         else if (property == "selectedIndex") RaisePropertyChanged(nameof(SelectedIndex));
         else if (property == "checkedIndices") RaisePropertyChanged(nameof(CheckedIndices));
+        else if (property == "position") RaisePropertyChanged(nameof(Position));
+        else if (property == "itemExpanded") RaisePropertyChanged(nameof(ItemDepths));
+        // A refused split leaves the canonical geometry in place, and the projected
+        // splitter follows it back.
+        else if (property == "splits") RaisePropertyChanged(nameof(Splits));
     }
 
     public void AcceptPending(string property, string eventId)
@@ -211,12 +265,29 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "minimum": Minimum = value.GetInt32(); break;
             case "maximum": Maximum = value.GetInt32(); break;
             case "position": Position = value.GetInt32(); break;
+            case "smallChange": SmallChange = value.GetInt32(); break;
+            case "largeChange": LargeChange = value.GetInt32(); break;
+            case "vertical": Vertical = value.GetBoolean(); break;
+            case "reversed": Reversed = value.GetBoolean(); break;
+            case "editableLabels": EditableLabels = value.GetBoolean(); break;
+            case "editingIndex": EditingIndex = value.GetInt32(); break;
+            case "itemDepths":
+            case "itemExpanded":
+            case "itemHasChildren":
+                // The three tree arrays are one hierarchy, so a projected tree is
+                // never rebuilt from a partially updated set of them.
+                throw new ProtocolException(
+                    "TreeView hierarchy state is republished as a full snapshot, not as a field patch.");
             case "indeterminate": Indeterminate = value.GetBoolean(); break;
+            case "active": Active = value.GetBoolean(); break;
+            case "windowState": WindowState = value.GetString() ?? "normal"; break;
+            case "clientRect": ClientRect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid MDI child client rect patch."); break;
             case "rect": Rect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid node rect patch."); break;
             case "items": ReplaceItems(value.Deserialize<List<string>>() ?? []); break;
             case "itemRects": ReplaceItemRects(value.Deserialize<List<PixelRect>>() ?? []); break;
             case "columns": ReplaceColumns(value.Deserialize<List<string>>() ?? []); break;
             case "columnWidths": ReplaceColumnWidths(value.Deserialize<List<int>>() ?? []); break;
+            case "columnOrder": ReplaceColumnOrder(value.Deserialize<List<int>>() ?? []); break;
             case "rows": ReplaceRows(value.Deserialize<List<List<string>>>() ?? []); break;
             case "imageWidth": ImageWidth = value.GetInt32(); break;
             case "imageHeight": ImageHeight = value.GetInt32(); break;
@@ -228,12 +299,38 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (matchingEcho) _pendingEventIds.Remove(property);
     }
 
+    private static ulong ParseStyle(string? value) =>
+        value is not null && value.StartsWith("0x", StringComparison.Ordinal) &&
+        ulong.TryParse(value.AsSpan(2), System.Globalization.NumberStyles.AllowHexSpecifier,
+            System.Globalization.CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : 0;
+
     private void ReplaceItems(IEnumerable<string> items)
     {
         if (Items.SequenceEqual(items, StringComparer.Ordinal)) return;
         Items.Clear();
         foreach (var item in items) Items.Add(item);
         RaisePropertyChanged(nameof(Items));
+    }
+
+    // Depths, expansion, and child flags describe one tree, so they are replaced
+    // together and announced once: the factory rebuilds from that notification
+    // rather than from an intermediate combination of the three.
+    private void ReplaceTreeState(
+        IReadOnlyList<int> depths,
+        IReadOnlyList<bool> expanded,
+        IReadOnlyList<bool> hasChildren)
+    {
+        if (ItemDepths.SequenceEqual(depths) && ItemExpanded.SequenceEqual(expanded) &&
+            ItemHasChildren.SequenceEqual(hasChildren)) return;
+        ItemDepths.Clear();
+        foreach (var depth in depths) ItemDepths.Add(depth);
+        ItemExpanded.Clear();
+        foreach (var value in expanded) ItemExpanded.Add(value);
+        ItemHasChildren.Clear();
+        foreach (var value in hasChildren) ItemHasChildren.Add(value);
+        RaisePropertyChanged(nameof(ItemDepths));
     }
 
     private void ReplaceSelectedIndices(IEnumerable<int> selectedIndices)
@@ -268,6 +365,14 @@ public sealed class ControlNodeViewModel : ObservableObject
         RaisePropertyChanged(nameof(Columns));
     }
 
+    private void ReplaceColumnOrder(IEnumerable<int> order)
+    {
+        if (ColumnOrder.SequenceEqual(order)) return;
+        ColumnOrder.Clear();
+        foreach (var logical in order) ColumnOrder.Add(logical);
+        RaisePropertyChanged(nameof(ColumnOrder));
+    }
+
     private void ReplaceColumnWidths(IEnumerable<int> widths)
     {
         if (ColumnWidths.SequenceEqual(widths)) return;
@@ -292,6 +397,48 @@ public sealed class ControlNodeViewModel : ObservableObject
         ToolbarItems.Clear();
         foreach (var item in items) ToolbarItems.Add(item);
         RaisePropertyChanged(nameof(ToolbarItems));
+    }
+
+    private void ReplaceSplits(IEnumerable<PaneSplit> splits)
+    {
+        if (Splits.SequenceEqual(splits)) return;
+        Splits.Clear();
+        foreach (var split in splits) Splits.Add(split);
+        RaisePropertyChanged(nameof(Splits));
+    }
+
+    private void ReplaceChromeRegions(IEnumerable<ChromeRegion> regions)
+    {
+        if (ChromeRegions.SequenceEqual(regions)) return;
+        ChromeRegions.Clear();
+        foreach (var region in regions) ChromeRegions.Add(region);
+        RaisePropertyChanged(nameof(ChromeRegions));
+    }
+
+    private void ReplaceIslandItems(IEnumerable<AccessibleIslandItem> items)
+    {
+        if (IslandItems.SequenceEqual(items)) return;
+        IslandItems.Clear();
+        foreach (var item in items) IslandItems.Add(item);
+        RaisePropertyChanged(nameof(IslandItems));
+    }
+
+    // Icons and their per-item indexes are one description of the same items, so
+    // they are replaced together and announced once.
+    private void ReplaceItemImagery(
+        IReadOnlyList<ImageListEntry> imageList,
+        IReadOnlyList<int> itemImages,
+        IReadOnlyList<int> selectedImages)
+    {
+        if (ImageList.SequenceEqual(imageList) && ItemImages.SequenceEqual(itemImages) &&
+            ItemSelectedImages.SequenceEqual(selectedImages)) return;
+        ImageList.Clear();
+        foreach (var entry in imageList) ImageList.Add(entry);
+        ItemImages.Clear();
+        foreach (var index in itemImages) ItemImages.Add(index);
+        ItemSelectedImages.Clear();
+        foreach (var index in selectedImages) ItemSelectedImages.Add(index);
+        RaisePropertyChanged(nameof(ItemImages));
     }
 
     private void ApplyProgressState(int minimum, int maximum, int position)

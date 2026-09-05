@@ -22,7 +22,12 @@ public sealed class TranslatedWindow : Window
     private MenuBar? _menuBar;
     private readonly Func<ActionInvokeMessage, ulong, Task> _sendAction;
     private readonly Func<string> _nextEventId;
-    private readonly Dictionary<string, (ControlNodeViewModel? Node, string Property)> _pending = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PendingNodeAction> _pending = new(StringComparer.Ordinal);
+    // A node property action the Bridge refused because the revision moved under it.
+    // Keyed by the refused event id: the Bridge sends the rejection first and the patch
+    // that carries the newer revision second, so the replay has to wait for that patch
+    // or it would be refused for exactly the same reason.
+    private readonly Dictionary<string, NodeActionReplay> _staleReplays = new(StringComparer.Ordinal);
     private readonly TaskCompletionSource _loaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly AppWindow _appWindow;
     private readonly Dictionary<string, FrameworkElement> _controls = new(StringComparer.Ordinal);
@@ -172,6 +177,7 @@ public sealed class TranslatedWindow : Window
     {
         PresenterActionIntent? presenterReplay = null;
         BoundsActionIntent? boundsReplay = null;
+        NodeActionReplay? nodeReplay = null;
         RendererDiagnostics.Log($"window.patch event={patch.EventId ?? "-"} rev={patch.Revision} stateBefore={ViewModel.State} inFlight={_presenterActions.InFlightEventId ?? "-"}");
         _applyingCanonical = true;
         try
@@ -197,6 +203,11 @@ public sealed class TranslatedWindow : Window
             // Clear the bounds action before reading LocalPlacementPending so the
             // patch that answers a move is free to apply the canonical result.
             boundsReplay = _boundsActions.CompletePatch(patch.EventId, ViewModel.Bounds);
+            if (patch.EventId is not null &&
+                _staleReplays.Remove(patch.EventId, out var queuedReplay))
+            {
+                nodeReplay = queuedReplay;
+            }
             if (structural) RebuildControls();
             ApplyWindowState(ShouldApplyCanonicalPlacement(
                 _committed, placementChanged, placementActionPatch, LocalPlacementPending));
@@ -208,6 +219,26 @@ public sealed class TranslatedWindow : Window
         RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"}");
         if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
         if (boundsReplay is { } boundsIntent) QueueOrEmitBoundsAction(boundsIntent);
+        if (nodeReplay is { } nodeIntent) EmitStaleReplay(nodeIntent);
+    }
+
+    // Re-send a property action the Bridge refused as stale, now that the revision it
+    // was refused against has arrived.  The node is looked up again because a
+    // structural patch can replace the collection, and a node that no longer exists has
+    // nothing left to ask for.
+    private void EmitStaleReplay(NodeActionReplay replay)
+    {
+        var node = ViewModel.Nodes.FirstOrDefault(candidate =>
+            candidate.NodeId == replay.NodeId);
+        if (node is null || !ControlFactory.AllowsAction(node, replay.Action))
+        {
+            RendererDiagnostics.Log(
+                $"stale replay dropped node={replay.NodeId} action={replay.Action}");
+            return;
+        }
+        RendererDiagnostics.Log(
+            $"stale replay action={replay.Action} node={replay.NodeId} retry={replay.RetryCount} rev={ViewModel.Revision}");
+        EmitAction(node, replay.Property, replay.Action, replay.Value, replay.RetryCount);
     }
 
     public void ApplyActionResult(ActionResultMessage result)
@@ -234,6 +265,18 @@ public sealed class TranslatedWindow : Window
                     _pending.Remove(result.EventId);
                     pending.Node?.RejectPending(pending.Property, result.EventId);
                     if (pending.Property == "close") _closePending = false;
+                    // A revision race is not a refusal of the request: the Bridge only
+                    // says the snapshot the request named is no longer current.  An
+                    // action that carries the absolute state the user asked for can be
+                    // re-sent once against the revision that replaces it.
+                    if (result.Status == "stale" && pending.Node is { } staleNode &&
+                        NodeActionReplayPolicy.IsReplayableAfterStale(pending.Property) &&
+                        pending.RetryCount < NodeActionReplayPolicy.MaxStaleRetries)
+                    {
+                        _staleReplays[result.EventId] = new NodeActionReplay(
+                            staleNode.NodeId, pending.Property, pending.Action,
+                            pending.Value, pending.RetryCount + 1);
+                    }
                 }
                 else if (result.Snapshot is not null ||
                          (result.Status == "accepted" && pending.Property == "invoke"))
@@ -303,6 +346,7 @@ public sealed class TranslatedWindow : Window
             _retired = true;
             _closePending = false;
             _pending.Clear();
+            _staleReplays.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
@@ -332,6 +376,7 @@ public sealed class TranslatedWindow : Window
             _retired = true;
             _closePending = false;
             _pending.Clear();
+            _staleReplays.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
@@ -375,13 +420,14 @@ public sealed class TranslatedWindow : Window
             {
                 _canvas.Children.Add(control);
             }
-            else if (_controls[node.ParentNodeId] is SemanticDialogContainer container)
+            else if (_controls[node.ParentNodeId] is ISemanticContainer container)
             {
                 container.Children.Add(control);
             }
             else
             {
-                throw new InvalidOperationException("Validated control parent is not a dialog container.");
+                throw new InvalidOperationException(
+                    "Validated control parent is not a projected container.");
             }
         }
     }
@@ -497,7 +543,8 @@ public sealed class TranslatedWindow : Window
             .FirstOrDefault();
         node ??= ViewModel.Nodes.FirstOrDefault(candidate =>
             candidate.Enabled && candidate.Visible &&
-            candidate.Kind is "edit" or "password" or "comboBox" or "listBox" or "listView");
+            candidate.Kind is "edit" or "password" or "comboBox" or "listBox" or "listView"
+                or "treeView" or "slider");
         if (node is not null && _controls.TryGetValue(node.NodeId, out var control))
         {
             // Win32 WS_TABSTOP describes dialog traversal, not whether a main
@@ -540,13 +587,27 @@ public sealed class TranslatedWindow : Window
             "select" => "selectedIndex",
             "setSelection" => "selectedIndices",
             "setItemCheck" => "checkedIndices",
+            "setItemText" => "items",
+            "setValue" => "position",
+            "setExpand" => "itemExpanded",
+            "setSplit" => "splits",
+            "setColumnOrder" => "columnOrder",
+            "islandInvoke" => "islandItems",
             _ => action,
         };
 
     private void EmitMenuAction(MenuItemViewModel item) =>
         EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId);
 
-    private string? EmitAction(ControlNodeViewModel? node, string property, string action, object? value)
+    private string? EmitAction(ControlNodeViewModel? node, string property, string action, object? value) =>
+        EmitAction(node, property, action, value, 0);
+
+    private string? EmitAction(
+        ControlNodeViewModel? node,
+        string property,
+        string action,
+        object? value,
+        int retryCount)
     {
         if (!CanEmitActions) return null;
         if ((property == "invoke" || property == "close" || property.StartsWith("menu:", StringComparison.Ordinal)) &&
@@ -557,7 +618,7 @@ public sealed class TranslatedWindow : Window
         }
         var eventId = _nextEventId();
         node?.RegisterPending(property, eventId);
-        _pending[eventId] = (node, property);
+        _pending[eventId] = new PendingNodeAction(node, property, action, value, retryCount);
         if (property is "state" or "bounds") _placementEventIds.Add(eventId);
         var message = new ActionInvokeMessage
         {
@@ -800,6 +861,14 @@ internal sealed class SemanticContentViewport : Canvas
     public SemanticContentViewport()
     {
         AutomationProperties.SetAutomationId(this, AutomationId);
+        // A Canvas with no Background renders no visual of its own, so its UIA
+        // bounding rectangle collapses onto the union of its children.  The Bridge
+        // reads this element's origin as the native client origin and adds each
+        // node's client-relative rect to it, so a collapsed viewport shifts every
+        // expected bound by the offset of whichever control happens to sit
+        // closest to the top-left.  A transparent fill costs nothing visually and
+        // makes the reported rectangle the element's real layout rectangle.
+        Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
     }
 
     protected override AutomationPeer OnCreateAutomationPeer() =>

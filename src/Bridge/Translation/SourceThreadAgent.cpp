@@ -1,5 +1,8 @@
 #include "SourceThreadAgent.h"
+#include "AccessibleIsland.h"
 #include "DirectUiEngine.h"
+#include "MenuBarCapture.h"
+#include "WindowCapture.h"
 
 #include "../../Common/FluentShell.h"
 
@@ -42,6 +45,13 @@ constexpr UINT kCommandPlaceBehind = 14;
 constexpr UINT kCommandRestoreDirectUiActivation = 15;
 constexpr UINT kCommandDirectUiNodeAction = 16;
 constexpr UINT kCommandNavigateDirectUiProjected = 17;
+// The two halves of the staged menu-bar read.  They are separate commands because the
+// application opens its popup from its own message loop, which only runs between them.
+constexpr UINT kCommandMenuBarDrive = 18;
+constexpr UINT kCommandMenuBarRead = 19;
+// How long the bar is given to leave its own menu-tracking state after a read, while
+// popups are still suppressed.
+constexpr DWORD kMenuBarSettleMs = 120;
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
 constexpr wchar_t kDirectUiGenerationProperty[] = L"FluentShell.Bridge.DirectUiGeneration";
 
@@ -58,6 +68,21 @@ public:
 private:
     DPI_AWARENESS_CONTEXT previous_ = nullptr;
 };
+
+// A deferred accessible island action.  It travels as its own heap payload rather
+// than as a Command because nothing waits for it: the provider may enter a modal loop
+// inside accDoDefaultAction, and the projection's canonical state comes from the next
+// capture either way.
+struct DeferredIslandAction final {
+    HWND island = nullptr;
+    int index = -1;
+    std::wstring name;
+    std::wstring action;
+};
+
+// Distinguishes a deferred island action from a tracked command in the posted
+// message's wParam, which is zero for every command.
+constexpr WPARAM kDeferredIslandAction = 1;
 
 struct Command final {
     std::atomic<long> references{ 1 };
@@ -77,11 +102,22 @@ struct Command final {
     DirectUiActionBinding directUiBinding;
     const DirectUiWindowProfile* profile = nullptr;
     HWND sibling = nullptr;
+    // The menu-bar toolbar and the 1-based accessible index of the button being read.
+    HWND menuBarToolbar = nullptr;
+    int menuBarIndex = 0;
+    bool menuBarSystemMenu = false;
+    bool menuBarNoPopup = false;
+    DWORD menuBarPopupWaitMs = 0;
+    std::vector<MenuItemSnapshot> menuItems;
     ActionOutcome outcome;
     bool captured = false;
     bool cloaked = false;
     uint64_t expectedFingerprint = 0;
     bool success = false;
+    // The application ran the operation and declined it.  That is the application
+    // working, not the projection failing, so the surface keeps its projection and
+    // the renderer is told the action was rejected.
+    bool refused = false;
     std::atomic<bool> cancelled{ false };
     std::wstring error;
 };
@@ -239,7 +275,9 @@ void MarkWindowCloseCompleted(HWND window) noexcept {
 
 bool RelevantMessage(UINT message) noexcept {
     // Common-control message values overlap heavily inside WM_USER. Keep the
-    // Toolbar mutators out of the switch so aliases cannot create duplicate cases.
+    // Toolbar and Trackbar mutators out of the switch so aliases cannot create
+    // duplicate cases: TBM_SETRANGEMIN and PBM_GETRANGE, TBM_SETSELSTART and
+    // SB_SETTEXTW, and several others are the same number.
     if (message == TB_ENABLEBUTTON || message == TB_HIDEBUTTON ||
         message == TB_INDETERMINATE || message == TB_MARKBUTTON ||
         message == TB_PRESSBUTTON || message == TB_CHECKBUTTON ||
@@ -252,6 +290,15 @@ bool RelevantMessage(UINT message) noexcept {
         message == TB_SETEXTENDEDSTYLE || message == TB_SETBUTTONSIZE ||
         message == TB_SETBITMAPSIZE || message == TB_SETROWS ||
         message == TB_MOVEBUTTON || message == TB_AUTOSIZE) return true;
+    // Trackbar range, position, and step mutators. Without them a dirty-gated
+    // reconcile would never notice a native slider update.
+    if (message == TBM_SETPOS || message == TBM_SETPOSNOTIFY ||
+        message == TBM_SETRANGE || message == TBM_SETRANGEMIN ||
+        message == TBM_SETRANGEMAX || message == TBM_SETLINESIZE ||
+        message == TBM_SETPAGESIZE || message == TBM_SETTICFREQ ||
+        message == TBM_SETSEL || message == TBM_SETSELSTART ||
+        message == TBM_SETSELEND || message == TBM_CLEARSEL ||
+        message == TBM_SETBUDDY || message == TBM_SETTOOLTIPS) return true;
     switch (message) {
     case WM_SETTEXT:
     case WM_ENABLE:
@@ -315,6 +362,22 @@ bool RelevantMessage(UINT message) noexcept {
     case TCM_SETTOOLTIPS:
     case TCM_SETMINTABWIDTH:
     case TCM_SETEXTENDEDSTYLE:
+    // TreeView hierarchy, selection, and expansion mutators.
+    case TVM_INSERTITEMA:
+    case TVM_INSERTITEMW:
+    case TVM_DELETEITEM:
+    case TVM_EXPAND:
+    case TVM_SETITEMA:
+    case TVM_SETITEMW:
+    case TVM_SELECTITEM:
+    case TVM_SORTCHILDREN:
+    case TVM_SORTCHILDRENCB:
+    case TVM_SETIMAGELIST:
+    case TVM_SETINDENT:
+    case TVM_SETITEMHEIGHT:
+    case TVM_SETEXTENDEDSTYLE:
+    case TVM_SETTOOLTIPS:
+    case TVM_ENDEDITLABELNOW:
     case SB_SIMPLE:
     case SB_SETTEXTW:
     // ProgressBar state is driven entirely by these messages.  Without them a
@@ -610,11 +673,13 @@ bool ApplySetCheck(
 bool ApplySelect(
     Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
     const bool selectable = node.kind == ControlKind::ComboBox ||
-        node.kind == ControlKind::ListBox || node.kind == ControlKind::TabControl;
+        node.kind == ControlKind::ListBox || node.kind == ControlKind::TabControl ||
+        node.kind == ControlKind::TreeView;
     if (!selectable) return true;
     const int requested = command->action.integerValue;
     const bool tab = node.kind == ControlKind::TabControl;
-    const bool validIndex = requested >= (tab ? 0 : -1) &&
+    const bool tree = node.kind == ControlKind::TreeView;
+    const bool validIndex = requested >= (tab || tree ? 0 : -1) &&
         (requested == -1 || static_cast<size_t>(requested) < node.items.size());
     if (!validIndex) return true;
     if (AbortIfCancelled(command)) return false;
@@ -624,6 +689,12 @@ bool ApplySelect(
         command->success = SelectTabControl(
             agent->Root(), target, node.controlId, requested,
             static_cast<int>(node.items.size()));
+        return true;
+    }
+    if (tree) {
+        // The tree raises its own selection notifications, so nothing is
+        // synthesized on its behalf.
+        command->success = SelectTreeViewItem(target, requested);
         return true;
     }
     const bool combo = node.kind == ControlKind::ComboBox;
@@ -731,6 +802,136 @@ bool ApplyToolbarCommand(
     return true;
 }
 
+bool ApplySetValue(
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::Slider) return true;
+    const int requested = command->action.integerValue;
+    if (requested < node.minimum || requested > node.maximum) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = SetTrackbarPosition(
+        agent->Root(), target, node.vertical, requested);
+    return true;
+}
+
+bool ApplySetExpand(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::TreeView) return true;
+    const int index = command->action.itemIndex;
+    if (index < 0 || static_cast<size_t>(index) >= node.items.size()) return true;
+    if (AbortIfCancelled(command)) return false;
+    // Expansion may run an application handler that inserts children, so the
+    // command is completed only after the control reports the requested state.
+    const bool applied = SetTreeViewItemExpanded(
+        target, index, command->action.booleanValue);
+    if (AbortIfCancelled(command)) return false;
+    command->success = applied;
+    return true;
+}
+
+bool ApplySetItemText(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    const bool renamable = (node.kind == ControlKind::TreeView ||
+        node.kind == ControlKind::ListView) && node.editableLabels;
+    if (!renamable) return true;
+    const int index = command->action.itemIndex;
+    const size_t itemCount = node.kind == ControlKind::TreeView
+        ? node.items.size() : node.rows.size();
+    if (index < 0 || static_cast<size_t>(index) >= itemCount) return true;
+    if (AbortIfCancelled(command)) return false;
+    // The rename opens and closes the control's own label session, so the
+    // application's veto and its normalization both apply before this reports
+    // success.
+    const bool renamed = node.kind == ControlKind::TreeView
+        ? RenameTreeViewItem(target, index, command->action.text)
+        : RenameListViewItem(target, index, command->action.text);
+    if (AbortIfCancelled(command)) return false;
+    command->success = renamed;
+    // A label session that ran and left the old text is the application refusing
+    // the new one, which is a rejected action rather than a broken projection.
+    command->refused = !renamed;
+    if (!renamed) command->error = L"the application refused the new label";
+    return true;
+}
+
+bool ApplyIslandInvoke(
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::AccessibleIsland || !agent) return true;
+    if (AbortIfCancelled(command)) return false;
+    const int index = command->action.itemIndex;
+    if (index < 0 || static_cast<size_t>(index) >= node.islandItems.size()) return true;
+    const auto& item = node.islandItems[static_cast<size_t>(index)];
+    // The provider's default action may open a menu of its own, so it is queued to run
+    // after this command returns rather than inside its deadline.  The published name
+    // and action travel with it so the deferred handler can refuse an element that
+    // moved.
+    command->success = agent->PostIslandAction(target, index, item.name, item.actionName);
+    if (!command->success) command->error = L"the island action could not be queued";
+    return true;
+}
+
+bool ApplySetColumnOrder(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView) return true;
+    if (AbortIfCancelled(command)) return false;
+    const auto& order = command->action.integerValues;
+    if (order.empty() || order.size() != node.columns.size()) return true;
+    // The control's own header owns the display order, so the projection sets it
+    // through the documented order array and then lets the capture read back what
+    // the control settled on.
+    const bool applied = SetListViewColumnOrder(
+        target, std::vector<int>(order.begin(), order.end()));
+    if (AbortIfCancelled(command)) return false;
+    command->success = applied;
+    command->refused = !applied;
+    if (!applied) command->error = L"the list refused the requested column order";
+    return true;
+}
+
+bool ApplySetSplit(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::PaneContainer) return true;
+    if (AbortIfCancelled(command)) return false;
+    // The split is resolved against the container's live geometry rather than the
+    // snapshot it was requested from: a drag arrives while the panes may already
+    // have moved, and the two panes it divides are the only windows that change.
+    const bool moved = SetPaneSplit(
+        target, command->action.itemIndex, command->action.integerValue);
+    if (AbortIfCancelled(command)) return false;
+    command->success = moved;
+    // The application's own layout is what refuses a split it will not accept, so
+    // a refusal keeps the projection and reports the canonical geometry back.
+    command->refused = !moved;
+    if (!moved) command->error = L"the container refused the requested split";
+    return true;
+}
+
+bool ApplyMdiCommand(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::MdiChild) return true;
+    if (AbortIfCancelled(command)) return false;
+    const std::wstring& verb = command->action.text;
+    if (verb == L"activate") {
+        const HWND client = GetParent(target);
+        if (!client) return true;
+        // WM_MDIACTIVATE through the client is the documented activation path, so
+        // the application sees the same deactivate/activate pair a click produces.
+        command->success = PostMessageW(
+            client, WM_MDIACTIVATE, reinterpret_cast<WPARAM>(target), 0) != FALSE;
+        return true;
+    }
+    // Every caption command is posted as the system command the native caption
+    // button posts, so an application that vetoes or reinterprets one keeps doing
+    // so.  These may enter a modal loop, which is why they are posted.
+    WPARAM systemCommand = 0;
+    if (verb == L"close") systemCommand = SC_CLOSE;
+    else if (verb == L"minimize") systemCommand = SC_MINIMIZE;
+    else if (verb == L"maximize") systemCommand = SC_MAXIMIZE;
+    else if (verb == L"restore") systemCommand = SC_RESTORE;
+    else return true;
+    command->success = PostMessageW(target, WM_SYSCOMMAND, systemCommand, 0) != FALSE;
+    return true;
+}
+
 using NodeAction = bool (*)(Command*, SourceThreadAgent*, HWND, const ControlNode&);
 
 struct NodeActionEntry final {
@@ -745,7 +946,14 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"select", &ApplySelect },
     NodeActionEntry{ L"setSelection", &ApplySetSelection },
     NodeActionEntry{ L"setItemCheck", &ApplySetItemCheck },
+    NodeActionEntry{ L"setItemText", &ApplySetItemText },
+    NodeActionEntry{ L"setValue", &ApplySetValue },
+    NodeActionEntry{ L"setExpand", &ApplySetExpand },
     NodeActionEntry{ L"toolbarCommand", &ApplyToolbarCommand },
+    NodeActionEntry{ L"mdiCommand", &ApplyMdiCommand },
+    NodeActionEntry{ L"setSplit", &ApplySetSplit },
+    NodeActionEntry{ L"setColumnOrder", &ApplySetColumnOrder },
+    NodeActionEntry{ L"islandInvoke", &ApplyIslandInvoke },
 };
 
 NodeAction FindNodeAction(std::wstring_view action) noexcept {
@@ -840,6 +1048,106 @@ bool ExecuteCloak(Command* command) {
     if (AbortIfCancelled(command)) return false;
     return SetCloakAndVerify(
         command, command->agent->Root(), command->cloaked, L"DWMWA_CLOAK failed");
+}
+
+// Arms popup interception and performs one menu-bar button's own default action.  The
+// application opens the popup after this returns, from its own loop, where the hook
+// records it.
+bool ExecuteMenuBarDrive(Command* command) {
+    if (AbortIfCancelled(command)) return false;
+    command->success = DriveMenuBarButton(
+        command->menuBarToolbar, command->menuBarIndex, command->action.text,
+        command->error);
+    return true;
+}
+
+// Drives one menu-bar button and waits, on the source thread, for the application to open
+// the popup it asked for.  The wait is a bounded pump of the application's own queue,
+// because that queue is what opens the popup: nothing else can make it happen, and a
+// time-based guess either misses the popup or lets it reach the screen after the bracket
+// has been given up on.  Bridge commands arriving during the pump are requeued.
+bool ExecuteMenuBarRead(Command* command) {
+    if (AbortIfCancelled(command)) return false;
+    auto* agent = command->agent;
+    command->menuItems.clear();
+    command->menuBarSystemMenu = false;
+    // comctl32 will not enter menu mode for a window that is not active, so the read has
+    // to make the native window active for as long as it takes to open one popup.  The
+    // window is cloaked and every popup is swallowed, so nothing of this is visible; the
+    // foreground is handed straight back to whoever held it.
+    const HWND previousForeground = GetForegroundWindow();
+    const HWND root = agent->Root();
+    const DWORD selfThread = GetCurrentThreadId();
+    const DWORD foreignThread = previousForeground
+        ? GetWindowThreadProcessId(previousForeground, nullptr) : 0;
+    const bool attached = foreignThread && foreignThread != selfThread &&
+        AttachThreadInput(selfThread, foreignThread, TRUE) != FALSE;
+    SetForegroundWindow(root);
+    SetActiveWindow(root);
+    const auto handBack = [&]() noexcept {
+        if (previousForeground && IsWindow(previousForeground)) {
+            SetForegroundWindow(previousForeground);
+        }
+        if (attached) AttachThreadInput(selfThread, foreignThread, FALSE);
+    };
+    if (!DriveMenuBarButton(command->menuBarToolbar, command->menuBarIndex,
+            command->action.text, command->error)) {
+        handBack();
+        command->success = false;
+        return true;
+    }
+    agent->SetDeferringCommands(true);
+    const ULONGLONG deadline = GetTickCount64() + command->menuBarPopupWaitMs;
+    while (!MenuPopupRecorded() && GetTickCount64() < deadline) {
+        if (command->cancelled.load(std::memory_order_acquire)) break;
+        MSG message{};
+        while (!MenuPopupRecorded() &&
+               PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (MenuPopupRecorded()) break;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 16, QS_ALLINPUT);
+    }
+    agent->SetDeferringCommands(false);
+    std::wstring captureReason;
+    const bool recorded = TakeRecordedMenu(
+        command->menuItems, command->menuBarSystemMenu, captureReason);
+    DisarmPopupInterception();
+    // The bar's own tracking state has to be left as it was found, or the next button's
+    // click is read by the control as closing the menu it thinks is still open.  This runs
+    // while popup suppression still holds, so nothing can escape to the screen.
+    if (command->menuBarToolbar && IsWindow(command->menuBarToolbar)) {
+        SendMessageW(command->menuBarToolbar, WM_CANCELMODE, 0, 0);
+    }
+    if (IsWindow(root)) SendMessageW(root, WM_CANCELMODE, 0, 0);
+    handBack();
+    if (!recorded) {
+        command->success = false;
+        command->menuBarNoPopup = true;
+        command->error = L"menu-bar toolbar button opened no popup within the read window";
+        try {
+            FluentShell::Log(L"Menu-bar read: button " +
+                std::to_wstring(command->menuBarIndex) +
+                L" drove but opened no popup (suppression=" +
+                std::to_wstring(PopupSuppressionActive() ? 1 : 0) +
+                L", foreground=" +
+                std::to_wstring(GetForegroundWindow() == root ? 1 : 0) + L")");
+        } catch (...) {}
+        return true;
+    }
+    if (command->menuBarSystemMenu) {
+        // A window's system menu is the chrome the projection already draws on the
+        // window's own Fluent caption, so it is skipped rather than projected twice.
+        command->success = true;
+        return true;
+    }
+    command->success = !command->menuItems.empty();
+    if (!command->success) {
+        command->error = captureReason.empty()
+            ? std::wstring(L"intercepted menu had no projectable items") : captureReason;
+    }
+    return true;
 }
 
 bool ExecuteCaptureAndCloak(Command* command) {
@@ -1369,6 +1677,8 @@ CommandHandler HandlerFor(UINT kind) noexcept {
     case kCommandDirectUiNodeAction: return &ExecuteDirectUiNodeAction;
     case kCommandNavigateDirectUiProjected:
         return &ExecuteNavigateDirectUiProjected;
+    case kCommandMenuBarDrive: return &ExecuteMenuBarDrive;
+    case kCommandMenuBarRead: return &ExecuteMenuBarRead;
     default: return nullptr;
     }
 }
@@ -1420,9 +1730,43 @@ LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && wParam == PM_REMOVE && lParam) {
         auto* message = reinterpret_cast<MSG*>(lParam);
         auto* agent = AgentForMessage(message->message);
+        if (agent && message->message == agent->MessageId() &&
+            message->wParam == kDeferredIslandAction) {
+            // Fire and forget: the payload owns itself and the provider's action may
+            // spin a modal loop, so nothing waits on this.
+            auto* deferred = reinterpret_cast<DeferredIslandAction*>(message->lParam);
+            message->message = WM_NULL;
+            if (deferred) {
+                std::wstring reason;
+                if (!InvokeAccessibleIslandItem(deferred->island, deferred->index,
+                        deferred->name, deferred->action, reason)) {
+                    try {
+                        FluentShell::Log(L"Island action did not run: " + reason);
+                    } catch (...) {}
+                }
+                delete deferred;
+            }
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
         if (agent && message->message == agent->MessageId()) {
             auto* command = reinterpret_cast<Command*>(message->lParam);
             if (IsTrackedCommand(command, agent)) {
+                // While a command is pumping the source thread's own messages -- which is
+                // how a menu bar's popup is waited for -- another command must not be
+                // dispatched re-entrantly.  It is put back on the queue instead, so its
+                // caller keeps waiting rather than being answered out of order.
+                if (agent->DeferringCommands()) {
+                    message->message = WM_NULL;
+                    if (!PostThreadMessageW(agent->ThreadId(), agent->MessageId(),
+                            message->wParam, message->lParam)) {
+                        UntrackCommand(command);
+                        SetEvent(command->started);
+                        command->error = L"source-thread command could not be requeued";
+                        Complete(command);
+                        Release(command);
+                    }
+                    return CallNextHookEx(nullptr, code, wParam, lParam);
+                }
                 UntrackCommand(command);
                 message->message = WM_NULL;
                 SetEvent(command->started);
@@ -1735,9 +2079,33 @@ bool SourceThreadAgent::Invoke(
     }
     outcome = std::move(command->outcome);
     if (!command->success && outcome.error.empty()) outcome.error = command->error;
+    outcome.refused = command->refused;
     const bool success = command->success;
     Release(command);
     return success;
+}
+
+bool SourceThreadAgent::PostIslandAction(
+    HWND island,
+    int index,
+    const std::wstring& expectedName,
+    const std::wstring& expectedAction) noexcept {
+    try {
+        auto* deferred = new (std::nothrow) DeferredIslandAction();
+        if (!deferred) return false;
+        deferred->island = island;
+        deferred->index = index;
+        deferred->name = expectedName;
+        deferred->action = expectedAction;
+        if (!PostThreadMessageW(threadId_, message_, kDeferredIslandAction,
+                reinterpret_cast<LPARAM>(deferred))) {
+            delete deferred;
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool SourceThreadAgent::SetCloaked(
@@ -1953,6 +2321,101 @@ bool SourceThreadAgent::InvokeDirectUiNodeAction(
     if (posted) previousActive = command->sibling;
     Release(command);
     return success;
+}
+
+// One menu bar drawn with a toolbar, read in the only order the application allows:
+// arm and drive one button, let the application's own loop run, then collect the popup it
+// opened.  The whole bar is read or none of it is, because a menu bar missing one of its
+// menus is worse than one that was never projected.
+bool SourceThreadAgent::ReadMenuBarToolbar(
+    HWND toolbar,
+    DWORD popupWaitMs,
+    std::wstring& error,
+    DWORD timeoutMs,
+    HANDLE cancelEvent) {
+    const int buttons = MenuBarButtonCount(toolbar);
+    if (buttons <= 0) {
+        error = L"menu-bar toolbar publishes no accessible buttons";
+        return false;
+    }
+    // Held for the whole read, not per button: an application opens its popup from its own
+    // message loop, so one that arrives after a button was given up on must still be
+    // swallowed rather than appearing over the projection.
+    PopupSuppressionScope suppression;
+    // Leaves the bar's own tracking state as it was found, while suppression still holds,
+    // so nothing can still be on its way out when the screen stops being protected.
+    const auto settleBar = [&]() noexcept {
+        if (IsWindow(toolbar)) SendMessageW(toolbar, WM_CANCELMODE, 0, 0);
+        if (IsWindow(root_)) SendMessageW(root_, WM_CANCELMODE, 0, 0);
+        Sleep(kMenuBarSettleMs);
+    };
+    std::vector<MenuItemSnapshot> menu;
+    for (int index = 1; index <= buttons; ++index) {
+        std::wstring name = MenuBarButtonName(toolbar, index);
+        if (name.empty()) {
+            error = L"menu-bar toolbar publishes an unnamed top-level menu";
+            return false;
+        }
+        MenuItemSnapshot top;
+        top.kind = MenuItemKind::Popup;
+        top.text = std::move(name);
+        top.enabled = true;
+        // Identity is the item's position in the *projected* menu, not in the native bar:
+        // a system menu is skipped, and the renderer admits a menu only when every path is
+        // its own index under its parent's.
+        top.itemId = std::to_wstring(menu.size());
+
+        Command* read = CreateCommand(kCommandMenuBarRead, this);
+        if (!read) {
+            error = L"source command allocation failed";
+            settleBar();
+            return false;
+        }
+        read->menuBarToolbar = toolbar;
+        read->menuBarIndex = index;
+        read->menuBarPopupWaitMs = popupWaitMs;
+        read->action.text = top.itemId;
+        const bool readPosted = Post(read, timeoutMs, cancelEvent);
+        const bool readOk = readPosted && read->success;
+        const bool systemMenu = readOk && read->menuBarSystemMenu;
+        // Told apart from a real failure: the command ran and the application simply
+        // opened no popup for that button.
+        const bool openedNothing = readPosted && !read->success && read->menuBarNoPopup;
+        if (!readOk) {
+            error = readPosted ? read->error
+                : std::wstring(L"source UI thread did not acknowledge the menu-bar read");
+        } else if (!systemMenu) {
+            top.items = std::move(read->menuItems);
+        }
+        Release(read);
+        if (!readOk && !openedNothing) {
+            settleBar();
+            return false;
+        }
+        if (systemMenu) continue;
+        // A top-level menu the application opens nothing for is a menu with nothing in it
+        // right now -- MMC's Window menu on a console with no snap-in windows is one.  The
+        // native bar still shows its title, so the projection shows the title too and
+        // leaves it with no items rather than dropping the menu or refusing the bar.
+        if (top.items.empty()) {
+            top.enabled = false;
+        }
+        menu.push_back(std::move(top));
+    }
+    settleBar();
+    if (menu.empty()) {
+        error = L"menu-bar toolbar has no projectable menus";
+        return false;
+    }
+    // Published into the capture context the source thread owns, so the next capture
+    // carries the menu and drops the toolbar node.
+    captureContext_.menuBarToolbarMenu = std::move(menu);
+    captureContext_.menuBarToolbar = toolbar;
+    return true;
+}
+
+bool SourceThreadAgent::HasMenuBarToolbarMenu() const noexcept {
+    return !captureContext_.menuBarToolbarMenu.empty();
 }
 
 bool SourceThreadAgent::PlaceBehind(

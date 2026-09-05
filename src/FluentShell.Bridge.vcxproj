@@ -47,7 +47,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>dwmapi.lib;comctl32.lib;advapi32.lib;bcrypt.lib;runtimeobject.lib;uiautomationcore.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dwmapi.lib;comctl32.lib;advapi32.lib;bcrypt.lib;runtimeobject.lib;uiautomationcore.lib;oleacc.lib;oleaut32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -66,6 +66,9 @@
     <ClCompile Include="Bridge\Ipc\FrameCodec.cpp" />
     <ClCompile Include="Bridge\Ipc\Protocol.cpp" />
     <ClCompile Include="Bridge\Translation\ControlAdapters.cpp" />
+    <ClCompile Include="Bridge\Translation\AccessibleIsland.cpp" />
+    <ClCompile Include="Bridge\Translation\MenuBarCapture.cpp" />
+    <ClCompile Include="Bridge\Translation\DialogSnapshots.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />
     <ClCompile Include="Bridge\Translation\DirectUiEngine.cpp" />
     <ClCompile Include="Bridge\Translation\DirectUiProfiles.cpp" />
@@ -80,6 +83,9 @@
     <ClInclude Include="Bridge\Ipc\FrameCodec.h" />
     <ClInclude Include="Bridge\Ipc\Protocol.h" />
     <ClInclude Include="Bridge\Translation\ControlAdapters.h" />
+    <ClInclude Include="Bridge\Translation\AccessibleIsland.h" />
+    <ClInclude Include="Bridge\Translation\MenuBarCapture.h" />
+    <ClInclude Include="Bridge\Translation\DialogSnapshots.h" />
     <ClInclude Include="Bridge\Translation\DialogTranslator.h" />
     <ClInclude Include="Bridge\Translation\DirectUiEngine.h" />
     <ClInclude Include="Bridge\Translation\RendererSession.h" />
