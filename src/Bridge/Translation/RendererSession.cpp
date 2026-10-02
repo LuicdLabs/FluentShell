@@ -1550,6 +1550,19 @@ void RendererSession::HandleAction(const ActionRequest& action) {
     actionCondition_.notify_one();
 }
 
+// A property action that does not land leaves canonical state where it was.
+// The projection stays up and reconcile republishes that state. Command actions
+// are absent: failing to deliver a click or a close is still a broken surface.
+bool IsRecoverableActionFailure(std::wstring_view action) noexcept {
+    return action == L"setText" || action == L"setCheck" || action == L"select" ||
+        action == L"setSelection" || action == L"setFocusedIndex" ||
+        action == L"setItemCheck" || action == L"setItemText" ||
+        action == L"setValue" || action == L"setExpand" || action == L"setSplit" ||
+        action == L"setColumnOrder" || action == L"scrollBy" ||
+        action == L"move" || action == L"resize" ||
+        action == L"minimize" || action == L"maximize" || action == L"restore";
+}
+
 void RendererSession::HandleNativeAction(
     const ActionRequest& action,
     const std::shared_ptr<Surface>& surface) {
@@ -2070,15 +2083,25 @@ void RendererSession::HandleNativeAction(
         // An application that ran the operation and declined it is not a broken
         // projection: canonical state is untouched, so the window keeps its
         // projection and the renderer is told this one action was rejected.
-        if (outcome.refused) {
-            try {
-                FluentShell::Log(L"Native action refused by the application: " +
-                    action.action + L" (" + outcome.error + L")");
-            } catch (...) {}
+        // A property action that did not land (selection, focus, scroll, text)
+        // is the same kind of failure. Tearing the whole window back to native
+        // for it is what dropped MMC a few seconds after the menu refresh, with
+        // no other log line naming the action.
+        const bool keepProjected = outcome.refused ||
+            IsRecoverableActionFailure(action.action);
+        try {
+            FluentShell::Log((keepProjected
+                    ? L"Native action rejected; projection stays: "
+                    : L"Native action failed; restoring: ") +
+                action.action + L" (" +
+                (outcome.error.empty() ? L"no source-thread detail" : outcome.error) +
+                L")");
+        } catch (...) {}
+        if (keepProjected) {
             canonicalLock.unlock();
             std::unique_lock rejectLock(surface->mutex);
             RejectAction(surface, rejectLock, action, L"rejected",
-                outcome.error.empty() ? L"the application refused the action" : outcome.error);
+                outcome.error.empty() ? L"the native action did not apply" : outcome.error);
             return;
         }
         canonicalLock.unlock();

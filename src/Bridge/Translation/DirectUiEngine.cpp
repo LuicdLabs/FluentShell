@@ -2224,8 +2224,10 @@ bool SameDirectUiDetailContent(
         a.items == b.items && SameRectList(a.itemRects, b.itemRects) &&
         a.rows == b.rows && a.checkedIndices == b.checkedIndices &&
         a.columnOrder == b.columnOrder && a.itemNativeIds == b.itemNativeIds &&
-        a.itemImages == b.itemImages && a.editingIndex == b.editingIndex &&
+        a.itemImages == b.itemImages && a.itemSelectedImages == b.itemSelectedImages &&
+        a.itemStateImages == b.itemStateImages && a.editingIndex == b.editingIndex &&
         SameItemImageList(a.imageList, b.imageList) &&
+        SameItemImageList(a.stateImageList, b.stateImageList) &&
         a.itemDepths == b.itemDepths && a.itemExpanded == b.itemExpanded &&
         a.checked == b.checked && a.minimum == b.minimum &&
         a.maximum == b.maximum && a.position == b.position &&

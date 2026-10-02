@@ -214,6 +214,11 @@ struct ControlNode final {
     std::vector<ImageListEntry> imageList;
     std::vector<int> itemImages;
     std::vector<int> itemSelectedImages;
+    // TreeView only. State images are a second list drawn beside the item icon.
+    // -1 means the item draws none. Overlay images are not stored here: capture
+    // composites them into the normal and selected icons they decorate.
+    std::vector<ImageListEntry> stateImageList;
+    std::vector<int> itemStateImages;
     // The control advertises in-place label editing, so the projection offers a
     // rename that runs through the native control's own edit session.
     bool editableLabels = false;

@@ -163,6 +163,10 @@ public sealed record ControlNode
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<int>? ItemSelectedImages { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ImageListEntry>? StateImageList { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? ItemStateImages { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? EditableLabels { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? EditingIndex { get; init; }
@@ -214,6 +218,16 @@ public sealed record ItemTextActionValue
     public int Index { get; init; }
     [JsonPropertyName("text")]
     public string Text { get; init; } = string.Empty;
+}
+
+// A non-report ListView scroll, in the control's own pixels. The delta is what the
+// proxy moved since the native origin was last published, not an absolute position.
+public sealed record ScrollByActionValue
+{
+    [JsonPropertyName("dx")]
+    public int Dx { get; init; }
+    [JsonPropertyName("dy")]
+    public int Dy { get; init; }
 }
 
 // A projected splitter drag: which split of the container moved, and where its

@@ -426,11 +426,11 @@ bool ProbeTabControl(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& re
     return true;
 }
 
-// The bounded TreeView subset: a textual, iconless, single-selection tree whose
-// hierarchy, expansion, and selection are all readable from the control itself.
-// Label editing, checkbox/state images, hover selection, auto-collapse, and
-// callback tooltips each own behavior the projection cannot reproduce, so each
-// keeps the whole window native by name.
+// The bounded TreeView subset: a single-selection tree whose hierarchy,
+// expansion, selection, item icons, overlays, and state images are all readable
+// from the control itself. Checkbox toggles, hover selection, auto-collapse,
+// and callback tooltips each own behavior the projection cannot reproduce, so
+// each keeps the whole window native by name.
 bool ProbeTreeView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     constexpr DWORD unsupportedStyle = TVS_CHECKBOXES |
         TVS_TRACKSELECT | TVS_SINGLEEXPAND | TVS_INFOTIP | TVS_RTLREADING;
@@ -465,12 +465,8 @@ bool ProbeTreeView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reas
         return RejectFlags(reason, L"TreeView has unsupported extended style bit(s) ",
             rejected, extended, flags, std::size(flags));
     }
-    // The normal image list is projected as bounded owned pixels the items index
-    // into.  A state image list is a different contract -- checkbox and overlay
-    // imagery the projection does not reproduce -- so it still keeps the tree
-    // native.
-    if (SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_STATE, 0) != 0)
-        return Reject(reason, L"TreeView state image list is not supported");
+    // A state image list is painted beside each item that names one. Checkbox
+    // styles stay refused above: those glyphs are a toggle, not decoration.
     // The control's built-in tooltip only re-renders a truncated item label the
     // adapter already captures, so its presence is not interrogated.  Application
     // tooltip *content* arrives through TVS_INFOTIP and TVS_EX_RICHTOOLTIP, and
@@ -1185,28 +1181,53 @@ bool ResolveItemImage(
     return true;
 }
 
+// One referenced icon. Overlay 0 is the plain image; a nonzero overlay is the
+// image the control draws with that image-list overlay composited on top.
+struct IconReference final {
+    int index = 0;
+    int overlay = 0;
+    bool operator==(const IconReference&) const noexcept = default;
+    bool operator<(const IconReference& other) const noexcept {
+        return index < other.index || (index == other.index && overlay < other.overlay);
+    }
+};
+
 // Item providers have already been read exactly once. Copy only the native icons
 // those item values reference, then remap both arrays into this snapshot's owned
 // list. MMC keeps icons for unloaded snap-ins in the same HIMAGELIST; unused
 // entries do not consume the projection's count or decoded-pixel budget.
+// itemOverlays, when present, is one overlay index per itemImages slot and is
+// applied to the selected-state icon of that same item.
 bool CaptureReferencedImageList(
     HIMAGELIST images,
     std::vector<int>& itemImages,
     std::vector<int>* itemSelectedImages,
+    const std::vector<int>* itemOverlays,
     std::vector<ImageListEntry>& imageList,
     std::wstring& reason) {
     imageList.clear();
     const int count = images ? ImageList_GetImageCount(images) : 0;
     if (count < 0)
         return Reject(reason, L"image list metadata is unavailable");
-    std::vector<int> references;
+    if (itemOverlays && (itemOverlays->size() != itemImages.size() ||
+            (itemSelectedImages && itemSelectedImages->size() != itemOverlays->size())))
+        return Reject(reason, L"item overlay count does not match the items");
+    std::vector<IconReference> references;
     references.reserve(itemImages.size() +
         (itemSelectedImages ? itemSelectedImages->size() : 0));
     const auto collect = [&](std::vector<int>& indexes) {
-        for (int& index : indexes) {
+        for (size_t slot = 0; slot < indexes.size(); ++slot) {
+            int& index = indexes[slot];
             if (!ResolveItemImage(index, static_cast<size_t>(count), index, reason))
                 return false;
-            if (index >= 0) references.push_back(index);
+            if (index < 0) continue;
+            int overlay = 0;
+            if (itemOverlays) {
+                overlay = (*itemOverlays)[slot];
+                if (overlay < 0 || overlay > 15)
+                    return Reject(reason, L"TreeView overlay image index is outside 0..15");
+            }
+            references.push_back({ index, overlay });
         }
         return true;
     };
@@ -1234,9 +1255,16 @@ bool CaptureReferencedImageList(
     if (references.size() > Ipc::kMaxImageListBytes / iconBytes)
         return Reject(reason, L"referenced image list exceeds the decoded pixel budget");
     imageList.reserve(references.size());
-    for (const int index : references) {
-        HICON icon = ImageList_GetIcon(images, index, ILD_NORMAL);
-        if (!icon) return Reject(reason, L"image list icon copy failed");
+    for (const IconReference& reference : references) {
+        const UINT flags = reference.overlay == 0
+            ? static_cast<UINT>(ILD_NORMAL)
+            : ILD_NORMAL | INDEXTOOVERLAYMASK(reference.overlay);
+        HICON icon = ImageList_GetIcon(images, reference.index, flags);
+        if (!icon) {
+            return Reject(reason, reference.overlay == 0
+                ? L"image list icon copy failed"
+                : L"TreeView overlay image could not be copied");
+        }
         ImageListEntry entry;
         const bool copied = CaptureIconPixels(icon, entry.imageWidth, entry.imageHeight,
             entry.imageFormat, entry.imageData, reason);
@@ -1252,13 +1280,36 @@ bool CaptureReferencedImageList(
         imageList.push_back(std::move(entry));
     }
     const auto remap = [&](std::vector<int>& indexes) {
-        for (int& index : indexes) {
-            if (index >= 0) index = static_cast<int>(
-                std::lower_bound(references.begin(), references.end(), index) - references.begin());
+        for (size_t slot = 0; slot < indexes.size(); ++slot) {
+            int& index = indexes[slot];
+            if (index < 0) continue;
+            const IconReference key{ index, itemOverlays ? (*itemOverlays)[slot] : 0 };
+            index = static_cast<int>(
+                std::lower_bound(references.begin(), references.end(), key) - references.begin());
         }
     };
     remap(itemImages);
     if (itemSelectedImages) remap(*itemSelectedImages);
+    return true;
+}
+
+size_t ImageListBytes(const std::vector<ImageListEntry>& images) noexcept {
+    size_t bytes = 0;
+    for (const auto& entry : images) bytes += entry.imageData.size();
+    return bytes;
+}
+
+// The normal list and the state list share one icon budget. Each list is
+// already capped on its own; this is what stops the pair from doubling it.
+bool ImageListsFitBudget(
+    const std::vector<ImageListEntry>& first,
+    const std::vector<ImageListEntry>& second,
+    std::wstring& reason) {
+    if (second.size() > Ipc::kMaxImageListImages - first.size())
+        return Reject(reason, L"referenced image list exceeds the icon cap");
+    const size_t bytes = ImageListBytes(first);
+    if (ImageListBytes(second) > Ipc::kMaxImageListBytes - bytes)
+        return Reject(reason, L"referenced image list exceeds the decoded pixel budget");
     return true;
 }
 
@@ -1651,7 +1702,7 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     if (!CaptureReferencedImageList(reinterpret_cast<HIMAGELIST>(
             SendMessageW(hwnd, LVM_GETIMAGELIST,
                 node.listViewMode == L"largeIcon" ? LVSIL_NORMAL : LVSIL_SMALL, 0)),
-            node.itemImages, nullptr, node.imageList, reason)) return false;
+            node.itemImages, nullptr, nullptr, node.imageList, reason)) return false;
     const HWND editControl = reinterpret_cast<HWND>(
         SendMessageW(hwnd, LVM_GETEDITCONTROL, 0, 0));
     node.editingIndex = editControl && IsWindow(editControl)
@@ -2343,10 +2394,10 @@ bool CollectTreeViewItems(
 bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     std::vector<TreeViewItemHandle> handles;
     if (!CollectTreeViewItems(hwnd, handles, reason)) return false;
-    if (handles.empty())
-        return Reject(reason, L"TreeView has no items to project");
     // A TreeView projects as its items, so the HWND's own text would only
-    // duplicate them in the UIA name.
+    // duplicate them in the UIA name. An empty tree is still that projection:
+    // a console clears its scope tree while a snap-in reloads, and refusing
+    // the moment in between restores the whole window.
     node.text.clear();
     node.automationName.clear();
     node.items.clear();
@@ -2355,23 +2406,38 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.itemHasChildren.clear();
     node.itemImages.clear();
     node.itemSelectedImages.clear();
+    node.itemStateImages.clear();
+    node.imageList.clear();
+    node.stateImageList.clear();
     node.items.reserve(handles.size());
     node.itemDepths.reserve(handles.size());
     node.itemExpanded.reserve(handles.size());
     node.itemHasChildren.reserve(handles.size());
     node.itemImages.reserve(handles.size());
     node.itemSelectedImages.reserve(handles.size());
+    node.itemStateImages.reserve(handles.size());
     node.editableLabels = (static_cast<DWORD>(node.style) & TVS_EDITLABELS) != 0;
+    node.editingIndex = -1;
+    node.selectedIndex = -1;
+    node.multiSelect = false;
+    if (handles.empty()) return true;
     const HWND editControl = reinterpret_cast<HWND>(
         SendMessageW(hwnd, TVM_GETEDITCONTROL, 0, 0));
     const HTREEITEM editing = editControl && IsWindow(editControl)
         ? TreeViewRelative(hwnd, TVGN_CARET, nullptr)
         : nullptr;
-    node.editingIndex = -1;
     const HTREEITEM selected = TreeViewRelative(hwnd, TVGN_CARET, nullptr);
-    node.selectedIndex = -1;
-    node.multiSelect = false;
+    // State-image index 0 means the item draws no state image. The same bits
+    // are TVIS_USERMASK when the control has no state image list, so they are
+    // application-private storage and not a reason to refuse the window.
+    const auto stateImages = reinterpret_cast<HIMAGELIST>(
+        SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_STATE, 0));
+    const int stateCount = stateImages ? ImageList_GetImageCount(stateImages) : 0;
+    if (stateImages && stateCount < 0)
+        return Reject(reason, L"TreeView state image list metadata is unavailable");
     size_t totalText = 0;
+    std::vector<int> overlays;
+    overlays.reserve(handles.size());
     std::vector<wchar_t> buffer(kMaxTreeLabelChars + 1);
     for (size_t index = 0; index < handles.size(); ++index) {
         std::fill(buffer.begin(), buffer.end(), L'\0');
@@ -2389,8 +2455,6 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             return Reject(reason, L"TreeView item state is unavailable");
         if (item.cChildren == I_CHILDRENCALLBACK)
             return Reject(reason, L"callback-child TreeView item is not supported");
-        if ((item.state & (TVIS_STATEIMAGEMASK | TVIS_OVERLAYMASK)) != 0)
-            return Reject(reason, L"TreeView item state or overlay image is not supported");
         const size_t length = wcsnlen_s(buffer.data(), buffer.size());
         if (length == 0)
             return Reject(reason, L"TreeView requires nonempty textual labels");
@@ -2412,13 +2476,32 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         };
         node.itemImages.push_back(imageIndex(item.iImage));
         node.itemSelectedImages.push_back(imageIndex(item.iSelectedImage));
+        // The overlay index lives in the same normal image list. It is captured
+        // already composited, because that is the icon the control paints.
+        overlays.push_back(static_cast<int>((item.state & TVIS_OVERLAYMASK) >> 8));
+        const int stateImage = static_cast<int>((item.state & TVIS_STATEIMAGEMASK) >> 12);
+        // I_IMAGENONE, not -1: -1 is I_IMAGECALLBACK, and the shared image
+        // capture rejects that when a list exists. The capture remaps the
+        // sentinel to the protocol's -1 afterwards.
+        if (stateImage == 0 || !stateImages) {
+            node.itemStateImages.push_back(I_IMAGENONE);
+        } else if (stateImage >= stateCount) {
+            return Reject(reason, L"TreeView state image index is outside the state image list");
+        } else {
+            node.itemStateImages.push_back(stateImage);
+        }
         if (handles[index].item == selected) node.selectedIndex = static_cast<int>(index);
         if (editing && handles[index].item == editing)
             node.editingIndex = static_cast<int>(index);
     }
-    return CaptureReferencedImageList(reinterpret_cast<HIMAGELIST>(
-        SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_NORMAL, 0)),
-        node.itemImages, &node.itemSelectedImages, node.imageList, reason);
+    if (!CaptureReferencedImageList(reinterpret_cast<HIMAGELIST>(
+            SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_NORMAL, 0)),
+            node.itemImages, &node.itemSelectedImages, &overlays, node.imageList, reason))
+        return false;
+    if (!CaptureReferencedImageList(
+            stateImages, node.itemStateImages, nullptr, nullptr, node.stateImageList, reason))
+        return false;
+    return ImageListsFitBudget(node.imageList, node.stateImageList, reason);
 }
 
 bool CaptureTrackbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
@@ -2840,6 +2923,52 @@ bool SetListViewColumnOrder(HWND listView, const std::vector<int>& order) noexce
             InvalidateRect(header, nullptr, TRUE);
         }
         return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool SetListViewFocusedIndex(HWND listView, int index) noexcept {
+    if (!listView || index < -1 ||
+        GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId()) return false;
+    try {
+        const auto count = SendMessageW(listView, LVM_GETITEMCOUNT, 0, 0);
+        if (count < 0 || index >= count) return false;
+        const auto selectedBefore = static_cast<int>(SendMessageW(
+            listView, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED));
+        LVITEMW state{};
+        state.stateMask = LVIS_FOCUSED;
+        state.state = 0;
+        SendMessageW(listView, LVM_SETITEMSTATE, static_cast<WPARAM>(-1),
+            reinterpret_cast<LPARAM>(&state));
+        if (index >= 0) {
+            state.state = LVIS_FOCUSED;
+            SendMessageW(listView, LVM_SETITEMSTATE, static_cast<WPARAM>(index),
+                reinterpret_cast<LPARAM>(&state));
+            SendMessageW(listView, LVM_ENSUREVISIBLE, static_cast<WPARAM>(index), FALSE);
+        }
+        const auto focused = static_cast<int>(SendMessageW(
+            listView, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_FOCUSED));
+        const auto selectedAfter = static_cast<int>(SendMessageW(
+            listView, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_SELECTED));
+        return focused == index && selectedAfter == selectedBefore;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool ScrollListViewBy(HWND listView, int dx, int dy) noexcept {
+    if (!listView || GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId()) return false;
+    if (dx < -Ipc::kMaxCoordinate || dx > Ipc::kMaxCoordinate ||
+        dy < -Ipc::kMaxCoordinate || dy > Ipc::kMaxCoordinate) return false;
+    try {
+        std::wstring mode;
+        std::wstring ignored;
+        if (!ReadListViewMode(listView, static_cast<DWORD>(GetWindowLongPtrW(listView, GWL_STYLE)),
+                mode, ignored) || mode.empty() || mode == L"report") return false;
+        if (dx == 0 && dy == 0) return true;
+        return SendMessageW(listView, LVM_SCROLL, static_cast<WPARAM>(dx),
+            static_cast<LPARAM>(dy)) != FALSE;
     } catch (...) {
         return false;
     }

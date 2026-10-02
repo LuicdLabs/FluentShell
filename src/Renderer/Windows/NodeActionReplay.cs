@@ -49,5 +49,5 @@ internal static class NodeActionReplayPolicy
     /// </summary>
     public static bool IsReplayableAfterStale(string property) =>
         property is "itemExpanded" or "checked" or "selectedIndex" or "selectedIndices"
-            or "checkedIndices";
+            or "checkedIndices" or "focusedIndex";
 }

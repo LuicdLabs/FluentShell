@@ -157,7 +157,7 @@ internal static class ProtocolValidator
         {
             "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck",
             "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder",
-            "islandInvoke", "activateItem",
+            "islandInvoke", "activateItem", "setFocusedIndex", "scrollBy",
             "toolbarCommand", "mdiCommand",
         };
 
@@ -187,6 +187,25 @@ internal static class ProtocolValidator
                 if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var itemIndex) ||
                     itemIndex < 0 || itemIndex >= ProtocolConstants.MaxItems)
                     throw new ProtocolException("activateItem requires a bounded item index.");
+                return;
+            case "setFocusedIndex":
+                if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var focusedIndex) ||
+                    focusedIndex < -1 || focusedIndex >= ProtocolConstants.MaxItems)
+                    throw new ProtocolException("setFocusedIndex requires a focused item index or -1.");
+                return;
+            case "scrollBy":
+                var scrollNames = value.ValueKind == JsonValueKind.Object
+                    ? value.EnumerateObject().Select(property => property.Name)
+                        .Order(StringComparer.Ordinal).ToArray()
+                    : [];
+                if (scrollNames is not ["dx", "dy"] ||
+                    !value.TryGetProperty("dx", out var scrollDx) ||
+                    !scrollDx.TryGetInt32(out var scrollDxValue) ||
+                    scrollDxValue is < -ProtocolConstants.MaxCoordinate or > ProtocolConstants.MaxCoordinate ||
+                    !value.TryGetProperty("dy", out var scrollDy) ||
+                    !scrollDy.TryGetInt32(out var scrollDyValue) ||
+                    scrollDyValue is < -ProtocolConstants.MaxCoordinate or > ProtocolConstants.MaxCoordinate)
+                    throw new ProtocolException("scrollBy requires dx and dy inside the coordinate cap.");
                 return;
             case "setText":
                 if (value.ValueKind != JsonValueKind.String)
@@ -481,6 +500,9 @@ internal static class ProtocolValidator
         if (node.Kind != "treeView" && node.ItemSelectedImages is not null)
             throw new ProtocolException(
                 "Only TreeView nodes can carry selected-state item images.");
+        if (node.Kind != "treeView" &&
+            (node.StateImageList is not null || node.ItemStateImages is not null))
+            throw new ProtocolException("Only TreeView nodes can carry state images.");
         if (node.Kind != "mdiChild" &&
             (node.Active is not null || node.WindowState is not null || node.ClientRect is not null))
             throw new ProtocolException("Only MDI child nodes can carry caption state.");
@@ -1241,14 +1263,16 @@ internal static class ProtocolValidator
     {
         if (node.ItemDepths is not { } depths || node.ItemExpanded is not { } expanded ||
             node.ItemHasChildren is not { } hasChildren ||
-            node.Items.Count is <= 0 or > ProtocolConstants.MaxItems ||
+            node.Items.Count > ProtocolConstants.MaxItems ||
             depths.Count != node.Items.Count || expanded.Count != node.Items.Count ||
             hasChildren.Count != node.Items.Count)
             throw new ProtocolException(
                 "TreeView requires one depth, expansion, and child flag per bounded item.");
         if (node.Items.Any(string.IsNullOrEmpty))
             throw new ProtocolException("TreeView requires nonempty textual labels.");
-        if (depths[0] != 0)
+        // An empty tree has no root. A console clears its scope tree while a
+        // snap-in reloads, and that moment is still a complete hierarchy.
+        if (node.Items.Count > 0 && depths[0] != 0)
             throw new ProtocolException("TreeView must start at a root item.");
         for (var index = 0; index < depths.Count; ++index)
         {
@@ -1268,6 +1292,8 @@ internal static class ProtocolValidator
             throw new ProtocolException("Multi-select TreeView projection is not supported.");
         if (node.ItemSelectedImages is null)
             throw new ProtocolException("TreeView selected-state item images are missing.");
+        if (node.StateImageList is null || node.ItemStateImages is null)
+            throw new ProtocolException("TreeView state images are missing.");
         ValidateItemImagery(node, node.Items.Count);
     }
 
@@ -1290,19 +1316,13 @@ internal static class ProtocolValidator
         if (node.ImageList is not { } imageList || node.ItemImages is not { } itemImages ||
             node.EditableLabels is null || node.EditingIndex is not { } editingIndex)
             throw new ProtocolException("Item imagery or label editing state is missing.");
-        if (imageList.Count > ProtocolConstants.MaxImageListImages)
-            throw new ProtocolException("Image list exceeds the icon cap.");
-        // Preflight the complete list before decoding any base64 or allocating
-        // bitmaps. Many small referenced icons are valid; their aggregate pixel
-        // bytes must retain the same bound as a list of large icons.
+        // A tree's state images share the icon budget with its normal list, so
+        // the pair cannot double the cap a single list is already held to.
+        var stateList = node.Kind == "treeView" ? node.StateImageList : null;
+        var imageCount = 0;
         var imageBytes = 0;
-        foreach (var entry in imageList)
-        {
-            var entryBytes = ValidateImageListEntryMetadata(entry);
-            if (entryBytes > ProtocolConstants.MaxImageListBytes - imageBytes)
-                throw new ProtocolException("Image list exceeds the decoded pixel budget.");
-            imageBytes += entryBytes;
-        }
+        AccumulateImageList(imageList, ref imageCount, ref imageBytes);
+        if (stateList is not null) AccumulateImageList(stateList, ref imageCount, ref imageBytes);
         if (itemImages.Count != itemCount)
             throw new ProtocolException("Every item needs exactly one image index.");
         if (itemImages.Any(index => index < -1 || index >= imageList.Count))
@@ -1315,12 +1335,39 @@ internal static class ProtocolValidator
                 throw new ProtocolException(
                     "A selected item image index is outside the image list.");
         }
+        if (node.ItemStateImages is { } stateImages)
+        {
+            if (stateImages.Count != itemCount)
+                throw new ProtocolException("Every tree item needs exactly one state image index.");
+            if (stateImages.Any(index => index < -1 || index >= (stateList?.Count ?? 0)))
+                throw new ProtocolException(
+                    "A state image index is outside the state image list.");
+        }
         if (editingIndex < -1 || editingIndex >= itemCount)
             throw new ProtocolException("editingIndex is outside the item range.");
         if (editingIndex >= 0 && node.EditableLabels != true)
             throw new ProtocolException(
                 "An edit session cannot be open on a control without editable labels.");
         foreach (var entry in imageList) ValidateImageListEntry(entry);
+        if (stateList is not null)
+            foreach (var entry in stateList) ValidateImageListEntry(entry);
+    }
+
+    // Metadata only. The caller decodes pixels after every index has been
+    // checked, so a list that is already over budget never reaches base64.
+    private static void AccumulateImageList(
+        IReadOnlyList<ImageListEntry> imageList, ref int imageCount, ref int imageBytes)
+    {
+        if (imageList.Count > ProtocolConstants.MaxImageListImages - imageCount)
+            throw new ProtocolException("Image list exceeds the icon cap.");
+        imageCount += imageList.Count;
+        foreach (var entry in imageList)
+        {
+            var entryBytes = ValidateImageListEntryMetadata(entry);
+            if (entryBytes > ProtocolConstants.MaxImageListBytes - imageBytes)
+                throw new ProtocolException("Image list exceeds the decoded pixel budget.");
+            imageBytes += entryBytes;
+        }
     }
 
     private static int ValidateImageListEntryMetadata(ImageListEntry entry)
@@ -1680,12 +1727,14 @@ internal static class ProtocolValidator
 
     private static readonly string[] RequiredTreeViewProperties =
         ["selectedIndex", "itemDepths", "itemExpanded", "itemHasChildren",
-         "itemSelectedImages", "imageList", "itemImages", "editableLabels", "editingIndex"];
+         "itemSelectedImages", "imageList", "itemImages", "stateImageList",
+         "itemStateImages", "editableLabels", "editingIndex"];
 
     // The parallel per-item arrays a projected tree carries.  They are checked as
     // arrays, and their presence on any other kind is a violation.
     private static readonly string[] TreeViewItemArrays =
-        ["itemDepths", "itemExpanded", "itemHasChildren", "itemSelectedImages"];
+        ["itemDepths", "itemExpanded", "itemHasChildren", "itemSelectedImages",
+         "itemStateImages"];
 
     private static readonly string[] RequiredSliderProperties =
         ["minimum", "maximum", "position", "smallChange", "largeChange"];
@@ -1791,6 +1840,15 @@ internal static class ProtocolValidator
                 RequireProperties(node, $"{context}.treeView", RequiredTreeViewProperties);
                 foreach (var name in TreeViewItemArrays)
                     RequireKind(node.GetProperty(name), JsonValueKind.Array, $"{context}.treeView.{name}");
+                var stateImages = RequireKind(node.GetProperty("stateImageList"), JsonValueKind.Array,
+                    $"{context}.treeView.stateImageList");
+                foreach (var image in stateImages.EnumerateArray())
+                    RequireProperties(image, $"{context}.treeView.stateImageList.icon", RequiredImageProperties);
+            }
+            else if (node.TryGetProperty("stateImageList", out _))
+            {
+                throw new ProtocolException(
+                    $"{context}.node carries TreeView-only state images.");
             }
             else if (TreeViewItemArrays.Any(name =>
                          node.TryGetProperty(name, out var hierarchy) &&

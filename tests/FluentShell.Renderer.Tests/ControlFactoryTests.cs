@@ -102,6 +102,20 @@ public sealed class ControlFactoryTests
     }
 
     [Fact]
+    public void SysLinkSlotBoundsRecoverTheCenteredNativeRectangle()
+    {
+        // About MMC: native SysLink 969,622 368x38; the centered text visual
+        // the default peer published was 969,633 368x16.
+        var corrected = ControlFactory.CenteredLayoutSlotBounds(
+            new global::Windows.Foundation.Rect(969, 633, 368, 16), 368, 38);
+
+        Assert.Equal(969, corrected.X);
+        Assert.Equal(622, corrected.Y);
+        Assert.Equal(368, corrected.Width);
+        Assert.Equal(38, corrected.Height);
+    }
+
+    [Fact]
     public void SplitsExactlyOneSysLinkLabelIntoInlineSegments()
     {
         var segments = ControlFactory.SplitSysLinkText(
@@ -225,6 +239,17 @@ public sealed class ControlFactoryTests
         Assert.False(ControlFactory.HasRenderableTreeShape(mismatched));
         var rootless = ControlNodeViewModel.FromSnapshot(TreeNode() with { ItemDepths = [1, 1] });
         Assert.False(ControlFactory.HasRenderableTreeShape(rootless));
+
+        var empty = ControlNodeViewModel.FromSnapshot(TreeNode() with
+        {
+            Items = [],
+            ItemDepths = [],
+            ItemExpanded = [],
+            ItemHasChildren = [],
+            ItemStateImages = [],
+            SelectedIndex = -1,
+        });
+        Assert.True(ControlFactory.HasRenderableTreeShape(empty));
     }
 
     [Fact]
@@ -282,6 +307,8 @@ public sealed class ControlFactoryTests
         ItemDepths = [0, 1],
         ItemExpanded = [true, false],
         ItemHasChildren = [true, false],
+        ItemStateImages = [-1, -1],
+        StateImageList = [],
         SelectedIndex = 1,
     };
 

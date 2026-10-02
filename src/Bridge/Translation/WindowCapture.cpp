@@ -935,6 +935,17 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         for (const int image : node.itemImages) HashBytes(hash, image);
         HashBytes(hash, node.itemSelectedImages.size());
         for (const int image : node.itemSelectedImages) HashBytes(hash, image);
+        HashBytes(hash, node.stateImageList.size());
+        for (const auto& entry : node.stateImageList) {
+            HashBytes(hash, entry.imageWidth);
+            HashBytes(hash, entry.imageHeight);
+            HashString(hash, entry.imageFormat);
+            HashBytes(hash, entry.imageData.size());
+            if (!entry.imageData.empty())
+                HashRange(hash, entry.imageData.data(), entry.imageData.size());
+        }
+        HashBytes(hash, node.itemStateImages.size());
+        for (const int image : node.itemStateImages) HashBytes(hash, image);
         HashBytes(hash, node.editableLabels);
         HashBytes(hash, node.editingIndex);
         HashBytes(hash, node.imageWidth);

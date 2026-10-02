@@ -65,6 +65,52 @@ internal static class ListViewPresentation
             Width = checked((int)(right - left)), Height = checked((int)(bottom - top)),
         };
     }
+
+    // The proxy scroll offset is in DIPs and the native list scrolls in pixels.
+    // `alreadySent` is the portion of the current gesture already handed to the
+    // control, so a stream of ViewChanged events does not replay the same delta.
+    internal static bool TryIncrementalScroll(
+        double offsetX, double offsetY, double pinnedX, double pinnedY, double scale,
+        int alreadySentX, int alreadySentY, out int dx, out int dy)
+    {
+        dx = dy = 0;
+        if (scale <= 0 || !double.IsFinite(offsetX) || !double.IsFinite(offsetY) ||
+            !double.IsFinite(pinnedX) || !double.IsFinite(pinnedY)) return false;
+        var totalX = (int)Math.Round((offsetX - pinnedX) / scale);
+        var totalY = (int)Math.Round((offsetY - pinnedY) / scale);
+        dx = Math.Clamp(totalX - alreadySentX, -65535, 65535);
+        dy = Math.Clamp(totalY - alreadySentY, -65535, 65535);
+        return dx != 0 || dy != 0;
+    }
+}
+
+internal readonly record struct ListViewActivationIntent(int Index, string Identity);
+
+internal enum ListViewActivationDecision
+{
+    Wait,
+    Activate,
+    Drop,
+}
+
+internal static class ListViewActivationIntentPolicy
+{
+    // The intention names the item by the label it had when the user asked.
+    // A later snapshot may carry that same label at the same index; a different
+    // label there is a different item, and activating it would retarget the gesture.
+    public static ListViewActivationDecision Decide(
+        ListViewActivationIntent intent,
+        IReadOnlyList<string> items,
+        IReadOnlyList<int> selected,
+        int focused)
+    {
+        if (intent.Index < 0 || intent.Index >= items.Count ||
+            !string.Equals(items[intent.Index], intent.Identity, StringComparison.Ordinal))
+            return ListViewActivationDecision.Drop;
+        return focused == intent.Index && selected.Contains(intent.Index)
+            ? ListViewActivationDecision.Activate
+            : ListViewActivationDecision.Wait;
+    }
 }
 
 internal sealed class ActivatableListViewItem : ListViewItem

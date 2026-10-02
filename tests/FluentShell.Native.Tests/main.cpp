@@ -3791,6 +3791,9 @@ void TestTreeViewCaptureAndExpansion() {
         Check(node->itemImages == std::vector<int>{ 0, 0, 0, 0 } &&
               node->itemSelectedImages == std::vector<int>{ 1, 1, 1, 1 },
             "TreeView per-item image indexes were not captured");
+        Check(node->stateImageList.empty() &&
+              node->itemStateImages == std::vector<int>{ -1, -1, -1, -1 },
+            "TreeView invented state images for items that draw none");
         if (node->itemImages != std::vector<int>{ 0, 0, 0, 0 } ||
             node->itemSelectedImages != std::vector<int>{ 1, 1, 1, 1 }) {
             std::wcerr << L"actual tree item images:";
@@ -3851,15 +3854,138 @@ void TestTreeViewCaptureAndExpansion() {
 
     Translation::ControlKind kind{};
     std::wstring reason;
-    HIMAGELIST states = ImageList_Create(16, 16, ILC_COLOR32, 1, 1);
-    SendMessageW(tree, TVM_SETIMAGELIST, TVSIL_STATE,
-        reinterpret_cast<LPARAM>(states));
+    // Overlay images are painted on the item icon, so the projected icon is the
+    // composited glyph rather than a reason to restore the native window.
+    if (icons) {
+        Check(ImageList_SetOverlayImage(icons, 1, 1) != FALSE,
+            "TreeView overlay image was not registered");
+        TVITEMW overlayItem{};
+        overlayItem.mask = TVIF_HANDLE | TVIF_STATE;
+        overlayItem.hItem = events;
+        overlayItem.stateMask = TVIS_OVERLAYMASK;
+        overlayItem.state = INDEXTOOVERLAYMASK(1);
+        Check(SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&overlayItem)) != FALSE,
+            "TreeView overlay state was not stored");
+        Translation::ControlNode overlaid;
+        overlaid.kind = Translation::ControlKind::TreeView;
+        overlaid.style = treeStyle;
+        reason.clear();
+        Check(Translation::CaptureControlDetail(tree, overlaid, reason),
+            "TreeView with an overlay image was rejected");
+        if (!reason.empty()) std::wcerr << L"overlay rejection: " << reason << L'\n';
+        Check(overlaid.itemImages.size() == 4 && overlaid.itemImages[3] != overlaid.itemImages[0],
+            "TreeView overlay did not produce a distinct item icon");
+        HICON composited = ImageList_GetIcon(icons, 0, ILD_NORMAL | INDEXTOOVERLAYMASK(1));
+        std::vector<uint8_t> compositedPixels;
+        uint32_t overlayWidth = 0;
+        uint32_t overlayHeight = 0;
+        std::wstring overlayFormat;
+        std::wstring overlayReason;
+        const bool overlayCopied = composited && Translation::CaptureOwnedIconPixels(
+            composited, overlayWidth, overlayHeight, overlayFormat, compositedPixels, overlayReason);
+        if (composited) DestroyIcon(composited);
+        Check(overlayCopied && overlaid.itemImages[3] >= 0 &&
+              static_cast<size_t>(overlaid.itemImages[3]) < overlaid.imageList.size() &&
+              overlaid.imageList[static_cast<size_t>(overlaid.itemImages[3])].imageData == compositedPixels,
+            "TreeView overlay icon was not the control's composited glyph");
+        overlayItem.state = 0;
+        SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&overlayItem));
+    }
+
+    // State image index 0 means "draw nothing", so a referenced glyph is index 1.
+    // The same bits without a list are TVIS_USERMASK and must not refuse the tree.
+    const auto addColor = [](HIMAGELIST list, uint8_t red, uint8_t green, uint8_t blue) {
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = 16;
+        info.bmiHeader.biHeight = -16;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        const HDC screen = GetDC(nullptr);
+        const HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (screen) ReleaseDC(nullptr, screen);
+        if (!bitmap || !bits) return -1;
+        auto* pixels = static_cast<uint32_t*>(bits);
+        const uint32_t pixel = static_cast<uint32_t>(blue) |
+            (static_cast<uint32_t>(green) << 8) |
+            (static_cast<uint32_t>(red) << 16) |
+            0xFF000000u;
+        for (int i = 0; i < 16 * 16; ++i) pixels[i] = pixel;
+        const int index = ImageList_Add(list, bitmap, nullptr);
+        DeleteObject(bitmap);
+        return index;
+    };
+    HIMAGELIST states = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 3, 1);
+    Check(states && addColor(states, 0, 0, 0) == 0 && addColor(states, 220, 20, 20) == 1 &&
+          addColor(states, 20, 20, 220) == 2,
+        "TreeView state image glyphs were not created");
+    SendMessageW(tree, TVM_SETIMAGELIST, TVSIL_STATE, reinterpret_cast<LPARAM>(states));
     reason.clear();
-    Check(states && !Translation::ClassifyControl(tree, kind, reason) &&
-          reason.find(L"state image list") != std::wstring::npos,
-        "a TreeView state image list was accepted");
+    Check(Translation::ClassifyControl(tree, kind, reason) &&
+          kind == Translation::ControlKind::TreeView,
+        "a TreeView state image list was rejected");
+    TVITEMW stateItem{};
+    stateItem.mask = TVIF_HANDLE | TVIF_STATE;
+    stateItem.hItem = root;
+    stateItem.stateMask = TVIS_STATEIMAGEMASK;
+    stateItem.state = INDEXTOSTATEIMAGEMASK(1);
+    Check(SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&stateItem)) != FALSE,
+        "TreeView state image was not stored");
+    stateItem.hItem = services;
+    stateItem.state = INDEXTOSTATEIMAGEMASK(2);
+    SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&stateItem));
+    Translation::ControlNode stated;
+    stated.kind = Translation::ControlKind::TreeView;
+    stated.style = treeStyle;
+    reason.clear();
+    Check(Translation::CaptureControlDetail(tree, stated, reason),
+        "TreeView with state images was rejected");
+    if (!reason.empty()) std::wcerr << L"state-image rejection: " << reason << L'\n';
+    Check(stated.itemStateImages == std::vector<int>{ 0, 1, -1, -1 } &&
+          stated.stateImageList.size() == 2 &&
+          stated.stateImageList[0].imageData != stated.stateImageList[1].imageData,
+        "TreeView state images were not captured as a separate list");
+    HICON stateGlyph = states ? ImageList_GetIcon(states, 1, ILD_NORMAL) : nullptr;
+    std::vector<uint8_t> statePixels;
+    uint32_t stateWidth = 0;
+    uint32_t stateHeight = 0;
+    std::wstring stateFormat;
+    std::wstring stateReason;
+    const bool stateCopied = stateGlyph && Translation::CaptureOwnedIconPixels(
+        stateGlyph, stateWidth, stateHeight, stateFormat, statePixels, stateReason);
+    if (stateGlyph) DestroyIcon(stateGlyph);
+    Check(stateCopied && !stated.stateImageList.empty() &&
+          stated.stateImageList[0].imageData == statePixels,
+        "TreeView state image pixels were not image-list index 1");
+    if (!stated.itemStateImages.empty()) {
+        Translation::WindowSnapshot owned;
+        owned.nodes.push_back(stated);
+        const auto stateFingerprint = Translation::SnapshotFingerprint(owned);
+        owned.nodes[0].itemStateImages[0] = 1;
+        Check(stateFingerprint != Translation::SnapshotFingerprint(owned),
+            "TreeView state image index was omitted from the fingerprint");
+    }
     SendMessageW(tree, TVM_SETIMAGELIST, TVSIL_STATE, 0);
     if (states) ImageList_Destroy(states);
+    stateItem.hItem = root;
+    stateItem.state = INDEXTOSTATEIMAGEMASK(4);
+    SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&stateItem));
+    stateItem.hItem = services;
+    stateItem.state = 0;
+    SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&stateItem));
+    reason.clear();
+    Translation::ControlNode userMask;
+    userMask.kind = Translation::ControlKind::TreeView;
+    userMask.style = treeStyle;
+    Check(Translation::CaptureControlDetail(tree, userMask, reason) &&
+          userMask.stateImageList.empty() &&
+          userMask.itemStateImages == std::vector<int>{ -1, -1, -1, -1 },
+        "TreeView user-mask bits without a state image list were refused");
+    stateItem.hItem = root;
+    stateItem.state = 0;
+    SendMessageW(tree, TVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&stateItem));
     reason.clear();
     Check(Translation::ClassifyControl(tree, kind, reason) &&
           kind == Translation::ControlKind::TreeView,
@@ -3888,6 +4014,19 @@ void TestTreeViewCaptureAndExpansion() {
     Check(!Translation::CaptureControlDetail(tree, detail, reason) &&
           reason.find(L"nonempty") != std::wstring::npos,
         "TreeView accepted an item with no label");
+    // A tree with nothing inserted is a real console state, not an unsupported
+    // control. The select that lands in that moment must not roll the window back.
+    SendMessageW(tree, TVM_DELETEITEM, 0, reinterpret_cast<LPARAM>(TVI_ROOT));
+    reason.clear();
+    Translation::ControlNode empty;
+    empty.kind = Translation::ControlKind::TreeView;
+    empty.style = treeStyle;
+    Check(Translation::CaptureControlDetail(tree, empty, reason) &&
+          empty.items.empty() && empty.selectedIndex == -1 &&
+          empty.itemDepths.empty() && empty.itemStateImages.empty() &&
+          empty.imageList.empty() && empty.stateImageList.empty(),
+        "an empty TreeView was rejected");
+    if (!reason.empty()) std::wcerr << L"empty-tree rejection: " << reason << L'\n';
     DestroyWindow(window);
     if (icons) ImageList_Destroy(icons);
 }

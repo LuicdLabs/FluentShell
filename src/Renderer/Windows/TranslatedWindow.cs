@@ -752,6 +752,7 @@ public sealed class TranslatedWindow : Window
             "setCheck" => "checked",
             "select" => "selectedIndex",
             "setSelection" => "selectedIndices",
+            "setFocusedIndex" => "focusedIndex",
             "setItemCheck" => "checkedIndices",
             "setItemText" => "items",
             "setValue" => "position",

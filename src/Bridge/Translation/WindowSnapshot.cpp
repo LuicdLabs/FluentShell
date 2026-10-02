@@ -255,6 +255,22 @@ JsonObject NodeToJson(const ControlNode& node) {
             itemSelectedImages.Append(JsonValue::CreateNumberValue(image));
         }
         result.Insert(L"itemSelectedImages", itemSelectedImages);
+        JsonArray stateImageList;
+        for (const auto& entry : node.stateImageList) {
+            JsonObject image;
+            image.Insert(L"imageWidth", JsonValue::CreateNumberValue(entry.imageWidth));
+            image.Insert(L"imageHeight", JsonValue::CreateNumberValue(entry.imageHeight));
+            image.Insert(L"imageFormat", JsonValue::CreateStringValue(entry.imageFormat));
+            image.Insert(L"imageData",
+                JsonValue::CreateStringValue(Base64Encode(entry.imageData)));
+            stateImageList.Append(image);
+        }
+        result.Insert(L"stateImageList", stateImageList);
+        JsonArray itemStateImages;
+        for (const int image : node.itemStateImages) {
+            itemStateImages.Append(JsonValue::CreateNumberValue(image));
+        }
+        result.Insert(L"itemStateImages", itemStateImages);
     }
     if (node.kind == ControlKind::TreeView || node.kind == ControlKind::ListView) {
         JsonArray imageList;
@@ -582,6 +598,42 @@ bool ParseActionValue(
             return false;
         }
         action.itemIndex = static_cast<int>(index);
+        return true;
+    }
+    if (action.action == L"setFocusedIndex") {
+        if (value.ValueType() != JsonValueType::Number) {
+            error = L"setFocusedIndex requires an integer item index";
+            return false;
+        }
+        const double index = value.GetNumber();
+        if (!std::isfinite(index) || std::trunc(index) != index ||
+            index < -1 || index >= static_cast<double>(Ipc::kMaxListItems)) {
+            error = L"setFocusedIndex index is outside range";
+            return false;
+        }
+        action.itemIndex = static_cast<int>(index);
+        return true;
+    }
+    if (action.action == L"scrollBy") {
+        if (value.ValueType() != JsonValueType::Object) {
+            error = L"scrollBy requires a dx/dy object";
+            return false;
+        }
+        const auto object = value.GetObject();
+        if (object.Size() != 2 || !object.HasKey(L"dx") || !object.HasKey(L"dy")) {
+            error = L"scrollBy requires exactly dx and dy";
+            return false;
+        }
+        LONG dx = 0;
+        LONG dy = 0;
+        if (!JsonInteger(object, L"dx", dx) || !JsonInteger(object, L"dy", dy) ||
+            dx < -Ipc::kMaxCoordinate || dx > Ipc::kMaxCoordinate ||
+            dy < -Ipc::kMaxCoordinate || dy > Ipc::kMaxCoordinate) {
+            error = L"scrollBy delta is outside range";
+            return false;
+        }
+        action.integerValue = dx;
+        action.itemIndex = dy;
         return true;
     }
     if (action.action == L"setSelection") {
@@ -1090,7 +1142,7 @@ bool ParseActionInvoke(
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
-            L"setSelection", L"setItemCheck", L"setItemText", L"activateItem", L"setValue", L"setExpand",
+            L"setSelection", L"setFocusedIndex", L"setItemCheck", L"setItemText", L"activateItem", L"scrollBy", L"setValue", L"setExpand",
             L"setSplit", L"setColumnOrder", L"islandInvoke",
             L"menuCommand", L"popupCommand", L"toolbarCommand", L"mdiCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
@@ -1101,8 +1153,10 @@ bool ParseActionInvoke(
         }
         const bool requiresNode = action.action == L"invoke" || action.action == L"setText" ||
             action.action == L"setCheck" || action.action == L"select" ||
-            action.action == L"setSelection" || action.action == L"setItemCheck" ||
+            action.action == L"setSelection" || action.action == L"setFocusedIndex" ||
+            action.action == L"setItemCheck" ||
             action.action == L"setItemText" || action.action == L"activateItem" ||
+            action.action == L"scrollBy" ||
             action.action == L"setValue" || action.action == L"setExpand" ||
             action.action == L"setSplit" ||
             action.action == L"setColumnOrder" ||
@@ -1321,8 +1375,9 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"select") {
-        // A tab control and a tree always have a current item; a list or combo box
-        // can legitimately have none, so only those accept -1.
+        // A tab control and a populated tree name an existing item. An empty
+        // tree has nothing to select. A list or combo box can legitimately have
+        // none, so only those accept -1.
         const bool requiresItem = node.kind == ControlKind::TabControl ||
             node.kind == ControlKind::TreeView;
         const bool selectable = node.kind == ControlKind::ComboBox ||
@@ -1367,9 +1422,11 @@ bool ValidateActionForSnapshot(
     }
     if (action.action == L"activateItem") {
         if (node.kind != ControlKind::ListView || !node.itemActivationSupported ||
-            node.itemNativeIds.size() != ListViewItemCount(node) || action.itemIndex < 0 ||
-            static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node)) {
-            error = L"activateItem requires an index within a ListView with native activation";
+            node.itemNativeIds.size() != ListViewItemCount(node) ||
+            (action.itemIndex < 0 && action.itemIndex > -1) ||
+            (action.itemIndex >= 0 &&
+                static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node))) {
+            error = L"activateItem requires a ListView item index with native activation";
             return false;
         }
         return true;
@@ -1545,6 +1602,7 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
         action == L"move" || action == L"resize" || action == L"setValue" ||
         action == L"setSplit" ||
         action == L"setColumnOrder" ||
+        action == L"scrollBy" ||
         action == L"islandInvoke" || action == L"popupCommand" ||
         action == L"mdiCommand";
 }

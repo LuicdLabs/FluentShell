@@ -132,9 +132,13 @@ adapter.
   depth, expansion, child evidence, and normal/selected image indexes, with single
   selection, a real expansion route so a lazily populated tree still fills in
   through its own `TVN_ITEMEXPANDING`, and in-place label editing where
-  `TVS_EDITLABELS` admits it. State images and checkboxes, hover selection,
-  auto-collapse, callback children, application infotips, and multi-select
-  extended styles remain native.
+  `TVS_EDITLABELS` admits it. An empty tree is a valid snapshot, because a console
+  clears its scope tree while a snap-in reloads. Overlay images are composited into
+  the item icon the control paints. A state image list is a second bounded list
+  drawn beside the icon; state-image bits with no list are the control's private
+  user mask and are not a refusal. Checkboxes, hover selection, auto-collapse,
+  callback children, application infotips, and multi-select extended styles remain
+  native.
 - A bounded `msctls_trackbar32` subset is implemented: range, position, line and
   page size, orientation, and the native reversed hint, driven through the
   control's own `WM_HSCROLL`/`WM_VSCROLL` notification and validated as UIA
@@ -161,8 +165,12 @@ implemented rather than refused.
   items resolve to an index outside it, is refused instead of projected with
   missing icons. Trees additionally carry the selected-state index, so the
   projection shows the open-folder icon for the current selection the way the
-  native control does. State and overlay image lists stay refused: they encode
-  application state the projection has no contract for.
+  native control does. An overlay is not a second list: capture composites it
+  into the icon the control draws, keyed by image index plus overlay index, so
+  two items can share a base image and still differ where one carries a badge.
+  State images travel as `stateImageList` and `itemStateImages` and share the
+  icon count and decoded-pixel budget. Checkbox styles stay refused, because
+  those glyphs are a toggle the control owns rather than a decoration.
 - **A rename runs the native control's own label session.** The renderer hosts the
   typing experience locally (F2 or the UIA Value pattern opens a TextBox over the
   item), and the commit is one source-thread command that opens

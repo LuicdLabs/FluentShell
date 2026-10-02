@@ -73,6 +73,14 @@ int ProportionalSplitTarget(
 // column.  `order` must be a permutation of the column indexes.
 bool SetListViewColumnOrder(HWND listView, const std::vector<int>& order) noexcept;
 
+// Moves only LVIS_FOCUSED. Selection is untouched. -1 clears focus; a nonnegative
+// index also asks the control to bring that item into its own viewport.
+bool SetListViewFocusedIndex(HWND listView, int index) noexcept;
+
+// Scrolls a non-report ListView by a pixel delta through LVM_SCROLL. Report views
+// are refused here because their projection scrolls inside the WinUI presenter.
+bool ScrollListViewBy(HWND listView, int dx, int dy) noexcept;
+
 // Resolves a stable native ListView ID and verifies its reverse mapping. UINT_MAX
 // and IDs whose item was removed are invalid; ID zero is a valid native identity.
 int ResolveListViewItemByNativeId(HWND listView, uint32_t nativeId) noexcept;

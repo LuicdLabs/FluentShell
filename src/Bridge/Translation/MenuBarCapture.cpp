@@ -492,9 +492,14 @@ static bool ReadOrInvokeMenuBarToolbar(
         void Release() noexcept {
             if (released) return;
             released = true;
-            // This marker belongs only to the current bounded read. Leaving it
-            // behind would make a later cloaked state suppress unrelated menus.
-            if (IsWindow(root)) RemovePropW(root, kReadOwnerProperty);
+            // The read-owner marker deliberately outlives this bounded read. A
+            // cancelled or finished read can leave popup callbacks queued in the
+            // application's own message queue, and those callbacks fire after the
+            // read scope is gone. While the native root stays cloaked (that is,
+            // the projection is still covering it) those late popups must stay
+            // suppressed, so the marker is left in place. ShouldSuppressPopup also
+            // requires DWM_CLOAKED_APP, so restoring the native root ends the
+            // suppression on its own and the marker is harmless once uncloaked.
             suppression.reset();
             g_menuBarReadInProgress = false;
             if (active && IsWindow(active)) SetActiveWindow(active);

@@ -108,6 +108,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     public ObservableCollection<ImageListEntry> ImageList { get; } = [];
     public ObservableCollection<int> ItemImages { get; } = [];
     public ObservableCollection<int> ItemSelectedImages { get; } = [];
+    public ObservableCollection<ImageListEntry> StateImageList { get; } = [];
+    public ObservableCollection<int> ItemStateImages { get; } = [];
     public bool EditableLabels { get => _editableLabels; private set => SetProperty(ref _editableLabels, value); }
     public int EditingIndex { get => _editingIndex; private set => SetProperty(ref _editingIndex, value); }
     public ObservableCollection<IReadOnlyList<string>> Rows { get; } = [];
@@ -191,7 +193,8 @@ public sealed class ControlNodeViewModel : ObservableObject
         ReplaceItems(node.Items);
         ReplaceTreeState(node.ItemDepths ?? [], node.ItemExpanded ?? [], node.ItemHasChildren ?? []);
         ReplaceItemImagery(
-            node.ImageList ?? [], node.ItemImages ?? [], node.ItemSelectedImages ?? []);
+            node.ImageList ?? [], node.ItemImages ?? [], node.ItemSelectedImages ?? [],
+            node.StateImageList ?? [], node.ItemStateImages ?? []);
         EditableLabels = node.EditableLabels ?? false;
         EditingIndex = node.EditingIndex ?? -1;
         ReplaceItemRects(node.ItemRects ?? []);
@@ -235,6 +238,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool IsPendingEcho(string property, string? eventId) =>
         eventId is not null && _pendingEventIds.TryGetValue(property, out var pending) && pending == eventId;
 
+    public bool HasPending(string property) => _pendingEventIds.ContainsKey(property);
+
     public void RejectPending(string property, string eventId)
     {
         if (!IsPendingEcho(property, eventId)) return;
@@ -242,6 +247,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (property == "text") DraftText = Text;
         else if (property == "selectedIndex") RaisePropertyChanged(nameof(SelectedIndex));
         else if (property == "checkedIndices") RaisePropertyChanged(nameof(CheckedIndices));
+        else if (property == "focusedIndex") RaisePropertyChanged(nameof(FocusedIndex));
         else if (property == "position") RaisePropertyChanged(nameof(Position));
         else if (property == "itemExpanded") RaisePropertyChanged(nameof(ItemDepths));
         else if (property == "toolbarCommand") RaisePropertyChanged(nameof(ToolbarItems));
@@ -450,16 +456,24 @@ public sealed class ControlNodeViewModel : ObservableObject
     private void ReplaceItemImagery(
         IReadOnlyList<ImageListEntry> imageList,
         IReadOnlyList<int> itemImages,
-        IReadOnlyList<int> selectedImages)
+        IReadOnlyList<int> selectedImages,
+        IReadOnlyList<ImageListEntry> stateImageList,
+        IReadOnlyList<int> stateImages)
     {
         if (ImageList.SequenceEqual(imageList) && ItemImages.SequenceEqual(itemImages) &&
-            ItemSelectedImages.SequenceEqual(selectedImages)) return;
+            ItemSelectedImages.SequenceEqual(selectedImages) &&
+            StateImageList.SequenceEqual(stateImageList) &&
+            ItemStateImages.SequenceEqual(stateImages)) return;
         ImageList.Clear();
         foreach (var entry in imageList) ImageList.Add(entry);
         ItemImages.Clear();
         foreach (var index in itemImages) ItemImages.Add(index);
         ItemSelectedImages.Clear();
         foreach (var index in selectedImages) ItemSelectedImages.Add(index);
+        StateImageList.Clear();
+        foreach (var entry in stateImageList) StateImageList.Add(entry);
+        ItemStateImages.Clear();
+        foreach (var index in stateImages) ItemStateImages.Add(index);
         RaisePropertyChanged(nameof(ItemImages));
     }
 

@@ -51,7 +51,10 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // It also adds inert staticDecoration nodes for built-in Static frames and fills.
 // Minor 22 adds MSAA page-tab islands with canonical selection state.
 // Minor 23 adds positioned ListView modes, revision-gated item activation, and toolbar radio groups.
-inline constexpr uint16_t kProtocolMinor = 23;
+// Minor 24 separates ListView focus from selection and scrolls non-report views natively.
+// Minor 25 projects TreeView state images beside the item. Overlay images are
+// composited into the existing item icons, and an empty tree is a valid snapshot.
+inline constexpr uint16_t kProtocolMinor = 25;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

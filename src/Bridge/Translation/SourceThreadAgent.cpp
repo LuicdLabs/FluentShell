@@ -784,14 +784,14 @@ bool ApplySetSelection(
     const auto& requested = command->action.integerValues;
 
     LVITEMW state{};
-    state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+    state.stateMask = LVIS_SELECTED;
     state.state = 0;
     SendMessageW(target, LVM_SETITEMSTATE,
         static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(&state));
     for (size_t index = 0; index < requested.size(); ++index) {
         if (AbortIfCancelled(command)) return false;
-        state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-        state.state = LVIS_SELECTED | (index == 0 ? LVIS_FOCUSED : 0);
+        state.stateMask = LVIS_SELECTED;
+        state.state = LVIS_SELECTED;
         SendMessageW(target, LVM_SETITEMSTATE,
             static_cast<WPARAM>(requested[index]), reinterpret_cast<LPARAM>(&state));
     }
@@ -813,6 +813,10 @@ bool ApplySetSelection(
         previous = selected;
     }
     command->success = actual == requested;
+    // The control ran the selection and settled somewhere else. That is a
+    // refusal of this action, not a broken projection.
+    command->refused = !command->success;
+    if (!command->success) command->error = L"the list did not keep the requested selection";
     return true;
 }
 
@@ -842,6 +846,28 @@ bool ExecuteCaptureDirectUiBootstrap(Command* command) {
         return TRUE;
     }, reinterpret_cast<LPARAM>(command->agent));
     command->agent->ClearDirty();
+    return true;
+}
+
+bool ApplySetFocusedIndex(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView) return true;
+    if (AbortIfCancelled(command)) return false;
+    const int index = command->action.itemIndex;
+    if (index < -1 || (index >= 0 && static_cast<size_t>(index) >= ListViewItemCount(node))) return true;
+    command->success = SetListViewFocusedIndex(target, index);
+    command->refused = !command->success;
+    if (!command->success) command->error = L"the list refused the focus change";
+    return true;
+}
+
+bool ApplyScrollBy(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView || node.listViewMode == L"report") return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = ScrollListViewBy(target, command->action.integerValue, command->action.itemIndex);
+    command->refused = !command->success;
+    if (!command->success) command->error = L"the list did not scroll";
     return true;
 }
 
@@ -999,6 +1025,8 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"setCheck", &ApplySetCheck },
     NodeActionEntry{ L"select", &ApplySelect },
     NodeActionEntry{ L"setSelection", &ApplySetSelection },
+    NodeActionEntry{ L"setFocusedIndex", &ApplySetFocusedIndex },
+    NodeActionEntry{ L"scrollBy", &ApplyScrollBy },
     NodeActionEntry{ L"setItemCheck", &ApplySetItemCheck },
     NodeActionEntry{ L"setItemText", &ApplySetItemText },
     NodeActionEntry{ L"setValue", &ApplySetValue },

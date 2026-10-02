@@ -795,6 +795,8 @@ public class ProtocolValidatorTests
                 ],
                 ItemImages = [0, 0, -1],
                 ItemSelectedImages = [0, -1, -1],
+                StateImageList = [],
+                ItemStateImages = [-1, -1, -1],
                 EditableLabels = true,
                 EditingIndex = -1,
             },
@@ -898,9 +900,31 @@ public class ProtocolValidatorTests
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
         snapshot.Nodes[0] = valid with { MultiSelect = true };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { ItemStateImages = [-1, 4, -1] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+
+        // A console tree is empty while its snap-in reloads. That is a complete
+        // snapshot, and the selection is "nothing" rather than a missing root.
+        snapshot.Nodes[0] = valid with
+        {
+            Items = [],
+            ItemDepths = [],
+            ItemExpanded = [],
+            ItemHasChildren = [],
+            ItemImages = [],
+            ItemSelectedImages = [],
+            ItemStateImages = [],
+            ImageList = [],
+            StateImageList = [],
+            SelectedIndex = -1,
+            EditableLabels = false,
+        };
+        ProtocolValidator.ValidateSnapshot(snapshot);
 
         // Only a tree may carry per-item hierarchy state.
         snapshot.Nodes[0] = NodeOfKind("listBox") with { ItemDepths = [0] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = NodeOfKind("listBox") with { StateImageList = [] };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
     }
 

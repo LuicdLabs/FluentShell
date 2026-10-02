@@ -57,6 +57,22 @@ public class ItemImageryProtocolTests
     }
 
     [Fact]
+    public void StateImagesShareTheNormalIconBudget()
+    {
+        var icons = Enumerable.Repeat(Icon(64), 64).ToList();
+        var node = ItemNode("treeView", icons, [0]) with
+        {
+            StateImageList = [Icon(1)],
+            ItemStateImages = [0],
+        };
+        var exception = Assert.Throws<ProtocolException>(() => Validate(node));
+        Assert.Contains("decoded pixel budget", exception.Message);
+
+        node = node with { StateImageList = [], ItemStateImages = [-1] };
+        Validate(node);
+    }
+
+    [Fact]
     public void TwoDistinctReferencesPerMaximumTreeItemFitTheCountCap()
     {
         var icons = Enumerable.Repeat(Icon(1), ProtocolConstants.MaxImageListImages).ToList();
@@ -161,6 +177,8 @@ public class ItemImageryProtocolTests
             ItemExpanded = Enumerable.Repeat(false, items.Count).ToList(),
             ItemHasChildren = Enumerable.Repeat(false, items.Count).ToList(),
             ItemSelectedImages = indexes.ToList(),
+            StateImageList = [],
+            ItemStateImages = Enumerable.Repeat(-1, items.Count).ToList(),
         } : node with
         {
             Columns = ["Name"],

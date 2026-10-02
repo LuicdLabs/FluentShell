@@ -102,14 +102,22 @@
         },
         {
           "if": { "properties": { "kind": { "const": "treeView" } }, "required": ["kind"] },
-          "then": { "required": ["selectedIndex", "items", "itemDepths", "itemExpanded", "itemHasChildren", "itemSelectedImages"] },
+          "then": { "required": ["selectedIndex", "items", "itemDepths", "itemExpanded", "itemHasChildren", "itemSelectedImages", "stateImageList", "itemStateImages"] },
           "else": {
             "properties": {
               "itemDepths": { "maxItems": 0 },
               "itemExpanded": { "maxItems": 0 },
-              "itemHasChildren": { "maxItems": 0 }
+              "itemHasChildren": { "maxItems": 0 },
+              "itemStateImages": { "maxItems": 0 },
+              "stateImageList": { "maxItems": 0 }
             },
-            "not": { "required": ["itemSelectedImages"] }
+            "not": {
+              "anyOf": [
+                { "required": ["itemSelectedImages"] },
+                { "required": ["itemStateImages"] },
+                { "required": ["stateImageList"] }
+              ]
+            }
           }
         },
         {
@@ -291,11 +299,26 @@
         "itemHasChildren": { "type": "array", "maxItems": 4096, "items": { "type": "boolean" } },
         "itemImages": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": -1, "maximum": 8191 } },
         "itemSelectedImages": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": -1, "maximum": 8191 } },
+        "itemStateImages": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": -1, "maximum": 8191 } },
         "editableLabels": { "type": "boolean" },
         "editingIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
         "imageList": {
           "type": "array", "maxItems": 8192,
           "description": "Compact referenced icons. Runtime validation also limits aggregate decoded BGRA pixels to 1048576 bytes per node.",
+          "items": {
+            "type": "object",
+            "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"],
+            "properties": {
+              "imageWidth": { "type": "integer", "minimum": 1, "maximum": 64 },
+              "imageHeight": { "type": "integer", "minimum": 1, "maximum": 64 },
+              "imageFormat": { "const": "bgra8-premultiplied" },
+              "imageData": { "type": "string", "minLength": 8, "maxLength": 21848, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            }
+          }
+        },
+        "stateImageList": {
+          "type": "array", "maxItems": 8192,
+          "description": "Referenced TreeView state-image icons, sharing the normal image list's count and decoded-pixel budget.",
           "items": {
             "type": "object",
             "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"],
@@ -590,6 +613,26 @@
           "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 4095 } } }
         },
         {
+          "if": { "properties": { "action": { "const": "setFocusedIndex" } }, "required": ["action"] },
+          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": -1, "maximum": 4095 } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "scrollBy" } }, "required": ["action"] },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["dx", "dy"],
+                "properties": {
+                  "dx": { "type": "integer", "minimum": -65535, "maximum": 65535 },
+                  "dy": { "type": "integer", "minimum": -65535, "maximum": 65535 }
+                }
+              }
+            }
+          }
+        },
+        {
           "if": { "properties": { "action": { "const": "islandInvoke" } }, "required": ["action"] },
           "then": {
             "properties": {
@@ -629,7 +672,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "islandInvoke", "activateItem", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "setItemCheck", "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "islandInvoke", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

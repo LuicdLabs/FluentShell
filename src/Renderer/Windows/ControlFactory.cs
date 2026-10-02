@@ -730,10 +730,32 @@ internal sealed class ControlFactory
             "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><Canvas/></ItemsPanelTemplate>");
         var contentBounds = new PixelRect();
         var pendingScroll = false;
+        var sentScrollX = 0;
+        var sentScrollY = 0;
+        ScrollViewer? scrollHook = null;
+        void OnListScroll(object? sender, ScrollViewerViewChangedEventArgs args)
+        {
+            if (pendingScroll || _isApplyingCanonical() || viewModel.ListViewMode == "report" ||
+                sender is not ScrollViewer scroll || !_lifetime.IsActive) return;
+            if (!ListViewPresentation.TryIncrementalScroll(
+                    scroll.HorizontalOffset, scroll.VerticalOffset,
+                    -contentBounds.X * _scale, -contentBounds.Y * _scale, _scale,
+                    sentScrollX, sentScrollY, out var dx, out var dy) ||
+                !AllowsAction(viewModel, "scrollBy")) return;
+            sentScrollX += dx;
+            sentScrollY += dy;
+            _action(viewModel, "scrollBy", new ScrollByActionValue { Dx = dx, Dy = dy });
+        }
         void ApplyItemLayout()
         {
             if (!_lifetime.IsActive || viewModel.ListViewMode == "report" || control.ItemsPanelRoot is not Canvas canvas) return;
             var scroll = FindScrollViewer(control);
+            if (!ReferenceEquals(scroll, scrollHook))
+            {
+                if (scrollHook is not null) scrollHook.ViewChanged -= OnListScroll;
+                scrollHook = scroll;
+                if (scrollHook is not null) scrollHook.ViewChanged += OnListScroll;
+            }
             var x = -contentBounds.X * _scale;
             var y = -contentBounds.Y * _scale;
             // Include the viewport after translating a negative native origin,
@@ -760,6 +782,8 @@ internal sealed class ControlFactory
         var rowContents = new List<ProjectedItemContent>();
         var selectionAnchor = -1;
         long itemPresentationGeneration = 0;
+        ListViewActivationIntent? pendingActivation = null;
+        var activationRequested = false;
 
         int FocusedItemIndex()
         {
@@ -770,12 +794,62 @@ internal sealed class ControlFactory
             return focused is ListViewItem item ? control.IndexFromContainer(item) : control.SelectedIndex;
         }
 
+        void RequestActivationState(int index)
+        {
+            if (activationRequested || _isApplyingCanonical()) return;
+            activationRequested = true;
+            if (!viewModel.SelectedIndices.Contains(index) &&
+                !viewModel.HasPending("selectedIndices") &&
+                AllowsAction(viewModel, "setSelection"))
+            {
+                var selection = viewModel.MultiSelect
+                    ? CanonicalSelectionIndices(viewModel.SelectedIndices.Append(index))
+                    : new[] { index };
+                if (!viewModel.SelectedIndices.SequenceEqual(selection))
+                    _action(viewModel, "setSelection", selection);
+            }
+            if (viewModel.FocusedIndex != index &&
+                !viewModel.HasPending("focusedIndex") &&
+                AllowsAction(viewModel, "setFocusedIndex"))
+                _action(viewModel, "setFocusedIndex", index);
+        }
+
+        void FlushActivation()
+        {
+            if (pendingActivation is not { } intent) return;
+            switch (ListViewActivationIntentPolicy.Decide(
+                intent, viewModel.Items, viewModel.SelectedIndices, viewModel.FocusedIndex))
+            {
+                case ListViewActivationDecision.Drop:
+                    pendingActivation = null;
+                    activationRequested = false;
+                    return;
+                case ListViewActivationDecision.Wait:
+                    if (_isApplyingCanonical())
+                        control.DispatcherQueue.TryEnqueue(FlushActivation);
+                    else RequestActivationState(intent.Index);
+                    return;
+                default:
+                    if (_isApplyingCanonical())
+                    {
+                        control.DispatcherQueue.TryEnqueue(FlushActivation);
+                        return;
+                    }
+                    pendingActivation = null;
+                    activationRequested = false;
+                    _action(viewModel, "activateItem", intent.Index);
+                    return;
+            }
+        }
+
         void ActivateItem(int index)
         {
             if (_isApplyingCanonical() || !viewModel.ItemActivationSupported ||
-                index < 0 || index >= control.Items.Count ||
+                index < 0 || index >= control.Items.Count || index >= viewModel.Items.Count ||
                 rowContents.Any(content => content.IsEditing) || !AllowsAction(viewModel, "activateItem")) return;
-            _action(viewModel, "activateItem", index);
+            pendingActivation = new ListViewActivationIntent(index, viewModel.Items[index]);
+            activationRequested = false;
+            FlushActivation();
         }
 
         ActivatableListViewItem WrapItem(FrameworkElement content, int index, string name)
@@ -1079,6 +1153,8 @@ internal sealed class ControlFactory
                             index, string.Join(" ", viewModel.Rows[index]))
                         : BuildIconItem(index, icons[index]));
                 pendingScroll = !report;
+                sentScrollX = 0;
+                sentScrollY = 0;
                 ApplyItemLayout();
             }
             finally
@@ -1098,6 +1174,11 @@ internal sealed class ControlFactory
             if (!viewModel.SelectedIndices.SequenceEqual(selection) &&
                 AllowsAction(viewModel, "setSelection"))
                 _action(viewModel, "setSelection", selection);
+            var focus = FocusedItemIndex();
+            if (focus < 0 && selection.Length > 0) focus = selection[^1];
+            if (focus >= 0 && focus != viewModel.FocusedIndex &&
+                AllowsAction(viewModel, "setFocusedIndex"))
+                _action(viewModel, "setFocusedIndex", focus);
         };
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
@@ -1108,16 +1189,24 @@ internal sealed class ControlFactory
                 nameof(viewModel.Rows) or nameof(viewModel.ColumnHeadersVisible) or
                 nameof(viewModel.CheckBoxes) or nameof(viewModel.ItemImages) or
                 nameof(viewModel.EditableLabels))
+            {
                 RebuildRows();
+                FlushActivation();
+            }
             else if (args.PropertyName == nameof(viewModel.MultiSelect))
             {
                 control.SelectionMode = SelectionModeFor(viewModel.MultiSelect);
                 ApplyCanonicalSelection();
             }
             else if (args.PropertyName == nameof(viewModel.SelectedIndices))
+            {
                 ApplyCanonicalSelection();
+                FlushActivation();
+            }
             else if (args.PropertyName == nameof(viewModel.CheckedIndices))
                 ApplyCanonicalChecks();
+            else if (args.PropertyName == nameof(viewModel.FocusedIndex))
+                FlushActivation();
         });
         control.KeyDown += (_, args) =>
         {
@@ -1134,6 +1223,7 @@ internal sealed class ControlFactory
                         global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
                     var ctrl = (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control) &
                         global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+                    destination.Focus(FocusState.Keyboard);
                     if (shift && viewModel.MultiSelect)
                     {
                         if (selectionAnchor < 0) selectionAnchor = Math.Max(0, current);
@@ -1147,14 +1237,21 @@ internal sealed class ControlFactory
                         finally { applyingSelection = false; }
                         if (!_isApplyingCanonical() && AllowsAction(viewModel, "setSelection"))
                             _action(viewModel, "setSelection", CanonicalSelectionIndices(control.SelectedItems.Cast<object>().Select(control.Items.IndexOf)));
+                        if (!_isApplyingCanonical() && next != viewModel.FocusedIndex &&
+                            AllowsAction(viewModel, "setFocusedIndex"))
+                            _action(viewModel, "setFocusedIndex", next);
                     }
-                    else if (!ctrl)
+                    else if (ctrl)
+                    {
+                        if (!_isApplyingCanonical() && next != viewModel.FocusedIndex &&
+                            AllowsAction(viewModel, "setFocusedIndex"))
+                            _action(viewModel, "setFocusedIndex", next);
+                    }
+                    else
                     {
                         selectionAnchor = next;
                         control.SelectedIndex = next;
                     }
-                    destination.Focus(FocusState.Keyboard);
-                    destination.StartBringIntoView();
                 }
                 args.Handled = true;
                 return;
@@ -1623,6 +1720,7 @@ internal sealed class ControlFactory
             control.Rebuild(viewModel.Items, viewModel.ItemDepths,
                 viewModel.ItemExpanded, viewModel.ItemHasChildren,
                 ItemIcons(viewModel, viewModel.Items.Count, viewModel.SelectedIndex),
+                StateIcons(viewModel, viewModel.Items.Count),
                 viewModel.SelectedIndex);
         }
         Rebuild();
@@ -1662,6 +1760,24 @@ internal sealed class ControlFactory
             var image = ImageIndexForItem(viewModel, index, selectedIndex);
             if (image < 0 || image >= decoded.Length) continue;
             decoded[image] ??= BitmapForImageListEntry(viewModel.ImageList[image]);
+            icons[index] = decoded[image];
+        }
+        return icons;
+    }
+
+    // State images are a second list, drawn to the left of the item icon. -1,
+    // or a missing entry, draws nothing. The index is not swapped on selection:
+    // a state glyph is not the selected-state icon.
+    private static IReadOnlyList<ImageSource?> StateIcons(ControlNodeViewModel viewModel, int itemCount)
+    {
+        var decoded = new WriteableBitmap?[viewModel.StateImageList.Count];
+        var icons = new ImageSource?[itemCount];
+        for (var index = 0; index < itemCount; ++index)
+        {
+            if (index >= viewModel.ItemStateImages.Count) continue;
+            var image = viewModel.ItemStateImages[index];
+            if (image < 0 || image >= decoded.Length) continue;
+            decoded[image] ??= BitmapForImageListEntry(viewModel.StateImageList[image]);
             icons[index] = decoded[image];
         }
         return icons;
@@ -1842,11 +1958,12 @@ internal sealed class ControlFactory
     // would describe a different tree, so the projection waits for a complete one
     // instead of rendering an intermediate shape.
     internal static bool HasRenderableTreeShape(ControlNodeViewModel viewModel) =>
-        viewModel.Items.Count is > 0 and <= ProtocolConstants.MaxItems &&
+        viewModel.Items.Count <= ProtocolConstants.MaxItems &&
         viewModel.ItemDepths.Count == viewModel.Items.Count &&
         viewModel.ItemExpanded.Count == viewModel.Items.Count &&
         viewModel.ItemHasChildren.Count == viewModel.Items.Count &&
-        viewModel.ItemDepths[0] == 0 &&
+        viewModel.ItemStateImages.Count == viewModel.Items.Count &&
+        (viewModel.Items.Count == 0 || viewModel.ItemDepths[0] == 0) &&
         viewModel.SelectedIndex >= -1 && viewModel.SelectedIndex < viewModel.Items.Count;
 
     internal static IReadOnlyList<TabHeaderRow> GroupTabHeaderRows(
@@ -1968,6 +2085,28 @@ internal sealed class ControlFactory
             reported.Y,
             owner.ActualWidth * scale,
             owner.ActualHeight * scale);
+    }
+
+    // A SysLink's default peer reports the centered text line, not the HWND slot.
+    // MMC's About dialog measured that as 368x16 at y+11 against a 368x38 native
+    // control, which misses the committed gate's 18px tolerance on height. The
+    // visual is already in physical pixels and inset inside the slot, so the slot
+    // origin is that visual shifted back by half the leftover on each axis.
+    internal static global::Windows.Foundation.Rect CenteredLayoutSlotBounds(
+        global::Windows.Foundation.Rect reported,
+        double slotWidth,
+        double slotHeight)
+    {
+        if (slotWidth <= 0 || slotHeight <= 0 ||
+            reported.Width <= 0 || reported.Height <= 0)
+            return reported;
+        var x = reported.X;
+        var y = reported.Y;
+        var insetX = slotWidth - reported.Width;
+        var insetY = slotHeight - reported.Height;
+        if (insetX > 1) x -= insetX / 2;
+        if (insetY > 1) y -= insetY / 2;
+        return new global::Windows.Foundation.Rect(x, y, slotWidth, slotHeight);
     }
 
     // The native control chose each button's width by measuring its label with GDI, and
@@ -2516,6 +2655,7 @@ internal sealed class SemanticTabControlAutomationPeer(SemanticTabControl owner)
 internal sealed class ProjectedItemContent : Grid
 {
     private const double LabelFontSize = 12;
+    private readonly Image _state = new() { Stretch = Stretch.None, IsHitTestVisible = false };
     private readonly Image _icon = new() { Stretch = Stretch.None, IsHitTestVisible = false };
     private readonly TextBlock _label = new()
     {
@@ -2544,13 +2684,18 @@ internal sealed class ProjectedItemContent : Grid
         else
         {
             ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            Grid.SetColumn(_label, 1);
+            Grid.SetColumn(_icon, 1);
+            Grid.SetColumn(_label, 2);
         }
+        Children.Add(_state);
         Children.Add(_icon);
         Children.Add(_label);
+        AutomationProperties.SetAccessibilityView(_state, AccessibilityView.Raw);
         AutomationProperties.SetAccessibilityView(_icon, AccessibilityView.Raw);
         AutomationProperties.SetAccessibilityView(_label, AccessibilityView.Raw);
+        ApplyStateIcon(null);
     }
 
     public string Text { get; private set; } = string.Empty;
@@ -2565,13 +2710,21 @@ internal sealed class ProjectedItemContent : Grid
     // name from the data object.  This element *is* that object.
     public override string ToString() => Text;
 
-    public void Apply(string text, ImageSource? icon)
+    public void Apply(string text, ImageSource? icon, ImageSource? stateIcon = null)
     {
         Text = text;
         _label.Text = text;
         AutomationProperties.SetName(this, text);
+        ApplyStateIcon(stateIcon);
         ApplyIcon(icon);
         if (_editor is not null) _editor.Text = text;
+    }
+
+    public void ApplyStateIcon(ImageSource? icon)
+    {
+        _state.Source = icon;
+        _state.Visibility = icon is null ? Visibility.Collapsed : Visibility.Visible;
+        _state.Margin = icon is null ? new Thickness(0) : new Thickness(0, 0, 4, 0);
     }
 
     public void ApplyIcon(ImageSource? icon)
@@ -2614,7 +2767,7 @@ internal sealed class ProjectedItemContent : Grid
         _editor.LostFocus += (_, _) => EndEdit(commit: true);
         _label.Visibility = Visibility.Collapsed;
         if (_largeIcon) Grid.SetRow(_editor, 1);
-        else Grid.SetColumn(_editor, 1);
+        else Grid.SetColumn(_editor, 2);
         Children.Add(_editor);
         _editor.SelectAll();
         _editor.Focus(FocusState.Programmatic);
@@ -2742,10 +2895,12 @@ internal sealed class SemanticTreeViewControl : ContentControl
         IReadOnlyList<bool> expanded,
         IReadOnlyList<bool> hasChildren,
         IReadOnlyList<ImageSource?> icons,
+        IReadOnlyList<ImageSource?> stateIcons,
         int selectedIndex)
     {
         if (labels.Count != depths.Count || labels.Count != expanded.Count ||
-            labels.Count != hasChildren.Count || labels.Count != icons.Count)
+            labels.Count != hasChildren.Count || labels.Count != icons.Count ||
+            labels.Count != stateIcons.Count)
             throw new ArgumentException(
                 "Tree labels, depths, expansion, child flags, and icons must have matching counts.",
                 nameof(depths));
@@ -2769,7 +2924,7 @@ internal sealed class SemanticTreeViewControl : ContentControl
                 {
                     Editable = EditableLabels,
                 };
-                content.Apply(labels[index], icons[index]);
+                content.Apply(labels[index], icons[index], stateIcons[index]);
                 var node = new TreeViewNode { Content = content };
                 if (depth == 0) _tree.RootNodes.Add(node);
                 else ancestors[depth - 1].Children.Add(node);
@@ -3565,6 +3720,15 @@ internal sealed class SemanticSysLinkAutomationPeer(SemanticSysLinkControl owner
 
     protected override string GetClassNameCore() => "SysLink";
     protected override string GetNameCore() => AutomationProperties.GetName(owner);
+    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
+    {
+        var reported = base.GetBoundingRectangleCore();
+        var scale = owner.XamlRoot?.RasterizationScale ?? 0;
+        if (scale <= 0 || owner.ActualWidth <= 0 || owner.ActualHeight <= 0)
+            return reported;
+        return ControlFactory.CenteredLayoutSlotBounds(
+            reported, owner.ActualWidth * scale, owner.ActualHeight * scale);
+    }
 }
 
 internal sealed class SemanticStatusBarControl : ContentControl

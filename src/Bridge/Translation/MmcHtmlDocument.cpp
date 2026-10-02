@@ -134,9 +134,12 @@ bool MmcHtmlDocumentDetail::ReadContent(IHTMLDocument2* source, const RECT& clie
             Text tag;
             if (FAILED(element->get_tagName(&tag.value))) return reject(L"MMC HTML element tag is unavailable");
             const auto tagName = tag.String();
+            // "!" is the tag MSHTML reports for the DOCTYPE declaration. A
+            // standards-mode document carries one, and it is a parsing directive
+            // with no content, layout, or behavior, so it is inert markup.
             static constexpr std::array inertTags{ L"HTML", L"HEAD", L"TITLE", L"META", L"LINK", L"STYLE",
                 L"SCRIPT", L"BODY", L"DIV", L"SPAN", L"TABLE", L"TBODY", L"TR", L"TD", L"TH",
-                L"NOBR", L"BR", L"P", L"B", L"I", L"U", L"STRONG", L"EM", L"FONT", L"PARAM" };
+                L"NOBR", L"BR", L"P", L"B", L"I", L"U", L"STRONG", L"EM", L"FONT", L"PARAM", L"!" };
             bool decoration = false;
             if (tagName == L"OBJECT") {
                 ComPtr<IHTMLObjectElement> object;
@@ -151,7 +154,7 @@ bool MmcHtmlDocumentDetail::ReadContent(IHTMLDocument2* source, const RECT& clie
                 if (!decoration && !events) return reject(L"MMC HTML contains an unsupported embedded object");
             } else if (std::none_of(inertTags.begin(), inertTags.end(), [&](const auto* allowed) {
                     return tagName == allowed;
-                })) return reject(L"MMC HTML contains interactive or unsupported content");
+                })) return reject(std::wstring(L"MMC HTML contains interactive or unsupported content: ") + tagName);
             // The resource keeps executable and document-level markup in HEAD.
             // In particular, CCF_HTML_DETAILS must not add it to a content slot.
             if (tagName == L"SCRIPT" || tagName == L"STYLE" || tagName == L"LINK" ||

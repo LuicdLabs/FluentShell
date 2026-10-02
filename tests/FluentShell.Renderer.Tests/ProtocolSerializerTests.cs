@@ -656,6 +656,8 @@ public sealed class ProtocolSerializerTests
             ImageList = [],
             ItemImages = [-1, -1, -1],
             ItemSelectedImages = [-1, -1, -1],
+            StateImageList = [],
+            ItemStateImages = [-1, -1, -1],
             EditableLabels = false,
             EditingIndex = -1,
         };
@@ -670,6 +672,8 @@ public sealed class ProtocolSerializerTests
             ItemExpanded = null,
             ItemHasChildren = null,
             ItemSelectedImages = null,
+            StateImageList = null,
+            ItemStateImages = null,
             ImageList = null,
             ItemImages = null,
             EditableLabels = null,
@@ -694,6 +698,8 @@ public sealed class ProtocolSerializerTests
         Assert.Equal([0, 1, 2], tree.ItemDepths);
         Assert.Equal([true, false, false], tree.ItemExpanded);
         Assert.Equal([true, true, false], tree.ItemHasChildren);
+        Assert.Equal([-1, -1, -1], tree.ItemStateImages);
+        Assert.Empty(tree.StateImageList!);
         Assert.Equal(2, tree.SelectedIndex);
         var slider = decoded.Window.Nodes[1];
         Assert.Equal(20, slider.Maximum);
