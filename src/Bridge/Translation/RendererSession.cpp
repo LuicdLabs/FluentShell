@@ -890,7 +890,7 @@ bool RendererSession::SynchronizeNativeRevision(ProjectionAttempt& attempt) {
         // else means the cloak itself, or the surface identity, is broken.
         if (error != L"native revision changed before cloak" ||
             barrier.surfaceId != surface->snapshot.surfaceId) {
-            return RejectProjection(L"native revision barrier or cloak failed");
+            return RejectProjection(L"native revision barrier or cloak failed: " + error);
         }
         if (++resyncs > kMaxResyncs || std::chrono::steady_clock::now() >= deadline) {
             return RejectProjection(
@@ -1525,7 +1525,11 @@ void RendererSession::HandleAction(const ActionRequest& action) {
     // rebased onto the current revision instead of being revision-gated.
     if (!IsRequestSemanticAction(action.action) &&
         action.expectedRevision != surface->snapshot.revision) {
-        RejectAction(surface, lock, action, L"stale", L"revision mismatch");
+        // A virtual row's index can name a different item after a patch. It is
+        // never safe to replay the old index merely because the state is absolute.
+        RejectAction(surface, lock, action,
+            IsOwnerDataListViewIndexedAction(action, surface->snapshot) ? L"rejected" : L"stale",
+            L"revision mismatch");
         return;
     }
     std::wstring semanticError;
@@ -1592,7 +1596,9 @@ void RendererSession::HandleNativeAction(
     const bool requestSemantic = IsRequestSemanticAction(action.action);
     if (requestSemantic) effectiveAction.expectedRevision = surface->snapshot.revision;
     if (!requestSemantic && action.expectedRevision != surface->snapshot.revision) {
-        RejectAction(surface, lock, action, L"stale", L"revision mismatch");
+        RejectAction(surface, lock, action,
+            IsOwnerDataListViewIndexedAction(action, surface->snapshot) ? L"rejected" : L"stale",
+            L"revision mismatch");
         return;
     }
     std::wstring semanticError;
@@ -1602,7 +1608,8 @@ void RendererSession::HandleNativeAction(
     }
     // Index actions must keep the canonical native row identity across the hop
     // to the source thread, even if native changes have not yet been reconciled.
-    if (effectiveAction.action == L"activateItem")
+    if (effectiveAction.action == L"activateItem" ||
+        IsOwnerDataListViewIndexedAction(effectiveAction, surface->snapshot))
         effectiveAction.expectedNativeFingerprint = surface->fingerprint;
     if (effectiveAction.action == L"menuCommand")
         effectiveAction.expectedMenuBindingGeneration = surface->snapshot.menuBindingGeneration;
@@ -2079,7 +2086,11 @@ void RendererSession::HandleNativeAction(
 
     lock.unlock();
     ActionOutcome outcome;
-    if (!agent || !agent->Invoke(effectiveAction, outcome, 2000, shutdownEvent_)) {
+    const bool actionApplied = agent && agent->Invoke(effectiveAction, outcome, 2000, shutdownEvent_);
+    // A refused indexed action can carry the fresh canonical capture which
+    // proved its index stale. Publish that revision through the same checked
+    // path as a successful action, while reporting a non-replayable rejection.
+    if (!actionApplied && !(outcome.refused && !outcome.snapshot.surfaceId.empty())) {
         // An application that ran the operation and declined it is not a broken
         // projection: canonical state is untouched, so the window keeps its
         // projection and the renderer is told this one action was rejected.
@@ -2142,7 +2153,7 @@ void RendererSession::HandleNativeAction(
         }
         const uint64_t revision = surface->snapshot.revision;
         const auto resultPayload = SerializeActionResult(
-            nonce_, action, L"accepted", revision);
+            nonce_, action, actionApplied ? L"accepted" : L"rejected", revision, outcome.error);
         // WM_CLOSE is merely queued at this point. Keep its renderer pending
         // entry alive until the root is destroyed or reconcile observes the
         // completed handler and returns closeRejected.

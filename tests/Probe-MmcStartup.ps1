@@ -14,6 +14,9 @@ param(
     [ValidateRange(3, 60)][int]$ObserveSeconds = 8,
     [ValidateRange(1, 20)][int]$Repetitions = 1,
     [switch]$AccessibilityDiagnostics,
+    # Keep both MMC and the Injector at the caller's integrity level. Some MMC
+    # manifests otherwise request elevation before a read-only startup probe.
+    [switch]$RunAsInvoker,
     # Empty MMC honors SW_HIDE, so explicitly show the interactive test window
     # when validating its visible projection. It is closed by this probe.
     [switch]$ShowConsole
@@ -115,7 +118,30 @@ try {
             $mmcLaunch = @{ FilePath = $mmcExecutable; WindowStyle = $(if ($ShowConsole) { 'Normal' } else { 'Hidden' }); PassThru = $true }
             if ($mmcName -ne 'empty') { $mmcLaunch.ArgumentList = (Join-Path $mmcSystem "$mmcName.msc") }
             $mmcStartedUtc = [datetime]::UtcNow
-            $mmcProcess = Start-Process @mmcLaunch
+            $mmcPreviousCompatibility = $env:__COMPAT_LAYER
+            try {
+                if ($RunAsInvoker) { $env:__COMPAT_LAYER = 'RunAsInvoker' }
+                $mmcProcess = Start-Process @mmcLaunch
+            } catch {
+                # Launch happens before a Process handle exists. Retain a row for
+                # this console instead of losing the entire batch to a UAC cancel
+                # or an unavailable snap-in host. No injection was attempted.
+                $mmcLaunchError = $_.Exception.Message
+                Set-Content -LiteralPath (Join-Path $mmcReportDirectory "$mmcLogName-launch.log") `
+                    -Value $mmcLaunchError -Encoding utf8
+                $mmcResults += [pscustomobject]@{
+                    Console = $mmcName; Iteration = $mmcIteration; ProcessId = $null; InjectorExit = $null
+                    Outcome = 'launch-failed'; ProjectedTitles = @(); Error = $mmcLaunchError
+                    OverallOutcome = 'launch-failed'; StableStartupAndCleanup = $null
+                    TargetAliveAtObservationEnd = $null; TargetUnexpectedExitCode = $null
+                    RendererExitStatus = 'not-launched'; RendererExitWithinTimeout = $null
+                    RendererProcesses = @(); RendererObservationErrors = @()
+                    RunAsInvoker = [bool]$RunAsInvoker
+                }
+                $mmcResults | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $mmcReportDirectory 'results.json') -Encoding utf8
+                Write-Output "$mmcLogName`: launch-failed ($mmcLaunchError)"
+                continue
+            } finally { $env:__COMPAT_LAYER = $mmcPreviousCompatibility }
             $mmcPid = $mmcProcess.Id
             $mmcExitCode = -1
             $mmcInjectorAttempted = $false
@@ -272,6 +298,7 @@ try {
                     RendererExitStatus = $mmcRendererExitStatus; RendererExitWithinTimeout = $mmcRendererExitWithinTimeout
                     RendererProcesses = @($mmcRenderers.Values | Select-Object ProcessId, CreationTimeUtc, ExecutablePath, WasAliveBeforeTargetCleanup, ExitState, ExitCode, ExitTimeUtc, Error)
                     RendererObservationErrors = $mmcRendererErrors
+                    RunAsInvoker = [bool]$RunAsInvoker
                 }
                 $mmcResults | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $mmcReportDirectory 'results.json') -Encoding utf8
                 Write-Output "$mmcLogName`: $mmcOverallOutcome (Startup $mmcOutcome; Injector exit $mmcExitCode; Renderer exit $mmcRendererExitStatus)"

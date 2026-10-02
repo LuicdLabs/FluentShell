@@ -3,6 +3,7 @@
 #include "../../src/Bridge/Translation/ControlAdapters.h"
 #include "../../src/Bridge/Translation/WindowCapture.h"
 #include "../../src/Bridge/Translation/SourceThreadAgent.h"
+#include "../../src/Bridge/Translation/ListViewActivation.h"
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
@@ -13,6 +14,8 @@
 #include "ItemImageCaptureTests.h"
 #include "MmcHtmlDocumentTests.h"
 #include "ListViewModeRegressionTests.h"
+#include "OwnerDataListViewTests.h"
+#include "OwnerDataListViewActionTests.h"
 #include "ToolbarRadioGroupTests.h"
 #include "UiAutomationProjectionTests.h"
 
@@ -97,6 +100,7 @@ void Check(bool condition, const char* message) {
 
 #include "MdiCaptureRegressionTests.h"
 #include "StaticDecorationRegressionTests.h"
+#include "SiblingZOrderCaptureTests.h"
 
 std::string ReadFixture(const wchar_t* name) {
     const auto path = std::filesystem::current_path() / L"tests" / L"ProtocolFixtures" / name;
@@ -1781,8 +1785,9 @@ void TestStructuredCommonControlCapture() {
     virtualContext.generation = 1;
     virtualContext.revision = 1;
     Check(virtualList && !Translation::CaptureWindow(
-            virtualWindow, virtualContext, rejected, error),
-        "virtual ListView was accepted by the bounded adapter");
+            virtualWindow, virtualContext, rejected, error) &&
+            error.find(L"no native report columns") != std::wstring::npos,
+        "virtual report ListView without columns was accepted by the bounded adapter");
     DestroyWindow(virtualWindow);
 }
 
@@ -4271,6 +4276,8 @@ void TestMdiFrameCaptureAndCommands() {
 #include "MenuBarIdentityRegressionTests.h"
 #include "SourceThreadStabilityRegressionTests.h"
 #include "ListViewActivationTests.h"
+#include "NativeListViewDoubleClickTests.h"
+#include "ListViewActivationFallbackTests.h"
 
 } // namespace
 
@@ -4321,6 +4328,8 @@ int wmain() {
     TestSourceThreadCallbackLifetime();
     TestMenuActionBindingGeneration();
     TestDeferredListViewActivation();
+    TestNativeListViewDoubleClickDispatch();
+    TestListViewNativeActivationFallback();
     TestPopupMenuState();
     TestSourceThreadPopupTracking();
     TestPopupActionProtocol();
@@ -4328,11 +4337,14 @@ int wmain() {
     TestToolbarCaptureBoundary();
     TestVirtualDialogSnapshots();
     TestPaneContainerCaptureAndSplit();
+    TestOverlappingSiblingZOrderCapture();
     TestAccessibleIslandBoundary();
     TestAccessiblePageTabs();
     FluentShell::Tests::TestUiAutomationProjectionScope(Check);
     FluentShell::Tests::TestMmcHtmlDocumentAdmission(Check);
     FluentShell::Tests::TestListViewModes(Check);
+    FluentShell::Tests::TestOwnerDataListViews(Check);
+    FluentShell::Tests::TestOwnerDataListViewActions(Check);
     FluentShell::Tests::TestToolbarRadioGroups(Check);
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";

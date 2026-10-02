@@ -113,7 +113,7 @@ adapter.
 - A bounded report-mode `SysListView32` subset is implemented with native
   columns/rows, visible or hidden headers, independent selection, optional
   `LVS_EX_CHECKBOXES` state/actions, per-item icons, and in-place label editing
-  where `LVS_EDITLABELS` admits it. Virtual, owner/custom-draw, grouped,
+  where `LVS_EDITLABELS` admits it. Owner/custom-draw, grouped,
   activation-tracking, and header-drag semantics remain native.
 - A bounded textual top-tab `SysTabControl32` subset is implemented with native
   multiline header rectangles, semantic vetoable selection, and Tab/TabItem UIA.
@@ -148,7 +148,33 @@ adapter.
   UpDown, and tooltip subsets.
 - Model selection, expansion, grouping, sorting, and notifications as typed
   capabilities.
-- Reject `LVS_OWNERDATA`, callback items, private data, custom draw, and missing
+- Bounded `LVS_OWNERDATA` ListViews are supported in report, large-icon,
+  small-icon, and list modes. `LVM_GETITEMW` obtains text and image indexes
+  through the application's own `LVN_GETDISPINFO` callback on the owning GUI
+  thread; `LVM_GETITEMTEXT` is unsupported for these controls. The same 4,096-item,
+  64-column, and 256 Ki-character aggregate text limits apply. Columns, native
+  item geometry, selection, focus, scrolling, and the application's in-place
+  label-edit acceptance or veto retain their existing contracts. Virtual row
+  indexes are never treated as stable item IDs, so deferred default activation
+  remains disabled. Indexed mutations reject an unreconciled native snapshot
+  change before touching the application. Owner-data checkboxes and callback
+  state images, overlays, cut state, or drop highlighting remain native until
+  their application-owned state contracts can be projected faithfully.
+- Plain report lists inherit WinUI's virtualizing `ItemsStackPanel`; assigning
+  a null panel before theme attachment previously forced full realization.
+  Checkable reports remain fully realized while the UIA checkbox gate maps
+  enumeration order to canonical row indexes.
+- Stable-ID ListView activation first invokes the current MSAA default action.
+  A missing method (`DISP_E_MEMBERNOTFOUND`) may use native double-click only
+  when current metadata matches `CreateStdAccessibleObject`, native selection
+  and focus still identify the original item, and the control hit-tests a
+  visible first-column label/icon point. Native handlers generate their own
+  notifications. No Enter or fabricated `WM_NOTIFY` replacement is used.
+  Provider callbacks, item replacement, cancellation, restore and capture
+  changes are guarded before dispatch and before the trailing button-up.
+  Computer Management result-list navigation has live evidence; other snap-in
+  actions and dialogs remain tracked in the validation matrix.
+- Reject unmodeled callback semantics, private data, custom draw, and missing
   accessibility/state evidence.
 
 ### Tranche H: Per-Item Imagery And In-Place Renaming

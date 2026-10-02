@@ -1,4 +1,6 @@
 using FluentShell.Renderer.Protocol;
+using FluentShell.Renderer.ViewModels;
+using System.ComponentModel;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Automation.Peers;
@@ -84,7 +86,7 @@ internal static class ListViewPresentation
     }
 }
 
-internal readonly record struct ListViewActivationIntent(int Index, string Identity);
+internal readonly record struct ListViewActivationIntent(int Index, string NativeId);
 
 internal enum ListViewActivationDecision
 {
@@ -95,21 +97,154 @@ internal enum ListViewActivationDecision
 
 internal static class ListViewActivationIntentPolicy
 {
-    // The intention names the item by the label it had when the user asked.
-    // A later snapshot may carry that same label at the same index; a different
-    // label there is a different item, and activating it would retarget the gesture.
+    // Selection and focus acknowledgements can arrive after a row was removed
+    // or replaced. Labels and indexes are not identities, even when both match.
+    // Keep the native ID captured when the user asked; a move also drops the
+    // intention rather than interpreting the old index as a different target.
     public static ListViewActivationDecision Decide(
         ListViewActivationIntent intent,
-        IReadOnlyList<string> items,
+        IReadOnlyList<string> nativeIds,
         IReadOnlyList<int> selected,
         int focused)
     {
-        if (intent.Index < 0 || intent.Index >= items.Count ||
-            !string.Equals(items[intent.Index], intent.Identity, StringComparison.Ordinal))
+        if (string.IsNullOrEmpty(intent.NativeId) || intent.Index < 0 || intent.Index >= nativeIds.Count ||
+            !string.Equals(nativeIds[intent.Index], intent.NativeId, StringComparison.Ordinal))
             return ListViewActivationDecision.Drop;
         return focused == intent.Index && selected.Contains(intent.Index)
             ? ListViewActivationDecision.Activate
             : ListViewActivationDecision.Wait;
+    }
+}
+
+// Owns one gesture through its real selection/focus acknowledgements. A request
+// that finishes without those states, or is definitively rejected, consumes the
+// gesture; selecting the same item later must not revive an old double-click.
+internal sealed class ListViewActivationCoordinator : IDisposable
+{
+    private readonly ControlNodeViewModel _node;
+    private readonly Action<string, object?> _send;
+    private readonly Func<string, bool> _allows;
+    private readonly Func<bool> _applyingCanonical;
+    private readonly Func<Action, bool> _enqueue;
+    private ListViewActivationIntent? _intent;
+    private bool _selectionRequested;
+    private bool _focusRequested;
+    private bool _flushQueued;
+    private bool _disposed;
+
+    internal ListViewActivationCoordinator(ControlNodeViewModel node,
+        Action<string, object?> send, Func<string, bool> allows,
+        Func<bool> applyingCanonical, Func<Action, bool> enqueue)
+    {
+        _node = node;
+        _send = send;
+        _allows = allows;
+        _applyingCanonical = applyingCanonical;
+        _enqueue = enqueue;
+        node.PropertyChanged += OnCanonicalChanged;
+        node.PendingActionsChanged += QueueFlush;
+        node.PendingActionRejected += OnRejected;
+    }
+
+    internal bool HasPending => _intent is not null;
+
+    internal void Request(int index)
+    {
+        Cancel();
+        if (_disposed || _applyingCanonical() || !_node.ItemActivationSupported ||
+            !_allows("activateItem") || index < 0 || index >= _node.ItemNativeIds.Count) return;
+        _intent = new(index, _node.ItemNativeIds[index]);
+        Flush();
+    }
+
+    internal void Cancel()
+    {
+        _intent = null;
+        _selectionRequested = _focusRequested = false;
+    }
+
+    private void OnRejected(string property)
+    {
+        if (property is "selectedIndices" or "focusedIndex") Cancel();
+    }
+
+    private void OnCanonicalChanged(object? sender, PropertyChangedEventArgs args)
+    {
+        if (args.PropertyName is nameof(_node.ItemNativeIds) or nameof(_node.SelectedIndices) or
+            nameof(_node.FocusedIndex) or nameof(_node.ItemActivationSupported) or nameof(_node.Enabled) or
+            nameof(_node.Visible)) QueueFlush();
+    }
+
+    private void QueueFlush()
+    {
+        if (_disposed || _intent is null || _flushQueued) return;
+        _flushQueued = _enqueue(() =>
+        {
+            _flushQueued = false;
+            Flush();
+        });
+        if (!_flushQueued) Cancel();
+    }
+
+    private void Flush()
+    {
+        if (_disposed || _intent is not { } intent) return;
+        if (_applyingCanonical()) { QueueFlush(); return; }
+        if (!_node.ItemActivationSupported || !_node.Enabled || !_node.Visible || !_allows("activateItem") ||
+            ListViewActivationIntentPolicy.Decide(intent, _node.ItemNativeIds,
+                _node.SelectedIndices, _node.FocusedIndex) == ListViewActivationDecision.Drop)
+        {
+            Cancel();
+            return;
+        }
+        var selected = _node.SelectedIndices.Contains(intent.Index);
+        var focused = _node.FocusedIndex == intent.Index;
+        if ((_selectionRequested && !_node.HasPending("selectedIndices") && !selected) ||
+            (_focusRequested && !_node.HasPending("focusedIndex") && !focused))
+        {
+            Cancel();
+            return;
+        }
+        if (!_selectionRequested)
+        {
+            _selectionRequested = true;
+            if (!selected && !_node.HasPending("selectedIndices") && _allows("setSelection"))
+            {
+                var selection = _node.MultiSelect
+                    ? _node.SelectedIndices.Append(intent.Index).Distinct().Order().ToArray()
+                    : new[] { intent.Index };
+                _send("setSelection", selection);
+            }
+        }
+        if (_intent is null) return;
+        if (!_focusRequested)
+        {
+            _focusRequested = true;
+            if (!focused && !_node.HasPending("focusedIndex") && _allows("setFocusedIndex"))
+                _send("setFocusedIndex", intent.Index);
+        }
+        if (_intent is null) return;
+        // Emission can be gated, and an existing request may have been joined.
+        // Each prerequisite gets one attempt; only an actual pending request
+        // can justify waiting for a state that has not arrived.
+        if ((!selected && !_node.HasPending("selectedIndices")) ||
+            (!focused && !_node.HasPending("focusedIndex")))
+        {
+            Cancel();
+            return;
+        }
+        if (_node.HasPending("selectedIndices") || _node.HasPending("focusedIndex")) return;
+        Cancel();
+        _send("activateItem", intent.Index);
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        Cancel();
+        _node.PropertyChanged -= OnCanonicalChanged;
+        _node.PendingActionsChanged -= QueueFlush;
+        _node.PendingActionRejected -= OnRejected;
     }
 }
 

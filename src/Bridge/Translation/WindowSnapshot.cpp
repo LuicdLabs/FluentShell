@@ -220,6 +220,11 @@ JsonObject NodeToJson(const ControlNode& node) {
         result.Insert(L"listViewMode", JsonValue::CreateStringValue(node.listViewMode));
         result.Insert(L"itemActivationSupported",
             JsonValue::CreateBooleanValue(node.itemActivationSupported));
+        JsonArray itemNativeIds;
+        for (const uint32_t nativeId : node.itemNativeIds) {
+            itemNativeIds.Append(JsonValue::CreateStringValue(std::to_wstring(nativeId)));
+        }
+        result.Insert(L"itemNativeIds", itemNativeIds);
         JsonArray columnOrder;
         for (const int logical : node.columnOrder) {
             columnOrder.Append(JsonValue::CreateNumberValue(logical));
@@ -1423,7 +1428,7 @@ bool ValidateActionForSnapshot(
     if (action.action == L"activateItem") {
         if (node.kind != ControlKind::ListView || !node.itemActivationSupported ||
             node.itemNativeIds.size() != ListViewItemCount(node) ||
-            (action.itemIndex < 0 && action.itemIndex > -1) ||
+            action.itemIndex < 0 ||
             (action.itemIndex >= 0 &&
                 static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node))) {
             error = L"activateItem requires a ListView item index with native activation";
@@ -1441,6 +1446,26 @@ bool ValidateActionForSnapshot(
                 [&](int index) { return index < 0 ||
                     static_cast<size_t>(index) >= ListViewItemCount(node); })) {
             error = L"setSelection index is outside the ListView";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setFocusedIndex") {
+        if (node.kind != ControlKind::ListView || action.itemIndex < -1 ||
+            (action.itemIndex >= 0 &&
+                static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node))) {
+            error = L"setFocusedIndex requires a ListView item index or -1";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"scrollBy") {
+        if (node.kind != ControlKind::ListView ||
+            (node.listViewMode != L"largeIcon" && node.listViewMode != L"smallIcon" &&
+                node.listViewMode != L"list") ||
+            action.integerValue < -Ipc::kMaxCoordinate || action.integerValue > Ipc::kMaxCoordinate ||
+            action.itemIndex < -Ipc::kMaxCoordinate || action.itemIndex > Ipc::kMaxCoordinate) {
+            error = L"scrollBy requires bounded deltas on a non-report ListView";
             return false;
         }
         return true;

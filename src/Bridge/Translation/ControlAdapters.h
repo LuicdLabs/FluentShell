@@ -73,6 +73,11 @@ int ProportionalSplitTarget(
 // column.  `order` must be a permutation of the column indexes.
 bool SetListViewColumnOrder(HWND listView, const std::vector<int>& order) noexcept;
 
+// Reads an owned, bounded cell through the native control on its GUI thread.
+// Owner-data lists obtain their text through LVN_GETDISPINFO, not GETITEMTEXT.
+bool ReadListViewItemText(HWND listView, int row, int column,
+    std::wstring& text, std::wstring& reason);
+
 // Moves only LVIS_FOCUSED. Selection is untouched. -1 clears focus; a nonnegative
 // index also asks the control to bring that item into its own viewport.
 bool SetListViewFocusedIndex(HWND listView, int index) noexcept;

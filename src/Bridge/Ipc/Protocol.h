@@ -54,7 +54,9 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // Minor 24 separates ListView focus from selection and scrolls non-report views natively.
 // Minor 25 projects TreeView state images beside the item. Overlay images are
 // composited into the existing item icons, and an empty tree is a valid snapshot.
-inline constexpr uint16_t kProtocolMinor = 25;
+// Minor 26 carries stable native ListView item IDs so delayed activation cannot
+// target a replacement item with the same label and index.
+inline constexpr uint16_t kProtocolMinor = 26;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

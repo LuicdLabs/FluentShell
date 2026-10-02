@@ -47,7 +47,8 @@ public static class ProtocolConstants
     // Minor 24 separates ListView focus from selection and scrolls non-report views natively.
     // Minor 25 projects TreeView state images beside the item. Overlay images are
     // composited into the existing item icons, and an empty tree is a valid snapshot.
-    public const ushort Minor = 25;
+    // Minor 26 carries stable native ListView item IDs for delayed activation.
+    public const ushort Minor = 26;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;

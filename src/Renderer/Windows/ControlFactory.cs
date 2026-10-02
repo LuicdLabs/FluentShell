@@ -22,6 +22,9 @@ namespace FluentShell.Renderer.Windows;
 
 internal sealed class ControlFactory
 {
+    internal const int PaneChromeZIndex = -1;
+    internal const int DialogIconZIndex = ProtocolConstants.MaxNodes;
+    internal const int PaneSplitterZIndex = 1000;
     private const double NativeFontSize = 12;
     // The floor for a label fitted into the width the native control committed to.  A
     // menu bar rendered a fraction smaller is readable; one that reads "Favorit" is not.
@@ -118,16 +121,18 @@ internal sealed class ControlFactory
                 if (args.PropertyName == nameof(parent.Rect)) ApplyBounds(element, viewModel);
             });
         }
-        // Native child enumeration is front to back, so the first node of a sibling
-        // group is the one in front.  That only carries meaning where siblings
-        // genuinely overlap and the order is semantic: MDI children, whose front
-        // one is the activated window.  Every other sibling group keeps the
-        // enumeration order it was captured in.
-        Canvas.SetZIndex(element, viewModel.Kind == "mdiChild"
-            ? -viewModel.ZIndex
-            : viewModel.ZIndex);
+        Canvas.SetZIndex(element, ProjectionZIndexFor(viewModel));
         return element;
     }
+
+    internal static int ProjectionZIndexFor(ControlNodeViewModel viewModel) =>
+        // HWND children are captured front to back; XAML draws larger indexes
+        // in front. Keep nodes in 0..511 so container chrome stays behind them.
+        // Virtual dialogs and DirectUI profile slots already carry paint order,
+        // including a profile's HWND-backed slots, and must not be reversed.
+        viewModel.NativeHwnd is not null && viewModel.AdapterId.Length == 0
+            ? ProtocolConstants.MaxNodes - 1 - viewModel.ZIndex
+            : viewModel.ZIndex;
 
     private FrameworkElement CreateStaticDecoration(ControlNodeViewModel viewModel)
     {
@@ -725,7 +730,7 @@ internal sealed class ControlFactory
             SelectionMode = SelectionModeFor(viewModel.MultiSelect),
             HorizontalContentAlignment = HorizontalAlignment.Left,
         };
-        var reportPanel = control.ItemsPanel;
+        ItemsPanelTemplate? checkedReportPanel = null;
         var positionedPanel = (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
             "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><Canvas/></ItemsPanelTemplate>");
         var contentBounds = new PixelRect();
@@ -775,15 +780,31 @@ internal sealed class ControlFactory
                 else scroll.ChangeView(x, y, null, true);
             }
         }
-        control.Loaded += (_, _) => ApplyItemLayout();
+        var panelLogged = false;
+        control.Loaded += (_, _) =>
+        {
+            if (!panelLogged)
+            {
+                panelLogged = true;
+                var panel = control.ItemsPanelRoot;
+                var stack = panel as ItemsStackPanel;
+                RendererDiagnostics.Log($"ListView panel loaded node={viewModel.NodeId} mode={viewModel.ListViewMode} " +
+                    $"items={control.Items.Count} checkBoxes={viewModel.CheckBoxes} root={panel?.GetType().Name ?? "null"} " +
+                    $"children={panel?.Children.Count ?? -1} cache={stack?.FirstCacheIndex ?? -1}..{stack?.LastCacheIndex ?? -1}");
+            }
+            ApplyItemLayout();
+        };
         control.LayoutUpdated += (_, _) => ApplyItemLayout();
         var applyingSelection = false;
         var rowChecks = new List<CheckBox>();
         var rowContents = new List<ProjectedItemContent>();
         var selectionAnchor = -1;
         long itemPresentationGeneration = 0;
-        ListViewActivationIntent? pendingActivation = null;
-        var activationRequested = false;
+        var activation = new ListViewActivationCoordinator(viewModel,
+            (action, value) => _action(viewModel, action, value),
+            action => _lifetime.IsActive && AllowsAction(viewModel, action),
+            _isApplyingCanonical, callback => control.DispatcherQueue.TryEnqueue(() => callback()));
+        _lifetime.OnDispose(activation.Dispose);
 
         int FocusedItemIndex()
         {
@@ -794,62 +815,13 @@ internal sealed class ControlFactory
             return focused is ListViewItem item ? control.IndexFromContainer(item) : control.SelectedIndex;
         }
 
-        void RequestActivationState(int index)
-        {
-            if (activationRequested || _isApplyingCanonical()) return;
-            activationRequested = true;
-            if (!viewModel.SelectedIndices.Contains(index) &&
-                !viewModel.HasPending("selectedIndices") &&
-                AllowsAction(viewModel, "setSelection"))
-            {
-                var selection = viewModel.MultiSelect
-                    ? CanonicalSelectionIndices(viewModel.SelectedIndices.Append(index))
-                    : new[] { index };
-                if (!viewModel.SelectedIndices.SequenceEqual(selection))
-                    _action(viewModel, "setSelection", selection);
-            }
-            if (viewModel.FocusedIndex != index &&
-                !viewModel.HasPending("focusedIndex") &&
-                AllowsAction(viewModel, "setFocusedIndex"))
-                _action(viewModel, "setFocusedIndex", index);
-        }
-
-        void FlushActivation()
-        {
-            if (pendingActivation is not { } intent) return;
-            switch (ListViewActivationIntentPolicy.Decide(
-                intent, viewModel.Items, viewModel.SelectedIndices, viewModel.FocusedIndex))
-            {
-                case ListViewActivationDecision.Drop:
-                    pendingActivation = null;
-                    activationRequested = false;
-                    return;
-                case ListViewActivationDecision.Wait:
-                    if (_isApplyingCanonical())
-                        control.DispatcherQueue.TryEnqueue(FlushActivation);
-                    else RequestActivationState(intent.Index);
-                    return;
-                default:
-                    if (_isApplyingCanonical())
-                    {
-                        control.DispatcherQueue.TryEnqueue(FlushActivation);
-                        return;
-                    }
-                    pendingActivation = null;
-                    activationRequested = false;
-                    _action(viewModel, "activateItem", intent.Index);
-                    return;
-            }
-        }
-
         void ActivateItem(int index)
         {
-            if (_isApplyingCanonical() || !viewModel.ItemActivationSupported ||
+            if (!_lifetime.IsActive || _isApplyingCanonical() || !viewModel.ItemActivationSupported ||
                 index < 0 || index >= control.Items.Count || index >= viewModel.Items.Count ||
+                index >= viewModel.ItemNativeIds.Count ||
                 rowContents.Any(content => content.IsEditing) || !AllowsAction(viewModel, "activateItem")) return;
-            pendingActivation = new ListViewActivationIntent(index, viewModel.Items[index]);
-            activationRequested = false;
-            FlushActivation();
+            activation.Request(index);
         }
 
         ActivatableListViewItem WrapItem(FrameworkElement content, int index, string name)
@@ -857,7 +829,7 @@ internal sealed class ControlFactory
             var generation = itemPresentationGeneration;
             void InvokeCurrentItem()
             {
-                if (generation == itemPresentationGeneration) ActivateItem(index);
+                if (_lifetime.IsActive && generation == itemPresentationGeneration) ActivateItem(index);
             }
             var container = new ActivatableListViewItem
             {
@@ -1133,7 +1105,24 @@ internal sealed class ControlFactory
             try
             {
                 var report = viewModel.ListViewMode == "report";
-                control.ItemsPanel = report ? reportPanel : positionedPanel;
+                if (!report)
+                    control.ItemsPanel = positionedPanel;
+                else if (viewModel.CheckBoxes)
+                {
+                    // The UIA checkbox gate currently maps enumeration order to
+                    // canonical row indexes. Keep every checkbox realized until
+                    // that contract carries the identity of a virtualized row.
+                    checkedReportPanel ??= (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
+                        "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><StackPanel/></ItemsPanelTemplate>");
+                    control.ItemsPanel = checkedReportPanel;
+                }
+                else
+                {
+                    // Reading ItemsPanel before this control enters the tree
+                    // returns null. Writing that value back masks the themed
+                    // ItemsStackPanel and makes all report rows nonvirtualized.
+                    control.ClearValue(ItemsControl.ItemsPanelProperty);
+                }
                 ScrollViewer.SetHorizontalScrollMode(control, ScrollMode.Enabled);
                 ScrollViewer.SetHorizontalScrollBarVisibility(control, ScrollBarVisibility.Auto);
                 control.Header = ShouldRenderListViewHeader(viewModel)
@@ -1168,6 +1157,7 @@ internal sealed class ControlFactory
         control.SelectionChanged += (_, _) =>
         {
             if (applyingSelection || _isApplyingCanonical()) return;
+            activation.Cancel();
             var selection = CanonicalSelectionIndices(control.SelectedItems
                 .Cast<object>()
                 .Select(item => control.Items.IndexOf(item)));
@@ -1184,6 +1174,7 @@ internal sealed class ControlFactory
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects) or
                 nameof(viewModel.ListViewMode) or nameof(viewModel.ItemActivationSupported) or
+                nameof(viewModel.ItemNativeIds) or
                 nameof(viewModel.Columns) or nameof(viewModel.ColumnWidths) or
                 nameof(viewModel.ColumnOrder) or
                 nameof(viewModel.Rows) or nameof(viewModel.ColumnHeadersVisible) or
@@ -1191,7 +1182,6 @@ internal sealed class ControlFactory
                 nameof(viewModel.EditableLabels))
             {
                 RebuildRows();
-                FlushActivation();
             }
             else if (args.PropertyName == nameof(viewModel.MultiSelect))
             {
@@ -1201,16 +1191,28 @@ internal sealed class ControlFactory
             else if (args.PropertyName == nameof(viewModel.SelectedIndices))
             {
                 ApplyCanonicalSelection();
-                FlushActivation();
             }
             else if (args.PropertyName == nameof(viewModel.CheckedIndices))
                 ApplyCanonicalChecks();
-            else if (args.PropertyName == nameof(viewModel.FocusedIndex))
-                FlushActivation();
         });
+        // Both pointer presses of a double-click precede DoubleTapped, so they
+        // cancel an older gesture without cancelling the new activation. A later
+        // single-click or focus/navigation gesture always replaces the old intent.
+        control.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, _) =>
+        {
+            if (!_isApplyingCanonical()) activation.Cancel();
+        }), true);
+        control.GotFocus += (_, _) =>
+        {
+            if (!applyingSelection && !_isApplyingCanonical()) activation.Cancel();
+        };
         control.KeyDown += (_, args) =>
         {
             if (!_lifetime.IsActive) return;
+            if (args.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down or
+                VirtualKey.Home or VirtualKey.End or VirtualKey.PageUp or VirtualKey.PageDown or
+                VirtualKey.Tab or VirtualKey.Space or VirtualKey.F2 or VirtualKey.Escape)
+                activation.Cancel();
             if (viewModel.ListViewMode != "report" && !args.Handled &&
                 args.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down or VirtualKey.Home or VirtualKey.End &&
                 !IsListItemEditor(args.OriginalSource as DependencyObject, control))
@@ -3120,7 +3122,7 @@ internal sealed class SemanticPaneContainer : Canvas, ISemanticContainer
                     value => _splitRequested(position, value));
                 // Splitters sit above the panes so the strip between two panes stays
                 // hittable no matter which order the panes were added in.
-                Canvas.SetZIndex(created, 1000);
+                Canvas.SetZIndex(created, ControlFactory.PaneSplitterZIndex);
                 _splitters.Add(created);
                 Children.Add(created);
             }
@@ -3144,7 +3146,7 @@ internal sealed class SemanticPaneContainer : Canvas, ISemanticContainer
             if (index == _chrome.Count)
             {
                 var created = new Image { Stretch = Stretch.Fill, IsHitTestVisible = false };
-                Canvas.SetZIndex(created, -1);
+                Canvas.SetZIndex(created, ControlFactory.PaneChromeZIndex);
                 _chrome.Add(created);
                 Children.Add(created);
             }

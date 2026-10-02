@@ -1086,10 +1086,22 @@ bool ExecuteInvoke(Command* command) {
         command->error = L"native menu binding changed before selection";
         return true;
     }
-    if (action.action == L"activateItem" && (action.expectedNativeFingerprint == 0 ||
+    const bool indexedOwnerData = IsOwnerDataListViewIndexedAction(action, before);
+    const bool witnessedAction = action.action == L"activateItem" || indexedOwnerData ||
+        action.expectedNativeFingerprint != 0;
+    if (witnessedAction && (action.expectedNativeFingerprint == 0 ||
             SnapshotFingerprint(before) != action.expectedNativeFingerprint)) {
+        if (AbortIfCancelled(command)) return false;
         command->refused = true;
-        command->error = L"native ListView revision changed before activation";
+        command->error = L"native ListView revision changed before the indexed action";
+        if (action.action != L"activateItem") {
+            // The application can reorder virtual rows without changing their
+            // count. Publish what was actually read, but never retarget or replay
+            // the user's old index against that new ordering.
+            before.revision = action.expectedRevision + 1;
+            command->outcome.revision = before.revision;
+            command->outcome.snapshot = std::move(before);
+        }
         return true;
     }
     if (!ValidateActionForSnapshot(action, before, command->error)) {
@@ -1852,6 +1864,17 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
+bool IsOwnerDataListViewIndexedAction(
+    const ActionRequest& action, const WindowSnapshot& snapshot) noexcept {
+    if (!action.nodeId || (action.action != L"setSelection" &&
+            action.action != L"setFocusedIndex" && action.action != L"setItemText" &&
+            action.action != L"setItemCheck")) return false;
+    return std::any_of(snapshot.nodes.begin(), snapshot.nodes.end(), [&](const ControlNode& node) {
+        return node.nodeId == *action.nodeId && node.kind == ControlKind::ListView &&
+            (node.style & LVS_OWNERDATA) != 0;
+    });
+}
+
 SourceThreadAgent::SourceThreadAgent(
     HWND root, HMODULE module, DWORD threadId, UINT message) noexcept
     : root_(root), module_(module), threadId_(threadId), message_(message),
@@ -2275,6 +2298,15 @@ bool ReadListViewActivationIdentity(const ListViewActivationRequest& request,
     }
     state = static_cast<UINT>(SendMessageW(list, LVM_GETITEMSTATE,
         request.index, kListViewActivationState));
+    // Text/state providers can replace an item while answering a native read.
+    // Recheck the stable ID after those callbacks so the accessible child index
+    // cannot silently name a replacement with identical text and selection.
+    if (static_cast<size_t>(SendMessageW(list, LVM_GETITEMCOUNT, 0, 0)) != request.itemCount ||
+        ResolveListViewItemByNativeId(list, request.nativeId) != request.index ||
+        static_cast<uint32_t>(SendMessageW(list, LVM_MAPINDEXTOID, request.index, 0)) != request.nativeId) {
+        error = L"ListView activation item was replaced while its native metadata was read";
+        return false;
+    }
     return true;
 }
 
@@ -2344,6 +2376,39 @@ bool ReadListViewAccessibleAction(const ListViewActivationRequest& request,
     }
     return true;
 }
+}
+
+bool ReadListViewNativeActivationPoint(HWND listView, int index, POINT& point) noexcept {
+    if (!listView || index < 0 || GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId())
+        return false;
+    RECT client{};
+    if (!GetClientRect(listView, &client)) return false;
+    for (const int part : {LVIR_LABEL, LVIR_ICON}) {
+        RECT rectangle{part};
+        RECT visible{};
+        if (!SendMessageW(listView, LVM_GETITEMRECT, index, reinterpret_cast<LPARAM>(&rectangle)) ||
+            !IntersectRect(&visible, &rectangle, &client) || IsRectEmpty(&visible)) continue;
+        // LVIR_LABEL includes blank space in report view. Even a point inside
+        // that rectangle needs the control's exact semantic hit-test result.
+        for (const LONG x : {std::min(visible.left + 1, visible.right - 1),
+                visible.left + (visible.right - visible.left) / 2, visible.right - 1}) {
+            const POINT candidate{x, visible.top + (visible.bottom - visible.top) / 2};
+            if (candidate.x < 0 || candidate.y < 0 ||
+                candidate.x > std::numeric_limits<SHORT>::max() ||
+                candidate.y > std::numeric_limits<SHORT>::max()) continue;
+            LVHITTESTINFO hit{};
+            hit.pt = candidate;
+            const LRESULT found = SendMessageW(listView, LVM_HITTEST,
+                static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(&hit));
+            if (found == index && hit.iItem == index && hit.iSubItem == 0 &&
+                (hit.flags & (part == LVIR_LABEL ? LVHT_ONITEMLABEL : LVHT_ONITEMICON)) != 0 &&
+                (hit.flags & LVHT_ONITEMSTATEICON) == 0) {
+                point = candidate;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 namespace {
@@ -2597,6 +2662,15 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             error = L"a native item action is already pending";
             return false;
         }
+        // Accessible metadata can pump the source queue before a deferred
+        // request exists. Reserve the action slot throughout preparation, and
+        // never publish work from a lifetime that a nested command cancelled.
+        struct PreparingScope final {
+            SourceThreadAgent* agent;
+            ~PreparingScope() { agent->nativeActionRunning_ = false; }
+        } preparing{this};
+        nativeActionRunning_ = true;
+        const auto cancellation = listViewActivationCancellation_;
         ListViewActivationRequest request;
         request.listView = node.hwnd;
         request.nodeId = node.nodeId;
@@ -2606,8 +2680,12 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
         request.itemCount = ListViewItemCount(node);
         request.viewStyle = static_cast<DWORD>(node.style) & kListViewActivationStyle;
         request.text = node.items[index];
-        if (!ListViewActivationReady(root_, request) ||
-            !ReadListViewActivationIdentity(request, request.nativeState, error)) return false;
+        const auto current = [&] {
+            return !shuttingDown_.load() && cancellation == listViewActivationCancellation_ &&
+                ListViewActivationReady(root_, request);
+        };
+        if (!current() || !ReadListViewActivationIdentity(request, request.nativeState, error) ||
+            !current()) return false;
         const bool selected = std::find(node.selectedIndices.begin(), node.selectedIndices.end(), index) !=
             node.selectedIndices.end();
         const bool checked = std::find(node.checkedIndices.begin(), node.checkedIndices.end(), index) !=
@@ -2619,13 +2697,17 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             error = L"ListView activation selection, focus or check state changed";
             return false;
         }
-        AccessibleListViewItem live;
-        if (!ReadListViewAccessibleAction(request, live, request.accessibleName,
-                request.defaultAction, request.accessibleState, error)) return false;
+        {
+            AccessibleListViewItem live;
+            if (!ReadListViewAccessibleAction(request, live, request.accessibleName,
+                    request.defaultAction, request.accessibleState, error)) return false;
+            // A provider's Release can pump too. Finish its lifetime before
+            // final validation and publication of the deferred message.
+        }
         UINT state = 0;
-        if (!ListViewActivationReady(root_, request) ||
-            !ReadListViewActivationIdentity(request, state, error) || state != request.nativeState) {
-            error = L"ListView item changed while its default action was read";
+        if (!current() || !ReadListViewActivationIdentity(request, state, error) ||
+            state != request.nativeState || !current()) {
+            error = L"ListView item or activation lifetime changed while its default action was read";
             return false;
         }
         queuedListViewActivation_ = std::move(request);
@@ -2714,11 +2796,26 @@ void SourceThreadAgent::CancelDeferredActionOnSourceThread(WPARAM kind, uint64_t
 }
 
 void SourceThreadAgent::RunListViewActivationOnSourceThread(const ListViewActivationRequest& request) noexcept {
+    if (GetCurrentThreadId() != threadId_ || nativeActionRunning_) return;
+    struct RunningScope final {
+        SourceThreadAgent* agent;
+        ~RunningScope() {
+            agent->nativeActionRunning_ = false;
+            agent->RequestMenuBarRefresh();
+            agent->MarkDirty();
+        }
+    } running{this};
+    nativeActionRunning_ = true;
+    const auto cancellation = listViewActivationCancellation_;
     try {
-        const auto identity = captureContext_.nodeIds.find(request.listView);
-        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || trackedPopup_ ||
-            identity == captureContext_.nodeIds.end() || identity->second.nodeId != request.nodeId ||
-            identity->second.generation != request.generation || !ListViewActivationReady(root_, request)) return;
+        const auto ready = [&] {
+            const auto identity = captureContext_.nodeIds.find(request.listView);
+            return !shuttingDown_.load() && !trackedPopup_ &&
+                cancellation == listViewActivationCancellation_ &&
+                identity != captureContext_.nodeIds.end() && identity->second.nodeId == request.nodeId &&
+                identity->second.generation == request.generation && ListViewActivationReady(root_, request);
+        };
+        if (!ready()) return;
         UINT nativeState = 0;
         std::wstring error;
         AccessibleListViewItem live;
@@ -2727,31 +2824,95 @@ void SourceThreadAgent::RunListViewActivationOnSourceThread(const ListViewActiva
         long state = 0;
         if (!ReadListViewActivationIdentity(request, nativeState, error) ||
             nativeState != request.nativeState ||
+            !ready() ||
             !ReadListViewAccessibleAction(request, live, name, action, state, error) ||
             name != request.accessibleName || action != request.defaultAction || state != request.accessibleState ||
-            !ListViewActivationReady(root_, request) ||
-            !ReadListViewActivationIdentity(request, nativeState, error) || nativeState != request.nativeState) {
+            !ready() ||
+            !ReadListViewActivationIdentity(request, nativeState, error) || nativeState != request.nativeState ||
+            !ready()) {
             FluentShell::Log(L"ListView default action was stale or unavailable: " + error);
             MarkDirty();
             return;
         }
         // Re-read on the same live object that receives the action, after all native
-        // item-identity checks. No synthetic pointer, key, or guessed notification.
+        // item-identity checks. The accessible provider always gets the first attempt.
         name.clear();
         action.clear();
         if (!ReadListViewAccessibleAction(request, live, name, action, state, error) ||
             name != request.accessibleName || action != request.defaultAction || state != request.accessibleState ||
-            shuttingDown_.load() || !ListViewActivationReady(root_, request) ||
-            !ReadListViewActivationIdentity(request, nativeState, error) || nativeState != request.nativeState) {
+            !ready() ||
+            !ReadListViewActivationIdentity(request, nativeState, error) || nativeState != request.nativeState ||
+            !ready()) {
             MarkDirty();
             return;
         }
         const HRESULT invoked = live.object->accDoDefaultAction(live.child);
-        if (FAILED(invoked)) FluentShell::Log(L"ListView provider refused its default action");
-        RequestMenuBarRefresh();
-        MarkDirty();
+        bool nativeDispatched = false;
+        if (invoked == DISP_E_MEMBERNOTFOUND && ready()) {
+            // Stock ListView MSAA can advertise a double-click while leaving its
+            // default-action method unimplemented. Admit the control's own
+            // double-click path only for the exact standard accessible contract;
+            // a refusal or an application-specific default action is not replaced.
+            Microsoft::WRL::ComPtr<IAccessible> standardRoot;
+            AccessibleListViewItem standard;
+            std::wstring standardName;
+            std::wstring standardAction;
+            long standardState = 0;
+            name.clear();
+            action.clear();
+            const bool standardContract = ReadListViewAccessibleAction(request, live, name, action, state, error) &&
+                name == request.accessibleName && action == request.defaultAction && state == request.accessibleState &&
+                ready() &&
+                SUCCEEDED(CreateStdAccessibleObject(request.listView,
+                OBJID_CLIENT, IID_PPV_ARGS(standardRoot.GetAddressOf()))) && standardRoot &&
+                ReadListViewAccessibleAction(request, standard, standardName, standardAction,
+                    standardState, error, standardRoot.Get()) &&
+                standardName == request.accessibleName && standardAction == request.defaultAction &&
+                standardState == request.accessibleState;
+            const auto currentItem = [&] {
+                UINT currentState = 0;
+                constexpr UINT selectedFocused = LVIS_SELECTED | LVIS_FOCUSED;
+                constexpr DWORD unsupported = LVS_EX_TRACKSELECT | LVS_EX_ONECLICKACTIVATE | LVS_EX_TWOCLICKACTIVATE;
+                return ready() && (request.viewStyle & (LVS_OWNERDATA | LVS_OWNERDRAWFIXED)) == 0 &&
+                    (request.nativeState & selectedFocused) == selectedFocused &&
+                    ReadListViewActivationIdentity(request, currentState, error) &&
+                    currentState == request.nativeState &&
+                    SendMessageW(request.listView, LVM_GETSELECTEDCOUNT, 0, 0) == 1 &&
+                    SendMessageW(request.listView, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_FOCUSED) == request.index &&
+                    (SendMessageW(request.listView, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & unsupported) == 0 &&
+                    SendMessageW(request.listView, LVM_ISGROUPVIEWENABLED, 0, 0) == FALSE &&
+                    ReadListViewActivationIdentity(request, currentState, error) &&
+                    currentState == request.nativeState && ready();
+            };
+            POINT point{};
+            if (standardContract && currentItem() && !GetCapture() &&
+                ReadListViewNativeActivationPoint(request.listView, request.index, point) && currentItem() && !GetCapture()) {
+                const LPARAM position = MAKELPARAM(static_cast<SHORT>(point.x), static_cast<SHORT>(point.y));
+                // Selection/focus already completed. Stock comctl32 processes
+                // the second click pair directly and emits its own NM_DBLCLK and
+                // LVN_ITEMACTIVATE. No foreground switch or forged WM_NOTIFY.
+                SendMessageW(request.listView, WM_LBUTTONDBLCLK, MK_LBUTTON, position);
+                nativeDispatched = true;
+                POINT after{};
+                if (currentItem() && ReadListViewNativeActivationPoint(request.listView, request.index, after) &&
+                    after.x == point.x && after.y == point.y && currentItem() && !GetCapture())
+                    SendMessageW(request.listView, WM_LBUTTONUP, 0, position);
+                FluentShell::Log(L"ListView default action dispatched through native double-click handler");
+            }
+        }
+        if (invoked != S_OK && !nativeDispatched) {
+            wchar_t result[16]{};
+            swprintf_s(result, L"0x%08lX", static_cast<unsigned long>(invoked));
+            FluentShell::Log(L"ListView default action did not complete: HRESULT=" +
+                std::wstring(result) + L" hwnd=" + Ipc::HwndToString(request.listView) +
+                L" node=" + std::to_wstring(request.nodeId) +
+                L" index=" + std::to_wstring(request.index) +
+                L" nativeId=" + std::to_wstring(request.nativeId) +
+                L" childId=" + std::to_wstring(live.child.lVal) +
+                L" action='" + action + L"'");
+        }
     } catch (...) {
-        MarkDirty();
+        // The consumed request is never replayed after a provider exception.
     }
 }
 
@@ -2787,6 +2948,7 @@ void SourceThreadAgent::CancelPopupOnSourceThread(bool activeOnly) noexcept {
     // EnableWindow(FALSE) sends WM_CANCELMODE. A provider can disable its opener
     // before entering TrackPopupMenu; that does not cancel the pending open request.
     if (activeOnly && !trackedPopup_) return;
+    ++listViewActivationCancellation_;
     CancelNativeActionOnSourceThread();
     queuedListViewActivation_.reset();
     queuedListViewActivationToken_ = 0;

@@ -296,8 +296,6 @@ bool ReadListViewMode(HWND hwnd, DWORD style, std::wstring& mode, std::wstring& 
 }
 
 bool ProbeListView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & LVS_OWNERDATA) != 0)
-        return Reject(reason, L"virtual owner-data ListView is not supported (LVS_OWNERDATA)");
     if ((style & LVS_OWNERDRAWFIXED) != 0)
         return Reject(reason, L"owner-draw ListView is not supported (LVS_OWNERDRAWFIXED)");
     std::wstring mode;
@@ -312,6 +310,25 @@ bool ProbeListView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reas
         LVS_EX_ONECLICKACTIVATE | LVS_EX_TWOCLICKACTIVATE;
     const auto extended = static_cast<DWORD>(
         SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
+    // Virtual lists keep only selection and focus in comctl32. The existing
+    // checkbox action writes stored state images, so it cannot truthfully offer
+    // application-owned check state through that same contract.
+    if ((style & LVS_OWNERDATA) != 0 && (extended & LVS_EX_CHECKBOXES) != 0)
+        return Reject(reason, L"owner-data ListView checkboxes require application-owned state semantics (LVS_OWNERDATA | LVS_EX_CHECKBOXES)");
+    if ((style & LVS_OWNERDATA) != 0) {
+        const auto callbackMask = static_cast<UINT>(SendMessageW(hwnd, LVM_GETCALLBACKMASK, 0, 0));
+        constexpr UINT nativeState = LVIS_SELECTED | LVIS_FOCUSED;
+        if (const UINT rejected = callbackMask & ~nativeState; rejected != 0) {
+            static constexpr NamedFlag flags[] = {
+                { LVIS_STATEIMAGEMASK, L"LVIS_STATEIMAGEMASK" },
+                { LVIS_OVERLAYMASK, L"LVIS_OVERLAYMASK" },
+                { LVIS_CUT, L"LVIS_CUT" },
+                { LVIS_DROPHILITED, L"LVIS_DROPHILITED" },
+            };
+            return RejectFlags(reason, L"owner-data ListView has unsupported callback state flag(s) ",
+                rejected, callbackMask, flags, std::size(flags));
+        }
+    }
     if (const DWORD rejected = extended & unsupportedExtended; rejected != 0) {
         static constexpr NamedFlag flags[] = {
             { LVS_EX_TRACKSELECT, L"LVS_EX_TRACKSELECT" },
@@ -1456,13 +1473,32 @@ bool ReadListViewCell(
     int column,
     std::wstring& text,
     std::wstring& reason) {
+    const bool ownerData = (GetWindowLongPtrW(hwnd, GWL_STYLE) & LVS_OWNERDATA) != 0;
     return ReadGrowingText(text, reason,
         L"ListView item text exceeds the protocol string limit",
         [&](std::wstring& buffer, size_t& length, std::wstring& error) {
             LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.iItem = row;
             item.iSubItem = column;
             item.pszText = buffer.data();
             item.cchTextMax = static_cast<int>(buffer.size());
+            // LVM_GETITEMTEXT is explicitly unsupported for LVS_OWNERDATA.
+            // GETITEM asks the control to obtain text through the owner's own
+            // LVN_GETDISPINFO callback, on this HWND's GUI thread.
+            if (ownerData) {
+                if (!SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item)))
+                    return Reject(error, L"owner-data ListView item text read failed");
+                if (!item.pszText || item.pszText == LPSTR_TEXTCALLBACKW)
+                    return Reject(error, L"owner-data ListView did not return item text");
+                length = wcsnlen_s(item.pszText, buffer.size());
+                // GETITEM may return a pointer to provider-owned text instead
+                // of filling the caller's buffer. Own a bounded copy before the
+                // next callback can replace that storage.
+                if (item.pszText != buffer.data() && length < buffer.size())
+                    std::copy_n(item.pszText, length, buffer.data());
+                return true;
+            }
             const int copied = static_cast<int>(SendMessageW(
                 hwnd, LVM_GETITEMTEXTW, row, reinterpret_cast<LPARAM>(&item)));
             if (copied < 0) return Reject(error, L"ListView item text read failed");
@@ -1646,10 +1682,13 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.itemImages.clear();
     node.itemImages.reserve(static_cast<size_t>(count));
     const uint32_t invalidId = std::numeric_limits<uint32_t>::max();
-    const bool stableIds = count == 0 ||
+    // Owner-data indices are positions in the application's current data, not
+    // stable item identities. Some common-control versions answer the ID
+    // messages anyway; never let that authorize deferred activation.
+    const bool stableIds = (style & LVS_OWNERDATA) == 0 && (count == 0 ||
         (static_cast<uint32_t>(SendMessageW(hwnd, LVM_MAPINDEXTOID,
             static_cast<WPARAM>(-1), 0)) == invalidId &&
-         static_cast<int>(SendMessageW(hwnd, LVM_MAPIDTOINDEX, invalidId, 0)) == -1);
+         static_cast<int>(SendMessageW(hwnd, LVM_MAPIDTOINDEX, invalidId, 0)) == -1));
     // Older controls may lack this extension. Display and selection remain
     // admissible, but an empty ID vector cannot authorize item activation.
     if (stableIds) node.itemNativeIds.reserve(static_cast<size_t>(count));
@@ -1731,6 +1770,12 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.selectedIndex = node.selectedIndices.empty() ? -1 : node.selectedIndices.front();
     node.itemActivationSupported = stableIds &&
         ListViewItemsHaveNativeDefaultActions(hwnd, node);
+    // A virtual text/image callback can also change the control's state
+    // contract. Do not publish a snapshot that omitted state installed during
+    // those callbacks, even when the row count and presentation stayed fixed.
+    if ((style & LVS_OWNERDATA) != 0 && !ProbeListView(hwnd,
+            static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)), admittedKind, reason))
+        return false;
     std::wstring finalMode;
     if (SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0) != count ||
         !ReadListViewMode(hwnd, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)),
@@ -2886,6 +2931,14 @@ bool ApplyToolbarCheckState(
             return Reject(reason, L"Toolbar native check-state readback disagrees with its command");
     }
     return true;
+}
+
+bool ReadListViewItemText(HWND listView, int row, int column,
+    std::wstring& text, std::wstring& reason) {
+    if (!listView || row < 0 || column < 0 ||
+        GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId())
+        return Reject(reason, L"ListView text must be read on its owning GUI thread");
+    return ReadListViewCell(listView, row, column, text, reason);
 }
 
 int ResolveListViewItemByNativeId(HWND listView, uint32_t nativeId) noexcept {

@@ -8,6 +8,7 @@ constexpr UINT kListActivationSentinel = WM_APP + 372;
 enum class ListActivationProbe : WPARAM {
     Cancel, Duplicate, Replace, Rename, State, DisabledItem, HiddenList, DisabledParent,
     ChangedAction, ChangedView, ReplaceDuringFinalRead, StateDuringFinalRead,
+    ProviderRefused, ProviderUnavailable,
 };
 
 // The rest of this test host intentionally exercises legacy common controls.
@@ -90,6 +91,33 @@ struct ListActivationRuntime final {
     bool replayPosted = false;
     long itemState = 0;
     bool changedAction = false;
+    HRESULT actionResult = S_OK;
+    bool standardMetadata = false;
+    bool replaceDuringAction = false;
+    bool renameDuringAction = false;
+    bool clearStateDuringAction = false;
+    bool cancelDuringAction = false;
+    bool changeDefaultDuringAction = false;
+    bool reenterDuringAction = false;
+    bool reentrantRefused = false;
+    bool actionMutated = false;
+    bool cancelDuringPreparationRead = false;
+    bool reenterDuringPreparationRead = false;
+    bool preparationCancelled = false;
+    unsigned preparationReentries = 0;
+    bool preparationReentrantRefused = false;
+    bool pumpDuringPreparationRelease = false;
+    unsigned preparationReleasePumps = 0;
+    bool actionDuringPreparationRelease = false;
+    bool deferredConsumedDuringPreparationRelease = false;
+    unsigned completedDefaultActionReads = 0;
+    unsigned armFinalIdentityAfterDefaultRead = 0;
+    bool interceptFinalIdentityRead = false;
+    unsigned syntheticInputMessages = 0;
+    unsigned activationNotifications = 0;
+    UINT stateAfterAction = 0;
+    uint32_t idAfterAction = UINT32_MAX;
+    std::wstring textAfterAction;
     ~ListActivationRuntime() {
         for (HANDLE event : {ready, drained, modalStarted, modalRelease, returned})
             if (event) CloseHandle(event);
@@ -108,7 +136,35 @@ public:
         return S_OK;
     }
     ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
-    ULONG STDMETHODCALLTYPE Release() override { const ULONG n = --references_; if (!n) delete this; return n; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG n = --references_;
+        if (!n) {
+            if (pumpOnFinalRelease_) {
+                pumpOnFinalRelease_ = false;
+                ++runtime_.preparationReleasePumps;
+                runtime_.wrongThread.store(runtime_.wrongThread.load() ||
+                    GetCurrentThreadId() != runtime_.thread.load());
+                const unsigned callsBefore = runtime_.calls.load();
+                if (auto* agent = runtime_.agent.load()) {
+                    // Release can enter application code too. The outer Post
+                    // must not have published its deferred action at this point.
+                    for (unsigned removed = 0; removed < 32; ++removed) {
+                        MSG queued{};
+                        if (!PeekMessageW(&queued, nullptr, agent->MessageId(), agent->MessageId(), PM_NOREMOVE)) break;
+                        const bool listActivation = queued.wParam == 3;
+                        if (!PeekMessageW(&queued, nullptr, agent->MessageId(), agent->MessageId(), PM_REMOVE)) break;
+                        runtime_.deferredConsumedDuringPreparationRelease =
+                            runtime_.deferredConsumedDuringPreparationRelease || listActivation;
+                        TranslateMessage(&queued);
+                        DispatchMessageW(&queued);
+                    }
+                }
+                runtime_.actionDuringPreparationRelease = runtime_.calls.load() != callsBefore;
+            }
+            delete this;
+        }
+        return n;
+    }
     HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* count) override { if (count) *count = 0; return S_OK; }
     HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo**) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID, LPOLESTR*, UINT, LCID, DISPID*) override { return E_NOTIMPL; }
@@ -122,6 +178,8 @@ public:
     HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch** value) override { if (value) *value = nullptr; return S_FALSE; }
     HRESULT STDMETHODCALLTYPE get_accName(VARIANT child, BSTR* name) override {
         if (!name || child.vt != VT_I4 || child.lVal <= 0) return E_INVALIDARG;
+        if (runtime_.standardMetadata)
+            return ReadStandard([&](IAccessible* object) { return object->get_accName(child, name); });
         wchar_t text[128]{};
         LVITEMW item{};
         item.pszText = text;
@@ -134,12 +192,16 @@ public:
     HRESULT STDMETHODCALLTYPE get_accDescription(VARIANT, BSTR*) override { return S_FALSE; }
     HRESULT STDMETHODCALLTYPE get_accRole(VARIANT child, VARIANT* role) override {
         if (!role) return E_POINTER;
+        if (runtime_.standardMetadata)
+            return ReadStandard([&](IAccessible* object) { return object->get_accRole(child, role); });
         role->vt = VT_I4;
         role->lVal = child.lVal == CHILDID_SELF ? ROLE_SYSTEM_LIST : ROLE_SYSTEM_LISTITEM;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_accState(VARIANT child, VARIANT* state) override {
         if (!state) return E_POINTER;
+        if (runtime_.standardMetadata)
+            return ReadStandard([&](IAccessible* object) { return object->get_accState(child, state); });
         runtime_.wrongThread.store(runtime_.wrongThread.load() || GetCurrentThreadId() != runtime_.thread.load());
         state->vt = VT_I4;
         state->lVal = STATE_SYSTEM_SELECTABLE | runtime_.itemState;
@@ -152,7 +214,7 @@ public:
     HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT, BSTR*) override { return S_FALSE; }
     HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT*) override { return S_FALSE; }
     HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT*) override { return S_FALSE; }
-    HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT, BSTR* action) override {
+    HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT child, BSTR* action) override {
         if (!action) return E_POINTER;
         ++runtime_.providerReadDepth;
         if (runtime_.pumpAfterQueue.load()) {
@@ -190,9 +252,42 @@ public:
                 ListView_SetItemState(runtime_.list.load(), 0, LVIS_SELECTED, LVIS_SELECTED);
             }
         }
-        *action = SysAllocString(runtime_.changedAction ? L"Different action" : L"Open");
         --runtime_.providerReadDepth;
-        return *action ? S_OK : E_OUTOFMEMORY;
+        HRESULT result = S_OK;
+        if (runtime_.standardMetadata && !runtime_.changedAction)
+            result = ReadStandard([&](IAccessible* object) { return object->get_accDefaultAction(child, action); });
+        else {
+            *action = SysAllocString(runtime_.changedAction ? L"Different action" : L"Open");
+            result = *action ? S_OK : E_OUTOFMEMORY;
+        }
+        if (runtime_.cancelDuringPreparationRead) {
+            runtime_.cancelDuringPreparationRead = false;
+            if (auto* agent = runtime_.agent.load()) {
+                agent->CancelPopupOnSourceThread();
+                runtime_.preparationCancelled = true;
+            }
+        }
+        if (runtime_.reenterDuringPreparationRead) {
+            // A faulty preparing guard must still produce a bounded test.
+            runtime_.reenterDuringPreparationRead = false;
+            ++runtime_.preparationReentries;
+            std::wstring error;
+            bool refused = false;
+            auto* agent = runtime_.agent.load();
+            runtime_.preparationReentrantRefused = agent &&
+                !agent->PostListViewActivation(runtime_.node, 0, refused, error) && refused;
+        }
+        if (runtime_.pumpDuringPreparationRelease) {
+            runtime_.pumpDuringPreparationRelease = false;
+            pumpOnFinalRelease_ = true;
+        }
+        ++runtime_.completedDefaultActionReads;
+        // Arm only after the standard provider has returned, so its own state
+        // queries cannot consume the final native identity-read probe early.
+        if (runtime_.armFinalIdentityAfterDefaultRead != 0 &&
+            runtime_.completedDefaultActionReads == runtime_.armFinalIdentityAfterDefaultRead)
+            runtime_.interceptFinalIdentityRead = true;
+        return result;
     }
     HRESULT STDMETHODCALLTYPE accSelect(long, VARIANT) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE accLocation(long*, long*, long*, long*, VARIANT) override { return E_NOTIMPL; }
@@ -203,6 +298,40 @@ public:
         runtime_.actionInsideProviderRead.store(runtime_.actionInsideProviderRead.load() || runtime_.providerReadDepth != 0);
         if (child.vt != VT_I4 || child.lVal != 1) return E_INVALIDARG;
         runtime_.calls.fetch_add(1);
+        if (runtime_.reenterDuringAction) {
+            runtime_.reenterDuringAction = false;
+            std::wstring error;
+            bool refused = false;
+            auto* agent = runtime_.agent.load();
+            runtime_.reentrantRefused = agent &&
+                !agent->PostListViewActivation(runtime_.node, 0, refused, error) && refused;
+        }
+        if (runtime_.replaceDuringAction) {
+            SendMessageW(runtime_.list.load(), LVM_DELETEITEM, 0, 0);
+            LVITEMW item{};
+            item.mask = LVIF_TEXT;
+            item.pszText = const_cast<LPWSTR>(L"Component");
+            SendMessageW(runtime_.list.load(), LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
+            ListView_SetItemState(runtime_.list.load(), 0, LVIS_SELECTED | LVIS_FOCUSED,
+                LVIS_SELECTED | LVIS_FOCUSED);
+            runtime_.actionMutated = true;
+        }
+        if (runtime_.renameDuringAction) {
+            ListView_SetItemText(runtime_.list.load(), 0, 0, const_cast<LPWSTR>(L"Changed"));
+            runtime_.actionMutated = true;
+        }
+        if (runtime_.clearStateDuringAction) {
+            ListView_SetItemState(runtime_.list.load(), 0, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            runtime_.actionMutated = true;
+        }
+        if (runtime_.changeDefaultDuringAction) {
+            runtime_.changedAction = true;
+            runtime_.actionMutated = true;
+        }
+        if (runtime_.cancelDuringAction) {
+            if (auto* agent = runtime_.agent.load()) agent->CancelPopupOnSourceThread();
+            runtime_.actionMutated = true;
+        }
         if (runtime_.modal.load()) {
             SetEvent(runtime_.modalStarted);
             while (WaitForSingleObject(runtime_.modalRelease, 0) == WAIT_TIMEOUT) {
@@ -215,18 +344,45 @@ public:
             }
         }
         SetEvent(runtime_.returned);
-        return S_OK;
+        return runtime_.actionResult;
     }
     HRESULT STDMETHODCALLTYPE put_accName(VARIANT, BSTR) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE put_accValue(VARIANT, BSTR) override { return E_NOTIMPL; }
 private:
+    template<typename Read>
+    HRESULT ReadStandard(Read&& read) {
+        runtime_.wrongThread.store(runtime_.wrongThread.load() || GetCurrentThreadId() != runtime_.thread.load());
+        winrt::com_ptr<IAccessible> standard;
+        const HRESULT result = CreateStdAccessibleObject(runtime_.list.load(), OBJID_CLIENT,
+            IID_IAccessible, standard.put_void());
+        return FAILED(result) || !standard ? result : read(standard.get());
+    }
     std::atomic<ULONG> references_{1};
+    bool pumpOnFinalRelease_ = false;
     ListActivationRuntime& runtime_;
 };
+
+LRESULT CALLBACK ListActivationParentSubclass(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam, UINT_PTR subclassId, DWORD_PTR data) {
+    auto& runtime = *reinterpret_cast<ListActivationRuntime*>(data);
+    if (message == WM_NOTIFY && lParam) {
+        const auto& notification = *reinterpret_cast<const NMHDR*>(lParam);
+        if (notification.hwndFrom == runtime.list.load() &&
+            (notification.code == NM_DBLCLK || notification.code == NM_RETURN ||
+                notification.code == LVN_ITEMACTIVATE)) ++runtime.activationNotifications;
+    }
+    const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, ListActivationParentSubclass, subclassId);
+    return result;
+}
 
 LRESULT CALLBACK ListActivationSubclass(HWND window, UINT message, WPARAM wParam,
     LPARAM lParam, UINT_PTR subclassId, DWORD_PTR data) {
     auto& runtime = *reinterpret_cast<ListActivationRuntime*>(data);
+    if (message == WM_KEYDOWN || message == WM_KEYUP || message == WM_CHAR ||
+        message == WM_SYSKEYDOWN || message == WM_SYSKEYUP || message == WM_SYSCHAR ||
+        message == WM_LBUTTONDOWN || message == WM_LBUTTONUP || message == WM_LBUTTONDBLCLK)
+        ++runtime.syntheticInputMessages;
     if (message == WM_GETOBJECT && static_cast<LONG>(lParam) == OBJID_CLIENT) {
         auto* accessible = new ListActivationAccessible(runtime);
         const LRESULT result = LresultFromObject(IID_IAccessible, wParam, accessible);
@@ -265,6 +421,8 @@ LRESULT CALLBACK ListActivationSubclass(HWND window, UINT message, WPARAM wParam
         case ListActivationProbe::DisabledParent: EnableWindow(runtime.parent, FALSE); break;
         case ListActivationProbe::ChangedAction: runtime.changedAction = true; break;
         case ListActivationProbe::ChangedView: SendMessageW(window, LVM_SETVIEW, LV_VIEW_SMALLICON, 0); break;
+        case ListActivationProbe::ProviderRefused: runtime.actionResult = S_FALSE; break;
+        case ListActivationProbe::ProviderUnavailable: runtime.actionResult = DISP_E_MEMBERNOTFOUND; break;
         case ListActivationProbe::ReplaceDuringFinalRead:
         case ListActivationProbe::StateDuringFinalRead:
             runtime.mutateOnDefaultActionRead = 2;
@@ -276,8 +434,15 @@ LRESULT CALLBACK ListActivationSubclass(HWND window, UINT message, WPARAM wParam
         return 0;
     }
     if (message == kListActivationSentinel) {
+        runtime.stateAfterAction = static_cast<UINT>(SendMessageW(window, LVM_GETITEMSTATE, 0,
+            LVIS_SELECTED | LVIS_FOCUSED | LVIS_CUT | LVIS_DROPHILITED | LVIS_STATEIMAGEMASK));
+        runtime.idAfterAction = static_cast<uint32_t>(SendMessageW(window, LVM_MAPINDEXTOID, 0, 0));
+        wchar_t text[128]{};
+        ListView_GetItemText(window, 0, 0, text, 128);
+        runtime.textAfterAction = text;
         runtime.itemState = 0;
         runtime.changedAction = false;
+        runtime.actionResult = S_OK;
         runtime.mutateOnDefaultActionRead = 0;
         ShowWindow(window, SW_SHOWNOACTIVATE);
         EnableWindow(runtime.parent, TRUE);
@@ -314,6 +479,7 @@ void TestDeferredListViewActivation() {
         runtime.root.store(root);
         runtime.list.store(list);
         if (list) {
+            SetWindowSubclass(runtime.parent, ListActivationParentSubclass, 0xAB32, reinterpret_cast<DWORD_PTR>(&runtime));
             SetWindowSubclass(list, ListActivationSubclass, 0xAB31, reinterpret_cast<DWORD_PTR>(&runtime));
             LVITEMW item{};
             item.mask = LVIF_TEXT;
@@ -369,13 +535,15 @@ void TestDeferredListViewActivation() {
             ListActivationProbe::DisabledItem, ListActivationProbe::HiddenList,
             ListActivationProbe::DisabledParent, ListActivationProbe::ChangedAction,
             ListActivationProbe::ChangedView, ListActivationProbe::ReplaceDuringFinalRead,
-            ListActivationProbe::StateDuringFinalRead}) {
+            ListActivationProbe::StateDuringFinalRead, ListActivationProbe::ProviderRefused,
+            ListActivationProbe::ProviderUnavailable}) {
         const bool ready = capture();
         if (!ready) std::wcerr << L"ListView activation capture: " << error << L'\n';
         Check(ready, "ListView activation capability or stable native ID was not captured");
         if (!ready) { cleanup(); return; }
         ResetEvent(runtime.drained);
         runtime.calls.store(0);
+        runtime.syntheticInputMessages = runtime.activationNotifications = 0;
         runtime.firstQueued = runtime.secondRefused = runtime.replayPosted = false;
         const bool done = PostMessageW(runtime.list.load(), kListActivationProbe, static_cast<WPARAM>(scenario), 0) &&
             WaitForSingleObject(runtime.drained, 2000) == WAIT_OBJECT_0;
@@ -383,6 +551,13 @@ void TestDeferredListViewActivation() {
         if (scenario == ListActivationProbe::Duplicate)
             Check(runtime.calls.load() == 1 && runtime.secondRefused && runtime.replayPosted,
                 "duplicate/replayed ListView activation did not execute exactly once");
+        else if (scenario == ListActivationProbe::ProviderRefused || scenario == ListActivationProbe::ProviderUnavailable) {
+            Check(runtime.calls.load() == 1 && runtime.syntheticInputMessages == 0 && runtime.activationNotifications == 0,
+                "failed ListView default action was retried or replaced with synthetic activation");
+            Check(runtime.stateAfterAction == 0 && runtime.idAfterAction == runtime.node.itemNativeIds[0] &&
+                    runtime.textAfterAction == runtime.node.items[0],
+                "failed ListView default action changed canonical item identity, text or state");
+        }
         else Check(runtime.calls.load() == 0, "cancelled or stale ListView activation invoked its provider");
         if (scenario == ListActivationProbe::ReplaceDuringFinalRead || scenario == ListActivationProbe::StateDuringFinalRead)
             Check(runtime.mutatedDuringRead, "ListView final provider-read mutation was not exercised");

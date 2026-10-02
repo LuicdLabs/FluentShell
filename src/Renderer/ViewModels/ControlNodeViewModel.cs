@@ -102,6 +102,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     public ObservableCollection<string> Columns { get; } = [];
     public ObservableCollection<int> ColumnWidths { get; } = [];
     public ObservableCollection<int> ColumnOrder { get; } = [];
+    public ObservableCollection<string> ItemNativeIds { get; } = [];
     public ObservableCollection<int> ItemDepths { get; } = [];
     public ObservableCollection<bool> ItemExpanded { get; } = [];
     public ObservableCollection<bool> ItemHasChildren { get; } = [];
@@ -200,6 +201,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         ReplaceItemRects(node.ItemRects ?? []);
         ListViewMode = node.ListViewMode ?? "report";
         ItemActivationSupported = node.ItemActivationSupported ?? false;
+        ReplaceItemNativeIds(node.ItemNativeIds ?? []);
         ReplaceSelectedIndices(node.SelectedIndices);
         ReplaceCheckedIndices(node.CheckedIndices ?? []);
         ReplaceColumns(node.Columns);
@@ -215,6 +217,7 @@ public sealed class ControlNodeViewModel : ObservableObject
             node.ImageHeight ?? 0,
             node.ImageFormat ?? string.Empty,
             node.ImageData ?? string.Empty);
+        var completedPending = !preserveTransient && _pendingEventIds.Count != 0;
         if (!preserveTransient) _pendingEventIds.Clear();
         else if (eventId is not null)
         {
@@ -224,8 +227,10 @@ public sealed class ControlNodeViewModel : ObservableObject
                 .ToArray())
             {
                 _pendingEventIds.Remove(property);
+                completedPending = true;
             }
         }
+        if (completedPending) PendingActionsChanged?.Invoke();
         // The projected button changes its own checked state while the native
         // command runs. A veto can leave the canonical array unchanged, so the
         // matching echo must still restore the native group's checked members.
@@ -233,17 +238,31 @@ public sealed class ControlNodeViewModel : ObservableObject
             RaisePropertyChanged(nameof(ToolbarItems));
     }
 
-    public void RegisterPending(string property, string eventId) => _pendingEventIds[property] = eventId;
+    internal event Action? PendingActionsChanged;
+    internal event Action<string>? PendingActionRejected;
+
+    public void RegisterPending(string property, string eventId)
+    {
+        _pendingEventIds[property] = eventId;
+        PendingActionsChanged?.Invoke();
+    }
 
     public bool IsPendingEcho(string property, string? eventId) =>
         eventId is not null && _pendingEventIds.TryGetValue(property, out var pending) && pending == eventId;
 
     public bool HasPending(string property) => _pendingEventIds.ContainsKey(property);
 
-    public void RejectPending(string property, string eventId)
+    public void RejectPending(string property, string eventId, bool willReplay = false)
     {
         if (!IsPendingEcho(property, eventId)) return;
-        _pendingEventIds.Remove(property);
+        // A stale action remains in flight until its resync patch schedules the
+        // one allowed replay. Dependent gestures must not mistake that gap for
+        // a completed request whose canonical state failed to change.
+        if (!willReplay)
+        {
+            _pendingEventIds.Remove(property);
+            PendingActionRejected?.Invoke(property);
+        }
         if (property == "text") DraftText = Text;
         else if (property == "selectedIndex") RaisePropertyChanged(nameof(SelectedIndex));
         else if (property == "checkedIndices") RaisePropertyChanged(nameof(CheckedIndices));
@@ -254,6 +273,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         // A refused split leaves the canonical geometry in place, and the projected
         // splitter follows it back.
         else if (property == "splits") RaisePropertyChanged(nameof(Splits));
+        PendingActionsChanged?.Invoke();
     }
 
     public void AcceptPending(string property, string eventId)
@@ -261,6 +281,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         if (!IsPendingEcho(property, eventId)) return;
         _pendingEventIds.Remove(property);
         if (property == "toolbarCommand") RaisePropertyChanged(nameof(ToolbarItems));
+        PendingActionsChanged?.Invoke();
     }
 
     public void ApplyCanonical(string property, System.Text.Json.JsonElement value, string? eventId)
@@ -284,6 +305,9 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "columnHeadersVisible": ColumnHeadersVisible = value.GetBoolean(); break;
             case "listViewMode": ListViewMode = value.GetString() ?? "report"; break;
             case "itemActivationSupported": ItemActivationSupported = value.GetBoolean(); break;
+            case "itemNativeIds":
+                throw new ProtocolException(
+                    "ListView identities are republished with their rows in a full snapshot, not as a field patch.");
             case "checkBoxes": CheckBoxes = value.GetBoolean(); break;
             case "checkedIndices": ReplaceCheckedIndices(value.Deserialize<List<int>>() ?? []); break;
             case "selectionStart": SelectionStart = value.GetInt32(); break;
@@ -323,7 +347,11 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "toolbarItems": ReplaceToolbarItems(value.Deserialize<List<ToolbarItemSnapshot>>() ?? []); break;
             default: throw new ProtocolException($"Unsupported node patch property '{property}'.");
         }
-        if (matchingEcho) _pendingEventIds.Remove(property);
+        if (matchingEcho)
+        {
+            _pendingEventIds.Remove(property);
+            PendingActionsChanged?.Invoke();
+        }
     }
 
     private static ulong ParseStyle(string? value) =>
@@ -390,6 +418,14 @@ public sealed class ControlNodeViewModel : ObservableObject
         Columns.Clear();
         foreach (var column in columns) Columns.Add(column);
         RaisePropertyChanged(nameof(Columns));
+    }
+
+    private void ReplaceItemNativeIds(IEnumerable<string> identities)
+    {
+        if (ItemNativeIds.SequenceEqual(identities, StringComparer.Ordinal)) return;
+        ItemNativeIds.Clear();
+        foreach (var identity in identities) ItemNativeIds.Add(identity);
+        RaisePropertyChanged(nameof(ItemNativeIds));
     }
 
     private void ReplaceColumnOrder(IEnumerable<int> order)

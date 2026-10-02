@@ -139,6 +139,8 @@ public sealed record ControlNode
     public string? ListViewMode { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ItemActivationSupported { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? ItemNativeIds { get; init; }
     public List<string> Columns { get; init; } = [];
     public List<int> ColumnWidths { get; init; } = [];
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

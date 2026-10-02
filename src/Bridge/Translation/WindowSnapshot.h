@@ -185,8 +185,9 @@ struct ControlNode final {
     // TCM_GETITEMRECT / non-report LVM_GETITEMRECT results in client-local physical
     // pixels. List items may lie outside the current viewport after scrolling.
     std::vector<RECT> itemRects;
-    // Bridge-only stable ListView identities. An item moving to a different
-    // numeric index must never redirect a deferred activation to another item.
+    // Stable ListView identities, sent as canonical decimal strings. An empty
+    // vector means the control has no stable identity contract (e.g. owner data).
+    // Delayed selection/activation must never be redirected to a replacement row.
     std::vector<uint32_t> itemNativeIds;
     // True only when stable item IDs and the native accessible default action
     // both exist. Older peers and controls without that capability expose false.

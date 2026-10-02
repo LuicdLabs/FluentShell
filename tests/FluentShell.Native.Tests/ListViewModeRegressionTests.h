@@ -143,8 +143,16 @@ inline void TestMode(DWORD mode, const wchar_t* name, void (*check)(bool, const 
     check(json.find("\"itemRects\":[") != std::string::npos &&
         json.find("\"listViewMode\":") != std::string::npos &&
         json.find("\"itemActivationSupported\":") != std::string::npos &&
-        json.find("itemNativeIds") == std::string::npos,
-        "ListView mode/geometry/capability wire contract omitted fields or leaked native IDs");
+        json.find("\"itemNativeIds\":[") != std::string::npos,
+        "ListView mode/geometry/capability wire contract omitted fields or stable identities");
+    std::string expectedIds = "\"itemNativeIds\":[";
+    for (size_t index = 0; index < node.itemNativeIds.size(); ++index) {
+        if (index != 0) expectedIds += ',';
+        expectedIds += '"' + std::to_string(node.itemNativeIds[index]) + '"';
+    }
+    expectedIds += ']';
+    check(json.find(expectedIds) != std::string::npos,
+        "ListView stable IDs were not serialized as canonical decimal strings in item order");
     ActionRequest action;
     action.nodeId = node.nodeId;
     action.action = L"setSelection";
@@ -201,16 +209,13 @@ inline void TestAdmissionAndActivation(void (*check)(bool, const char*)) {
     if (!fixture.ready) return;
     ControlKind kind{};
     std::wstring error;
-    for (const DWORD flag : { LVS_OWNERDATA, LVS_OWNERDRAWFIXED }) {
-        const HWND unsupported = CreateWindowExW(0, WC_LISTVIEWW, L"",
-            WS_CHILD | LVS_ICON | flag, 0, 0, 200, 100, fixture.root, nullptr,
-            GetModuleHandleW(nullptr), nullptr);
-        check(unsupported && !ClassifyControl(unsupported, kind, error) &&
-            error.find(flag == LVS_OWNERDATA ? L"LVS_OWNERDATA" : L"LVS_OWNERDRAWFIXED") !=
-                std::wstring::npos,
-            "ListView owner-data/owner-draw rejection lost its separate diagnostic");
-        if (unsupported) DestroyWindow(unsupported);
-    }
+    const HWND unsupported = CreateWindowExW(0, WC_LISTVIEWW, L"",
+        WS_CHILD | LVS_ICON | LVS_OWNERDRAWFIXED, 0, 0, 200, 100, fixture.root, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    check(unsupported && !ClassifyControl(unsupported, kind, error) &&
+        error.find(L"LVS_OWNERDRAWFIXED") != std::wstring::npos,
+        "ListView owner-draw rejection lost its specific diagnostic");
+    if (unsupported) DestroyWindow(unsupported);
     SetWindowSubclass(fixture.list, TileViewEvidence, 700, 0);
     check(!ClassifyControl(fixture.list, kind, error) && error.find(L"tile") != std::wstring::npos,
         "tile view was admitted as a legacy icon view");

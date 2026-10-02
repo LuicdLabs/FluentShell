@@ -39,7 +39,7 @@ public class ListViewModeProtocolTests
 
     internal static ControlNode IconList(string mode = "largeIcon") => TestData.Snapshot().Nodes[0] with
     {
-        Kind = "listView", ListViewMode = mode, ItemActivationSupported = true,
+        Kind = "listView", ListViewMode = mode, ItemActivationSupported = true, ItemNativeIds = ["0", "7"],
         Items = ["Computers", "Event Viewer"], Rows = [], Columns = [], ColumnWidths = [], ColumnOrder = [],
         ColumnHeadersVisible = false, CheckBoxes = false, CheckedIndices = [],
         ItemRects = [new() { X = 0, Y = 0, Width = 80, Height = 70 }, new() { X = 80, Y = 0, Width = 80, Height = 70 }],
@@ -78,7 +78,7 @@ public class ListViewModeProtocolTests
     {
         var actual = RoundTrip(IconList() with
         {
-            Items = [], ItemRects = [], ItemImages = [], SelectedIndices = [], FocusedIndex = -1,
+            Items = [], ItemRects = [], ItemImages = [], ItemNativeIds = [], SelectedIndices = [], FocusedIndex = -1,
         });
         Assert.Empty(actual.Items);
         Assert.True(ControlFactory.HasRenderableListViewShape(ControlNodeViewModel.FromSnapshot(actual)));
@@ -89,7 +89,7 @@ public class ListViewModeProtocolTests
     {
         var report = IconList() with
         {
-            ListViewMode = null, ItemActivationSupported = null, ItemRects = null,
+            ListViewMode = null, ItemActivationSupported = null, ItemNativeIds = null, ItemRects = null,
             Columns = ["Name"], ColumnWidths = [100], ColumnOrder = [0], Rows = [["Computers"], ["Event Viewer"]],
         };
         var model = ControlNodeViewModel.FromSnapshot(RoundTrip(report));
@@ -107,6 +107,7 @@ public class ListViewModeProtocolTests
         var node = json.RootElement.GetProperty("window").GetProperty("nodes")[0];
         Assert.False(node.TryGetProperty("listViewMode", out _));
         Assert.False(node.TryGetProperty("itemActivationSupported", out _));
+        Assert.False(node.TryGetProperty("itemNativeIds", out _));
     }
 
     [Fact]

@@ -483,7 +483,8 @@ internal static class ProtocolValidator
             throw new ProtocolException("Only ListView nodes can carry a column display order.");
         if (node.Kind is not ("tabControl" or "listView") && node.ItemRects is not null)
             throw new ProtocolException("Only TabControl and ListView nodes can carry itemRects.");
-        if (node.Kind != "listView" && (node.ListViewMode is not null || node.ItemActivationSupported is not null))
+        if (node.Kind != "listView" && (node.ListViewMode is not null ||
+            node.ItemActivationSupported is not null || node.ItemNativeIds is not null))
             throw new ProtocolException("Only ListView nodes can carry list presentation and activation state.");
         // Source-generated binding leaves an omitted collection null, so presence
         // is measured by content: an older peer that always emitted these arrays
@@ -1160,6 +1161,24 @@ internal static class ProtocolValidator
             throw new ProtocolException("ListView view mode is unsupported.");
         var report = mode == "report";
         var itemCount = report ? node.Rows.Count : node.Items.Count;
+        var nativeIds = node.ItemNativeIds;
+        if (nativeIds is not null)
+        {
+            if (nativeIds.Count > ProtocolConstants.MaxItems ||
+                (nativeIds.Count != 0 && nativeIds.Count != itemCount))
+                throw new ProtocolException("ListView itemNativeIds must be empty or name every item within the cap.");
+            var identities = new HashSet<ulong>();
+            foreach (var identity in nativeIds)
+            {
+                var value = ParseUInt64(identity, "listView.itemNativeIds");
+                // LVM_MAPINDEXTOID permits zero, but UINT_MAX is failure.
+                if (value >= uint.MaxValue || !identities.Add(value))
+                    throw new ProtocolException("ListView itemNativeIds contains an invalid or duplicate native identity.");
+            }
+        }
+        if (node.ItemActivationSupported == true &&
+            (nativeIds is null || nativeIds.Count != itemCount))
+            throw new ProtocolException("ListView activation requires a stable native ID for every item.");
         if (node.ColumnHeadersVisible is null)
             throw new ProtocolException("ListView columnHeadersVisible is missing.");
         if (node.CheckBoxes is null || node.CheckedIndices is null ||
@@ -1800,10 +1819,13 @@ internal static class ProtocolValidator
             if (kind == "listView")
             {
                 RequireProperties(node, $"{context}.listView", RequiredListViewProperties);
+                if (node.TryGetProperty("itemNativeIds", out var nativeIds))
+                    RequireKind(nativeIds, JsonValueKind.Array, $"{context}.listView.itemNativeIds");
             }
             else if (node.TryGetProperty("columnHeadersVisible", out _) ||
                      node.TryGetProperty("checkBoxes", out _) ||
-                     node.TryGetProperty("checkedIndices", out _))
+                     node.TryGetProperty("checkedIndices", out _) ||
+                     node.TryGetProperty("itemNativeIds", out _))
             {
                 throw new ProtocolException($"{context}.node carries ListView-only fields for a non-ListView kind.");
             }

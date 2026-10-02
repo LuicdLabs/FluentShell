@@ -46,15 +46,20 @@ struct ListViewActivationRequest final {
 struct ActionOutcome final {
     bool accepted = false;
     bool destroyed = false;
-    // The application ran the requested operation and declined it.  Canonical
-    // state is intact, so the surface stays projected and the renderer is told the
-    // action was rejected.
+    // The application declined the operation, or the indexed target changed
+    // before it could run. Canonical state is intact, so the surface stays
+    // projected and the renderer is told the action was rejected.
     bool refused = false;
     uint64_t closeSequence = 0;
     uint64_t revision = 0;
     WindowSnapshot snapshot;
     std::wstring error;
 };
+
+// Virtual item indices identify only the published ordering. These actions must
+// not run, or automatically replay, after that native snapshot has changed.
+bool IsOwnerDataListViewIndexedAction(
+    const ActionRequest& action, const WindowSnapshot& snapshot) noexcept;
 
 inline HWND SyntheticNotificationTarget(HWND root, HWND target) noexcept {
     const HWND parent = GetParent(target);
@@ -227,14 +232,9 @@ inline bool RenameListViewItem(HWND listView, int index, const std::wstring& tex
         SendMessageW(listView, LVM_CANCELEDITLABEL, 0, 0);
         return false;
     }
-    std::vector<wchar_t> buffer(text.size() + 2, L'\0');
-    LVITEMW read{};
-    read.iSubItem = 0;
-    read.pszText = buffer.data();
-    read.cchTextMax = static_cast<int>(buffer.size());
-    if (SendMessageW(listView, LVM_GETITEMTEXTW, static_cast<WPARAM>(index),
-            reinterpret_cast<LPARAM>(&read)) < 0) return false;
-    return text == buffer.data();
+    std::wstring actual;
+    std::wstring reason;
+    return ReadListViewItemText(listView, index, 0, actual, reason) && actual == text;
 }
 
 class SourceThreadAgent final : public std::enable_shared_from_this<SourceThreadAgent> {
@@ -505,6 +505,7 @@ private:
     uint64_t queuedListViewActivationToken_ = 0;
     std::optional<ListViewActivationRequest> queuedListViewActivation_;
     bool rearmListViewActivation_ = false;
+    uint64_t listViewActivationCancellation_ = 0;
     // All of this state belongs to the source GUI thread. The native tracking call
     // keeps its HMENU alive while the renderer owns the visible flyout.
     // Posted messages hold only a token. Cancelling/unhooking releases the request

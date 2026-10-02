@@ -72,6 +72,15 @@ public sealed class TranslatedWindow : Window
         _root.Children.Add(_canvas);
         Content = _root;
         _canvas.KeyDown += OnCanvasKeyDown;
+        _root.AddHandler(UIElement.PointerPressedEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, args) =>
+        {
+            if (Environment.GetEnvironmentVariable("FLUENTSHELL_DIAG_ACCESSIBILITY") != "1") return;
+            var point = args.GetCurrentPoint(_root).Position;
+            var hits = VisualTreeHelper.FindElementsInHostCoordinates(point, _root)
+                .OfType<FrameworkElement>().Take(12)
+                .Select(hit => $"{hit.GetType().Name}:{AutomationProperties.GetAutomationId(hit)}:{Canvas.GetZIndex(hit)}");
+            RendererDiagnostics.Log($"pointer hit x={point.X:F0} y={point.Y:F0} source={args.OriginalSource?.GetType().Name} hits={string.Join(";", hits)}");
+        }), true);
         if (MicaController.IsSupported()) SystemBackdrop = new MicaBackdrop();
         ExtendsContentIntoTitleBar = false;
         Hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
@@ -282,15 +291,16 @@ public sealed class TranslatedWindow : Window
                 if (result.Status is "rejected" or "stale" or "closeRejected")
                 {
                     _pending.Remove(result.EventId);
-                    pending.Node?.RejectPending(pending.Property, result.EventId);
+                    var willReplay = result.Status == "stale" && pending.Node is not null &&
+                        NodeActionReplayPolicy.IsReplayableAfterStale(pending.Property) &&
+                        pending.RetryCount < NodeActionReplayPolicy.MaxStaleRetries;
+                    pending.Node?.RejectPending(pending.Property, result.EventId, willReplay);
                     if (pending.Property == "close") _closePending = false;
                     // A revision race is not a refusal of the request: the Bridge only
                     // says the snapshot the request named is no longer current.  An
                     // action that carries the absolute state the user asked for can be
                     // re-sent once against the revision that replaces it.
-                    if (result.Status == "stale" && pending.Node is { } staleNode &&
-                        NodeActionReplayPolicy.IsReplayableAfterStale(pending.Property) &&
-                        pending.RetryCount < NodeActionReplayPolicy.MaxStaleRetries)
+                    if (willReplay && pending.Node is { } staleNode)
                     {
                         _staleReplays[result.EventId] = new NodeActionReplay(
                             staleNode.NodeId, pending.Property, pending.Action,
@@ -444,6 +454,8 @@ public sealed class TranslatedWindow : Window
         foreach (var node in ViewModel.Nodes)
         {
             var control = factory.Create(node);
+            if (Environment.GetEnvironmentVariable("FLUENTSHELL_DIAG_ACCESSIBILITY") == "1")
+                control.Loaded += (_, _) => RendererDiagnostics.Log($"node layout node={node.NodeId} kind={node.Kind} parent={node.ParentNodeId} rect={node.Rect.X},{node.Rect.Y},{node.Rect.Width},{node.Rect.Height} relative={Canvas.GetLeft(control)},{Canvas.GetTop(control)} actual={control.ActualWidth},{control.ActualHeight} z={Canvas.GetZIndex(control)}");
             _controls[node.NodeId] = control;
             if (node.ParentNodeId is null)
             {
@@ -614,7 +626,7 @@ public sealed class TranslatedWindow : Window
         AutomationProperties.SetName(icon, name);
         Canvas.SetLeft(icon, 16);
         Canvas.SetTop(icon, 16);
-        Canvas.SetZIndex(icon, 512);
+        Canvas.SetZIndex(icon, ControlFactory.DialogIconZIndex);
         return icon;
     }
 
