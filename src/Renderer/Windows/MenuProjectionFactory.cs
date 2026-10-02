@@ -5,8 +5,16 @@ using Microsoft.UI.Xaml.Controls;
 
 namespace FluentShell.Renderer.Windows;
 
-internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
+internal sealed class MenuProjectionFactory(
+    Action<MenuItemViewModel> invoke, PresentationLifetime lifetime, string? popupId = null)
 {
+    public MenuFlyout CreateFlyout(IEnumerable<MenuItemViewModel> items)
+    {
+        var flyout = new MenuFlyout();
+        foreach (var item in items) flyout.Items.Add(CreateItem(item));
+        return flyout;
+    }
+
     public MenuBar Create(IEnumerable<MenuItemViewModel> items)
     {
         var bar = new MenuBar();
@@ -21,7 +29,7 @@ internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
                 IsEnabled = item.Enabled,
             };
             ApplyAutomation(root, item);
-            item.PropertyChanged += (_, args) =>
+            lifetime.Subscribe(item, (_, args) =>
             {
                 if (args.PropertyName == nameof(item.Text))
                 {
@@ -31,7 +39,7 @@ internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
                 }
                 else if (args.PropertyName == nameof(item.Enabled)) root.IsEnabled = item.Enabled;
                 else if (args.PropertyName == nameof(item.IsDefault)) ApplyAutomation(root, item);
-            };
+            });
             foreach (var child in item.Items) root.Items.Add(CreateItem(child));
             bar.Items.Add(root);
         }
@@ -55,6 +63,17 @@ internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
                 IsEnabled = item.Enabled,
             };
             ApplyAutomation(popup, item);
+            lifetime.Subscribe(item, (_, args) =>
+            {
+                if (args.PropertyName == nameof(item.Text))
+                {
+                    popup.Text = Win32Mnemonic.DisplayText(item.Text);
+                    popup.AccessKey = Win32Mnemonic.AccessKey(item.Text);
+                    ApplyAutomation(popup, item);
+                }
+                else if (args.PropertyName == nameof(item.Enabled)) popup.IsEnabled = item.Enabled;
+                else if (args.PropertyName == nameof(item.IsDefault)) ApplyAutomation(popup, item);
+            });
             foreach (var child in item.Items) popup.Items.Add(CreateItem(child));
             return popup;
         }
@@ -63,7 +82,7 @@ internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
             {
                 Text = Win32Mnemonic.DisplayText(item.Text),
                 IsChecked = item.Checked,
-                GroupName = $"native-menu-{item.ItemId[..item.ItemId.LastIndexOf('.')]}",
+                GroupName = RadioGroupName(item.ItemId, popupId),
             }
             : item.Checked
             ? new ToggleMenuFlyoutItem
@@ -75,7 +94,7 @@ internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
         command.AccessKey = Win32Mnemonic.AccessKey(item.Text);
         command.IsEnabled = item.Enabled;
         ApplyAutomation(command, item);
-        item.PropertyChanged += (_, args) =>
+        lifetime.Subscribe(item, (_, args) =>
         {
             if (args.PropertyName == nameof(item.Text))
             {
@@ -95,24 +114,40 @@ internal sealed class MenuProjectionFactory(Action<MenuItemViewModel> invoke)
                 if (command is RadioMenuFlyoutItem radio) radio.IsChecked = item.Checked;
             }
             else if (args.PropertyName == nameof(item.IsDefault)) ApplyAutomation(command, item);
-        };
+        });
         if (command is MenuFlyoutItem flyout)
-            flyout.Click += (_, _) => invoke(item);
+            flyout.Click += (_, _) => lifetime.Invoke(() => invoke(item));
         else if (command is ToggleMenuFlyoutItem toggle)
-            toggle.Click += (_, _) => invoke(item);
+            toggle.Click += (_, _) => lifetime.Invoke(() => invoke(item));
         else if (command is RadioMenuFlyoutItem radio)
-            radio.Click += (_, _) => invoke(item);
+            radio.Click += (_, _) => lifetime.Invoke(() => invoke(item));
         return command;
     }
 
-    private static void ApplyAutomation(DependencyObject element, MenuItemViewModel item)
+    private void ApplyAutomation(DependencyObject element, MenuItemViewModel item)
     {
-        AutomationProperties.SetAutomationId(element, AutomationId(item.ItemId));
+        AutomationProperties.SetAutomationId(element, popupId is null
+            ? AutomationId(item.ItemId) : PopupAutomationId(popupId, item.ItemId));
         AutomationProperties.SetName(element, Win32Mnemonic.DisplayText(item.Text));
         AutomationProperties.SetItemStatus(element, item.IsDefault ? "Default" : string.Empty);
-        if (item.IsDefault && element is Control control)
-            control.FontWeight = new global::Windows.UI.Text.FontWeight { Weight = 700 };
+        if (element is Control control)
+        {
+            if (item.IsDefault)
+                control.FontWeight = new global::Windows.UI.Text.FontWeight { Weight = 700 };
+            else
+                control.ClearValue(Control.FontWeightProperty);
+        }
     }
 
     internal static string AutomationId(string itemId) => $"FluentShell.Menu.{itemId}";
+
+    internal static string PopupAutomationId(string popupId, string itemId) =>
+        $"FluentShell.Popup.{popupId}.Item.{itemId}";
+
+    internal static string RadioGroupName(string itemId, string? popupId = null)
+    {
+        var separator = itemId.LastIndexOf('.');
+        var parent = separator < 0 ? "root" : itemId[..separator];
+        return $"native-menu-{popupId ?? "bar"}-{parent}";
+    }
 }

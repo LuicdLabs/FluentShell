@@ -8,6 +8,7 @@ using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Automation.Peers;
@@ -20,6 +21,13 @@ public sealed class TranslatedWindow : Window
     private readonly Grid _root = new();
     private readonly SemanticContentViewport _canvas = new();
     private MenuBar? _menuBar;
+    private MenuFlyout? _popupFlyout;
+    private PresentationLifetime? _controlLifetime;
+    private PresentationLifetime? _popupLifetime;
+    private readonly PopupMenuCoordinator _popupCommands = new();
+    private readonly List<MenuItemViewModel> _popupItems = [];
+    private global::Windows.Foundation.Point? _popupPosition;
+    private bool _popupSyncQueued;
     private readonly Func<ActionInvokeMessage, ulong, Task> _sendAction;
     private readonly Func<string> _nextEventId;
     private readonly Dictionary<string, PendingNodeAction> _pending = new(StringComparer.Ordinal);
@@ -72,7 +80,11 @@ public sealed class TranslatedWindow : Window
         // WinUI requires an owner before an overlapped presenter can be marked
         // modal.  The owner proxy is resolved by WindowRegistry after this
         // window is constructed, so defer IsModal until SetOwner.
-        _root.Loaded += (_, _) => _loaded.TrySetResult();
+        _root.Loaded += (_, _) =>
+        {
+            _loaded.TrySetResult();
+            QueuePopupSynchronization();
+        };
         if (!SetCloaked(true)) throw new InvalidOperationException("Unable to cloak renderer proxy.");
         _appWindow.Title = ViewModel.Title;
         _appWindow.IsShownInSwitchers = ViewModel.ShowInTaskbar;
@@ -84,7 +96,12 @@ public sealed class TranslatedWindow : Window
         _subclassProc = OnSubclassMessage;
         if (!NativeWindowInterop.SetWindowSubclass(Hwnd, _subclassProc, SizeMoveSubclassId, 0))
             throw new InvalidOperationException("Unable to observe the renderer proxy move/size loop.");
-        Closed += (_, _) => RendererDiagnostics.Log($"window closed hwnd=0x{(ulong)(nuint)Hwnd:X} surface={ViewModel.SurfaceId}");
+        Closed += (_, _) =>
+        {
+            _controlLifetime?.Dispose();
+            _popupLifetime?.Dispose();
+            RendererDiagnostics.Log($"window closed hwnd=0x{(ulong)(nuint)Hwnd:X} surface={ViewModel.SurfaceId}");
+        };
         RebuildControls();
         ApplyWindowState();
         RefreshRenderDpi();
@@ -103,6 +120,7 @@ public sealed class TranslatedWindow : Window
     {
         _interactionBlocked = !enabled;
         ApplyInteractionState();
+        QueuePopupSynchronization();
     }
 
     public void Reactivate()
@@ -220,6 +238,7 @@ public sealed class TranslatedWindow : Window
         if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
         if (boundsReplay is { } boundsIntent) QueueOrEmitBoundsAction(boundsIntent);
         if (nodeReplay is { } nodeIntent) EmitStaleReplay(nodeIntent);
+        QueuePopupSynchronization();
     }
 
     // Re-send a property action the Bridge refused as stale, now that the revision it
@@ -279,7 +298,8 @@ public sealed class TranslatedWindow : Window
                     }
                 }
                 else if (result.Snapshot is not null ||
-                         (result.Status == "accepted" && pending.Property == "invoke"))
+                         (result.Status == "accepted" &&
+                          (pending.Property == "invoke" || pending.Action == "popupCommand")))
                 {
                     _pending.Remove(result.EventId);
                     pending.Node?.AcceptPending(pending.Property, result.EventId);
@@ -301,6 +321,7 @@ public sealed class TranslatedWindow : Window
         {
             _applyingCanonical = false;
         }
+        QueuePopupSynchronization();
     }
 
     public void Commit(bool show, ulong revision, bool interactive)
@@ -311,6 +332,7 @@ public sealed class TranslatedWindow : Window
         _applyingCanonical = true;
         try
         {
+            if (!show || !interactive) HidePopupFlyout();
             if (show)
             {
                 _committed = true;
@@ -333,10 +355,12 @@ public sealed class TranslatedWindow : Window
             }
         }
         finally { _applyingCanonical = false; }
+        QueuePopupSynchronization();
     }
 
     public void RetireFromBridge()
     {
+        _controlLifetime?.Dispose();
         _applyingCanonical = true;
         try
         {
@@ -344,6 +368,7 @@ public sealed class TranslatedWindow : Window
             _interactive = false;
             _gateBounds = null;
             _retired = true;
+            ClearPopupMenu();
             _closePending = false;
             _pending.Clear();
             _staleReplays.Clear();
@@ -367,6 +392,7 @@ public sealed class TranslatedWindow : Window
 
     public void CloseFromBridge()
     {
+        _controlLifetime?.Dispose();
         _applyingCanonical = true;
         try
         {
@@ -374,6 +400,7 @@ public sealed class TranslatedWindow : Window
             _interactive = false;
             _gateBounds = null;
             _retired = true;
+            ClearPopupMenu();
             _closePending = false;
             _pending.Clear();
             _staleReplays.Clear();
@@ -393,13 +420,15 @@ public sealed class TranslatedWindow : Window
 
     private void RebuildControls()
     {
+        _controlLifetime?.Dispose();
+        var lifetime = _controlLifetime = new PresentationLifetime();
         _canvas.Children.Clear();
         _controls.Clear();
         if (_menuBar is not null) _root.Children.Remove(_menuBar);
         _menuBar = null;
         if (ViewModel.Menu.Count != 0)
         {
-            _menuBar = new MenuProjectionFactory(EmitMenuAction).Create(ViewModel.Menu);
+            _menuBar = new MenuProjectionFactory(EmitMenuAction, lifetime).Create(ViewModel.Menu);
             Grid.SetRow(_menuBar, 0);
             _root.Children.Insert(0, _menuBar);
         }
@@ -409,7 +438,7 @@ public sealed class TranslatedWindow : Window
         var factory = new ControlFactory(
             Math.Max(1, (int)Math.Round(dpi)), ViewModel.Nodes, EmitNodeAction,
             () => !CanEmitActions,
-            IsImeComposing);
+            IsImeComposing, lifetime);
         var icon = CreateDialogIcon();
         if (icon is not null) _canvas.Children.Add(icon);
         foreach (var node in ViewModel.Nodes)
@@ -430,6 +459,143 @@ public sealed class TranslatedWindow : Window
                     "Validated control parent is not a projected container.");
             }
         }
+        QueuePopupSynchronization();
+    }
+
+    private void QueuePopupSynchronization()
+    {
+        if (_popupSyncQueued || _retired) return;
+        _popupSyncQueued = true;
+        if (!DispatcherQueue.TryEnqueue(() =>
+        {
+            _popupSyncQueued = false;
+            SynchronizePopupMenu();
+        })) _popupSyncQueued = false;
+    }
+
+    // Popup state is independent of the main menu/control shape. Anchor to the
+    // stable content canvas, using the island's actual projected transform, so a
+    // provider disabling/rebuilding its own action row does not dismiss the menu.
+    private void SynchronizePopupMenu()
+    {
+        if (_applyingCanonical || _retired) return;
+        var popup = ViewModel.PopupMenu;
+        if (_popupCommands.Observe(popup?.PopupId))
+        {
+            HidePopupFlyout();
+            _popupItems.Clear();
+        }
+        if (popup is null) return;
+        if (_popupCommands.HasResponse)
+        {
+            FlushPopupResponse();
+            return;
+        }
+        if (!_committed || !_interactive || !_root.IsLoaded) return;
+        if (!CanEmitActions || ViewModel.State == "minimized")
+        {
+            RespondToPopup(popup.PopupId, null);
+            return;
+        }
+        _root.UpdateLayout();
+        if (!TryGetPopupPosition(popup, out var position))
+        {
+            RespondToPopup(popup.PopupId, null);
+            return;
+        }
+        var sameShape = _popupItems.Count == popup.Items.Count &&
+            _popupItems.Zip(popup.Items).All(pair => pair.First.HasSameShape(pair.Second));
+        if (_popupFlyout is not null && sameShape && _popupPosition == position)
+        {
+            for (var index = 0; index < _popupItems.Count; index++)
+                _popupItems[index].ApplySnapshot(popup.Items[index], true);
+            return;
+        }
+        HidePopupFlyout();
+        _popupItems.Clear();
+        _popupItems.AddRange(popup.Items.Select(MenuItemViewModel.FromSnapshot));
+        var popupId = popup.PopupId;
+        var lifetime = _popupLifetime = new PresentationLifetime();
+        var flyout = new MenuProjectionFactory(
+            item => RespondToPopup(popupId, item.ItemId), lifetime, popupId).CreateFlyout(_popupItems);
+        _popupFlyout = flyout;
+        _popupPosition = position;
+        flyout.Closed += (_, _) =>
+        {
+            // Programmatic hiding clears this reference first. Click also records
+            // its terminal response in this input turn. Defer dismissal so a
+            // Closed notification delivered before Click cannot win that race.
+            if (!ReferenceEquals(_popupFlyout, flyout)) return;
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (ReferenceEquals(_popupFlyout, flyout)) RespondToPopup(popupId, null);
+            });
+        };
+        try
+        {
+            flyout.ShowAt(_canvas, new FlyoutShowOptions
+            {
+                Position = position,
+                Placement = FlyoutPlacementMode.BottomEdgeAlignedLeft,
+            });
+        }
+        catch (Exception exception)
+        {
+            RendererDiagnostics.Log($"popup presentation failed id={popupId}: {exception.Message}");
+            RespondToPopup(popupId, null);
+        }
+    }
+
+    private bool TryGetPopupPosition(
+        PopupMenuSnapshot popup, out global::Windows.Foundation.Point position)
+    {
+        position = default;
+        var node = ViewModel.Nodes.FirstOrDefault(candidate => candidate.NodeId == popup.NodeId);
+        if (PopupMenuAnchor.ItemRect(node, popup) is not { } rect ||
+            !_controls.TryGetValue(popup.NodeId, out var control) || control.XamlRoot is null)
+            return false;
+        // MMC disables More Actions while its native tracking call is pending.
+        // That is still the live anchor; enabled state does not retire the popup.
+        var scale = 96.0 / RenderDpi;
+        position = control.TransformToVisual(_canvas).TransformPoint(new global::Windows.Foundation.Point(
+            (rect.X + (ViewModel.Rtl ? rect.Width : 0)) * scale,
+            (rect.Y + rect.Height) * scale));
+        return double.IsFinite(position.X) && double.IsFinite(position.Y);
+    }
+
+    private void RespondToPopup(string popupId, string? itemId)
+    {
+        // A deferred Closed event may arrive after the canonical patch already
+        // retired or replaced the native tracking token.
+        if (_retired || ViewModel.PopupMenu?.PopupId != popupId) return;
+        if (!_popupCommands.Respond(popupId, itemId)) return;
+        HidePopupFlyout();
+        if (!_applyingCanonical) FlushPopupResponse();
+        QueuePopupSynchronization();
+    }
+
+    private void FlushPopupResponse()
+    {
+        if (_popupCommands.PendingResponse is not { } response) return;
+        if (EmitAction(null, $"popup:{response.PopupId}", "popupCommand", response) is not null)
+            _popupCommands.MarkSent(response.PopupId);
+    }
+
+    private void HidePopupFlyout()
+    {
+        _popupLifetime?.Dispose();
+        _popupLifetime = null;
+        var flyout = _popupFlyout;
+        _popupFlyout = null;
+        _popupPosition = null;
+        flyout?.Hide();
+    }
+
+    private void ClearPopupMenu()
+    {
+        _popupCommands.Observe(null);
+        HidePopupFlyout();
+        _popupItems.Clear();
     }
 
     private FontIcon? CreateDialogIcon()
@@ -609,8 +775,14 @@ public sealed class TranslatedWindow : Window
         object? value,
         int retryCount)
     {
-        if (!CanEmitActions) return null;
-        if ((property == "invoke" || property == "close" || property.StartsWith("menu:", StringComparison.Ordinal)) &&
+        // Completing native menu tracking must also work when that native menu
+        // has disabled its owner or a modal transition blocks ordinary input.
+        var terminalPopup = action == "popupCommand" && !_applyingCanonical &&
+            _committed && _interactive && !_retired;
+        if (!CanEmitActions && !terminalPopup) return null;
+        if ((property == "invoke" || property == "close" ||
+             property.StartsWith("menu:", StringComparison.Ordinal) ||
+             property.StartsWith("popup:", StringComparison.Ordinal)) &&
             _pending.Values.Any(pending =>
                 ReferenceEquals(pending.Node, node) && pending.Property == property))
         {
@@ -670,6 +842,13 @@ public sealed class TranslatedWindow : Window
 
     private void OnCanvasKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
     {
+        if (_popupFlyout is not null && args.Key == global::Windows.System.VirtualKey.Escape &&
+            _popupCommands.PopupId is { } popupId)
+        {
+            RespondToPopup(popupId, null);
+            args.Handled = true;
+            return;
+        }
         if (args.Key == global::Windows.System.VirtualKey.Enter)
         {
             var defaultButton = ViewModel.Nodes.FirstOrDefault(node => node.Kind == "button" && node.IsDefault && node.Enabled && node.Visible);

@@ -73,6 +73,16 @@ int ProportionalSplitTarget(
 // column.  `order` must be a permutation of the column indexes.
 bool SetListViewColumnOrder(HWND listView, const std::vector<int>& order) noexcept;
 
+// Resolves a stable native ListView ID and verifies its reverse mapping. UINT_MAX
+// and IDs whose item was removed are invalid; ID zero is a valid native identity.
+int ResolveListViewItemByNativeId(HWND listView, uint32_t nativeId) noexcept;
+
+// Applies the native check-state transition before a toolbar command reaches its
+// owner: CHECK toggles, CHECKGROUP selects one member, and ordinary buttons keep
+// application-owned latches. Rejects stale command identities or group boundaries.
+bool ApplyToolbarCheckState(
+    HWND toolbar, const ControlNode& node, uint32_t commandId, std::wstring& reason);
+
 // Copies an HICON into bounded, owned premultiplied BGRA pixels. Application
 // adapters may use this only after independently establishing a trusted source.
 bool CaptureOwnedIconPixels(

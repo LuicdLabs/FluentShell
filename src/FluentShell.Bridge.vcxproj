@@ -67,6 +67,7 @@
     <ClCompile Include="Bridge\Ipc\Protocol.cpp" />
     <ClCompile Include="Bridge\Translation\ControlAdapters.cpp" />
     <ClCompile Include="Bridge\Translation\AccessibleIsland.cpp" />
+    <ClCompile Include="Bridge\Translation\MmcHtmlDocument.cpp" />
     <ClCompile Include="Bridge\Translation\MenuBarCapture.cpp" />
     <ClCompile Include="Bridge\Translation\DialogSnapshots.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />
@@ -83,15 +84,20 @@
     <ClInclude Include="Bridge\Ipc\FrameCodec.h" />
     <ClInclude Include="Bridge\Ipc\Protocol.h" />
     <ClInclude Include="Bridge\Translation\ControlAdapters.h" />
+    <ClInclude Include="Bridge\Translation\PaintedPixel.h" />
+    <ClInclude Include="Bridge\Translation\PopupMenuState.h" />
     <ClInclude Include="Bridge\Translation\AccessibleIsland.h" />
+    <ClInclude Include="Bridge\Translation\MmcHtmlDocument.h" />
     <ClInclude Include="Bridge\Translation\MenuBarCapture.h" />
     <ClInclude Include="Bridge\Translation\DialogSnapshots.h" />
     <ClInclude Include="Bridge\Translation\DialogTranslator.h" />
     <ClInclude Include="Bridge\Translation\DirectUiEngine.h" />
     <ClInclude Include="Bridge\Translation\RendererSession.h" />
     <ClInclude Include="Bridge\Translation\SourceThreadAgent.h" />
+    <ClInclude Include="Bridge\Translation\ListViewActivation.h" />
     <ClInclude Include="Bridge\Translation\WindowCapture.h" />
     <ClInclude Include="Bridge\Translation\UiAutomationGeometry.h" />
+    <ClInclude Include="Bridge\Translation\UiAutomationProjection.h" />
     <ClInclude Include="Bridge\Translation\UiAutomationValidator.h" />
     <ClInclude Include="Bridge\Translation\WindowSnapshot.h" />
   </ItemGroup>

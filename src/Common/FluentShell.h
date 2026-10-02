@@ -72,7 +72,7 @@ inline void Log(std::wstring_view msg) {
     if (GetTempPathW(static_cast<DWORD>(std::size(temp)), temp) == 0) return;
     std::wstring path = temp;
     path += L"FluentShell.log";
-    const HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+    const HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
 
@@ -82,6 +82,9 @@ inline void Log(std::wstring_view msg) {
     swprintf_s(stamp, L"%02u:%02u:%02u.%03u ",
         now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
     std::wstring record = stamp;
+    // Multiple injected applications and native regressions share this log.
+    // Keep each result attributable to the process that actually produced it.
+    record += L"[pid=" + std::to_wstring(GetCurrentProcessId()) + L"] ";
     record.append(line, 0, line.size() - 1);
     record.append(L"\r\n");
 

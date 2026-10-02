@@ -2,6 +2,7 @@
 
 #include "ControlAdapters.h"
 #include "WindowCapture.h"
+#include "PopupMenuState.h"
 
 #include <commctrl.h>
 #include <atomic>
@@ -16,6 +17,31 @@ struct DirectUiActionBinding;
 struct DirectUiWindowProfile;
 struct DirectUiOwnedProfile;
 struct DirectUiBootstrapEvidence;
+
+struct IslandActionRequest final {
+    HWND island = nullptr;
+    uint64_t nodeId = 0;
+    uint64_t generation = 0;
+    int index = -1;
+    std::wstring name;
+    std::wstring action;
+    bool dropDown = false;
+};
+
+struct ListViewActivationRequest final {
+    HWND listView = nullptr;
+    uint64_t nodeId = 0;
+    uint64_t generation = 0;
+    int index = -1;
+    uint32_t nativeId = 0;
+    size_t itemCount = 0;
+    DWORD viewStyle = 0;
+    UINT nativeState = 0;
+    long accessibleState = 0;
+    std::wstring text;
+    std::wstring accessibleName;
+    std::wstring defaultAction;
+};
 
 struct ActionOutcome final {
     bool accepted = false;
@@ -335,13 +361,36 @@ public:
     // projection is committed and the native window is cloaked: the read asks the
     // application to open its own menus, which needs its message loop and must not
     // compete with the proxy for the foreground.
-    bool ReadMenuBarToolbar(
-        HWND toolbar,
+    bool RefreshMenuBarToolbar(
         DWORD popupWaitMs,
+        bool& changed,
         std::wstring& error,
-        DWORD timeoutMs = 6000,
+        DWORD timeoutMs = 8000,
         HANDLE cancelEvent = nullptr);
-    bool HasMenuBarToolbarMenu() const noexcept;
+    bool RefreshMenuBarOnSourceThread(DWORD popupWaitMs,
+        const std::atomic<bool>& cancelled, bool& changed, std::wstring& error);
+    bool InvokeMenuCommandOnSourceThread(uint32_t commandId,
+        const std::atomic<bool>& cancelled, std::wstring& error, uint64_t* queuedToken = nullptr);
+    void DispatchMenuActionOnSourceThread(uint64_t token) noexcept;
+    bool PostListViewActivation(const ControlNode& node, int index,
+        bool& refused, std::wstring& error, uint64_t* queuedToken = nullptr) noexcept;
+    void DispatchListViewActivationOnSourceThread(uint64_t token) noexcept;
+    // Only Bridge-issued generic actions enter this queue. Application-posted
+    // HWND messages are never intercepted or reordered.
+    bool PostNativeAction(const ActionRequest& action, const ControlNode* node,
+        bool& refused, std::wstring& error, uint64_t* queuedToken = nullptr,
+        uint64_t* closeSequence = nullptr) noexcept;
+    void DispatchNativeActionOnSourceThread(uint64_t token) noexcept;
+    // Bounded command dispatch consumes nested action messages and rearms them
+    // after Complete; a failed command cancels only the token it created.
+    void RearmDeferredActionsOnSourceThread() noexcept;
+    void CancelDeferredActionOnSourceThread(WPARAM kind, uint64_t token) noexcept;
+    void RequestMenuBarRefresh() noexcept { menuBarDirty_.store(true); }
+    bool MenuBarCommandsCurrentOnSourceThread() const noexcept {
+        return GetCurrentThreadId() == threadId_ &&
+            (!captureContext_.menuBarToolbar ||
+                (!menuBarDirty_.load() && !captureContext_.menuBarRefresh.pending));
+    }
     bool Shutdown() noexcept;
 
     HWND Root() const noexcept { return root_; }
@@ -349,10 +398,6 @@ public:
     bool IsDirty() const noexcept { return dirty_.load(); }
     void ClearDirty() noexcept { dirty_.store(false); }
     bool IsDestroyed() const noexcept { return destroyed_.load(); }
-    // True while a command is pumping the source thread's own messages.  Another command
-    // arriving then is requeued rather than dispatched inside the pump.
-    bool DeferringCommands() const noexcept { return deferCommands_.load(); }
-    void SetDeferringCommands(bool defer) noexcept { deferCommands_.store(defer); }
     uint64_t Generation() const noexcept { return generation_; }
     UINT MessageId() const noexcept { return message_; }
     // Queues one accessible island element's own default action to run on this thread
@@ -361,11 +406,12 @@ public:
     // loop, which would blow every bounded command deadline.  Identity is revalidated
     // inside the deferred handler, so an element that moved is dropped instead of
     // acted on.
-    bool PostIslandAction(
-        HWND island,
-        int index,
-        const std::wstring& expectedName,
-        const std::wstring& expectedAction) noexcept;
+    bool PostIslandAction(const ControlNode& node, int index, bool& refused,
+        uint64_t* queuedToken = nullptr) noexcept;
+    void DispatchIslandActionOnSourceThread(uint64_t token) noexcept;
+    bool TrackIslandPopupOnSourceThread(HMENU menu, UINT flags, HWND owner, BOOL& result);
+    bool CompletePopupOnSourceThread(const ActionRequest& action, std::wstring& error);
+    void CancelPopupOnSourceThread(bool activeOnly = false) noexcept;
     void MarkDirty(HWND window = nullptr, UINT message = 0) noexcept {
         lastMutationHwnd_.store(reinterpret_cast<uintptr_t>(window), std::memory_order_release);
         lastMutationMessage_.store(message, std::memory_order_release);
@@ -407,6 +453,8 @@ private:
     SourceThreadAgent(HWND root, HMODULE module, DWORD threadId, UINT message) noexcept;
     bool Post(void* command, DWORD timeoutMs, HANDLE cancelEvent = nullptr) noexcept;
     void UnhookAll() noexcept;
+    void RunIslandActionOnSourceThread(const IslandActionRequest& request) noexcept;
+    void RunListViewActivationOnSourceThread(const ListViewActivationRequest& request) noexcept;
 
     HWND root_ = nullptr;
     HMODULE module_ = nullptr;
@@ -425,7 +473,55 @@ private:
     std::atomic<uint64_t> closeIssued_{ 0 };
     std::atomic<uint64_t> closeCompleted_{ 0 };
     CaptureContext captureContext_;
-    std::atomic<bool> deferCommands_{ false };
+    struct NativeActionRequest final {
+        ActionRequest action;
+        HWND source = nullptr;
+        HWND owner = nullptr;
+        uint64_t nodeGeneration = 0;
+        ControlKind kind = ControlKind::StaticText;
+        HMENU menu = nullptr;
+        uint64_t menuFingerprint = 0;
+        uint64_t closeSequence = 0;
+    };
+    void RunNativeActionOnSourceThread(const NativeActionRequest& request) noexcept;
+    void CancelNativeActionOnSourceThread() noexcept;
+    uint64_t nextNativeActionToken_ = 1;
+    uint64_t queuedNativeActionToken_ = 0;
+    std::optional<NativeActionRequest> queuedNativeAction_;
+    bool rearmNativeAction_ = false;
+    bool nativeActionRunning_ = false;
+    struct MenuActionRequest final {
+        HWND toolbar = nullptr;
+        uint64_t toolbarGeneration = 0;
+        uint64_t bindingGeneration = 0;
+        std::vector<MenuBarButton> buttons;
+        MenuBarCommandBinding binding;
+    };
+    uint64_t nextMenuActionToken_ = 1;
+    uint64_t queuedMenuActionToken_ = 0;
+    std::optional<MenuActionRequest> queuedMenuAction_;
+    bool rearmMenuAction_ = false;
+    uint64_t nextListViewActivationToken_ = 1;
+    uint64_t queuedListViewActivationToken_ = 0;
+    std::optional<ListViewActivationRequest> queuedListViewActivation_;
+    bool rearmListViewActivation_ = false;
+    // All of this state belongs to the source GUI thread. The native tracking call
+    // keeps its HMENU alive while the renderer owns the visible flyout.
+    // Posted messages hold only a token. Cancelling/unhooking releases the request
+    // even when its message is never dispatched, and old tokens cannot run again.
+    uint64_t nextIslandActionToken_ = 1;
+    uint64_t queuedIslandActionToken_ = 0;
+    std::optional<IslandActionRequest> queuedIslandAction_;
+    bool rearmIslandAction_ = false;
+    std::optional<IslandActionRequest> pendingIslandMenu_;
+    std::optional<IslandActionRequest> trackedIslandMenu_;
+    ULONGLONG pendingIslandDeadline_ = 0;
+    PopupMenuState popupMenu_;
+    std::optional<PopupMenuDecision> popupDecision_;
+    HMENU trackedPopup_ = nullptr;
+    HWND trackedPopupOwner_ = nullptr;
+    std::wstring popupCaptureError_;
+    std::atomic<bool> menuBarDirty_{ false };
     uint64_t nextDirectUiWindowGeneration_ = 1;
     std::atomic<bool> directUiUiaPoisoned_{ false };
     const DirectUiWindowProfile* directUiProfile_ = nullptr;
@@ -434,5 +530,6 @@ private:
 };
 
 void RetainSourceThreadAgent(std::shared_ptr<SourceThreadAgent> agent) noexcept;
+bool TryTrackIslandPopup(HMENU menu, UINT flags, HWND owner, BOOL& result) noexcept;
 
 } // namespace FluentShell::Bridge::Translation

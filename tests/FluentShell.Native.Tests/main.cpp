@@ -7,13 +7,24 @@
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
+#include "../../src/Bridge/Translation/MenuBarCapture.h"
+#include "../../src/Bridge/Translation/PopupMenuState.h"
+#include "../../src/Bridge/Translation/PaintedPixel.h"
+#include "ItemImageCaptureTests.h"
+#include "MmcHtmlDocumentTests.h"
+#include "ListViewModeRegressionTests.h"
+#include "ToolbarRadioGroupTests.h"
+#include "UiAutomationProjectionTests.h"
 
 #include <winrt/base.h>
 #include <objbase.h>
+#include <oleacc.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <prsht.h>
 #include <UIAutomation.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -83,6 +94,9 @@ void Check(bool condition, const char* message) {
     ++g_failures;
     std::cerr << "FAIL: " << message << '\n';
 }
+
+#include "MdiCaptureRegressionTests.h"
+#include "StaticDecorationRegressionTests.h"
 
 std::string ReadFixture(const wchar_t* name) {
     const auto path = std::filesystem::current_path() / L"tests" / L"ProtocolFixtures" / name;
@@ -1045,6 +1059,7 @@ void TestActionSemanticValidation() {
     listView.nodeId = 8;
     listView.kind = Translation::ControlKind::ListView;
     listView.rows = { { L"one" }, { L"two" } };
+    listView.items = { L"one", L"two" };
     listView.checkBoxes = true;
     snapshot.nodes.push_back(listView);
     Translation::ControlNode tabControl;
@@ -2243,6 +2258,487 @@ void TestTabOrderRejectionSpecificity() {
     if (privateRoot) DestroyWindow(privateRoot);
 }
 
+constexpr UINT kTestMenuPopup = WM_APP + 301;
+constexpr UINT kTestMenuFlood = WM_APP + 302;
+constexpr UINT kTestIslandPopup = WM_APP + 303;
+constexpr UINT kTestIslandProbe = WM_APP + 304;
+constexpr UINT kTestIslandSentinel = WM_APP + 305;
+
+enum class TestIslandProbe : WPARAM {
+    CancelQueued,
+    DuplicateQueued,
+    DisabledItem,
+    DisabledIsland,
+    HiddenIsland,
+    DisabledRoot,
+};
+
+struct TestIslandProbeResult final {
+    bool firstQueued = false;
+    bool firstRefused = false;
+    bool secondQueued = false;
+    bool secondRefused = false;
+    bool replayPosted = false;
+    bool sentinelPosted = false;
+    bool directAccepted = false;
+    bool directReason = false;
+    unsigned directInvocations = 0;
+    unsigned providerInvocations = 0;
+    bool wrongThread = false;
+};
+
+struct TestIslandPopupRuntime final {
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE tracking = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE returned = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE command = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE probeDrained = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<HWND> root{ nullptr };
+    std::atomic<HWND> island{ nullptr };
+    std::atomic<DWORD> thread{ 0 };
+    std::atomic<UINT> flags{ TPM_RETURNCMD };
+    std::atomic<bool> disableOpener{ true };
+    std::atomic<BOOL> result{ FALSE };
+    std::atomic<bool> handled{ false };
+    std::atomic<bool> menuAliveAtReturn{ false };
+    std::atomic<unsigned> ownerCommands{ 0 };
+    std::atomic<unsigned> rootCommands{ 0 };
+    std::atomic<UINT> lastCommand{ 0 };
+    std::atomic<unsigned> providerInvocations{ 0 };
+    std::atomic<bool> openProviderPopup{ true };
+    std::atomic<Translation::SourceThreadAgent*> probeAgent{ nullptr };
+    Translation::ControlNode probeNode;
+    TestIslandProbeResult probeResult;
+    // The source thread publishes probeResult only after the queued messages drain.
+    std::atomic<bool> probeDone{ false };
+    ~TestIslandPopupRuntime() {
+        if (ready) CloseHandle(ready);
+        if (tracking) CloseHandle(tracking);
+        if (returned) CloseHandle(returned);
+        if (command) CloseHandle(command);
+        if (probeDrained) CloseHandle(probeDrained);
+    }
+};
+
+// A real toolbar HWND with an application-owned accessible menu provider. Its
+// default action posts the popup and destroys the HMENU immediately after the
+// intercept, matching MMC's asynchronous tracking/lifetime contract.
+class TestMenuAccessible final : public IAccessible, public IEnumVARIANT {
+public:
+    HWND toolbar = nullptr;
+    std::vector<std::wstring> names{ L"System", L"&File", L"&Window" };
+    std::atomic<bool>* cancellation = nullptr;
+    bool quitOnDrive = false;
+    bool flood = false;
+    bool checked = false;
+    bool escaped = false;
+    bool wrongThread = false;
+    bool itemEnabled = true;
+    bool omitDisabledAction = false;
+    bool pageTabs = false;
+    bool mixedPageRoles = false;
+    bool duplicateTabSelection = false;
+    int selectedTab = 1;
+    unsigned drives = 0;
+    DWORD thread = GetCurrentThreadId();
+    TestIslandPopupRuntime* islandRuntime = nullptr;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid == IID_IEnumVARIANT) {
+            *object = static_cast<IEnumVARIANT*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (iid != IID_IUnknown && iid != IID_IDispatch && iid != IID_IAccessible)
+            return E_NOINTERFACE;
+        *object = static_cast<IAccessible*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG refs = --references_;
+        if (!refs) delete this;
+        return refs;
+    }
+    HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* count) override {
+        if (count) *count = 0;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID, LPOLESTR*, UINT, LCID, DISPID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Invoke(DISPID, REFIID, LCID, WORD, DISPPARAMS*, VARIANT*, EXCEPINFO*, UINT*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE get_accParent(IDispatch** value) override { if (value) *value = nullptr; return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accChildCount(long* count) override {
+        wrongThread |= GetCurrentThreadId() != thread;
+        if (!count) return E_POINTER;
+        *count = static_cast<long>(names.size());
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_accChild(VARIANT, IDispatch** value) override { if (value) *value = nullptr; return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accName(VARIANT child, BSTR* name) override {
+        wrongThread |= GetCurrentThreadId() != thread;
+        if (!name) return E_POINTER;
+        *name = nullptr;
+        if (child.vt != VT_I4 || child.lVal < 1 ||
+            static_cast<size_t>(child.lVal) > names.size()) return E_INVALIDARG;
+        *name = SysAllocString(names[static_cast<size_t>(child.lVal - 1)].c_str());
+        return *name ? S_OK : E_OUTOFMEMORY;
+    }
+    HRESULT STDMETHODCALLTYPE get_accValue(VARIANT, BSTR*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accDescription(VARIANT, BSTR*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accRole(VARIANT child, VARIANT* role) override {
+        if (!role) return E_POINTER;
+        role->vt = VT_I4;
+        role->lVal = pageTabs ? (child.lVal == CHILDID_SELF ? ROLE_SYSTEM_PAGETABLIST
+            : mixedPageRoles && child.lVal == 2 ? ROLE_SYSTEM_PUSHBUTTON : ROLE_SYSTEM_PAGETAB)
+            : !islandRuntime ? ROLE_SYSTEM_MENUITEM
+            : child.vt == VT_I4 && child.lVal == CHILDID_SELF
+                ? ROLE_SYSTEM_CLIENT : ROLE_SYSTEM_BUTTONDROPDOWN;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_accState(VARIANT child, VARIANT* state) override {
+        wrongThread |= GetCurrentThreadId() != thread;
+        if (!state) return E_POINTER;
+        state->vt = VT_I4;
+        state->lVal = islandRuntime && !itemEnabled &&
+            child.vt == VT_I4 && child.lVal != CHILDID_SELF
+            ? STATE_SYSTEM_UNAVAILABLE : 0;
+        if (pageTabs && child.lVal != CHILDID_SELF) {
+            state->lVal = STATE_SYSTEM_SELECTABLE | STATE_SYSTEM_FOCUSABLE;
+            if (child.lVal == selectedTab || duplicateTabSelection) state->lVal |= STATE_SYSTEM_SELECTED;
+            if (!itemEnabled) state->lVal |= STATE_SYSTEM_UNAVAILABLE;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accHelpTopic(BSTR*, VARIANT, long*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accKeyboardShortcut(VARIANT, BSTR*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accFocus(VARIANT*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accSelection(VARIANT*) override { return S_FALSE; }
+    HRESULT STDMETHODCALLTYPE get_accDefaultAction(VARIANT, BSTR* action) override {
+        if (!action) return E_POINTER;
+        if (!itemEnabled && omitDisabledAction) { *action = nullptr; return S_FALSE; }
+        *action = pageTabs ? SysAllocString(L"Switch") : islandRuntime ? SysAllocString(L"Open") : nullptr;
+        return pageTabs || islandRuntime ? (*action ? S_OK : E_OUTOFMEMORY) : S_FALSE;
+    }
+    HRESULT STDMETHODCALLTYPE accSelect(long, VARIANT) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE accLocation(long* left, long* top, long* width, long* height, VARIANT child) override {
+        if (!islandRuntime && !pageTabs) return E_NOTIMPL;
+        if (!left || !top || !width || !height) return E_POINTER;
+        POINT origin{ 8, 8 };
+        if (pageTabs) origin = { (child.lVal - 1) * 65, 0 };
+        if (!ClientToScreen(toolbar, &origin)) return E_FAIL;
+        *left = origin.x;
+        *top = origin.y;
+        *width = 120;
+        *height = 28;
+        if (pageTabs) { *width = child.lVal == 1 ? 73 : 70; *height = 19; }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE accNavigate(long, VARIANT, VARIANT*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE accHitTest(long, long, VARIANT*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE accDoDefaultAction(VARIANT child) override {
+        wrongThread |= GetCurrentThreadId() != thread;
+        ++drives;
+        if (pageTabs) { selectedTab = child.lVal; return S_OK; }
+        if (islandRuntime) {
+            islandRuntime->providerInvocations.fetch_add(1);
+            if (!islandRuntime->openProviderPopup.load()) return S_OK;
+            return PostMessageW(toolbar, kTestIslandPopup, 0, 0) ? S_OK : E_FAIL;
+        }
+        if (quitOnDrive) { PostQuitMessage(73); return S_OK; }
+        if (cancellation) {
+            PostMessageW(toolbar, kTestMenuPopup, 2, 0);
+            cancellation->store(true);
+            return S_OK;
+        }
+        if (flood) {
+            PostMessageW(toolbar, kTestMenuFlood, 0, 0);
+            return S_OK;
+        }
+        if (child.vt == VT_I4 && child.lVal < 3)
+            PostMessageW(toolbar, kTestMenuPopup, child.lVal, 0);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE put_accName(VARIANT, BSTR) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE put_accValue(VARIANT, BSTR) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Next(ULONG count, VARIANT* values, ULONG* fetched) override {
+        if (!values) return E_POINTER;
+        ULONG copied = 0;
+        while (copied < count && enumIndex_ < names.size()) {
+            VariantInit(&values[copied]);
+            values[copied].vt = VT_I4;
+            values[copied].lVal = static_cast<LONG>(++enumIndex_);
+            ++copied;
+        }
+        if (fetched) *fetched = copied;
+        return copied == count ? S_OK : S_FALSE;
+    }
+    HRESULT STDMETHODCALLTYPE Skip(ULONG count) override {
+        const size_t skipped = std::min<size_t>(count, names.size() - enumIndex_);
+        enumIndex_ += skipped;
+        return skipped == count ? S_OK : S_FALSE;
+    }
+    HRESULT STDMETHODCALLTYPE Reset() override { enumIndex_ = 0; return S_OK; }
+    HRESULT STDMETHODCALLTYPE Clone(IEnumVARIANT**) override { return E_NOTIMPL; }
+
+private:
+    std::atomic<ULONG> references_{ 1 };
+    size_t enumIndex_ = 0;
+};
+
+LRESULT CALLBACK TestMenuToolbarSubclass(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+    UINT_PTR subclassId, DWORD_PTR data) {
+    auto* accessible = reinterpret_cast<TestMenuAccessible*>(data);
+    if (message == WM_GETOBJECT && static_cast<LONG>(lParam) == OBJID_CLIENT)
+        return LresultFromObject(IID_IAccessible, wParam, static_cast<IAccessible*>(accessible));
+    if (message == kTestIslandProbe && accessible->islandRuntime) {
+        auto& runtime = *accessible->islandRuntime;
+        auto& result = runtime.probeResult;
+        auto* agent = runtime.probeAgent.load(std::memory_order_acquire);
+        result = {};
+        if (agent) {
+            // Queue and mutate in one source callback, before the source hook can
+            // dispatch the posted action. The node still holds its enabled capture.
+            result.firstQueued = agent->PostIslandAction(
+                runtime.probeNode, 0, result.firstRefused);
+            switch (static_cast<TestIslandProbe>(wParam)) {
+            case TestIslandProbe::CancelQueued:
+                agent->CancelPopupOnSourceThread();
+                break;
+            case TestIslandProbe::DuplicateQueued: {
+                result.secondQueued = agent->PostIslandAction(
+                    runtime.probeNode, 0, result.secondRefused);
+                // Copy the real posted message without consuming it. Both copies
+                // must travel through the source hook before the sentinel runs.
+                MSG queued{};
+                if (result.firstQueued && PeekMessageW(&queued, nullptr,
+                        agent->MessageId(), agent->MessageId(), PM_NOREMOVE)) {
+                    result.replayPosted = PostThreadMessageW(agent->ThreadId(),
+                        queued.message, queued.wParam, queued.lParam) != FALSE;
+                }
+                break;
+            }
+            case TestIslandProbe::DisabledItem: {
+                accessible->itemEnabled = false;
+                const auto& item = runtime.probeNode.islandItems[0];
+                std::wstring reason;
+                result.directAccepted = Translation::InvokeAccessibleIslandItem(
+                    window, 0, item.name, item.actionName, reason);
+                result.directReason = !reason.empty();
+                result.directInvocations = runtime.providerInvocations.load();
+                break;
+            }
+            case TestIslandProbe::DisabledIsland:
+                EnableWindow(window, FALSE);
+                break;
+            case TestIslandProbe::HiddenIsland:
+                ShowWindow(window, SW_HIDE);
+                break;
+            case TestIslandProbe::DisabledRoot:
+                EnableWindow(runtime.root.load(), FALSE);
+                break;
+            }
+        }
+        result.sentinelPosted = PostMessageW(window, kTestIslandSentinel, wParam, 0) != FALSE;
+        return 0;
+    }
+    if (message == kTestIslandSentinel && accessible->islandRuntime) {
+        auto& runtime = *accessible->islandRuntime;
+        runtime.probeResult.providerInvocations = runtime.providerInvocations.load();
+        runtime.probeResult.wrongThread = accessible->wrongThread;
+        if (auto* agent = runtime.probeAgent.load(std::memory_order_acquire))
+            agent->CancelPopupOnSourceThread();
+        accessible->itemEnabled = true;
+        switch (static_cast<TestIslandProbe>(wParam)) {
+        case TestIslandProbe::DisabledIsland:
+            EnableWindow(window, TRUE);
+            break;
+        case TestIslandProbe::HiddenIsland:
+            ShowWindow(window, SW_SHOWNOACTIVATE);
+            break;
+        case TestIslandProbe::DisabledRoot:
+            EnableWindow(runtime.root.load(), TRUE);
+            break;
+        default:
+            break;
+        }
+        runtime.probeDone.store(true, std::memory_order_release);
+        SetEvent(runtime.probeDrained);
+        return 0;
+    }
+    if (message == kTestIslandPopup && accessible->islandRuntime) {
+        auto& runtime = *accessible->islandRuntime;
+        // MMC-style providers disable their opener before entering the tracking
+        // API. EnableWindow sends WM_CANCELMODE and must not lose this request.
+        if (runtime.disableOpener.load()) EnableWindow(window, FALSE);
+        const HMENU popup = CreatePopupMenu();
+        const HMENU nested = CreatePopupMenu();
+        AppendMenuW(popup, MF_STRING, 501, L"Direct command");
+        AppendMenuW(nested, MF_STRING, 502, L"Nested command");
+        AppendMenuW(popup, MF_POPUP, reinterpret_cast<UINT_PTR>(nested), L"More");
+        SetEvent(runtime.tracking);
+        BOOL result = FALSE;
+        const bool handled = Translation::TryTrackIslandPopup(popup, runtime.flags.load(), window, result);
+        runtime.result.store(result);
+        runtime.handled.store(handled);
+        runtime.menuAliveAtReturn.store(IsMenu(popup) != FALSE);
+        DestroyMenu(popup);
+        if (runtime.disableOpener.load()) EnableWindow(window, TRUE);
+        SetEvent(runtime.returned);
+        return 0;
+    }
+    if (message == WM_COMMAND && accessible->islandRuntime) {
+        auto& runtime = *accessible->islandRuntime;
+        runtime.ownerCommands.fetch_add(1);
+        runtime.lastCommand.store(LOWORD(wParam));
+        SetEvent(runtime.command);
+        return 0;
+    }
+    if (message == kTestMenuPopup) {
+        const HMENU popup = CreatePopupMenu();
+        AppendMenuW(popup, MF_STRING | (accessible->checked ? MF_CHECKED : 0),
+            wParam == 1 ? SC_CLOSE : 77, wParam == 1 ? L"Close" : L"Command");
+        if (Translation::PopupInterceptionArmed())
+            Translation::RecordInterceptedPopup(popup);
+        else if (!Translation::ShouldSuppressPopup(window)) accessible->escaped = true;
+        DestroyMenu(popup);
+        return 0;
+    }
+    if (message == kTestMenuFlood) {
+        if (accessible->flood) PostMessageW(window, kTestMenuFlood, 0, 0);
+        return 0;
+    }
+    if (message == WM_CANCELMODE) {
+        accessible->wrongThread |= GetCurrentThreadId() != accessible->thread;
+    }
+    const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    if (message == WM_NCDESTROY)
+        RemoveWindowSubclass(window, TestMenuToolbarSubclass, subclassId);
+    return result;
+}
+
+void TestMenuBarToolbarLifecycle() {
+    Translation::MenuBarRefreshPolicy policy;
+    Check(policy.ShouldRead(0), "initial menu refresh was not eligible");
+    policy.Complete(100, true);
+    Check(!policy.ShouldRead(100000), "quiet menu was reopened without a mutation");
+    policy.Invalidate(200);
+    Check(!policy.ShouldRead(849) && policy.ShouldRead(850),
+        "menu refresh did not debounce and respect its minimum interval");
+    policy.Complete(900, false);
+    Check(!policy.ShouldRead(1899) && policy.ShouldRead(1900),
+        "failed menu refresh did not back off");
+    policy.Complete(2000, false);
+    policy.Complete(4000, false);
+    Check(!policy.ShouldRead(100000), "unreadable menu retried without a bound");
+    policy.Invalidate(100000);
+    Check(policy.ShouldRead(100250), "new menu mutation did not restart bounded retry");
+
+    const HWND root = CreateWindowExW(0, L"Static", L"menu-bar-lifecycle",
+        WS_OVERLAPPEDWINDOW, 0, 0, 360, 220, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    const HWND toolbar = root ? CreateWindowExW(0, TOOLBARCLASSNAMEW, L"",
+        WS_CHILD | WS_VISIBLE, 0, 0, 350, 30, root, nullptr, GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && toolbar, "menu-bar lifecycle HWNDs were not created");
+    if (!root || !toolbar) { if (root) DestroyWindow(root); return; }
+    auto* accessible = new TestMenuAccessible();
+    accessible->toolbar = toolbar;
+    SetWindowSubclass(toolbar, TestMenuToolbarSubclass, 0xAA11,
+        reinterpret_cast<DWORD_PTR>(accessible));
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    Translation::CaptureContext context;
+    Translation::ObserveMenuBarToolbar(root, context);
+    Check(context.menuBarToolbar == toolbar && context.menuBarButtons.size() == 3,
+        "menu-bar observation did not discover the accessible toolbar");
+    Check(accessible->drives == 0, "capture observation opened native menus");
+    std::atomic<bool> cancelled{ false };
+    std::wstring error;
+    std::vector<Translation::MenuItemSnapshot> menu;
+    Check(Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            250, 3000, cancelled, menu, error),
+        "staged menu-bar capture rejected asynchronous popup lifetime");
+    Check(menu.size() == 2 && menu[0].itemId == L"0" && menu[0].items.size() == 1 &&
+        menu[0].items[0].commandId == 77 && menu[0].items[0].itemId == L"0.0" &&
+        menu[1].itemId == L"1" && !menu[1].enabled && menu[1].items.empty(),
+        "menu-bar capture lost copied commands, system-menu filtering or empty popup state");
+    context.menuBarToolbarMenu = menu;
+    Translation::ObserveMenuBarToolbar(root, context);
+    Check(!context.menuBarToolbarMenu.empty(), "unchanged toolbar discarded cached menu");
+    accessible->checked = true;
+    Check(Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            250, 3000, cancelled, menu, error) && menu.size() == 2 &&
+            menu[0].items.size() == 1 && menu[0].items[0].checked,
+        "menu-bar refresh did not capture a changed native checked state");
+    accessible->names[1] = L"&Console";
+    Translation::ObserveMenuBarToolbar(root, context);
+    Check(context.menuBarToolbarMenu.empty() && context.menuBarButtons[1].text == L"&Console",
+        "relabelled toolbar retained stale menu identities");
+    context.menuBarToolbarMenu = menu;
+    const auto generation = context.menuBarToolbarGeneration;
+    RemovePropW(toolbar, L"FluentShell.Bridge.NodeGeneration");
+    Translation::ObserveMenuBarToolbar(root, context);
+    Check(context.menuBarToolbarGeneration != generation && context.menuBarToolbarMenu.empty(),
+        "same-HWND replacement generation inherited a stale menu");
+    context.menuBarToolbarMenu = menu;
+    ShowWindow(toolbar, SW_HIDE);
+    Translation::ObserveMenuBarToolbar(root, context);
+    Check(!context.menuBarToolbar && context.menuBarToolbarMenu.empty(),
+        "disappeared toolbar kept its stale projected menu");
+    ShowWindow(toolbar, SW_SHOWNOACTIVATE);
+    Translation::ObserveMenuBarToolbar(root, context);
+    Check(context.menuBarToolbar == toolbar,
+        "toolbar appearing after initial absence was permanently ignored");
+
+    BOOL cloaked = TRUE;
+    Check(SUCCEEDED(DwmSetWindowAttribute(root, DWMWA_CLOAK, &cloaked, sizeof(cloaked))),
+        "test menu owner could not be cloaked");
+    accessible->cancellation = &cancelled;
+    Check(!Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            20, 1500, cancelled, menu, error) &&
+        !Translation::PopupInterceptionArmed() && !Translation::PopupSuppressionActive() &&
+        !Translation::MenuBarReadInProgress(),
+        "cancelled menu drive leaked interception or its pump scope");
+    MSG latePopup{};
+    Check(PeekMessageW(&latePopup, toolbar, kTestMenuPopup, kTestMenuPopup, PM_REMOVE) != FALSE,
+        "cancelled test drive did not queue its late popup");
+    if (latePopup.message == kTestMenuPopup) DispatchMessageW(&latePopup);
+    Check(!accessible->escaped && Translation::ShouldSuppressPopup(toolbar),
+        "cancelled menu read let a queued native popup escape over the projection");
+    cloaked = FALSE;
+    DwmSetWindowAttribute(root, DWMWA_CLOAK, &cloaked, sizeof(cloaked));
+    Check(!Translation::ShouldSuppressPopup(toolbar),
+        "restored native owner kept suppressing its own menus");
+    cancelled.store(false);
+    accessible->cancellation = nullptr;
+    accessible->quitOnDrive = true;
+    Check(!Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            20, 1500, cancelled, menu, error), "WM_QUIT did not stop menu capture");
+    MSG quit{};
+    Check(PeekMessageW(&quit, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE) && quit.wParam == 73,
+        "menu pump consumed the application's WM_QUIT or lost its exit code");
+    Check(!PeekMessageW(&quit, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE),
+        "menu pump reposted WM_QUIT more than once");
+    accessible->quitOnDrive = false;
+    accessible->flood = true;
+    const ULONGLONG started = GetTickCount64();
+    Check(!Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            500, 70, cancelled, menu, error) && GetTickCount64() - started < 1000,
+        "continuous native messages extended the menu read's total deadline");
+    accessible->flood = false;
+    MSG pending{};
+    while (PeekMessageW(&pending, toolbar, kTestMenuFlood, kTestMenuFlood, PM_REMOVE)) {}
+    Check(!accessible->escaped && !accessible->wrongThread &&
+        !Translation::PopupInterceptionArmed() && !Translation::PopupSuppressionActive() &&
+        !Translation::MenuBarReadInProgress(),
+        "menu lifecycle leaked a popup, read native state off-thread or leaked cleanup state");
+    DestroyWindow(root);
+    accessible->Release();
+}
+
 void TestStandardMenuCapture() {
     HWND window = CreateWindowExW(0, L"Static", L"menu-test", WS_OVERLAPPED,
         0, 0, 300, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -2305,6 +2801,370 @@ void TestStandardMenuCapture() {
     DestroyWindow(window);
 }
 
+void TestPopupMenuState() {
+    const HMENU menu = CreatePopupMenu();
+    const HMENU nested = CreatePopupMenu();
+    const HMENU disabled = CreatePopupMenu();
+    Check(menu && nested && disabled, "popup lifecycle menus were not created");
+    if (!menu || !nested || !disabled) {
+        if (menu) DestroyMenu(menu);
+        if (nested) DestroyMenu(nested);
+        if (disabled) DestroyMenu(disabled);
+        return;
+    }
+    AppendMenuW(menu, MF_STRING, 77, L"&Run");
+    AppendMenuW(nested, MF_STRING, 88, L"&Nested");
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(nested), L"More");
+    AppendMenuW(disabled, MF_STRING, 99, L"Unavailable");
+    AppendMenuW(menu, MF_POPUP | MF_DISABLED,
+        reinterpret_cast<UINT_PTR>(disabled), L"Disabled branch");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    std::wstring error;
+    std::vector<Translation::MenuItemSnapshot> items;
+    Check(Translation::CaptureMenuHandle(menu, L"", items, error) && items.size() == 4,
+        "native popup snapshot could not be captured for lifecycle tests");
+    if (items.size() != 4) { DestroyMenu(menu); return; }
+    // Capture normally propagates disabled ancestors. Test the state boundary
+    // independently by leaving the disabled branch's child locally enabled.
+    items[2].items[0].enabled = true;
+    Translation::PopupMenuState state;
+    Check(state.Begin(0, 4, items) == 0 && state.Begin(101, -1, items) == 0 &&
+        state.Begin(101, 4, {}) == 0 && !state.Current(),
+        "popup state admitted an invalid anchor or empty menu");
+    const uint64_t first = state.Begin(101, 4, items);
+    Check(first != 0 && state.Current() && state.Current()->popupId == first &&
+        state.Current()->nodeId == 101 && state.Current()->itemIndex == 4,
+        "popup state lost its token or native item anchor");
+    Check(state.Begin(202, 0, items) == 0 && state.Current()->popupId == first,
+        "a nested tracking attempt replaced the pending native popup");
+    Translation::PopupMenuDecision selected;
+    Check(!state.Resolve(first + 1, std::wstring(L"0"), selected) && state.Current(),
+        "stale popup token consumed the current native popup");
+    Check(!state.Resolve(first, std::wstring(L"1"), selected) &&
+        !state.Resolve(first, std::wstring(L"3"), selected) &&
+        !state.Resolve(first, std::wstring(L"missing"), selected) &&
+        !state.Resolve(first, std::wstring(L"2.0"), selected) && state.Current(),
+        "popup container, separator, missing path or disabled ancestor was selectable");
+    Check(state.Resolve(first, std::wstring(L"1.0"), selected) && !state.Current() &&
+        selected.popupId == first && selected.itemId == std::wstring(L"1.0") &&
+        selected.commandId == 88 && selected.text == L"&Nested" && !selected.IsDismissal(),
+        "nested popup selection did not terminalize with its command identity");
+    Check(Translation::PopupMenuState::MatchLiveChoice(items, selected),
+        "unchanged live popup rejected the selected command");
+    Check(!state.Resolve(first, std::wstring(L"0"), selected) && !state.Cancel(),
+        "one native tracking call accepted multiple terminal decisions");
+
+    std::vector<Translation::MenuItemSnapshot> live;
+    EnableMenuItem(nested, 88, MF_BYCOMMAND | MF_DISABLED);
+    Check(Translation::CaptureMenuHandle(menu, L"", live, error) &&
+        !Translation::PopupMenuState::MatchLiveChoice(live, selected),
+        "disabled live command retained authority from its old popup snapshot");
+    EnableMenuItem(nested, 88, MF_BYCOMMAND | MF_ENABLED);
+    ModifyMenuW(nested, 88, MF_BYCOMMAND | MF_STRING, 88, L"Renamed");
+    Check(Translation::CaptureMenuHandle(menu, L"", live, error) &&
+        !Translation::PopupMenuState::MatchLiveChoice(live, selected),
+        "renamed live command retained authority from its old popup snapshot");
+    ModifyMenuW(nested, 88, MF_BYCOMMAND | MF_STRING, 89, L"&Nested");
+    Check(Translation::CaptureMenuHandle(menu, L"", live, error) &&
+        !Translation::PopupMenuState::MatchLiveChoice(live, selected),
+        "replacement command ID retained authority at the selected item path");
+    ModifyMenuW(nested, 89, MF_BYCOMMAND | MF_STRING, 88, L"&Nested");
+    EnableMenuItem(menu, 1, MF_BYPOSITION | MF_DISABLED);
+    Check(Translation::CaptureMenuHandle(menu, L"", live, error) &&
+        !Translation::PopupMenuState::MatchLiveChoice(live, selected),
+        "disabled live ancestor allowed selection of its descendant command");
+    EnableMenuItem(menu, 1, MF_BYPOSITION | MF_ENABLED);
+    InsertMenuW(nested, 0, MF_BYPOSITION | MF_STRING, 87, L"Inserted");
+    Check(Translation::CaptureMenuHandle(menu, L"", live, error) &&
+        !Translation::PopupMenuState::MatchLiveChoice(live, selected),
+        "reordered live popup selected a different command at the old path");
+    RemoveMenu(nested, 0, MF_BYPOSITION);
+    CheckMenuItem(nested, 88, MF_BYCOMMAND | MF_CHECKED);
+    Check(Translation::CaptureMenuHandle(menu, L"", live, error) &&
+        Translation::PopupMenuState::MatchLiveChoice(live, selected),
+        "a check-state change incorrectly changed the selected command identity");
+
+    const uint64_t second = state.Begin(101, 4, items);
+    Check(second > first && !state.Resolve(first, std::nullopt, selected) && state.Current(),
+        "a late dismissal closed a newer popup or reused a token");
+    Check(state.Resolve(second, std::wstring(L"0"), selected) &&
+        selected.commandId == 77 && !state.Current(),
+        "top-level popup command could not complete tracking");
+    const uint64_t third = state.Begin(101, 4, items);
+    Check(third > second && state.Resolve(third, std::nullopt, selected) &&
+        selected.popupId == third && selected.IsDismissal() && selected.commandId == 0 &&
+        selected.text.empty() && !state.Current() &&
+        Translation::PopupMenuState::MatchLiveChoice({}, selected),
+        "null dismissal did not retire its popup without dispatching a command");
+    const uint64_t fourth = state.Begin(101, 4, items);
+    Check(fourth > third && state.Cancel() && !state.Current() &&
+        !state.Resolve(fourth, std::wstring(L"0"), selected),
+        "cancelled popup retained a selectable snapshot");
+    const uint64_t fifth = state.Begin(101, 4, items);
+    Check(fifth > fourth && state.Cancel() && !state.Cancel(),
+        "popup cancellation reused a token or terminalized twice");
+    Check(!Translation::PopupMenuState::MatchLiveChoice(items, {}),
+        "an unissued popup decision was accepted as a live dismissal");
+    DestroyMenu(menu);
+}
+
+LRESULT CALLBACK TestPopupRootSubclass(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+    UINT_PTR subclassId, DWORD_PTR data) {
+    auto* runtime = reinterpret_cast<TestIslandPopupRuntime*>(data);
+    if (message == WM_COMMAND) runtime->rootCommands.fetch_add(1);
+    const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, TestPopupRootSubclass, subclassId);
+    return result;
+}
+
+void TestSourceThreadPopupTracking() {
+    TestIslandPopupRuntime runtime;
+    Check(runtime.ready && runtime.tracking && runtime.returned && runtime.command && runtime.probeDrained,
+        "source popup test events were not created");
+    if (!runtime.ready || !runtime.tracking || !runtime.returned || !runtime.command ||
+        !runtime.probeDrained) return;
+    std::thread gui([&] {
+        runtime.thread.store(GetCurrentThreadId());
+        HWND root = nullptr;
+        TestMenuAccessible* accessible = nullptr;
+        ATOM registered = 0;
+        bool initialized = false;
+        try {
+            winrt::init_apartment(winrt::apartment_type::single_threaded);
+            initialized = true;
+            WNDCLASSW islandClass{};
+            islandClass.lpfnWndProc = DefWindowProcW;
+            islandClass.hInstance = GetModuleHandleW(nullptr);
+            islandClass.lpszClassName = L"DirectUIHWND";
+            registered = RegisterClassW(&islandClass);
+            root = CreateWindowExW(0, L"Static", L"source-popup-test",
+                WS_OVERLAPPEDWINDOW, 50, 50, 340, 220, nullptr, nullptr,
+                GetModuleHandleW(nullptr), nullptr);
+            const HWND island = root ? CreateWindowExW(0, L"DirectUIHWND", L"Actions",
+                WS_CHILD | WS_VISIBLE, 0, 0, 300, 150, root,
+                reinterpret_cast<HMENU>(991), GetModuleHandleW(nullptr), nullptr) : nullptr;
+            if (root && island) {
+                accessible = new TestMenuAccessible();
+                accessible->toolbar = island;
+                accessible->names = { L"Actions" };
+                accessible->islandRuntime = &runtime;
+                SetWindowSubclass(island, TestMenuToolbarSubclass, 0xAA12,
+                    reinterpret_cast<DWORD_PTR>(accessible));
+                SetWindowSubclass(root, TestPopupRootSubclass, 0xAA13,
+                    reinterpret_cast<DWORD_PTR>(&runtime));
+                ShowWindow(root, SW_SHOWNOACTIVATE);
+                runtime.island.store(island);
+                runtime.root.store(root);
+            }
+            SetEvent(runtime.ready);
+            MSG message{};
+            while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        } catch (...) {
+            SetEvent(runtime.ready);
+        }
+        if (root) DestroyWindow(root);
+        if (accessible) accessible->Release();
+        if (registered) UnregisterClassW(L"DirectUIHWND", GetModuleHandleW(nullptr));
+        if (initialized) winrt::uninit_apartment();
+    });
+
+    std::shared_ptr<Translation::SourceThreadAgent> agent;
+    const auto cleanup = [&] {
+        if (agent) {
+            std::wstring ignored;
+            agent->Restore(ignored);
+            agent->Shutdown();
+        }
+        if (runtime.thread.load()) PostThreadMessageW(runtime.thread.load(), WM_QUIT, 0, 0);
+        gui.join();
+        agent.reset();
+    };
+    Check(WaitForSingleObject(runtime.ready, 5000) == WAIT_OBJECT_0 && runtime.root.load(),
+        "source popup GUI thread did not create its island");
+    if (!runtime.root.load()) { cleanup(); return; }
+    agent = Translation::SourceThreadAgent::Attach(runtime.root.load(), GetModuleHandleW(nullptr));
+    Check(agent != nullptr, "source popup agent could not attach to its real GUI thread");
+    if (!agent) { cleanup(); return; }
+    std::wstring error;
+    Check(agent->SetCloaked(true, error), "source popup test could not cloak its native root");
+    Translation::WindowSnapshot snapshot;
+    snapshot.surfaceId = L"12121212-3434-5656-7878-909090909090";
+    snapshot.revision = 1;
+
+    const bool captured = agent->Capture(snapshot, error);
+    const auto probeAnchor = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& node) {
+            return node.kind == Translation::ControlKind::AccessibleIsland;
+        });
+    const bool probeReady = captured && probeAnchor != snapshot.nodes.end() &&
+        probeAnchor->islandItems.size() == 1 && probeAnchor->islandItems[0].enabled &&
+        probeAnchor->islandItems[0].dropDown;
+    Check(probeReady, "deferred island probes did not capture an enabled real provider item");
+    if (!probeReady) { cleanup(); return; }
+    runtime.probeNode = *probeAnchor;
+    runtime.probeAgent.store(agent.get(), std::memory_order_release);
+    runtime.openProviderPopup.store(false);
+    const auto probe = [&](TestIslandProbe scenario) {
+        ResetEvent(runtime.probeDrained);
+        runtime.probeDone.store(false, std::memory_order_release);
+        runtime.providerInvocations.store(0);
+        const bool drained = PostMessageW(runtime.island.load(), kTestIslandProbe,
+            static_cast<WPARAM>(scenario), 0) &&
+            WaitForSingleObject(runtime.probeDrained, 2000) == WAIT_OBJECT_0 &&
+            runtime.probeDone.load(std::memory_order_acquire);
+        Check(drained, "deferred island probe did not reach its source-thread sentinel");
+        if (!drained) return false;
+        const auto& result = runtime.probeResult;
+        const bool queued = result.firstQueued && !result.firstRefused &&
+            result.sentinelPosted && !result.wrongThread;
+        Check(queued, "deferred island probe could not queue on its owning source thread");
+        return queued;
+    };
+    if (!probe(TestIslandProbe::CancelQueued)) { cleanup(); return; }
+    Check(runtime.probeResult.providerInvocations == 0,
+        "cancelled island token invoked its provider after the source queue drained");
+
+    if (!probe(TestIslandProbe::DuplicateQueued)) { cleanup(); return; }
+    Check(!runtime.probeResult.secondQueued && runtime.probeResult.secondRefused,
+        "a second island action was accepted while the first token was still queued");
+    Check(runtime.probeResult.replayPosted && runtime.probeResult.providerInvocations == 1,
+        "an island action or replayed token invoked its provider more or less than once");
+
+    if (!probe(TestIslandProbe::DisabledItem)) { cleanup(); return; }
+    Check(!runtime.probeResult.directAccepted && runtime.probeResult.directReason &&
+        runtime.probeResult.directInvocations == 0,
+        "direct island invocation ran a provider whose current MSAA item was disabled");
+    Check(runtime.probeResult.providerInvocations == 0,
+        "queued island invocation used its old enabled capture after the MSAA item was disabled");
+
+    const auto refusesChangedWindow = [&](TestIslandProbe scenario, const char* message) {
+        if (!probe(scenario)) return false;
+        Check(runtime.probeResult.providerInvocations == 0, message);
+        return true;
+    };
+    if (!refusesChangedWindow(TestIslandProbe::DisabledIsland,
+            "queued island action invoked a provider after its HWND was disabled") ||
+        !refusesChangedWindow(TestIslandProbe::HiddenIsland,
+            "queued island action invoked a provider after its HWND was hidden") ||
+        !refusesChangedWindow(TestIslandProbe::DisabledRoot,
+            "queued island action invoked a provider after its root HWND was disabled")) {
+        cleanup();
+        return;
+    }
+    runtime.openProviderPopup.store(true);
+
+    const auto openPopup = [&](UINT flags) {
+        ResetEvent(runtime.tracking);
+        ResetEvent(runtime.returned);
+        ResetEvent(runtime.command);
+        runtime.flags.store(flags);
+        if (!agent->Capture(snapshot, error)) {
+            std::wcerr << L"source popup capture: " << error << L'\n';
+            return false;
+        }
+        const auto anchor = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [](const Translation::ControlNode& node) {
+                return node.kind == Translation::ControlKind::AccessibleIsland;
+            });
+        if (anchor == snapshot.nodes.end() || anchor->islandItems.size() != 1 ||
+            !anchor->islandItems[0].dropDown) return false;
+        Translation::ActionRequest action;
+        action.surfaceId = snapshot.surfaceId;
+        action.expectedRevision = snapshot.revision;
+        action.eventId = 1;
+        action.nodeId = anchor->nodeId;
+        action.action = L"islandInvoke";
+        action.itemIndex = 0;
+        Translation::ActionOutcome outcome;
+        if (!agent->Invoke(action, outcome) || !outcome.accepted) return false;
+        snapshot = std::move(outcome.snapshot);
+        if (WaitForSingleObject(runtime.tracking, 2000) != WAIT_OBJECT_0 ||
+            WaitForSingleObject(runtime.returned, 0) != WAIT_TIMEOUT) return false;
+        return agent->Capture(snapshot, error) && snapshot.popupMenu.has_value();
+    };
+    const auto answer = [&](std::optional<std::wstring> itemId) {
+        Translation::ActionRequest action;
+        action.surfaceId = snapshot.surfaceId;
+        action.expectedRevision = snapshot.revision;
+        action.eventId = 2;
+        action.action = L"popupCommand";
+        action.popupId = snapshot.popupMenu->popupId;
+        action.popupItemId = std::move(itemId);
+        Translation::ActionOutcome outcome;
+        const bool accepted = agent->Invoke(action, outcome) && outcome.accepted;
+        if (accepted) snapshot = std::move(outcome.snapshot);
+        return accepted && WaitForSingleObject(runtime.returned, 2000) == WAIT_OBJECT_0 &&
+            runtime.handled.load() && runtime.menuAliveAtReturn.load();
+    };
+
+    bool opened = openPopup(TPM_RETURNCMD);
+    Check(opened, "deferred source island action did not publish a tracked native popup");
+    if (opened) {
+        Check(answer(std::wstring(L"1.0")) && runtime.result.load() == 502 &&
+            runtime.ownerCommands.load() == 0 && runtime.rootCommands.load() == 0 &&
+            !snapshot.popupMenu,
+            "TPM_RETURNCMD selection lost its native result or dispatched an extra command");
+    }
+    if (opened && WaitForSingleObject(runtime.returned, 0) == WAIT_OBJECT_0) {
+        opened = openPopup(0);
+        Check(opened, "second native popup did not become available after terminal cleanup");
+        if (opened) {
+            Check(answer(std::wstring(L"0")) && runtime.result.load() != FALSE &&
+                WaitForSingleObject(runtime.command, 2000) == WAIT_OBJECT_0 &&
+                runtime.ownerCommands.load() == 1 && runtime.rootCommands.load() == 0 &&
+                runtime.lastCommand.load() == 501,
+                "popup command was not posted exactly once to its actual child owner");
+        }
+    }
+    if (opened && WaitForSingleObject(runtime.returned, 0) == WAIT_OBJECT_0) {
+        opened = openPopup(TPM_RETURNCMD);
+        Check(opened, "native popup was not available for dismissal");
+        if (opened) {
+            Check(answer(std::nullopt) && runtime.result.load() == FALSE &&
+                runtime.ownerCommands.load() == 1,
+                "popup dismissal returned a command or failed to release native tracking");
+        }
+    }
+    if (opened && WaitForSingleObject(runtime.returned, 0) == WAIT_OBJECT_0) {
+        opened = openPopup(TPM_RETURNCMD);
+        Check(opened, "native popup was not available for geometry cancellation");
+        if (opened) {
+            Translation::ActionRequest move;
+            move.surfaceId = snapshot.surfaceId;
+            move.expectedRevision = snapshot.revision;
+            move.eventId = 3;
+            move.action = L"move";
+            move.rect = snapshot.bounds;
+            OffsetRect(&move.rect, 10, 10);
+            move.hasRect = true;
+            Translation::ActionOutcome outcome;
+            Check(agent->Invoke(move, outcome) && outcome.accepted &&
+                !outcome.snapshot.popupMenu &&
+                WaitForSingleObject(runtime.returned, 2000) == WAIT_OBJECT_0 &&
+                runtime.result.load() == FALSE && runtime.ownerCommands.load() == 1,
+                "moving the owner left a native popup pending or dispatched a command");
+            if (outcome.accepted) snapshot = std::move(outcome.snapshot);
+        }
+    }
+    if (opened && WaitForSingleObject(runtime.returned, 0) == WAIT_OBJECT_0) {
+        opened = openPopup(TPM_RETURNCMD);
+        Check(opened, "native popup was not available for restore cancellation");
+        if (opened) {
+            Check(agent->Restore(error) &&
+                WaitForSingleObject(runtime.returned, 2000) == WAIT_OBJECT_0 &&
+                runtime.result.load() == FALSE && runtime.menuAliveAtReturn.load() &&
+                agent->Capture(snapshot, error) && !snapshot.popupMenu &&
+                runtime.ownerCommands.load() == 1,
+                "whole-surface restore did not cancel tracking before releasing its native menu");
+        }
+    }
+    cleanup();
+}
+
 void TestMenuActionValidationAndSerialization() {
     Translation::WindowSnapshot snapshot;
     Translation::MenuItemSnapshot root;
@@ -2324,6 +3184,10 @@ void TestMenuActionValidationAndSerialization() {
     std::wstring error;
     Check(Translation::ValidateActionForSnapshot(action, snapshot, error),
         "known enabled menu command was rejected");
+    snapshot.menu[0].enabled = false;
+    Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
+        "enabled command under a disabled menu was accepted");
+    snapshot.menu[0].enabled = true;
     action.menuCommandId = 78;
     Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
         "unknown menu command was accepted");
@@ -2334,6 +3198,56 @@ void TestMenuActionValidationAndSerialization() {
         json.find("\"commandId\":77") != std::string::npos &&
         json.find("\"itemId\":\"0.0\"") != std::string::npos,
         "typed menu snapshot was not serialized");
+}
+
+void TestPopupActionProtocol() {
+    constexpr auto nonce = L"00112233445566778899aabbccddeeff";
+    std::wstring error;
+    Translation::ActionRequest choice;
+    Check(Translation::ParseActionInvoke(ReadFixture(L"action.invoke.popup-command.json"),
+        nonce, choice, error) && choice.popupId == UINT64_MAX &&
+        choice.popupItemId == std::optional<std::wstring>(L"2.0") && !choice.nodeId,
+        "popup command fixture lost its canonical token or path");
+    Translation::ActionRequest dismiss;
+    Check(Translation::ParseActionInvoke(ReadFixture(L"action.invoke.popup-dismiss.json"),
+        nonce, dismiss, error) && dismiss.popupId == UINT64_MAX && !dismiss.popupItemId,
+        "popup dismissal fixture was not parsed as a null choice");
+    Check(Translation::IsRequestSemanticAction(L"popupCommand"),
+        "popup terminal response cannot rebase a harmless owner revision change");
+
+    Translation::MenuItemSnapshot leaf;
+    leaf.itemId = L"2.0";
+    leaf.text = L"Details";
+    leaf.commandId = 78;
+    Translation::MenuItemSnapshot branch;
+    branch.itemId = L"2";
+    branch.kind = Translation::MenuItemKind::Popup;
+    branch.text = L"View";
+    branch.items.push_back(leaf);
+    Translation::WindowSnapshot snapshot;
+    snapshot.popupMenu = Translation::PopupMenuSnapshot{UINT64_MAX, 10, 0, {branch}};
+    Check(Translation::ValidateActionForSnapshot(choice, snapshot, error) &&
+        Translation::ValidateActionForSnapshot(dismiss, snapshot, error),
+        "live popup command or dismissal was rejected");
+    snapshot.popupMenu->items[0].enabled = false;
+    Check(!Translation::ValidateActionForSnapshot(choice, snapshot, error) &&
+        Translation::ValidateActionForSnapshot(dismiss, snapshot, error),
+        "disabled popup ancestor allowed a command or prevented dismissal");
+    Translation::ActionRequest ordinary;
+    ordinary.action = L"menuCommand";
+    ordinary.menuCommandId = 78;
+    snapshot.menu.push_back(branch);
+    Check(!Translation::ValidateActionForSnapshot(ordinary, snapshot, error),
+        "main-menu action bypassed pending native popup tracking");
+    const auto fingerprint = Translation::SnapshotFingerprint(snapshot);
+    snapshot.popupMenu->popupId = 1;
+    Check(!Translation::ValidateActionForSnapshot(dismiss, snapshot, error) &&
+        fingerprint != Translation::SnapshotFingerprint(snapshot),
+        "expired popup retained authority or token change was omitted from fingerprint");
+    const auto payload = Translation::SerializeWindowOpen(nonce, snapshot);
+    Check(payload.find("\"popupMenu\"") != std::string::npos &&
+        payload.find("\"popupId\":\"1\"") != std::string::npos,
+        "native serializer omitted popup state or encoded its token as a number");
 }
 
 // The translated dialog lane answers the native call itself, so its snapshots are
@@ -2380,6 +3294,78 @@ LRESULT CALLBACK PaneContainerProc(HWND window, UINT message, WPARAM wParam, LPA
 // for itself and exposes no accessible children, which is exactly the shape that has
 // to be refused.  MMC's DirectUI Actions pane is the admitted case; the rules that
 // decide between them are what this covers.
+void TestAccessiblePageTabs() {
+    WNDCLASSW wc{};
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.lpszClassName = L"AMCCustomTab";
+    const ATOM registered = RegisterClassW(&wc);
+    const HWND root = CreateWindowExW(0, L"Static", L"page-tab-host", WS_OVERLAPPEDWINDOW,
+        40, 40, 400, 180, nullptr, nullptr, wc.hInstance, nullptr);
+    const HWND tabs = root ? CreateWindowExW(0, wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 240, 28, root, reinterpret_cast<HMENU>(721), wc.hInstance, nullptr) : nullptr;
+    Check(root && tabs, "MSAA page-tab fixture could not create its windows");
+    if (!root || !tabs) {
+        if (root) DestroyWindow(root);
+        if (registered) UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return;
+    }
+    auto* provider = new TestMenuAccessible();
+    provider->toolbar = tabs;
+    provider->pageTabs = true;
+    provider->names = { L"Extended", L"Standard" };
+    SetWindowSubclass(tabs, TestMenuToolbarSubclass, 0xAA13,
+        reinterpret_cast<DWORD_PTR>(provider));
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(tabs, kind, reason) &&
+        kind == Translation::ControlKind::AccessibleIsland,
+        "AMCCustomTab did not admit its real MSAA page-tab provider");
+    Translation::ControlNode node;
+    node.kind = kind;
+    Check(Translation::CaptureControlDetail(tabs, node, reason) && node.islandItems.size() == 2 &&
+        node.islandItems[0].kind == L"pageTab" && node.islandItems[0].selected &&
+        !node.islandItems[1].selected && node.islandItems[1].rect.left == 65,
+        "MSAA tab labels, geometry, or canonical selection were lost");
+    Translation::WindowSnapshot snapshot;
+    snapshot.nodes.push_back(node);
+    const auto before = Translation::SnapshotFingerprint(snapshot);
+    Check(Translation::InvokeAccessibleIslandItem(tabs, 1, L"Standard", L"Switch", reason) &&
+        provider->selectedTab == 2 && provider->drives == 1,
+        "MSAA tab action did not invoke the provider's own Switch action");
+    Check(Translation::CaptureControlDetail(tabs, snapshot.nodes[0], reason) &&
+        !snapshot.nodes[0].islandItems[0].selected && snapshot.nodes[0].islandItems[1].selected &&
+        Translation::SnapshotFingerprint(snapshot) != before,
+        "native page-tab selection did not update the capture fingerprint");
+    provider->itemEnabled = false;
+    provider->omitDisabledAction = true;
+    Check(Translation::CaptureControlDetail(tabs, node, reason) &&
+        !node.islandItems[0].enabled && node.islandItems[0].actionName.empty(),
+        "disabled MSAA page tab without a default action was dropped");
+    Check(!Translation::InvokeAccessibleIslandItem(tabs, 0, L"Extended", L"Switch", reason) &&
+        provider->drives == 1, "disabled MSAA page tab was invoked");
+    provider->itemEnabled = true;
+    Check(!Translation::InvokeAccessibleIslandItem(tabs, 0, L"Stale", L"Switch", reason) &&
+        provider->drives == 1, "stale MSAA page-tab identity was invoked");
+    provider->duplicateTabSelection = true;
+    Check(!Translation::ClassifyControl(tabs, kind, reason),
+        "MSAA tab list with multiple selections was admitted");
+    provider->duplicateTabSelection = false;
+    provider->selectedTab = 0;
+    Check(!Translation::ClassifyControl(tabs, kind, reason),
+        "MSAA tab list with no selection was admitted");
+    provider->selectedTab = 1;
+    provider->mixedPageRoles = true;
+    Check(!Translation::ClassifyControl(tabs, kind, reason),
+        "MSAA tab list with a non-tab item was admitted");
+    Check(!provider->wrongThread, "MSAA page-tab provider was read or invoked on a foreign thread");
+    RemoveWindowSubclass(tabs, TestMenuToolbarSubclass, 0xAA13);
+    DestroyWindow(root);
+    provider->Release();
+    if (registered) UnregisterClassW(wc.lpszClassName, wc.hInstance);
+}
+
 void TestAccessibleIslandBoundary() {
     HWND root = CreateWindowExW(0, L"Static", L"island-host", WS_OVERLAPPEDWINDOW,
         40, 40, 320, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -2488,6 +3474,28 @@ void TestPaneContainerCaptureAndSplit() {
     if (node.splits.size() != 1 || node.chromeRegions.size() != 1) {
         std::wcerr << L"splits=" << node.splits.size()
             << L" chrome=" << node.chromeRegions.size() << L'\n';
+    }
+
+    const uint8_t subpixelBlack[] = { 96, 192, 64 };
+    const uint8_t subpixelWhite[] = { 255, 240, 224 };
+    const uint8_t emptyBlack[] = { 0, 0, 0 };
+    const uint8_t emptyWhite[] = { 255, 255, 255 };
+    Check(Translation::RecoverPaintAlpha(subpixelBlack, subpixelWhite) >= 192,
+        "channel-dependent GDI paint alpha does not accommodate all color channels");
+    Check(Translation::RecoverPaintAlpha(emptyBlack, emptyWhite) == 0 &&
+        Translation::RecoverPaintAlpha(subpixelBlack, subpixelBlack) == 255,
+        "unpainted or opaque GDI pixels lost their original coverage");
+    Check(Translation::RecoverPaintAlpha(subpixelWhite, subpixelBlack) == 255,
+        "changing paint between passes produced invalid alpha");
+    if (node.chromeRegions.size() == 1) {
+        const auto& pixels = node.chromeRegions[0].imageData;
+        bool premultiplied = true;
+        for (size_t offset = 0; offset + 3 < pixels.size(); offset += 4) {
+            premultiplied &= pixels[offset] <= pixels[offset + 3] &&
+                pixels[offset + 1] <= pixels[offset + 3] &&
+                pixels[offset + 2] <= pixels[offset + 3];
+        }
+        Check(premultiplied, "captured container chrome is not premultiplied BGRA");
     }
 
     // Moving the split resizes exactly the two panes it divides.
@@ -3121,6 +4129,10 @@ void TestMdiFrameCaptureAndCommands() {
     g_testMdiClient = nullptr;
 }
 
+#include "MenuBarIdentityRegressionTests.h"
+#include "SourceThreadStabilityRegressionTests.h"
+#include "ListViewActivationTests.h"
+
 } // namespace
 
 int wmain() {
@@ -3139,6 +4151,7 @@ int wmain() {
         ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
     Check(InitCommonControlsEx(&controls) != FALSE,
         "common-control classes were not initialized");
+    FluentShell::Tests::TestReferencedItemImagery(Check);
     TestHeaderValidation();
     TestPipeRoundTrip();
     TestReadFrameUsesOneDeadline();
@@ -3153,6 +4166,7 @@ int wmain() {
     TestControlAdapterRegistry();
     TestEditableComboCaptureBoundary();
     TestStaticIconCaptureBoundary();
+    TestStaticDecorationCaptureAndRejection();
     TestAncestorEnabledTabOrderCapture();
     TestTabOrderRejectionSpecificity();
     TestStructuredCommonControlCapture();
@@ -3161,12 +4175,26 @@ int wmain() {
     TestTreeViewCaptureAndExpansion();
     TestTrackbarCaptureAndValue();
     TestMdiFrameCaptureAndCommands();
+    TestMdiCapturePreservesNavigationAcrossModalDisable();
     TestStandardMenuCapture();
+    TestMenuBarToolbarLifecycle();
+    TestMenuBarCommandIdentityAndNativeRouting();
+    TestSourceThreadCallbackLifetime();
+    TestMenuActionBindingGeneration();
+    TestDeferredListViewActivation();
+    TestPopupMenuState();
+    TestSourceThreadPopupTracking();
+    TestPopupActionProtocol();
     TestMenuActionValidationAndSerialization();
     TestToolbarCaptureBoundary();
     TestVirtualDialogSnapshots();
     TestPaneContainerCaptureAndSplit();
     TestAccessibleIslandBoundary();
+    TestAccessiblePageTabs();
+    FluentShell::Tests::TestUiAutomationProjectionScope(Check);
+    FluentShell::Tests::TestMmcHtmlDocumentAdmission(Check);
+    FluentShell::Tests::TestListViewModes(Check);
+    FluentShell::Tests::TestToolbarRadioGroups(Check);
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";
         return 1;

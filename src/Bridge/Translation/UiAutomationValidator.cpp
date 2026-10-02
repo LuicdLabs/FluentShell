@@ -1,5 +1,6 @@
 #include "UiAutomationValidator.h"
 #include "UiAutomationGeometry.h"
+#include "UiAutomationProjection.h"
 
 #include "../../Common/FluentShell.h"
 
@@ -10,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <future>
@@ -32,8 +34,30 @@ using Microsoft::WRL::ComPtr;
 // that provider and never accumulate detached COM workers in one Bridge session.
 std::atomic<bool> g_projectedUiaWorkerPoisoned{ false };
 
-constexpr std::wstring_view kContentViewportAutomationId =
-    L"FluentShell.ContentViewport";
+// The provider worker may outlive the caller after a deadline. Keep only
+// atomic values and static stage names here, so timeout diagnostics never wait
+// for that worker or inspect storage that rollback is about to release.
+struct ValidationProgress final {
+    std::atomic<const wchar_t*> stage{ L"worker startup" };
+    std::atomic<uint64_t> nodeId{ 0 };
+    std::atomic<ULONGLONG> startedAt{ GetTickCount64() };
+
+    std::wstring Describe() const {
+        const auto* name = stage.load(std::memory_order_acquire);
+        const auto node = nodeId.load(std::memory_order_relaxed);
+        const auto started = startedAt.load(std::memory_order_relaxed);
+        return std::wstring(name) + (node ? L" node=" + std::to_wstring(node) : L"") +
+            L" elapsed=" + std::to_wstring(GetTickCount64() - started) + L" ms";
+    }
+
+    void Begin(const wchar_t* name, uint64_t node = 0) {
+        if (GetTickCount64() - startedAt.load(std::memory_order_relaxed) > 250)
+            FluentShell::Log(L"slow UIA gate stage: " + Describe());
+        nodeId.store(node, std::memory_order_relaxed);
+        startedAt.store(GetTickCount64(), std::memory_order_relaxed);
+        stage.store(name, std::memory_order_release);
+    }
+};
 
 struct ComScope final {
     HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -327,8 +351,14 @@ bool RectClose(const RECT& left, const RECT& right, LONG tolerance = 18) noexcep
         std::abs((left.bottom - left.top) - (right.bottom - right.top)) <= tolerance;
 }
 
-int ExpectedControlType(ControlKind kind) noexcept {
-    switch (kind) {
+bool IsAccessibleTabList(const ControlNode& node) noexcept {
+    return node.kind == ControlKind::AccessibleIsland && !node.islandItems.empty() &&
+        node.islandItems.front().kind == L"pageTab";
+}
+
+int ExpectedControlType(const ControlNode& node) noexcept {
+    if (IsAccessibleTabList(node)) return UIA_TabControlTypeId;
+    switch (node.kind) {
     case ControlKind::StaticText: return UIA_TextControlTypeId;
     case ControlKind::StaticIcon: return UIA_ImageControlTypeId;
     case ControlKind::Separator: return UIA_SeparatorControlTypeId;
@@ -365,6 +395,7 @@ int ExpectedControlType(ControlKind kind) noexcept {
 }
 
 RequiredPattern PatternFor(const ControlNode& node) noexcept {
+    if (IsAccessibleTabList(node)) return RequiredPattern::Selection;
     switch (node.kind) {
     case ControlKind::Button: return RequiredPattern::Invoke;
     case ControlKind::CheckBox:
@@ -387,6 +418,8 @@ RequiredPattern PatternFor(const ControlNode& node) noexcept {
 bool HasPattern(
     IUIAutomationElement* element,
     RequiredPattern pattern,
+    ValidationProgress& progress,
+    uint64_t nodeId,
     std::wstring& error) noexcept {
     if (pattern == RequiredPattern::None) return true;
     PATTERNID patternId = 0;
@@ -418,6 +451,7 @@ bool HasPattern(
     }
     VARIANT value{};
     VariantInit(&value);
+    progress.Begin(L"pattern availability", nodeId);
     const HRESULT propertyResult = element->GetCurrentPropertyValue(availableProperty, &value);
     const bool propertyAvailable = SUCCEEDED(propertyResult) &&
         value.vt == VT_BOOL && value.boolVal == VARIANT_TRUE;
@@ -427,10 +461,12 @@ bool HasPattern(
             FAILED(propertyResult) ? propertyResult : E_NOINTERFACE);
     }
     void* raw = nullptr;
+    progress.Begin(L"pattern provider", nodeId);
     const HRESULT patternResult = element->GetCurrentPatternAs(patternId, *iid, &raw);
     if (FAILED(patternResult) || !raw)
         return FailHr(error, L"required UIA pattern is unavailable", patternResult);
     static_cast<IUnknown*>(raw)->Release();
+    progress.Begin(L"pattern complete", nodeId);
     return true;
 }
 
@@ -454,6 +490,7 @@ bool ValidateSysLinkDescendant(
     IUIAutomationElement* root,
     const ControlNode& node,
     DWORD rendererProcessId,
+    ValidationProgress& progress,
     std::wstring& error) noexcept {
     if (!automation || !root || node.items.size() != 1 || node.items.front().empty())
         return Fail(error, L"SysLink snapshot has no unique link label");
@@ -487,7 +524,7 @@ bool ValidateSysLinkDescendant(
         info.isKeyboardFocusable != (node.tabStop && node.enabled ? TRUE : FALSE)) {
         return Fail(error, L"SysLink hyperlink role, name, process, enabled, or focus state is incorrect");
     }
-    return HasPattern(link.Get(), RequiredPattern::Invoke, error);
+    return HasPattern(link.Get(), RequiredPattern::Invoke, progress, node.nodeId, error);
 }
 
 bool ValidateSliderRangeValue(
@@ -561,7 +598,7 @@ bool ValidateListViewCheckboxes(
     int length = 0;
     if (FAILED(findResult) || !matches || FAILED(matches->get_Length(&length)))
         return FailHr(error, L"ListView checkbox enumeration failed", findResult);
-    const int rowCount = static_cast<int>(node.rows.size());
+    const int rowCount = static_cast<int>(ListViewItemCount(node));
     if ((!node.checkBoxes && length != 0) ||
         (node.checkBoxes && rowCount != 0 && (length <= 0 || length > rowCount))) {
         return Fail(error, L"ListView checkbox descendants do not match native capability");
@@ -605,8 +642,10 @@ bool ValidateTabControlItems(
     ComPtr<IUIAutomationElementArray> items;
     result = element->FindAll(TreeScope_Children, condition.Get(), &items);
     int count = 0;
+    const bool island = IsAccessibleTabList(node);
+    const size_t expectedCount = island ? node.islandItems.size() : node.items.size();
     if (FAILED(result) || !items || FAILED(items->get_Length(&count)) ||
-        count != static_cast<int>(node.items.size()))
+        count != static_cast<int>(expectedCount))
         return Fail(error, L"TabControl UIA TabItem count does not match native items");
     int selectedCount = 0;
     for (int index = 0; index < count; ++index) {
@@ -617,10 +656,18 @@ bool ValidateTabControlItems(
         const HRESULT nameResult = item->get_CurrentName(&rawName);
         const std::wstring name = rawName ? rawName : L"";
         if (rawName) SysFreeString(rawName);
-        if (FAILED(nameResult) || name != DisplayText(node.items[static_cast<size_t>(index)]))
+        const auto itemIndex = static_cast<size_t>(index);
+        const auto expectedName = island ? node.islandItems[itemIndex].name
+            : DisplayText(node.items[itemIndex]);
+        if (FAILED(nameResult) || name != expectedName)
             return Fail(error, L"TabControl UIA TabItem name does not match its native label");
         BOOL focusable = FALSE;
-        if (FAILED(item->get_CurrentIsKeyboardFocusable(&focusable)) || !focusable)
+        const bool enabled = node.enabled && (!island || node.islandItems[itemIndex].enabled);
+        BOOL actualEnabled = FALSE;
+        if (FAILED(item->get_CurrentIsEnabled(&actualEnabled)) ||
+            (actualEnabled != FALSE) != enabled)
+            return Fail(error, L"TabControl UIA enabled state does not match native state");
+        if (FAILED(item->get_CurrentIsKeyboardFocusable(&focusable)) || (enabled && !focusable))
             return Fail(error, L"TabControl UIA TabItem is not keyboard focusable");
         ComPtr<IUIAutomationSelectionItemPattern> selection;
         result = item->GetCurrentPatternAs(UIA_SelectionItemPatternId,
@@ -630,7 +677,9 @@ bool ValidateTabControlItems(
         if (FAILED(result) || !selection || FAILED(selection->get_CurrentIsSelected(&selected)))
             return Fail(error, L"TabControl UIA TabItem lacks SelectionItem state");
         if (selected) ++selectedCount;
-        if ((selected != FALSE) != (index == node.selectedIndex))
+        const bool expectedSelected = island ? node.islandItems[itemIndex].selected
+            : index == node.selectedIndex;
+        if ((selected != FALSE) != expectedSelected)
             return Fail(error, L"TabControl UIA selection does not match native selection");
     }
     return selectedCount == 1 ||
@@ -641,6 +690,7 @@ bool ValidateToolbarItems(
     IUIAutomation* automation,
     IUIAutomationElement* element,
     const ControlNode& node,
+    ValidationProgress& progress,
     std::wstring& error) noexcept {
     if (!automation || !element) return Fail(error, L"Toolbar UIA element is unavailable");
     ComPtr<IUIAutomationCondition> condition;
@@ -648,6 +698,7 @@ bool ValidateToolbarItems(
     if (FAILED(result) || !condition)
         return FailHr(error, L"Toolbar child condition failed", result);
     ComPtr<IUIAutomationElementArray> children;
+    progress.Begin(L"toolbar children", node.nodeId);
     result = element->FindAll(TreeScope_Children, condition.Get(), &children);
     int count = 0;
     const auto visibleCount = static_cast<int>(std::count_if(
@@ -661,7 +712,8 @@ bool ValidateToolbarItems(
         for (const auto& item : node.toolbarItems) {
             if (item.hidden) continue;
             error += L"[" + std::wstring(item.kind == ToolbarItemKind::Separator
-                    ? L"sep" : item.kind == ToolbarItemKind::ToggleButton ? L"toggle" : L"push") +
+                    ? L"sep" : item.kind == ToolbarItemKind::ToggleButton ? L"toggle"
+                    : item.kind == ToolbarItemKind::RadioButton ? L"radio" : L"push") +
                 L" '" + DiagnosticText(DisplayText(item.text)) + L"']";
         }
         error += L" proxy=";
@@ -681,15 +733,18 @@ bool ValidateToolbarItems(
     int childIndex = 0;
     for (const auto& expected : node.toolbarItems) {
         if (expected.hidden) continue;
+        progress.Begin(L"toolbar item properties", node.nodeId);
         ComPtr<IUIAutomationElement> child;
         if (FAILED(children->GetElement(childIndex++, &child)) || !child)
             return Fail(error, L"Toolbar UIA child is unavailable");
         CONTROLTYPEID type = 0;
-        // A latched button is a XAML ToggleButton, which publishes the Button control
-        // type and the Toggle pattern rather than Invoke.
+        // CHECKGROUP uses a RadioButton and SelectionItem; a standalone latch
+        // uses a ToggleButton, which publishes the Button type and Toggle.
         const CONTROLTYPEID expectedType =
             expected.kind == ToolbarItemKind::Separator
-                ? UIA_SeparatorControlTypeId : UIA_ButtonControlTypeId;
+                ? UIA_SeparatorControlTypeId
+                : expected.kind == ToolbarItemKind::RadioButton
+                    ? UIA_RadioButtonControlTypeId : UIA_ButtonControlTypeId;
         if (FAILED(child->get_CurrentControlType(&type)) || type != expectedType)
             return Fail(error, L"Toolbar UIA child type does not match native item kind");
         if (expected.kind == ToolbarItemKind::Separator) continue;
@@ -701,11 +756,29 @@ bool ValidateToolbarItems(
         if (FAILED(nameResult) || name != DisplayText(expected.text) ||
             FAILED(child->get_CurrentIsEnabled(&enabled)) || enabled != (expected.enabled ? TRUE : FALSE))
             return Fail(error, L"Toolbar UIA button name or enabled state does not match native state");
-        // A latched button owns Toggle; a command button owns Invoke.  The projection
-        // draws whichever the control's own style declares.
+        if (expected.kind == ToolbarItemKind::RadioButton) {
+            if (expected.radioGroup <= 0)
+                return Fail(error, L"Toolbar radio item has no native group identity");
+            if (!HasPattern(child.Get(), RequiredPattern::SelectionItem,
+                    progress, node.nodeId, error)) return false;
+            ComPtr<IUIAutomationSelectionItemPattern> selection;
+            progress.Begin(L"toolbar radio selection", node.nodeId);
+            const HRESULT selectionResult = child->GetCurrentPatternAs(
+                UIA_SelectionItemPatternId, IID_IUIAutomationSelectionItemPattern,
+                reinterpret_cast<void**>(selection.GetAddressOf()));
+            if (FAILED(selectionResult) || !selection)
+                return FailHr(error, L"Toolbar radio SelectionItem read failed", selectionResult);
+            BOOL selected = FALSE;
+            if (FAILED(selection->get_CurrentIsSelected(&selected)) ||
+                (selected != FALSE) != expected.checked)
+                return Fail(error, L"Toolbar radio selection does not match native checked state");
+            continue;
+        }
+        // A standalone latched button owns Toggle; a command button owns Invoke.
         const bool latched = expected.kind == ToolbarItemKind::ToggleButton || expected.checked;
         if (!HasPattern(child.Get(),
-                latched ? RequiredPattern::Toggle : RequiredPattern::Invoke, error))
+                latched ? RequiredPattern::Toggle : RequiredPattern::Invoke,
+                progress, node.nodeId, error))
             return false;
     }
     return true;
@@ -791,17 +864,70 @@ bool IsDescendant(
     return false;
 }
 
+bool FindHostedXamlProjectionRoot(
+    IUIAutomation* automation,
+    IUIAutomationElement* host,
+    IUIAutomationElement* viewport,
+    IUIAutomationCacheRequest* cache,
+    DWORD rendererProcessId,
+    ComPtr<IUIAutomationElement>& projectionRoot,
+    std::wstring& error) noexcept {
+    ComPtr<IUIAutomationTreeWalker> walker;
+    HRESULT result = automation->get_ControlViewWalker(&walker);
+    if (FAILED(result) || !walker)
+        return FailHr(error, L"XAML projection ancestor walker is unavailable", result);
+
+    std::vector<ElementInfo> ancestors;
+    ComPtr<IUIAutomationElement> current = viewport;
+    for (unsigned depth = 0; depth < 64; ++depth) {
+        ComPtr<IUIAutomationElement> parent;
+        result = walker->GetParentElementBuildCache(current.Get(), cache, &parent);
+        if (FAILED(result) || !parent)
+            return FailHr(error, L"XAML content viewport ancestor is unavailable", result);
+        BOOL same = FALSE;
+        result = automation->CompareElements(host, parent.Get(), &same);
+        if (FAILED(result))
+            return FailHr(error, L"XAML content viewport host comparison failed", result);
+        if (same) {
+            const auto selected = FindOutermostXamlProjectionAncestorIndex(ancestors);
+            if (!selected) {
+                error = L"Win32 host has no XAML UIA projection ancestor of its content viewport; ancestors=";
+                for (const auto& ancestor : ancestors) {
+                    error += L"[" + ancestor.framework + L" type=" +
+                        std::to_wstring(ancestor.controlType) + L" id='" +
+                        DiagnosticText(ancestor.automationId) + L"']";
+                }
+                return false;
+            }
+            projectionRoot = ancestors[*selected].element;
+            return true;
+        }
+        ElementInfo info;
+        if (!ReadCachedElementInfo(parent.Get(), info, error)) return false;
+        if (info.processId != static_cast<int>(rendererProcessId))
+            return Fail(error, L"XAML content viewport ancestor has the wrong process identity");
+        ancestors.push_back(std::move(info));
+        current = std::move(parent);
+    }
+    return Fail(error, L"XAML content viewport ancestor chain does not reach its proxy host");
+}
+
 bool ValidateNativeIsolation(
     IUIAutomation* automation,
     const UiAutomationValidationOptions& options,
+    ValidationProgress& progress,
     std::wstring& error) noexcept {
     if (!options.nativeRoot) return true;
+    if (GetAncestor(options.nativeRoot, GA_ROOT) != options.nativeRoot)
+        return Fail(error, L"native isolation requires a top-level HWND");
+    progress.Begin(L"native cloak");
     DWORD cloak = 0;
     if (FAILED(DwmGetWindowAttribute(options.nativeRoot, DWMWA_CLOAKED, &cloak, sizeof(cloak))) ||
         (cloak & DWM_CLOAKED_APP) == 0) {
         return Fail(error, L"native root is not application-cloaked");
     }
     ComPtr<IUIAutomationElement> nativeElement;
+    progress.Begin(L"native UIA provider");
     const HRESULT result = automation->ElementFromHandle(options.nativeRoot, &nativeElement);
     if (FAILED(result) || !nativeElement)
         return FailHr(error, L"cloaked native root has no UIA provider", result);
@@ -817,11 +943,13 @@ bool ValidateNativeIsolation(
         return Fail(error, L"cloaked native root UIA isolation property unavailable");
 
     // IsOffscreen is not a reliable cloak signal on every Windows build.  The
-    // stronger contract is that the exact native HWND must not be discoverable
-    // from the desktop UIA tree.  Search by both process and native handle so
-    // a stale provider or a provider exposed by an accessibility bridge fails
-    // the whole-window cutover instead of leaving duplicate UIA surfaces.
+    // The canonical HWND is a top-level window, so check the desktop's immediate
+    // children for that exact process/handle. Searching every descendant also
+    // traverses unrelated applications' providers: on a populated desktop this
+    // took 12 seconds and poisoned otherwise valid MMC projections. Child scope
+    // checks top-level exposure without depending on those applications' content.
     ComPtr<IUIAutomationElement> desktop;
+    progress.Begin(L"desktop native isolation preparation");
     if (FAILED(automation->GetRootElement(&desktop)) || !desktop)
         return Fail(error, L"desktop UIA root is unavailable for native isolation");
     VARIANT processValue{};
@@ -852,8 +980,10 @@ bool ValidateNativeIsolation(
     if (FAILED(conditionResult) || !exactCondition)
         return FailHr(error, L"native isolation condition composition failed", conditionResult);
     ComPtr<IUIAutomationElement> exposed;
+    progress.Begin(L"desktop native isolation scan");
     const HRESULT findResult = desktop->FindFirst(
-        TreeScope_Descendants, exactCondition.Get(), &exposed);
+        TreeScope_Children, exactCondition.Get(), &exposed);
+    progress.Begin(L"desktop native isolation result");
     if (FAILED(findResult))
         return FailHr(error, L"desktop UIA native isolation query failed", findResult);
     if (exposed)
@@ -864,7 +994,9 @@ bool ValidateNativeIsolation(
 bool ValidateOnMta(
     const UiAutomationValidationOptions& options,
     const WindowSnapshot& snapshot,
+    ValidationProgress& progress,
     std::wstring& error) noexcept {
+    progress.Begin(L"UIA client initialization");
     PhysicalCoordinateScope dpi;
     ComScope com;
     if (!com.Usable()) return FailHr(error, L"UIA COM initialization failed", com.result);
@@ -900,6 +1032,7 @@ bool ValidateOnMta(
     }
 
     ComPtr<IUIAutomationElement> root;
+    progress.Begin(L"proxy UIA root");
     result = automation->ElementFromHandle(options.proxy, &root);
     if (FAILED(result) || !root) return FailHr(error, L"proxy UIA root unavailable", result);
     ElementInfo rootInfo;
@@ -949,6 +1082,7 @@ bool ValidateOnMta(
     }
 
     void* windowPatternRaw = nullptr;
+    progress.Begin(L"proxy Window pattern");
     result = root->GetCurrentPatternAs(
         UIA_WindowPatternId, IID_IUIAutomationWindowPattern, &windowPatternRaw);
     if (FAILED(result) || !windowPatternRaw)
@@ -975,6 +1109,7 @@ bool ValidateOnMta(
     ComPtr<IUIAutomationCacheRequest> elementCache;
     if (!BuildElementCacheRequest(automation.Get(), elementCache, error)) return false;
     std::vector<ElementInfo> elements;
+    progress.Begin(L"proxy descendants");
     if (!CollectCachedElements(root.Get(), controlViewCondition.Get(), elementCache.Get(),
             options.rendererProcessId,
             L"proxy UIA descendant enumeration failed",
@@ -984,24 +1119,24 @@ bool ValidateOnMta(
         return false;
     }
 
+    // Find the marker before choosing any inner XAML scope. A projected MMC MDI
+    // child often repeats the native frame title; narrowing by that name drops
+    // the viewport (its ancestor) and the menu bar (a sibling branch).
+    const auto hostViewportIndex = FindUniqueContentViewportIndex(elements);
+    if (!hostViewportIndex)
+        return Fail(error, L"proxy XAML content viewport is missing or duplicated in its host");
+    const auto& hostViewport = elements[*hostViewportIndex];
+    if (hostViewport.processId != static_cast<int>(options.rendererProcessId) ||
+        hostViewport.framework != L"XAML" || hostViewport.controlType != UIA_PaneControlTypeId ||
+        !hostViewport.isControl)
+        return Fail(error, L"proxy XAML content viewport identity is invalid");
+    const ComPtr<IUIAutomationElement> expectedViewport = hostViewport.element;
     ComPtr<IUIAutomationElement> projectionRoot = root;
     if (rootInfo.framework != L"XAML") {
-        auto candidate = std::find_if(elements.begin(), elements.end(), [&](const ElementInfo& info) {
-            return info.framework == L"XAML" && info.name == snapshot.title &&
-                (info.controlType == UIA_WindowControlTypeId ||
-                 info.controlType == UIA_PaneControlTypeId ||
-                 info.controlType == UIA_GroupControlTypeId);
-        });
-        if (candidate == elements.end()) {
-            candidate = std::find_if(elements.begin(), elements.end(), [](const ElementInfo& info) {
-                return info.framework == L"XAML" && info.automationId.empty() &&
-                    (info.controlType == UIA_PaneControlTypeId ||
-                     info.controlType == UIA_GroupControlTypeId);
-            });
-        }
-        if (candidate == elements.end())
-            return Fail(error, L"Win32 host has no XAML UIA projection descendant");
-        projectionRoot = candidate->element;
+        progress.Begin(L"XAML projection ancestors");
+        if (!FindHostedXamlProjectionRoot(automation.Get(), root.Get(), expectedViewport.Get(),
+                elementCache.Get(), options.rendererProcessId, projectionRoot, error)) return false;
+        progress.Begin(L"XAML projection descendants");
         if (!CollectCachedElements(projectionRoot.Get(), controlViewCondition.Get(),
                 elementCache.Get(), options.rendererProcessId,
                 L"XAML projection descendant enumeration failed",
@@ -1012,16 +1147,14 @@ bool ValidateOnMta(
         }
     }
 
-    const auto viewportCount = static_cast<size_t>(std::count_if(
-        elements.begin(), elements.end(), [](const ElementInfo& info) {
-            return info.automationId == kContentViewportAutomationId;
-        }));
-    if (viewportCount != 1)
+    const auto viewportIndex = FindUniqueContentViewportIndex(elements);
+    if (!viewportIndex)
         return Fail(error, L"proxy XAML content viewport is missing or duplicated");
-    const auto viewport = std::find_if(
-        elements.begin(), elements.end(), [](const ElementInfo& info) {
-            return info.automationId == kContentViewportAutomationId;
-        });
+    const auto viewport = elements.begin() + *viewportIndex;
+    BOOL sameViewport = FALSE;
+    if (FAILED(automation->CompareElements(expectedViewport.Get(), viewport->element.Get(),
+            &sameViewport)) || !sameViewport)
+        return Fail(error, L"proxy XAML content viewport changed during scope selection");
     if (viewport->processId != static_cast<int>(options.rendererProcessId) ||
         viewport->framework != L"XAML" || viewport->controlType != UIA_PaneControlTypeId ||
         !viewport->isControl ||
@@ -1035,11 +1168,22 @@ bool ValidateOnMta(
     std::unordered_map<uint64_t, std::unordered_set<std::wstring>> containerDescendants;
     std::unordered_map<uint64_t, RECT> expectedNodeBounds;
     for (const auto& node : snapshot.nodes) {
+        progress.Begin(L"node identity", node.nodeId);
         const auto expectedId = L"FluentShell.Node." + std::to_wstring(node.nodeId) +
             L"." + std::to_wstring(node.generation);
         expectedAutomationIds.insert(expectedId);
+        if (node.kind == ControlKind::StaticDecoration) {
+            // A frame/fill is visual structure, not a named control. Its raw
+            // WinUI borders must not become actionable accessibility elements.
+            if (std::any_of(elements.begin(), elements.end(), [&](const ElementInfo& element) {
+                    return element.automationId == expectedId &&
+                        (element.isControl || element.actionable || element.isKeyboardFocusable);
+                }))
+                return Fail(error, L"Static decoration was exposed as an interactive UIA control");
+            continue;
+        }
         if (!node.visible || node.kind == ControlKind::Separator) continue;
-        const int expectedType = ExpectedControlType(node.kind);
+        const int expectedType = ExpectedControlType(node);
         if (!expectedType) return Fail(error, L"snapshot contains an unknown UIA control kind");
         const auto expectedName = DisplayText(node.automationName);
         const RECT* parentVisibleBounds = nullptr;
@@ -1107,6 +1251,7 @@ bool ValidateOnMta(
             auto nested = containerDescendants.find(*node.parentNodeId);
             if (nested == containerDescendants.end()) {
                 std::unordered_set<std::wstring> identifiers;
+                progress.Begin(L"node parent nesting", node.nodeId);
                 if (!CollectDescendantAutomationIds(automation.Get(), parent->second.Get(),
                         controlViewCondition.Get(), identifiers, error)) return false;
                 nested = containerDescendants.emplace(
@@ -1133,12 +1278,14 @@ bool ValidateOnMta(
             return Fail(error, L"tab-stop native control is not keyboard focusable in XAML");
         if (node.kind == ControlKind::StaticIcon && matched.isKeyboardFocusable)
             return Fail(error, L"Static icon projection is unexpectedly keyboard focusable");
-        if (!HasPattern(matched.element.Get(), PatternFor(node), error)) return false;
+        if (!HasPattern(matched.element.Get(), PatternFor(node), progress, node.nodeId, error))
+            return false;
+        progress.Begin(L"node detail patterns", node.nodeId);
         if (node.kind == ControlKind::ProgressBar && node.indeterminate &&
             !LacksRangeValuePattern(matched.element.Get(), error)) return false;
         if (node.kind == ControlKind::SysLink &&
             !ValidateSysLinkDescendant(automation.Get(), matched.element.Get(), node,
-                options.rendererProcessId, error)) return false;
+                options.rendererProcessId, progress, error)) return false;
         if (node.kind == ControlKind::ListView &&
             !ValidateListViewSelectionCapability(matched.element.Get(), node, error)) return false;
         if (node.kind == ControlKind::Slider &&
@@ -1146,16 +1293,18 @@ bool ValidateOnMta(
         if (node.kind == ControlKind::ListView &&
             !ValidateListViewCheckboxes(
                 automation.Get(), matched.element.Get(), node, error)) return false;
-        if (node.kind == ControlKind::TabControl &&
+        if ((node.kind == ControlKind::TabControl || IsAccessibleTabList(node)) &&
             !ValidateTabControlItems(
                 automation.Get(), matched.element.Get(), node, error)) return false;
         if (node.kind == ControlKind::Toolbar &&
             !ValidateToolbarItems(
-                automation.Get(), matched.element.Get(), node, error)) return false;
+                automation.Get(), matched.element.Get(), node, progress, error)) return false;
         if (node.kind == ControlKind::ComboBox &&
-            !HasPattern(matched.element.Get(), RequiredPattern::ExpandCollapse, error)) return false;
+            !HasPattern(matched.element.Get(), RequiredPattern::ExpandCollapse,
+                progress, node.nodeId, error)) return false;
         if (node.kind == ControlKind::ComboBox && node.editable &&
-            !HasPattern(matched.element.Get(), RequiredPattern::Value, error)) return false;
+            !HasPattern(matched.element.Get(), RequiredPattern::Value,
+                progress, node.nodeId, error)) return false;
         if (node.kind == ControlKind::Password) {
             BOOL password = FALSE;
             if (FAILED(matched.element->get_CurrentIsPassword(&password)) || !password)
@@ -1207,6 +1356,7 @@ bool ValidateOnMta(
     // validates the persistent menu bar contract only; protocol validation and
     // renderer construction validate the complete closed flyout hierarchy.
     for (const auto& item : snapshot.menu) {
+        progress.Begin(L"menu identity");
         const auto expectedId = L"FluentShell.Menu." + item.itemId;
         ComPtr<IUIAutomationElement> element;
         if (!findMenuElement(expectedId, element)) return false;
@@ -1218,8 +1368,10 @@ bool ValidateOnMta(
             info.name != DisplayText(item.text) ||
             info.isEnabled != (item.enabled ? TRUE : FALSE) || !info.isControl)
             return Fail(error, L"projected top-level menu role, name, or enabled state is incorrect");
-        if (!HasPattern(element.Get(), RequiredPattern::ExpandCollapse, error)) return false;
+        if (!HasPattern(element.Get(), RequiredPattern::ExpandCollapse, progress, 0, error))
+            return false;
     }
+    progress.Begin(L"proxy ownership and z-order");
     if (options.expectedOwner) {
         if (GetWindow(options.proxy, GW_OWNER) != options.expectedOwner)
             return Fail(error, L"proxy owner does not match projected owner");
@@ -1234,6 +1386,7 @@ bool ValidateOnMta(
         return Fail(error, L"proxy is below the cloaked native root in z-order");
 
     if (options.requireFocus) {
+        progress.Begin(L"proxy focus");
         if (GetForegroundWindow() != options.proxy)
             return Fail(error, L"proxy did not take the native foreground slot");
         ComPtr<IUIAutomationElement> focused;
@@ -1251,6 +1404,7 @@ bool ValidateOnMta(
             return Fail(error, L"Win32 focus root is outside the proxy");
     }
     if (options.requireVisible) {
+        progress.Begin(L"proxy screen hit-test");
         const LONG width = snapshot.bounds.right - snapshot.bounds.left;
         const LONG height = snapshot.bounds.bottom - snapshot.bounds.top;
         const POINT samples[] = {
@@ -1285,7 +1439,8 @@ bool ValidateOnMta(
         if (!ScreenHitTestMatchesExposure(exposedProxy, resolvedProxy))
             return Fail(error, L"screen hit-test does not resolve to the exposed proxy tree");
     }
-    if (!ValidateNativeIsolation(automation.Get(), options, error)) return false;
+    if (!ValidateNativeIsolation(automation.Get(), options, progress, error)) return false;
+    progress.Begin(L"renderer final identity");
     return VerifyProcessIdentity(options.rendererProcessId, options.rendererCreated) ||
         Fail(error, L"renderer identity changed during committed UIA validation");
 }
@@ -1309,11 +1464,13 @@ bool ValidateProjectedSurface(
     };
     try {
         auto result = std::make_shared<std::promise<Result>>();
+        auto progress = std::make_shared<ValidationProgress>();
         auto future = result->get_future();
-        std::thread worker([result, options, snapshot] {
+        std::thread worker([result, progress, options, snapshot] {
             Result value;
             try {
-                value.ok = ValidateOnMta(options, snapshot, value.error);
+                value.ok = ValidateOnMta(options, snapshot, *progress, value.error);
+                progress->Begin(L"worker complete");
             } catch (...) {
                 value.ok = false;
                 value.error = L"UIA validator exception";
@@ -1328,7 +1485,8 @@ bool ValidateProjectedSurface(
             g_projectedUiaWorkerPoisoned.store(true, std::memory_order_release);
             worker.detach();
             return Fail(error,
-                L"UIA validation deadline expired; worker abandoned and session poisoned");
+                L"UIA validation deadline expired; worker abandoned and session poisoned; stage=" +
+                    progress->Describe());
         }
         worker.join();
         auto value = future.get();

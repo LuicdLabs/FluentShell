@@ -74,6 +74,27 @@ bool IsNonce(std::wstring_view value) noexcept {
     });
 }
 
+bool IsMenuItemPath(std::wstring_view value) noexcept {
+    if (value.empty() || value.size() > Ipc::kMaxMenuItemPathChars) return false;
+    size_t start = 0;
+    size_t depth = 0;
+    while (start < value.size()) {
+        if (++depth > Ipc::kMaxMenuDepth) return false;
+        const size_t dot = value.find(L'.', start);
+        const size_t end = dot == std::wstring_view::npos ? value.size() : dot;
+        if (end == start || (end - start > 1 && value[start] == L'0')) return false;
+        size_t index = 0;
+        for (size_t offset = start; offset < end; ++offset) {
+            if (value[offset] < L'0' || value[offset] > L'9') return false;
+            index = index * 10 + static_cast<size_t>(value[offset] - L'0');
+            if (index >= Ipc::kMaxMenuItems) return false;
+        }
+        if (dot == std::wstring_view::npos) return true;
+        start = dot + 1;
+    }
+    return false;
+}
+
 bool HasExpectedNonce(
     const JsonObject& root,
     std::wstring_view expectedNonce,
@@ -172,7 +193,8 @@ JsonObject NodeToJson(const ControlNode& node) {
         items.Append(JsonValue::CreateStringValue(item));
     }
     result.Insert(L"items", items);
-    if (node.kind == ControlKind::TabControl) {
+    if (node.kind == ControlKind::TabControl ||
+        (node.kind == ControlKind::ListView && node.listViewMode != L"report")) {
         JsonArray itemRects;
         for (const auto& rect : node.itemRects) itemRects.Append(RectToJson(rect));
         result.Insert(L"itemRects", itemRects);
@@ -195,6 +217,9 @@ JsonObject NodeToJson(const ControlNode& node) {
     }
     result.Insert(L"rows", rows);
     if (node.kind == ControlKind::ListView) {
+        result.Insert(L"listViewMode", JsonValue::CreateStringValue(node.listViewMode));
+        result.Insert(L"itemActivationSupported",
+            JsonValue::CreateBooleanValue(node.itemActivationSupported));
         JsonArray columnOrder;
         for (const int logical : node.columnOrder) {
             columnOrder.Append(JsonValue::CreateNumberValue(logical));
@@ -264,13 +289,16 @@ JsonObject NodeToJson(const ControlNode& node) {
             JsonObject value;
             value.Insert(L"kind", JsonValue::CreateStringValue(
                 item.kind == ToolbarItemKind::PushButton ? L"pushButton"
-                : item.kind == ToolbarItemKind::ToggleButton ? L"toggleButton" : L"separator"));
+                : item.kind == ToolbarItemKind::ToggleButton ? L"toggleButton"
+                : item.kind == ToolbarItemKind::RadioButton ? L"radioButton" : L"separator"));
             value.Insert(L"commandId", JsonValue::CreateNumberValue(item.commandId));
             value.Insert(L"rect", RectToJson(item.rect));
             value.Insert(L"text", JsonValue::CreateStringValue(item.text));
             value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
             value.Insert(L"hidden", JsonValue::CreateBooleanValue(item.hidden));
             value.Insert(L"checked", JsonValue::CreateBooleanValue(item.checked));
+            if (item.kind == ToolbarItemKind::RadioButton)
+                value.Insert(L"radioGroup", JsonValue::CreateNumberValue(item.radioGroup));
             value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
             value.Insert(L"wholeDropDown", JsonValue::CreateBooleanValue(item.wholeDropDown));
             // The icon fields travel only when the control actually draws one: a
@@ -321,6 +349,7 @@ JsonObject NodeToJson(const ControlNode& node) {
             value.Insert(L"actionName", JsonValue::CreateStringValue(item.actionName));
             value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
             value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
+            value.Insert(L"selected", JsonValue::CreateBooleanValue(item.selected));
             islandItems.Append(value);
         }
         result.Insert(L"islandItems", islandItems);
@@ -390,6 +419,17 @@ JsonObject SnapshotToJson(const WindowSnapshot& snapshot) {
     JsonArray menu;
     for (const auto& item : snapshot.menu) menu.Append(MenuItemToJson(item));
     result.Insert(L"menu", menu);
+    if (snapshot.popupMenu) {
+        const auto& popup = *snapshot.popupMenu;
+        JsonObject value;
+        value.Insert(L"popupId", JsonValue::CreateStringValue(Ipc::UInt64ToString(popup.popupId)));
+        value.Insert(L"nodeId", JsonValue::CreateStringValue(Ipc::UInt64ToString(popup.nodeId)));
+        value.Insert(L"itemIndex", JsonValue::CreateNumberValue(popup.itemIndex));
+        JsonArray items;
+        for (const auto& item : popup.items) items.Append(MenuItemToJson(item));
+        value.Insert(L"items", items);
+        result.Insert(L"popupMenu", value);
+    }
     JsonArray nodes;
     for (const auto& node : snapshot.nodes) nodes.Append(NodeToJson(node));
     result.Insert(L"nodes", nodes);
@@ -530,6 +570,20 @@ bool ParseActionValue(
         }
         return true;
     }
+    if (action.action == L"activateItem") {
+        if (value.ValueType() != JsonValueType::Number) {
+            error = L"activateItem requires an integer item index";
+            return false;
+        }
+        const double index = value.GetNumber();
+        if (!std::isfinite(index) || std::trunc(index) != index ||
+            index < 0 || index >= static_cast<double>(Ipc::kMaxListItems)) {
+            error = L"activateItem index is outside range";
+            return false;
+        }
+        action.itemIndex = static_cast<int>(index);
+        return true;
+    }
     if (action.action == L"setSelection") {
         if (value.ValueType() != JsonValueType::Array) {
             error = L"setSelection requires an integer array";
@@ -585,6 +639,29 @@ bool ParseActionValue(
             error = L"setItemText value exceeds limit";
             return false;
         }
+        return true;
+    }
+    if (action.action == L"popupCommand") {
+        if (value.ValueType() != JsonValueType::Object) {
+            error = L"popupCommand requires a popup token and item path";
+            return false;
+        }
+        const auto object = value.GetObject();
+        if (object.Size() != 2 || !object.HasKey(L"popupId") || !object.HasKey(L"itemId") ||
+            object.GetNamedValue(L"popupId").ValueType() != JsonValueType::String ||
+            !Ipc::TryParseUInt64(object.GetNamedString(L"popupId"), action.popupId) ||
+            action.popupId == 0) {
+            error = L"popupCommand requires a positive canonical popup token";
+            return false;
+        }
+        const auto item = object.GetNamedValue(L"itemId");
+        action.popupItemId.reset();
+        if (item.ValueType() == JsonValueType::Null) return true;
+        if (item.ValueType() != JsonValueType::String || !IsMenuItemPath(item.GetString())) {
+            error = L"popupCommand itemId must be a bounded canonical path or null";
+            return false;
+        }
+        action.popupItemId = item.GetString();
         return true;
     }
     if (action.action == L"islandInvoke") {
@@ -711,6 +788,7 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     switch (kind) {
     case ControlKind::StaticText: return L"static";
     case ControlKind::StaticIcon: return L"staticIcon";
+    case ControlKind::StaticDecoration: return L"staticDecoration";
     case ControlKind::Separator: return L"separator";
     case ControlKind::Button: return L"button";
     case ControlKind::CheckBox: return L"checkBox";
@@ -1012,9 +1090,9 @@ bool ParseActionInvoke(
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
-            L"setSelection", L"setItemCheck", L"setItemText", L"setValue", L"setExpand",
+            L"setSelection", L"setItemCheck", L"setItemText", L"activateItem", L"setValue", L"setExpand",
             L"setSplit", L"setColumnOrder", L"islandInvoke",
-            L"menuCommand", L"toolbarCommand", L"mdiCommand",
+            L"menuCommand", L"popupCommand", L"toolbarCommand", L"mdiCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -1024,7 +1102,7 @@ bool ParseActionInvoke(
         const bool requiresNode = action.action == L"invoke" || action.action == L"setText" ||
             action.action == L"setCheck" || action.action == L"select" ||
             action.action == L"setSelection" || action.action == L"setItemCheck" ||
-            action.action == L"setItemText" ||
+            action.action == L"setItemText" || action.action == L"activateItem" ||
             action.action == L"setValue" || action.action == L"setExpand" ||
             action.action == L"setSplit" ||
             action.action == L"setColumnOrder" ||
@@ -1147,6 +1225,38 @@ bool ValidateActionForSnapshot(
     const ActionRequest& action,
     const WindowSnapshot& snapshot,
     std::wstring& error) noexcept {
+    if (action.action == L"popupCommand") {
+        if (action.nodeId || action.popupId == 0 || !snapshot.popupMenu ||
+            snapshot.surfaceKind != SurfaceKind::Window ||
+            snapshot.popupMenu->popupId != action.popupId) {
+            error = L"popupCommand references an expired popup";
+            return false;
+        }
+        if (!action.popupItemId) return true;
+        if (!IsMenuItemPath(*action.popupItemId)) {
+            error = L"popupCommand item path is invalid";
+            return false;
+        }
+        const auto contains = [&](const auto& self,
+                                  const std::vector<MenuItemSnapshot>& items) -> bool {
+            for (const auto& item : items) {
+                if (!item.enabled) continue;
+                if (item.itemId == *action.popupItemId)
+                    return item.kind == MenuItemKind::Command && item.commandId != 0;
+                if (self(self, item.items)) return true;
+            }
+            return false;
+        };
+        if (contains(contains, snapshot.popupMenu->items)) return true;
+        error = L"popupCommand references an unknown or disabled item";
+        return false;
+    }
+    if (snapshot.popupMenu && action.action != L"close" && action.action != L"activate" &&
+        action.action != L"move" && action.action != L"resize" &&
+        action.action != L"minimize" && action.action != L"maximize" && action.action != L"restore") {
+        error = L"native popup awaits selection";
+        return false;
+    }
     if (action.action == L"menuCommand") {
         if (action.nodeId || action.menuCommandId == 0) {
             error = L"menuCommand identity is invalid";
@@ -1155,6 +1265,7 @@ bool ValidateActionForSnapshot(
         const auto contains = [&](const auto& self,
                                   const std::vector<MenuItemSnapshot>& items) -> bool {
             for (const auto& item : items) {
+                if (!item.enabled) continue;
                 if (item.kind == MenuItemKind::Command &&
                     item.commandId == action.menuCommandId)
                     return item.enabled;
@@ -1254,6 +1365,15 @@ bool ValidateActionForSnapshot(
         }
         return true;
     }
+    if (action.action == L"activateItem") {
+        if (node.kind != ControlKind::ListView || !node.itemActivationSupported ||
+            node.itemNativeIds.size() != ListViewItemCount(node) || action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node)) {
+            error = L"activateItem requires an index within a ListView with native activation";
+            return false;
+        }
+        return true;
+    }
     if (action.action == L"setSelection") {
         if (node.kind != ControlKind::ListView ||
             (!node.multiSelect && action.integerValues.size() > 1)) {
@@ -1262,7 +1382,7 @@ bool ValidateActionForSnapshot(
         }
         if (std::any_of(action.integerValues.begin(), action.integerValues.end(),
                 [&](int index) { return index < 0 ||
-                    static_cast<size_t>(index) >= node.rows.size(); })) {
+                    static_cast<size_t>(index) >= ListViewItemCount(node); })) {
             error = L"setSelection index is outside the ListView";
             return false;
         }
@@ -1276,7 +1396,7 @@ bool ValidateActionForSnapshot(
             return false;
         }
         const size_t itemCount = node.kind == ControlKind::TreeView
-            ? node.items.size() : node.rows.size();
+            ? node.items.size() : ListViewItemCount(node);
         if (action.itemIndex < 0 || static_cast<size_t>(action.itemIndex) >= itemCount) {
             error = L"setItemText index is outside the item range";
             return false;
@@ -1307,7 +1427,7 @@ bool ValidateActionForSnapshot(
         return true;
     }
     if (action.action == L"setColumnOrder") {
-        if (node.kind != ControlKind::ListView) {
+        if (node.kind != ControlKind::ListView || node.listViewMode != L"report") {
             error = L"setColumnOrder requires a report ListView node";
             return false;
         }
@@ -1340,7 +1460,7 @@ bool ValidateActionForSnapshot(
             return false;
         }
         if (action.itemIndex < 0 ||
-            static_cast<size_t>(action.itemIndex) >= node.rows.size()) {
+            static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node)) {
             error = L"setItemCheck index is outside the ListView";
             return false;
         }
@@ -1354,11 +1474,12 @@ bool ValidateActionForSnapshot(
         const auto item = std::find_if(node.toolbarItems.begin(), node.toolbarItems.end(),
             [&](const ToolbarItemSnapshot& candidate) {
                 return (candidate.kind == ToolbarItemKind::PushButton ||
-                        candidate.kind == ToolbarItemKind::ToggleButton) &&
+                        candidate.kind == ToolbarItemKind::ToggleButton ||
+                        candidate.kind == ToolbarItemKind::RadioButton) &&
                     candidate.commandId == action.menuCommandId;
             });
         if (item == node.toolbarItems.end() || !item->enabled || item->hidden) {
-            error = L"toolbarCommand references an unknown, disabled, or hidden push button";
+            error = L"toolbarCommand references an unknown, disabled, or hidden button";
             return false;
         }
         return true;
@@ -1424,7 +1545,7 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
         action == L"move" || action == L"resize" || action == L"setValue" ||
         action == L"setSplit" ||
         action == L"setColumnOrder" ||
-        action == L"islandInvoke" ||
+        action == L"islandInvoke" || action == L"popupCommand" ||
         action == L"mdiCommand";
 }
 

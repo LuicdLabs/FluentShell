@@ -42,6 +42,9 @@ public sealed class WindowViewModel : ObservableObject
     public string State { get => _state; private set => SetProperty(ref _state, value); }
     public ObservableCollection<ControlNodeViewModel> Nodes { get; } = [];
     public ObservableCollection<MenuItemViewModel> Menu { get; } = [];
+    // A native tracking menu has its own lifetime. Its appearance must not rebuild
+    // the controls or dismiss an open flyout on each ordinary canonical patch.
+    public PopupMenuSnapshot? PopupMenu { get; private set; }
 
     public static WindowViewModel FromSnapshot(WindowSnapshot snapshot)
     {
@@ -64,6 +67,7 @@ public sealed class WindowViewModel : ObservableObject
             var current = Nodes[index];
             if (incoming.NodeId != current.NodeId || incoming.Generation != current.Generation ||
                 incoming.NativeHwnd != current.NativeHwnd || incoming.Kind != current.Kind ||
+                (incoming.ListViewMode ?? "report") != current.ListViewMode ||
                 incoming.ParentNodeId != current.ParentNodeId ||
                 incoming.ZIndex != current.ZIndex ||
                 (incoming.TabIndex ?? incoming.ZIndex) != current.TabIndex ||
@@ -116,6 +120,7 @@ public sealed class WindowViewModel : ObservableObject
         Rtl = snapshot.Rtl;
         AdapterId = snapshot.AdapterId ?? string.Empty;
         PageId = snapshot.PageId ?? string.Empty;
+        PopupMenu = snapshot.PopupMenu;
         var ordered = snapshot.Nodes.OrderBy(node => node.ZIndex).ToArray();
         if (merge)
         {

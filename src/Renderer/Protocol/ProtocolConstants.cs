@@ -39,7 +39,13 @@ public static class ProtocolConstants
     // elements as typed items read through the accessibility contract the window
     // answers, and the islandInvoke route that performs one element's own default
     // action.
-    public const ushort Minor = 19;
+    // Minor 20 adds live island popup menus and token-scoped popupCommand.
+    // Minor 21 compacts referenced item icons and bounds their aggregate decoded
+    // bytes while allowing two distinct icon references per tree item.
+    // It also adds inert staticDecoration nodes for built-in Static frames and fills.
+    // Minor 22 adds MSAA page-tab islands with canonical selection state.
+    // Minor 23 adds positioned ListView modes, revision-gated item activation, and toolbar radio groups.
+    public const ushort Minor = 23;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;
@@ -59,12 +65,14 @@ public static class ProtocolConstants
     public const int MaxChromeRegionBytes = 1_024 * 1_024;
     public const int MaxIslandItems = 32;
     public const int MaxCoordinate = 65_535;
-    public const int MaxImageListImages = 64;
+    public const int MaxImageListImages = MaxItems * 2;
     public const int MaxImageListDimension = 64;
+    public const int MaxImageListBytes = 1_024 * 1_024;
     public const int MaxColumns = 64;
     public const int MaxPatchOperations = 1_024;
     public const int MaxMenuItems = 256;
     public const int MaxMenuDepth = 8;
+    public const int MaxMenuItemPathChars = 64;
     public const int MaxImageDimension = 96;
     public const int MaxImageBytes = MaxImageDimension * MaxImageDimension * 4;
     public const int MaxDirectUiBitmapDimension = 1024;

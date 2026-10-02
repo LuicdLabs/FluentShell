@@ -1,0 +1,10 @@
+{
+  "messageType": "action.invoke",
+  "sessionNonce": "00112233445566778899aabbccddeeff",
+  "surfaceId": "4f17d4bb-b2bf-42b8-a334-2f9ad8d54d42",
+  "nodeId": null,
+  "eventId": "21",
+  "expectedRevision": "8",
+  "action": "popupCommand",
+  "value": { "popupId": "18446744073709551615", "itemId": null }
+}

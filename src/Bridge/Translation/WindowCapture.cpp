@@ -159,31 +159,49 @@ bool IsDialogControlParent(HWND child) noexcept {
         (exStyle & WS_EX_CONTROLPARENT) != 0;
 }
 
+bool IsMdiChildWindow(HWND window) noexcept {
+    return (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)) &
+        WS_EX_MDICHILD) != 0;
+}
+
+bool IsMdiNavigationContainer(HWND window) noexcept {
+    if (IsMdiChildWindow(window)) return true;
+    wchar_t classBuffer[kMaxClassNameChars]{};
+    return FluentShell::EqualsIgnoreCase(ClassNameOf(window, classBuffer), L"MDIClient");
+}
+
+HWND NativeTabScope(HWND root, HWND child) noexcept {
+    for (HWND parent = GetParent(child); parent && parent != root; parent = GetParent(parent)) {
+        if (IsMdiChildWindow(parent)) return parent;
+    }
+    return root;
+}
+
 bool CaptureNativeTabOrder(
     HWND root,
     const std::vector<HWND>& handles,
     std::unordered_map<HWND, int>& tabIndexes,
     std::wstring& reason) {
-    std::unordered_set<HWND> candidates;
+    std::unordered_map<HWND, HWND> candidates;
     for (const HWND child : handles) {
-        if (IsCompositeImplementationChild(child)) continue;
+        if (IsCompositeImplementationChild(child) || IsMdiNavigationContainer(child)) continue;
         const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
         if (!IsDialogControlParent(child) && IsWindowVisible(child) &&
             IsEffectivelyEnabled(root, child) &&
             (style & WS_TABSTOP) != 0) {
-            candidates.insert(child);
+            candidates.emplace(child, NativeTabScope(root, child));
         }
     }
     if (candidates.empty()) return true;
 
     // Dialog-manager traversal is per container: an MDI child frame runs its own
     // IsDialogMessage loop, so the controls inside it are not reachable from the
-    // frame's walk.  Each container contributes its own ordered block, and the
-    // first walk that reaches a control fixes its order.
+    // frame's walk. Each control belongs to its nearest MDI child, or the root
+    // when it has none. Even a control-parent style that exposes an MDI subtree
+    // to the root's walk must not assign that subtree the root's tab order.
     std::vector<HWND> containers{ root };
     for (const HWND child : handles) {
-        if ((static_cast<DWORD>(GetWindowLongPtrW(child, GWL_EXSTYLE)) & WS_EX_MDICHILD) != 0 &&
-            IsWindowVisible(child)) {
+        if (IsMdiChildWindow(child) && IsWindowVisible(child)) {
             containers.push_back(child);
         }
     }
@@ -208,7 +226,8 @@ bool CaptureNativeTabOrder(
                 return false;
             }
             if (!visited.insert(next).second) break;
-            if (candidates.contains(next)) {
+            if (const auto candidate = candidates.find(next);
+                candidate != candidates.end() && candidate->second == container) {
                 tabIndexes.emplace(next, static_cast<int>(tabIndexes.size()));
             }
             current = next;
@@ -250,6 +269,7 @@ struct MenuCaptureState final {
     size_t count = 0;
     std::unordered_set<HMENU> menus;
     std::unordered_set<uint32_t> commandIds;
+    bool requireUniqueCommands = true;
 };
 
 bool CaptureMenuLevel(
@@ -370,7 +390,7 @@ bool CaptureMenuLevel(
             }
             item.kind = MenuItemKind::Command;
             item.commandId = info.wID;
-            if (!state.commandIds.insert(item.commandId).second) {
+            if (state.requireUniqueCommands && !state.commandIds.insert(item.commandId).second) {
                 reason = L"ambiguous duplicate executable menu command ID";
                 return false;
             }
@@ -538,7 +558,12 @@ bool CaptureCommonNodeFacets(
         ? L"Password edit"
         : node.text;
     node.groupStart = (node.style & WS_GROUP) != 0;
-    if (node.kind == ControlKind::DialogContainer) {
+    // WS_MAXIMIZEBOX aliases WS_TABSTOP. On an MDI frame that bit describes its
+    // caption, including while a modal dialog disables the owner; it must never
+    // turn into a disabled dialog tab stop. Keep the raw style for caption
+    // commands, and keep both structural MDI kinds outside dialog traversal.
+    if (node.kind == ControlKind::DialogContainer ||
+        node.kind == ControlKind::MdiClient || node.kind == ControlKind::MdiChild) {
         node.tabStop = false;
         node.tabIndex = -1;
     }
@@ -643,7 +668,7 @@ bool CaptureChildNodes(
         if (!IsWindowVisible(child) || IsCompositeImplementationChild(child)) continue;
         // The menu-bar toolbar is projected as the surface's menu, so it must not also
         // appear as a control: one native menu bar becomes one projected menu bar.
-        if (child == context.menuBarToolbar) continue;
+        if (child == context.menuBarToolbar && !context.menuBarToolbarMenu.empty()) continue;
         ControlNode node;
         if (!CaptureChildNode(child, context, scope, node, reason)) {
             AppendWindowEvidence(child, reason);
@@ -689,7 +714,8 @@ bool CaptureMenuHandle(
     HMENU menu,
     std::wstring_view itemIdPath,
     std::vector<MenuItemSnapshot>& items,
-    std::wstring& rejectionReason) noexcept {
+    std::wstring& rejectionReason,
+    bool requireUniqueCommands) noexcept {
     try {
         items.clear();
         if (!menu || !IsMenu(menu)) {
@@ -697,12 +723,43 @@ bool CaptureMenuHandle(
             return false;
         }
         MenuCaptureState state;
+        state.requireUniqueCommands = requireUniqueCommands;
         // Depth 1 with topLevel false: these are the items of a popup, not the bar.
         return CaptureMenuLevel(menu, 1, itemIdPath, false, true, false,
             state, items, rejectionReason);
     } catch (...) {
         rejectionReason = L"exception while capturing a menu handle";
         return false;
+    }
+}
+
+void ObserveMenuBarToolbar(HWND root, CaptureContext& context) noexcept {
+    try {
+        HWND toolbar = FindMenuBarToolbar(root);
+        ControlNode identity;
+        std::wstring reason;
+        std::vector<MenuBarButton> buttons;
+        if (toolbar && (!AssignNodeIdentity(toolbar, context, identity, reason) ||
+                !ReadMenuBarButtons(toolbar, buttons))) toolbar = nullptr;
+        if (!toolbar) {
+            identity.generation = 0;
+            buttons.clear();
+        }
+        if (toolbar == context.menuBarToolbar &&
+            identity.generation == context.menuBarToolbarGeneration &&
+            buttons == context.menuBarButtons) return;
+        context.menuBarToolbar = toolbar;
+        context.menuBarToolbarGeneration = identity.generation;
+        context.menuBarButtons = std::move(buttons);
+        context.menuBarToolbarMenu.clear();
+        context.menuBarToolbarCommands.clear();
+        context.menuBarRefresh.Invalidate(GetTickCount64());
+    } catch (...) {
+        context.menuBarToolbar = nullptr;
+        context.menuBarToolbarGeneration = 0;
+        context.menuBarButtons.clear();
+        context.menuBarToolbarMenu.clear();
+        context.menuBarToolbarCommands.clear();
     }
 }
 
@@ -725,52 +782,17 @@ bool CaptureWindow(
         }
         WindowSnapshot next;
         if (!CaptureTopLevelFacets(root, context, next, rejectionReason)) return false;
-        // A menu bar drawn with a toolbar is projected as a real menu, not as a row of
-        // buttons.  It is read once per surface: driving each button's own default action
-        // opens the application's menus, and doing that on every reconcile would ask the
-        // application to rebuild seven popups a second.  The result carries in
-        // `context.menuBarToolbarMenu` for later captures of the same surface.
-        // A menu read from a menu-bar toolbar carries over from the read that produced it,
-        // but it must never displace a menu the window itself owns: assigning
-        // unconditionally here wiped the HMENU menu bar of every ordinary window.
-        if (next.menu.empty()) next.menu = context.menuBarToolbarMenu;
-        const HWND menuBarToolbar = FindMenuBarToolbar(root);
-        if (menuBarToolbar) {
+        // Observation is cheap and never opens a popup. The post-commit source-thread
+        // command refreshes the contents only after meaningful application changes.
+        ObserveMenuBarToolbar(root, context);
+        if (context.menuBarToolbar) {
             if (GetMenu(root)) {
                 rejectionReason =
                     L"window has both an HMENU menu bar and a menu-bar toolbar";
                 return false;
             }
-            // Reading such a bar means asking the application to open its own menus, and
-            // that must not happen here.  The application opens a popup from its message
-            // loop rather than from inside the accessible default action, so the read has
-            // to span a return to that loop; and driving it while the native window still
-            // owns the foreground costs the proxy the foreground slot the committed gate
-            // requires.  The read therefore belongs to a stage that runs after the
-            // projection is committed and the native window is cloaked, which is why this
-            // pass only identifies the bar.
-            std::wstring menuReason;
-            if (context.menuBarToolbarMenu.empty() && context.menuBarToolbarReadable &&
-                !CaptureMenuBarToolbar(menuBarToolbar, next.menu, menuReason)) {
-                // Refusing here would take the whole window native for something the
-                // projection can still draw, so the toolbar keeps its own node and the
-                // reason is recorded once.
-                next.menu.clear();
-                if (!context.menuBarToolbarRejected) {
-                    context.menuBarToolbarRejected = true;
-                    try {
-                        FluentShell::Log(
-                            L"Menu-bar toolbar is projected as a toolbar rather than a menu: " +
-                            menuReason);
-                    } catch (...) {}
-                }
-            }
-            if (!context.menuBarToolbarMenu.empty()) {
-                context.menuBarToolbar = menuBarToolbar;
-            } else if (!next.menu.empty()) {
-                context.menuBarToolbarMenu = next.menu;
-                context.menuBarToolbar = menuBarToolbar;
-            }
+            next.menu = context.menuBarToolbarMenu;
+            next.menuBindingGeneration = context.menuBarBindingGeneration;
         }
         if (!CaptureChildNodes(root, context, next, rejectionReason)) {
             return false;
@@ -801,6 +823,7 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
     HashString(hash, snapshot.state);
     HashBytes(hash, snapshot.showInTaskbar);
     HashBytes(hash, snapshot.rtl);
+    HashBytes(hash, snapshot.menuBindingGeneration);
     HashString(hash, snapshot.adapterId);
     HashString(hash, snapshot.pageId);
     const auto hashMenu = [&](const auto& self,
@@ -819,6 +842,13 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         }
     };
     hashMenu(hashMenu, snapshot.menu);
+    HashBytes(hash, snapshot.popupMenu.has_value());
+    if (snapshot.popupMenu) {
+        HashBytes(hash, snapshot.popupMenu->popupId);
+        HashBytes(hash, snapshot.popupMenu->nodeId);
+        HashBytes(hash, snapshot.popupMenu->itemIndex);
+        hashMenu(hashMenu, snapshot.popupMenu->items);
+    }
     HashBytes(hash, snapshot.nodes.size());
     for (const auto& node : snapshot.nodes) {
         HashBytes(hash, node.nodeId);
@@ -865,8 +895,12 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.reversed);
         HashBytes(hash, node.items.size());
         for (const auto& item : node.items) HashString(hash, item);
+        HashString(hash, node.listViewMode);
         HashBytes(hash, node.itemRects.size());
         for (const auto& rect : node.itemRects) HashBytes(hash, rect);
+        HashBytes(hash, node.itemNativeIds.size());
+        for (const uint32_t nativeId : node.itemNativeIds) HashBytes(hash, nativeId);
+        HashBytes(hash, node.itemActivationSupported);
         HashBytes(hash, node.columns.size());
         for (const auto& column : node.columns) HashString(hash, column);
         HashBytes(hash, node.columnWidths.size());
@@ -910,6 +944,7 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         if (!node.imageData.empty()) HashRange(hash, node.imageData.data(), node.imageData.size());
         HashBytes(hash, node.toolbarItems.size());
         for (const auto& item : node.toolbarItems) {
+            HashBytes(hash, item.radioGroup);
             HashBytes(hash, item.kind);
             HashBytes(hash, item.commandId);
             HashBytes(hash, item.rect);
@@ -955,6 +990,7 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashString(hash, item.actionName);
             HashBytes(hash, item.enabled);
             HashBytes(hash, item.dropDown);
+            HashBytes(hash, item.selected);
         }
         HashString(hash, node.pageId);
         HashString(hash, node.semanticKey);

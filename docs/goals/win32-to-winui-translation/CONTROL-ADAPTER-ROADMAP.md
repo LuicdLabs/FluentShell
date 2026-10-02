@@ -455,6 +455,85 @@ the one before:
   "System", so the fitted label still trims to a stub where the native control draws a
   document icon.
 
+#### MMC menu lifecycle and interaction follow-up
+
+The toolbar-derived menu is now refreshed after semantic changes instead of being
+frozen at injection. Menu and toolbar commands, selection changes, and MDI changes
+invalidate it. Capture observes the toolbar's HWND generation, labels and enabled
+state without opening a popup; removal, recreation or relabelling discards stale
+identities. A quiet console reuses its menu. Refresh is debounced and failed reads
+have at most three attempts per invalidation.
+
+`SourceThreadAgent::RefreshMenuBarToolbar` queues the complete operation onto the
+owning GUI thread, including discovery, MSAA reads, popup capture, cleanup and
+publication. The pump checks a total deadline while draining messages, defers Bridge
+commands and preserves `WM_QUIT`. Intercepted HMENUs are copied before the application
+destroys them. Late popup callbacks from a previously read owner remain suppressed
+while that native root is cloaked; restoring it restores native popup behavior.
+
+A pending or failed refresh cannot dispatch old commands. Disabled menu ancestors
+also disable their commands, and a stale menu click is rejected without restoring
+the whole surface. Nested WinUI menus now track name, access key, enabled and default
+state changes. Icon toolbar buttons expose the native accessible name as a tooltip.
+
+The committed isolation gate checks the exact native process/HWND among desktop
+top-level UIA children, after confirming the HWND is top-level and application-cloaked.
+The former desktop descendant scan also walked unrelated applications' content and
+took about 12 seconds on the acceptance desktop, exceeding the 5-second gate budget.
+Gate timeouts now report the stage and node being checked.
+
+Native regression coverage uses a real toolbar HWND with a test MSAA provider that
+posts and destroys popup menus. It covers menu state refresh, toolbar identity,
+disabled ancestors, cancellation with a queued popup, preserved `WM_QUIT`, bounded
+retry, and a message stream that cannot extend the total deadline.
+
+The same MMC soak exposed a chrome capture bug with channel-dependent GDI text:
+the black/white reconstruction used the least covered RGB channel as scalar alpha,
+which could put another color channel above alpha and fault the renderer. It now
+uses the greatest coverage, preserving black-pass color and transparent unpainted
+pixels while guaranteeing premultiplied BGRA. Regression cases exercise different
+coverage per channel, changing paint, and transparent/opaque pixels; the real HWND
+capture test also checks every captured chrome pixel against the wire invariant.
+
+Validated on 2026-09-26 with Release builds: the 252 renderer tests, native suite,
+and production gates pass. Empty MMC reaches interactive commit, both pane toolbar
+buttons toggle their native panes, menu refresh follows each toggle, and native-name
+tooltips appear. After the alpha fix it remained projected for more than two minutes;
+`LegacyDialogHost` also reached interactive commit. Terminating MMC's renderer
+restored the complete native console. This validates the empty-console
+path, not arbitrary snap-in controls or every Actions-pane popup.
+
+#### Actions-pane popup projection
+
+Accessible-island dropdown actions now have a separate, live popup route. An
+`islandInvoke` records its HWND generation, item index, name, and default action on
+the source GUI thread. The matching `TrackPopupMenu`/`TrackPopupMenuEx` call keeps
+its native HMENU alive while its items travel in optional `window.popupMenu`
+state. The renderer opens a real WinUI `MenuFlyout` at the projected island item.
+Ordinary snapshot updates preserve the flyout and its native tracking token.
+
+Protocol minor 20 adds the popup token, anchor, items, and `popupCommand`. A choice
+names the token and item path; a null path dismisses the menu. The source thread
+revalidates the selected command against the still-live menu, including enabled
+ancestors, before returning its ID for `TPM_RETURNCMD` or posting `WM_COMMAND` to
+the actual tracking owner. Stale tokens are refused. WinUI sends one terminal
+reply even when Click and Closed both occur. A leaf's empty child array does not
+consume an extra level of the menu depth bound.
+
+The native modal pump continues servicing capture, selection, and restore
+commands. Toolbar-menu refresh pauses during tracking. Temporarily disabling the
+opener does not discard its pending request; changing the anchor identity,
+moving/minimizing/closing the frame, or restoring the native surface cancels it.
+An unsupported popup capture faults the surface through the normal supervisor
+rollback path. Owner-draw, modeless, drag/drop, and position-notification menus
+retain the existing capture boundary.
+
+Validation on 2026-09-27 includes 296 renderer tests and real HWND/source-thread
+integration tests for asynchronous opening, disabled openers, nested selection,
+actual-owner command routing, HMENU lifetime, dismissal, geometry changes, and
+whole-surface restore. These tests cover the implementation used by MMC's More
+Actions route; a manual click-through of this new route in MMC remains pending.
+
 ### Tranche I: Private Containers, Splitters, And Reorderable Headers
 
 The blockers that kept `mmc.exe` native were mostly *containers*, not controls: MMC's
@@ -589,6 +668,13 @@ itself. Unsupported custom or
 unexpectedly actionable roles keep the complete surface native.
 
 ## Target Findings
+
+The current full MMC scope and its per-console validation status are tracked in
+[MMC-VALIDATION-MATRIX.md](MMC-VALIDATION-MATRIX.md). Protocol minor 23 includes bounded
+referenced-icon compaction, Static frame/fill projection, accessible page tabs,
+positioned ListView modes and toolbar radio groups; MDI navigation and deferred
+source-action cancellation have native regressions. These
+shared fixes do not yet establish live support for every installed snap-in.
 
 - `notepad.exe`: current builds are blocked by HMENU and may additionally use
   RichEdit, status bars, or existing XAML. Menu and text-document tranches are

@@ -39,8 +39,8 @@ constexpr unsigned kQuietReconcileTicks = 4;
 // being broken.  Tolerate a few misses before discarding a working projection.
 constexpr unsigned kMaxCaptureTimeouts = 3;
 // How long the application's own message loop is pumped, per button, waiting for it to
-// open the popup that button was driven to open.  The read is one-shot per surface, so a
-// generous window costs nothing in steady state.
+// open the popup that button was driven to open. A bounded, debounced source-thread
+// policy refreshes only after meaningful menu changes.
 constexpr DWORD kMenuBarPopupWaitMs = 700;
 // Classic dialogs commonly destroy one owned top-level and create the next a
 // moment later. Require a quiet owner graph before reprojecting the root so it
@@ -198,7 +198,6 @@ struct RendererSession::Surface final {
     // re-layout does not silently discard the request.  See PaneSplitIntent.
     std::vector<PaneSplitIntent> splitIntents;
     // A menu bar drawn with a toolbar is read once per surface, after the commit.
-    bool menuBarToolbarRead = false;
     std::optional<uint64_t> verificationNode;
     std::unordered_map<uint64_t, int> buttonResults;
     std::optional<int> cancelResult;
@@ -1135,6 +1134,11 @@ TopLevelCensus EnumerateTopLevels() {
         else if (!IsWindowVisible(hwnd)) filtered = L"hidden";
         else if (FluentShell::EqualsIgnoreCase(className, L"#32768")) {
             filtered = L"native menu popup";
+        } else if (FluentShell::EqualsIgnoreCase(className, L"tooltips_class32") ||
+            FluentShell::EqualsIgnoreCase(className, L"Internet Explorer_Hidden")) {
+            // MSHTML's OLE channel HWND carries WS_VISIBLE despite having no user
+            // surface. Tooltips likewise belong to their controls, not the owner graph.
+            filtered = L"native control helper";
         } else if (FluentShell::IsShellOrXamlWindowClass(className)) {
             filtered = L"shell or XAML chrome";
         }
@@ -1583,6 +1587,12 @@ void RendererSession::HandleNativeAction(
         RejectAction(surface, lock, action, L"rejected", semanticError);
         return;
     }
+    // Index actions must keep the canonical native row identity across the hop
+    // to the source thread, even if native changes have not yet been reconciled.
+    if (effectiveAction.action == L"activateItem")
+        effectiveAction.expectedNativeFingerprint = surface->fingerprint;
+    if (effectiveAction.action == L"menuCommand")
+        effectiveAction.expectedMenuBindingGeneration = surface->snapshot.menuBindingGeneration;
 
     if (surface->directUiAdapter &&
         (action.action == L"move" || action.action == L"resize")) {
@@ -2275,59 +2285,46 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
         } catch (...) {}
         return timedOut ? L"timeout" : L"unsupported";
     }
-    surface->captureTimeouts = 0;
     ReassertRememberedSplits(pass);
-    ReadMenuBarToolbarOnce(pass);
+    if (const wchar_t* reason = RefreshMenuBarToolbar(pass)) {
+        if (std::wstring_view(reason) == L"timeout" && !stopping_.load() && !failed_.load() &&
+            ++surface->captureTimeouts < kMaxCaptureTimeouts) {
+            // Keep the published revision intact until its replacement captures
+            // successfully. The source binding witness rejects old menu clicks.
+            return nullptr;
+        }
+        return reason;
+    }
+    surface->captureTimeouts = 0;
     return PublishReconciledSnapshot(pass);
 }
 
-// A menu bar an application draws with a toolbar is read once, here, and never during a
-// capture: the read asks the application to open its own menus, which needs its message
-// loop to run between the drive and the read, and which must not compete with the proxy
-// for the foreground.  By the time reconcile runs the projection is committed and the
-// native window is cloaked, so the menus open and close invisibly.  The result lands in
-// the capture context, so the next capture publishes the menu and drops the toolbar node.
-void RendererSession::ReadMenuBarToolbarOnce(ReconcilePass& pass) {
-    const auto& surface = pass.surface;
-    {
-        std::scoped_lock lock(surface->mutex);
-        if (surface->menuBarToolbarRead) return;
-    }
-    const HWND toolbar = FindMenuBarToolbar(pass.agent->Root());
-    if (!toolbar) {
-        std::scoped_lock lock(surface->mutex);
-        surface->menuBarToolbarRead = true;
-        return;
-    }
-    if (pass.agent->HasMenuBarToolbarMenu()) {
-        std::scoped_lock lock(surface->mutex);
-        surface->menuBarToolbarRead = true;
-        return;
-    }
+// The source thread owns discovery, refresh policy and cached menu state. Reconcile
+// only requests the post-commit stage and publishes the resulting canonical capture.
+const wchar_t* RendererSession::RefreshMenuBarToolbar(ReconcilePass& pass) {
     std::wstring error;
-    const bool read = pass.agent->ReadMenuBarToolbar(
-        toolbar, kMenuBarPopupWaitMs, error, 8000, shutdownEvent_);
-    {
-        std::scoped_lock lock(surface->mutex);
-        surface->menuBarToolbarRead = true;
+    bool changed = false;
+    const bool refreshed = pass.agent->RefreshMenuBarToolbar(
+        kMenuBarPopupWaitMs, changed, error, 8000, shutdownEvent_);
+    if (!refreshed && !error.empty()) {
+        try { FluentShell::Log(L"Menu-bar refresh: " + error); } catch (...) {}
     }
-    try {
-        FluentShell::Log(read
-            ? L"Menu-bar toolbar projected as a real menu"
-            : L"Menu-bar toolbar stays a toolbar: " + error);
-    } catch (...) {}
-    if (!read) return;
-    // The menu only reaches the renderer through a capture, and this pass already has
-    // one that predates it.  Recapture so the projection changes in the same tick.
+    if (!changed) return nullptr;
+    // Do not publish a capture from before the cache change: menu and toolbar
+    // visibility must move together in one canonical revision.
+    WindowSnapshot next = pass.next;
     std::wstring captureError;
     bool timedOut = false;
-    if (!pass.agent->Capture(pass.next, captureError, 2000, shutdownEvent_, &timedOut)) {
+    if (pass.agent->Capture(next, captureError, 2000, shutdownEvent_, &timedOut)) {
+        pass.next = std::move(next);
+    } else {
         try {
-            FluentShell::Log(L"Recapture after the menu-bar read failed: " + captureError);
+            FluentShell::Log(L"Recapture after menu-bar refresh failed: " + captureError);
         } catch (...) {}
+        return timedOut ? L"timeout" : L"unsupported";
     }
+    return nullptr;
 }
-
 // Records what a completed setSplit actually produced, so a later application
 // re-layout can be measured against it.  The container's own stored proportion is
 // private data with no message that writes it, so the position the user asked for is

@@ -1,4 +1,5 @@
 #include "AccessibleIsland.h"
+#include "MmcHtmlDocument.h"
 
 #include "../../Common/FluentShell.h"
 #include "../Ipc/Protocol.h"
@@ -84,7 +85,13 @@ std::wstring TrimmedText(std::wstring text) {
 bool IsContainerRole(long role) noexcept {
     return role == ROLE_SYSTEM_CLIENT || role == ROLE_SYSTEM_PANE ||
         role == ROLE_SYSTEM_GROUPING || role == ROLE_SYSTEM_WINDOW ||
-        role == ROLE_SYSTEM_TOOLBAR;
+        role == ROLE_SYSTEM_TOOLBAR || role == ROLE_SYSTEM_PAGETABLIST;
+}
+
+bool IsPageTabHost(HWND window) noexcept {
+    wchar_t name[64]{};
+    return GetClassNameW(window, name, 64) > 0 &&
+        FluentShell::EqualsIgnoreCase(name, L"AMCCustomTab");
 }
 
 bool MapItemKind(long role, AccessibleItemKind& kind, bool& dropDown) noexcept {
@@ -107,6 +114,9 @@ bool MapItemKind(long role, AccessibleItemKind& kind, bool& dropDown) noexcept {
         return true;
     case ROLE_SYSTEM_LINK:
         kind = AccessibleItemKind::Link;
+        return true;
+    case ROLE_SYSTEM_PAGETAB:
+        kind = AccessibleItemKind::PageTab;
         return true;
     default:
         return false;
@@ -247,20 +257,24 @@ bool ReadItem(
             return Reject(reason, L"island child action name exceeds the protocol cap");
         }
     }
-    // The action string is the whole contract for driving the element, so an element
-    // the projection would render as actionable must carry one.  An element with no
-    // action is admitted only as text.
-    if (item.kind != AccessibleItemKind::Text && item.actionName.empty()) {
-        return Reject(reason, L"island child offers no accessible default action");
-    }
-    if (item.kind == AccessibleItemKind::Text && !item.actionName.empty()) {
-        return Reject(reason, L"island text child unexpectedly offers an action");
-    }
     long state = 0;
     if (!ReadState(target, element.id, state)) {
         return Reject(reason, L"island child state is unavailable");
     }
+    if ((state & STATE_SYSTEM_INVISIBLE) != 0) {
+        return Reject(reason, L"island child became invisible during capture");
+    }
     item.enabled = (state & STATE_SYSTEM_UNAVAILABLE) == 0;
+    // Disabled MMC commands can omit their default action. Preserve the disabled
+    // button, and require the provider's action as soon as it becomes enabled.
+    if (item.kind != AccessibleItemKind::Text && item.enabled && item.actionName.empty())
+        return Reject(reason, L"island child offers no accessible default action");
+    if (item.kind == AccessibleItemKind::Text && !item.actionName.empty())
+        return Reject(reason, L"island text child unexpectedly offers an action");
+    item.selected = item.kind == AccessibleItemKind::PageTab &&
+        (state & STATE_SYSTEM_SELECTED) != 0;
+    if (item.kind == AccessibleItemKind::PageTab && (state & STATE_SYSTEM_SELECTABLE) == 0)
+        return Reject(reason, L"island page tab is not selectable");
     long left = 0;
     long top = 0;
     long width = 0;
@@ -302,11 +316,70 @@ std::wstring AccessibleChildName(HWND window, int childIndex) noexcept {
 bool IsAccessibleIslandClass(std::wstring_view className) noexcept {
     static constexpr std::array kHostClasses{
         std::wstring_view{ L"DirectUIHWND" },
+        std::wstring_view{ L"AMCCustomTab" },
+        std::wstring_view{ L"Internet Explorer_Server" },
     };
     for (const auto& candidate : kHostClasses) {
         if (FluentShell::EqualsIgnoreCase(className, candidate)) return true;
     }
     return false;
+}
+
+std::wstring DescribeAccessibleIsland(HWND window) noexcept {
+    try {
+        AccessibleRef root;
+        std::wstring reason;
+        if (!OpenIsland(window, root, reason)) return reason;
+        std::wstring result;
+        size_t remaining = 32;
+        const auto visit = [&](auto&& recurse, IAccessible* object,
+                               const VARIANT& id, unsigned depth) -> void {
+            if (remaining == 0) return;
+            --remaining;
+            long role = -1, state = -1, count = 0;
+            ReadRole(object, id, role);
+            ReadState(object, id, state);
+            if (id.vt == VT_I4 && id.lVal == CHILDID_SELF)
+                object->get_accChildCount(&count);
+            BstrRef name, action;
+            object->get_accName(id, &name.value);
+            object->get_accDefaultAction(id, &action.value);
+            auto shortText = [](std::wstring text) {
+                if (text.size() > 80) text.resize(80);
+                for (auto& character : text)
+                    if (character < L' ') character = L' ';
+                return text;
+            };
+            result += L" {depth=" + std::to_wstring(depth) + L" role=" +
+                std::to_wstring(role) + L" state=" + std::to_wstring(state) +
+                L" children=" + std::to_wstring(count) + L" name='" +
+                shortText(name.Text()) + L"' action='" + shortText(action.Text()) + L"'}";
+            if (depth >= 4 || count <= 0 || remaining == 0) return;
+            const long requested = (std::min)(count, static_cast<long>(remaining));
+            std::vector<VARIANT> children(static_cast<size_t>(requested));
+            long obtained = 0;
+            if (SUCCEEDED(AccessibleChildren(object, 0, requested, children.data(), &obtained))) {
+                for (long index = 0; index < (std::min)(obtained, requested); ++index) {
+                    const auto& child = children[static_cast<size_t>(index)];
+                    if (child.vt == VT_DISPATCH && child.pdispVal) {
+                        IAccessible* raw = nullptr;
+                        if (SUCCEEDED(child.pdispVal->QueryInterface(IID_IAccessible,
+                                reinterpret_cast<void**>(&raw))) && raw) {
+                            AccessibleRef ref(raw);
+                            recurse(recurse, ref.value, SelfId(), depth + 1);
+                        }
+                    } else if (child.vt == VT_I4 && child.lVal != CHILDID_SELF) {
+                        recurse(recurse, object, child, depth + 1);
+                    }
+                }
+            }
+            for (auto& child : children) VariantClear(&child);
+        };
+        visit(visit, root.value, SelfId(), 0);
+        return result;
+    } catch (...) {
+        return L"accessible diagnostic failed";
+    }
 }
 
 bool ReadAccessibleIslandItems(
@@ -318,6 +391,10 @@ bool ReadAccessibleIslandItems(
         if (!island || !IsWindow(island)) {
             return Reject(reason, L"island window is gone");
         }
+        wchar_t className[64]{};
+        GetClassNameW(island, className, 64);
+        if (FluentShell::EqualsIgnoreCase(className, L"Internet Explorer_Server"))
+            return ReadMmcHtmlDocument(island, items, reason);
         RECT screenRect{};
         if (!GetWindowRect(island, &screenRect)) {
             return Reject(reason, L"island bounds are unavailable");
@@ -337,14 +414,40 @@ bool ReadAccessibleIslandItems(
         if (!ReadRole(root.value, self, rootRole) || !IsContainerRole(rootRole)) {
             return Reject(reason, L"island accessible root is not a container");
         }
+        if (IsPageTabHost(island) != (rootRole == ROLE_SYSTEM_PAGETABLIST))
+            return Reject(reason, L"island tab host has an inconsistent root role");
         std::vector<IslandElement> elements;
         if (!CollectElements(root.value, elements, reason)) return false;
         items.reserve(elements.size());
+        size_t selectedTabs = 0;
         for (const IslandElement& element : elements) {
             AccessibleIslandItem item;
             if (!ReadItem(root.value, element, screenRect, item, reason)) return false;
+            if ((rootRole == ROLE_SYSTEM_PAGETABLIST) !=
+                (item.kind == AccessibleItemKind::PageTab))
+                return Reject(reason, L"island page tabs require a homogeneous tab list");
+            if (item.selected) ++selectedTabs;
+            if (item.kind == AccessibleItemKind::PageTab) {
+                RECT client{};
+                if (!GetClientRect(island, &client) || item.rect.left < 0 || item.rect.top < 0 ||
+                    item.rect.right > client.right || item.rect.bottom > client.bottom)
+                    return Reject(reason, L"island page tab bounds fall outside its host");
+                for (const auto& previous : items) {
+                    RECT intersection{};
+                    // MMC's slanted page tabs overlap at their edges (the observed
+                    // 73 px and 70 px tabs overlap by 8 px). Keep those rectangles;
+                    // only containment, duplicate bands, or cross-row overlap is invalid.
+                    if (IntersectRect(&intersection, &previous.rect, &item.rect) &&
+                        (previous.rect.top != item.rect.top || previous.rect.bottom != item.rect.bottom ||
+                         previous.rect.left == item.rect.left || previous.rect.right == item.rect.right ||
+                         ((previous.rect.left < item.rect.left) != (previous.rect.right < item.rect.right))))
+                        return Reject(reason, L"island page tab bounds overlap inconsistently");
+                }
+            }
             items.push_back(std::move(item));
         }
+        if (rootRole == ROLE_SYSTEM_PAGETABLIST && selectedTabs != 1)
+            return Reject(reason, L"island tab list must have exactly one selected tab");
         return true;
     } catch (...) {
         items.clear();
@@ -359,29 +462,48 @@ bool InvokeAccessibleIslandItem(
     const std::wstring& expectedAction,
     std::wstring& reason) noexcept {
     try {
-        std::vector<AccessibleIslandItem> current;
-        if (!ReadAccessibleIslandItems(island, current, reason)) return false;
-        if (index < 0 || static_cast<size_t>(index) >= current.size()) {
-            return Reject(reason, L"island item index no longer exists");
+        if (!island || !IsWindow(island) || !IsWindowVisible(island) ||
+            !IsWindowEnabled(island)) {
+            return Reject(reason, L"island window is unavailable for an action");
         }
-        // The published name and action are the identity of the element the user
-        // clicked.  If either moved, the projection acts on nothing rather than on
-        // whatever slid into that position.
-        if (current[static_cast<size_t>(index)].name != expectedName ||
-            current[static_cast<size_t>(index)].actionName != expectedAction) {
-            return Reject(reason, L"island item identity changed before the action ran");
-        }
-        if (current[static_cast<size_t>(index)].actionName.empty()) {
-            return Reject(reason, L"island item offers no accessible default action");
+        POINT clientOrigin{};
+        if (!ClientToScreen(island, &clientOrigin)) {
+            return Reject(reason, L"island client origin is unavailable");
         }
         AccessibleRef root;
         if (!OpenIsland(island, root, reason)) return false;
+        long rootRole = 0;
+        if (!ReadRole(root.value, SelfId(), rootRole) || !IsContainerRole(rootRole)) {
+            return Reject(reason, L"island accessible root is not a container");
+        }
+        if (IsPageTabHost(island) != (rootRole == ROLE_SYSTEM_PAGETABLIST))
+            return Reject(reason, L"island tab host role changed before invocation");
         std::vector<IslandElement> elements;
         if (!CollectElements(root.value, elements, reason)) return false;
-        if (static_cast<size_t>(index) >= elements.size()) {
+        if (index < 0 || static_cast<size_t>(index) >= elements.size()) {
             return Reject(reason, L"island item index no longer exists");
         }
         const IslandElement& element = elements[static_cast<size_t>(index)];
+        AccessibleIslandItem current;
+        const RECT origin{ clientOrigin.x, clientOrigin.y, clientOrigin.x, clientOrigin.y };
+        if (!ReadItem(root.value, element, origin, current, reason)) return false;
+        if ((rootRole == ROLE_SYSTEM_PAGETABLIST) !=
+            (current.kind == AccessibleItemKind::PageTab))
+            return Reject(reason, L"island page tab role changed before invocation");
+        // The published name and action are the identity of the element the user
+        // clicked.  If either moved, the projection acts on nothing rather than on
+        // whatever slid into that position.
+        if (current.name != expectedName || current.actionName != expectedAction) {
+            return Reject(reason, L"island item identity changed before the action ran");
+        }
+        if (!current.enabled) {
+            return Reject(reason, L"island item became disabled before the action ran");
+        }
+        if (current.actionName.empty()) {
+            return Reject(reason, L"island item offers no accessible default action");
+        }
+        // Invoke the same object whose current identity and state were read above;
+        // reopening the provider here could resolve the index to another element.
         IAccessible* target = element.Target(root.value);
         const HRESULT performed = target->accDoDefaultAction(element.id);
         if (FAILED(performed)) {

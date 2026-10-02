@@ -1,6 +1,7 @@
 #pragma once
 
 #include "WindowSnapshot.h"
+#include "MenuBarCapture.h"
 
 #include <string>
 #include <unordered_map>
@@ -19,19 +20,20 @@ struct CaptureContext final {
     uint64_t nextNodeId = 1;
     uint64_t nextNodeGeneration = 1;
     std::unordered_map<HWND, NodeIdentity> nodeIds;
-    // A menu bar drawn with a toolbar is read once and reused: the read opens the
-    // application's own popups, so repeating it on every reconcile would be both
-    // expensive and visible.  Empty until the first capture finds one.
+    // Owned exclusively by the source thread. Capture only observes the bar; the
+    // post-commit refresh command opens its popups and publishes a complete menu.
     std::vector<MenuItemSnapshot> menuBarToolbarMenu;
+    std::vector<MenuBarCommandBinding> menuBarToolbarCommands;
+    uint64_t menuBarBindingGeneration = 0;
     HWND menuBarToolbar = nullptr;
-    // Set by the stage that is allowed to ask the application to open its own menus:
-    // after the projection is committed and the native window is cloaked.  A capture
-    // that runs before that only identifies the bar.
-    bool menuBarToolbarReadable = false;
-    // A menu-bar toolbar whose popups could not be read is projected as a toolbar
-    // instead, and the reason is logged once rather than on every capture.
-    bool menuBarToolbarRejected = false;
+    uint64_t menuBarToolbarGeneration = 0;
+    std::vector<MenuBarButton> menuBarButtons;
+    MenuBarRefreshPolicy menuBarRefresh;
 };
+
+// Revalidates HWND lifetime and published menu labels without driving the control.
+// Removes cached commands immediately when the bar disappears or changes identity.
+void ObserveMenuBarToolbar(HWND root, CaptureContext& context) noexcept;
 
 bool CaptureWindow(
     HWND root,
@@ -47,11 +49,14 @@ bool CaptureTopLevelMenu(
 // Captures one HMENU as projected menu items.  Used for a window's own menu bar and for
 // a popup an application opened from a menu-bar toolbar button, which is read from the
 // handle rather than from the window that would have shown it.
+// Only the toolbar binding lane may disable command uniqueness; it remaps duplicate
+// native IDs before publication and revalidates the original live item on invocation.
 bool CaptureMenuHandle(
     HMENU menu,
     std::wstring_view itemIdPath,
     std::vector<MenuItemSnapshot>& items,
-    std::wstring& rejectionReason) noexcept;
+    std::wstring& rejectionReason,
+    bool requireUniqueCommands = true) noexcept;
 
 uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept;
 

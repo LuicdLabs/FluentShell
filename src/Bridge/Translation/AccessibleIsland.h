@@ -30,6 +30,7 @@ enum class AccessibleItemKind {
     Text,
     Button,
     Link,
+    PageTab,
 };
 
 struct AccessibleIslandItem final {
@@ -46,6 +47,7 @@ struct AccessibleIslandItem final {
     // The element opens a menu of its own rather than completing in place, so the
     // projection draws the same affordance the native element draws.
     bool dropDown = false;
+    bool selected = false;
 };
 
 // True when the class is one of the closed set of accessible-island hosts.  Keyed on
@@ -59,6 +61,10 @@ struct AccessibleIslandItem final {
 std::wstring AccessibleChildName(HWND window, int childIndex) noexcept;
 
 bool IsAccessibleIslandClass(std::wstring_view className) noexcept;
+
+// Opt-in field diagnostics for an unadmitted HWND. Never invokes provider actions.
+// The tree is capped by depth, node count, and text length.
+std::wstring DescribeAccessibleIsland(HWND window) noexcept;
 
 // Reads the island's admitted items.  Fails closed with a specific reason: a missing
 // accessible object, a role outside the admitted set, an unnamed element, an

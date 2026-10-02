@@ -41,6 +41,7 @@ enum class ControlKind {
     Toolbar,
     PaneContainer,
     AccessibleIsland,
+    StaticDecoration,
     Count,
 };
 
@@ -50,6 +51,8 @@ enum class ToolbarItemKind {
     // A BTNS_CHECK button keeps its pressed look between clicks, so the projection
     // draws a toggle and carries the state the control owns.
     ToggleButton,
+    // A contiguous BTNS_CHECKGROUP run selects at most one native member.
+    RadioButton,
 };
 
 // One gap between two panes of a container, which the projection renders as a real
@@ -86,6 +89,7 @@ struct AccessibleIslandItemSnapshot final {
     std::wstring actionName;
     bool enabled = true;
     bool dropDown = false;
+    bool selected = false;
 };
 
 struct ToolbarItemSnapshot final {
@@ -96,6 +100,9 @@ struct ToolbarItemSnapshot final {
     bool enabled = true;
     bool hidden = false;
     bool checked = false;
+    // One-based contiguous native CHECKGROUP run, including hidden members.
+    // Zero belongs to every non-radio item and never joins a radio group.
+    int radioGroup = 0;
     // BTNS_DROPDOWN: the button carries an arrow that asks its owner for a menu
     // through TBN_DROPDOWN.  With BTNS_WHOLEDROPDOWN the whole button does that and
     // there is no separate command click at all.
@@ -110,10 +117,9 @@ struct ToolbarItemSnapshot final {
     std::vector<uint8_t> imageData;
 };
 
-// One icon of a control's own image list.  Item-bearing controls share a bounded
-// list and address it by index, exactly as Win32 does: a tree or list with two
-// hundred rows normally draws a handful of distinct icons, so embedding pixels
-// per item would multiply the same bytes across the payload.
+// One referenced icon from a control's own image list. Item-bearing controls
+// share a bounded compact list and address it by projection index; unused native
+// entries do not travel, and repeated references share the same owned pixels.
 struct ImageListEntry final {
     uint32_t imageWidth = 0;
     uint32_t imageHeight = 0;
@@ -173,8 +179,18 @@ struct ControlNode final {
     bool vertical = false;
     bool reversed = false;
     std::vector<std::wstring> items;
-    // TCM_GETITEMRECT results in TabControl client-local physical pixels.
+    // ListView presentation mode. Report remains the default for old snapshots;
+    // icon/list modes carry item labels and geometry without synthetic columns.
+    std::wstring listViewMode = L"report";
+    // TCM_GETITEMRECT / non-report LVM_GETITEMRECT results in client-local physical
+    // pixels. List items may lie outside the current viewport after scrolling.
     std::vector<RECT> itemRects;
+    // Bridge-only stable ListView identities. An item moving to a different
+    // numeric index must never redirect a deferred activation to another item.
+    std::vector<uint32_t> itemNativeIds;
+    // True only when stable item IDs and the native accessible default action
+    // both exist. Older peers and controls without that capability expose false.
+    bool itemActivationSupported = false;
     std::vector<std::wstring> columns;
     std::vector<int> columnWidths;
     // Report ListView only: the display order of the columns as a permutation of
@@ -191,9 +207,10 @@ struct ControlNode final {
     // reports this before its children exist, which is what lets a projected
     // expander reach a subtree the application has not inserted yet.
     std::vector<bool> itemHasChildren;
-    // The control's own image list and the per-item indexes into it.  -1 means the
-    // item draws no icon.  itemSelectedImages is the tree's separate selected-state
-    // index, which is how a folder opens and closes natively.
+    // Referenced native icons and the per-item indexes into this compact snapshot
+    // list, rebuilt on each capture. -1 means the item draws no icon.
+    // itemSelectedImages is the tree's separate selected-state index, which is
+    // how a folder opens and closes natively.
     std::vector<ImageListEntry> imageList;
     std::vector<int> itemImages;
     std::vector<int> itemSelectedImages;
@@ -223,6 +240,12 @@ struct ControlNode final {
     std::wstring accessKey;
 };
 
+// Report capture mirrors each first cell into items; every ListView view uses
+// this one canonical item sequence for selection, checks, editing and actions.
+inline size_t ListViewItemCount(const ControlNode& node) noexcept {
+    return node.items.size();
+}
+
 enum class MenuItemKind {
     Popup,
     Command,
@@ -238,6 +261,15 @@ struct MenuItemSnapshot final {
     bool checked = false;
     bool radio = false;
     bool isDefault = false;
+    std::vector<MenuItemSnapshot> items;
+};
+
+// A live native TrackPopupMenu call, anchored to the island item that opened it.
+// The token scopes item paths to this one invocation; native handles stay in Bridge.
+struct PopupMenuSnapshot final {
+    uint64_t popupId = 0;
+    uint64_t nodeId = 0;
+    int itemIndex = -1;
     std::vector<MenuItemSnapshot> items;
 };
 
@@ -263,6 +295,10 @@ struct WindowSnapshot final {
     bool showInTaskbar = true;
     bool rtl = false;
     std::vector<MenuItemSnapshot> menu;
+    // Bridge-only identity: a refreshed toolbar binding invalidates the revision
+    // even when its rendered labels/command IDs happen to remain identical.
+    uint64_t menuBindingGeneration = 0;
+    std::optional<PopupMenuSnapshot> popupMenu;
     std::vector<ControlNode> nodes;
     std::wstring adapterId;
     std::wstring pageId;
@@ -273,6 +309,13 @@ struct ActionRequest final {
     std::optional<uint64_t> nodeId;
     uint64_t eventId = 0;
     uint64_t expectedRevision = 0;
+    // Bridge-only witness taken from the canonical published snapshot. Indexed
+    // activation rechecks it before invoking, so an unpublished item replacement
+    // cannot redirect an action even when its label happens to be unchanged.
+    uint64_t expectedNativeFingerprint = 0;
+    // Toolbar menu IDs can be remapped by a refresh. Keep the canonical binding
+    // generation across the source-thread hop, including a failed recapture.
+    uint64_t expectedMenuBindingGeneration = 0;
     std::wstring action;
     std::wstring text;
     int integerValue = 0;
@@ -282,6 +325,8 @@ struct ActionRequest final {
     int selectionStart = 0;
     int selectionLength = 0;
     uint32_t menuCommandId = 0;
+    uint64_t popupId = 0;
+    std::optional<std::wstring> popupItemId;
     RECT rect{};
     bool hasRect = false;
 };

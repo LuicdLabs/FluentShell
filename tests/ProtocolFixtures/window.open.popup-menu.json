@@ -1,0 +1,87 @@
+{
+  "messageType": "window.open",
+  "sessionNonce": "00112233445566778899aabbccddeeff",
+  "window": {
+    "surfaceId": "4f17d4bb-b2bf-42b8-a334-2f9ad8d54d42",
+    "surfaceKind": "window",
+    "modal": false,
+    "canCancel": false,
+    "icon": "none",
+    "generation": "1",
+    "revision": "8",
+    "nativeHwnd": "0x100AA",
+    "ownerHwnd": null,
+    "title": "Console1",
+    "dpi": 144,
+    "bounds": { "x": 100, "y": 80, "width": 780, "height": 480 },
+    "clientBounds": { "x": 0, "y": 0, "width": 760, "height": 430 },
+    "windowStyle": "0xCF0000",
+    "windowExStyle": "0x0",
+    "visible": true,
+    "enabled": true,
+    "state": "normal",
+    "showInTaskbar": true,
+    "rtl": false,
+    "menu": [
+      {
+        "itemId": "0", "kind": "popup", "text": "&Action", "commandId": 0,
+        "enabled": true, "checked": false, "radio": false, "isDefault": false,
+        "items": [
+          {
+            "itemId": "0.0", "kind": "command", "text": "&Refresh", "commandId": 77,
+            "enabled": true, "checked": false, "radio": false, "isDefault": false,
+            "items": []
+          }
+        ]
+      }
+    ],
+    "popupMenu": {
+      "popupId": "18446744073709551615",
+      "nodeId": "10",
+      "itemIndex": 0,
+      "items": [
+        {
+          "itemId": "0", "kind": "command", "text": "&Refresh", "commandId": 77,
+          "enabled": true, "checked": false, "radio": false, "isDefault": true,
+          "items": []
+        },
+        {
+          "itemId": "1", "kind": "separator", "text": "", "commandId": 0,
+          "enabled": true, "checked": false, "radio": false, "isDefault": false,
+          "items": []
+        },
+        {
+          "itemId": "2", "kind": "popup", "text": "&View", "commandId": 0,
+          "enabled": true, "checked": false, "radio": false, "isDefault": false,
+          "items": [
+            {
+              "itemId": "2.0", "kind": "command", "text": "&Details", "commandId": 78,
+              "enabled": true, "checked": true, "radio": true, "isDefault": false,
+              "items": []
+            }
+          ]
+        }
+      ]
+    },
+    "nodes": [
+      {
+        "nodeId": "10", "generation": "1", "nativeHwnd": "0x100AB",
+        "parentNodeId": null, "kind": "accessibleIsland", "controlId": 0,
+        "zIndex": 0, "tabIndex": -1,
+        "rect": { "x": 560, "y": 0, "width": 200, "height": 430 },
+        "style": "0x50000000", "exStyle": "0x0",
+        "visible": true, "enabled": false, "tabStop": false, "dialogCode": 0,
+        "text": "", "automationName": "Actions", "editable": false, "items": [],
+        "selectedIndices": [], "columns": [], "columnWidths": [], "rows": [],
+        "islandItems": [
+          {
+            "kind": "button",
+            "rect": { "x": 8, "y": 30, "width": 180, "height": 30 },
+            "name": "More Actions", "description": "", "actionName": "Open",
+            "enabled": false, "dropDown": true
+          }
+        ]
+      }
+    ]
+  }
+}

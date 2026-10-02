@@ -31,6 +31,8 @@ public sealed record ToolbarItemSnapshot
     public bool? DropDown { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? WholeDropDown { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? RadioGroup { get; init; }
     public int? ImageWidth { get; init; }
     public int? ImageHeight { get; init; }
     public string? ImageFormat { get; init; }
@@ -79,6 +81,7 @@ public sealed record AccessibleIslandItem
     public string ActionName { get; init; } = string.Empty;
     public bool Enabled { get; init; }
     public bool DropDown { get; init; }
+    public bool Selected { get; init; }
 }
 
 public sealed record ControlNode
@@ -132,6 +135,10 @@ public sealed record ControlNode
     public List<string> Items { get; init; } = [];
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<PixelRect>? ItemRects { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ListViewMode { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ItemActivationSupported { get; init; }
     public List<string> Columns { get; init; } = [];
     public List<int> ColumnWidths { get; init; } = [];
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -245,6 +252,24 @@ public sealed record MenuItemSnapshot
     public List<MenuItemSnapshot> Items { get; init; } = [];
 }
 
+public sealed record PopupMenuSnapshot
+{
+    public string PopupId { get; init; } = "0";
+    public string NodeId { get; init; } = "0";
+    public int ItemIndex { get; init; }
+    public List<MenuItemSnapshot> Items { get; init; } = [];
+}
+
+public sealed record PopupCommandActionValue
+{
+    [JsonPropertyName("popupId")]
+    public string PopupId { get; init; } = "0";
+    // An explicit null dismisses this popup without choosing a native command.
+    [JsonPropertyName("itemId")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public string? ItemId { get; init; }
+}
+
 public sealed record WindowSnapshot
 {
     public Guid SurfaceId { get; init; }
@@ -268,6 +293,8 @@ public sealed record WindowSnapshot
     public bool ShowInTaskbar { get; init; }
     public bool Rtl { get; init; }
     public List<MenuItemSnapshot> Menu { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PopupMenuSnapshot? PopupMenu { get; init; }
     public List<ControlNode> Nodes { get; init; } = [];
     public string? AdapterId { get; init; }
     public string? PageId { get; init; }

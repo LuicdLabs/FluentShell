@@ -206,6 +206,8 @@ bool SameToolbarItems(
         const auto& b = right[index];
         if (a.kind != b.kind || a.commandId != b.commandId || !SameRect(a.rect, b.rect) ||
             a.text != b.text || a.enabled != b.enabled || a.hidden != b.hidden ||
+            a.checked != b.checked || a.radioGroup != b.radioGroup ||
+            a.dropDown != b.dropDown || a.wholeDropDown != b.wholeDropDown ||
             a.imageWidth != b.imageWidth || a.imageHeight != b.imageHeight ||
             a.imageFormat != b.imageFormat || a.imageData != b.imageData) return false;
     }
@@ -222,6 +224,7 @@ bool SameToolbarCommands(
     if (left.size() != right.size()) return false;
     for (size_t index = 0; index < left.size(); ++index) {
         if (left[index].kind != right[index].kind ||
+            left[index].radioGroup != right[index].radioGroup ||
             left[index].commandId != right[index].commandId ||
             left[index].text != right[index].text) return false;
     }
@@ -232,6 +235,19 @@ bool SameRectList(const std::vector<RECT>& left, const std::vector<RECT>& right)
     if (left.size() != right.size()) return false;
     for (size_t index = 0; index < left.size(); ++index) {
         if (!SameRect(left[index], right[index])) return false;
+    }
+    return true;
+}
+
+bool SameItemImageList(
+    const std::vector<ImageListEntry>& left,
+    const std::vector<ImageListEntry>& right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        if (a.imageWidth != b.imageWidth || a.imageHeight != b.imageHeight ||
+            a.imageFormat != b.imageFormat || a.imageData != b.imageData) return false;
     }
     return true;
 }
@@ -337,7 +353,7 @@ bool IsDirectUiCompositeKind(ControlKind kind) noexcept {
 size_t DirectUiNativeItemCount(const ControlNode& node) noexcept {
     switch (node.kind) {
     case ControlKind::ListView:
-        return node.rows.size();
+        return ListViewItemCount(node);
     case ControlKind::Toolbar:
         return node.toolbarItems.size();
     case ControlKind::ComboBox:
@@ -1158,9 +1174,18 @@ bool ApplyDirectUiDetailToNode(
         break;
     case ControlKind::ListView:
         node.items = detail.items;
+        node.listViewMode = detail.listViewMode;
+        node.itemRects = detail.itemRects;
+        node.itemNativeIds = detail.itemNativeIds;
+        node.itemActivationSupported = detail.itemActivationSupported;
         node.columns = detail.columns;
         node.columnWidths = detail.columnWidths;
+        node.columnOrder = detail.columnOrder;
         node.rows = detail.rows;
+        node.imageList = detail.imageList;
+        node.itemImages = detail.itemImages;
+        node.editableLabels = detail.editableLabels;
+        node.editingIndex = detail.editingIndex;
         node.columnHeadersVisible = detail.columnHeadersVisible;
         node.selectedIndex = detail.selectedIndex;
         node.selectedIndices = detail.selectedIndices;
@@ -1768,6 +1793,7 @@ bool BuildGenericSemanticProfile(
         case UIA_DataGridControlTypeId:
         case UIA_TableControlTypeId:
             if (!nativeListView || semantic.actionable ||
+                (backing->window.style & LVS_TYPEMASK) != LVS_REPORT ||
                 behavioralPatternMask != DirectUiPatternNone ||
                 (semantic.enabled && !semantic.focusable))
                 return Fail(error,
@@ -2173,6 +2199,8 @@ bool SameDirectUiDetailShape(
         a.readOnly == b.readOnly && a.multiline == b.multiline &&
         a.editable == b.editable && a.checkBoxes == b.checkBoxes &&
         a.columnHeadersVisible == b.columnHeadersVisible &&
+        a.listViewMode == b.listViewMode && a.editableLabels == b.editableLabels &&
+        a.itemActivationSupported == b.itemActivationSupported &&
         a.vertical == b.vertical && a.reversed == b.reversed &&
         a.smallChange == b.smallChange && a.largeChange == b.largeChange &&
         a.columns == b.columns && a.columnWidths == b.columnWidths;
@@ -2195,6 +2223,9 @@ bool SameDirectUiDetailContent(
         a.selectionLength == b.selectionLength && a.text == b.text &&
         a.items == b.items && SameRectList(a.itemRects, b.itemRects) &&
         a.rows == b.rows && a.checkedIndices == b.checkedIndices &&
+        a.columnOrder == b.columnOrder && a.itemNativeIds == b.itemNativeIds &&
+        a.itemImages == b.itemImages && a.editingIndex == b.editingIndex &&
+        SameItemImageList(a.imageList, b.imageList) &&
         a.itemDepths == b.itemDepths && a.itemExpanded == b.itemExpanded &&
         a.checked == b.checked && a.minimum == b.minimum &&
         a.maximum == b.maximum && a.position == b.position &&

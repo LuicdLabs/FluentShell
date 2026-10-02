@@ -2,6 +2,7 @@
 #include "AccessibleIsland.h"
 #include "DirectUiEngine.h"
 #include "MenuBarCapture.h"
+#include "ListViewActivation.h"
 #include "WindowCapture.h"
 
 #include "../../Common/FluentShell.h"
@@ -9,6 +10,8 @@
 #include <commctrl.h>
 #include <prsht.h>
 #include <dwmapi.h>
+#include <oleacc.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +22,7 @@
 #include <vector>
 #include <thread>
 #include <new>
+#include <limits>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -45,13 +49,7 @@ constexpr UINT kCommandPlaceBehind = 14;
 constexpr UINT kCommandRestoreDirectUiActivation = 15;
 constexpr UINT kCommandDirectUiNodeAction = 16;
 constexpr UINT kCommandNavigateDirectUiProjected = 17;
-// The two halves of the staged menu-bar read.  They are separate commands because the
-// application opens its popup from its own message loop, which only runs between them.
-constexpr UINT kCommandMenuBarDrive = 18;
-constexpr UINT kCommandMenuBarRead = 19;
-// How long the bar is given to leave its own menu-tracking state after a read, while
-// popups are still suppressed.
-constexpr DWORD kMenuBarSettleMs = 120;
+constexpr UINT kCommandMenuBarRefresh = 18;
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
 constexpr wchar_t kDirectUiGenerationProperty[] = L"FluentShell.Bridge.DirectUiGeneration";
 
@@ -69,20 +67,13 @@ private:
     DPI_AWARENESS_CONTEXT previous_ = nullptr;
 };
 
-// A deferred accessible island action.  It travels as its own heap payload rather
-// than as a Command because nothing waits for it: the provider may enter a modal loop
-// inside accDoDefaultAction, and the projection's canonical state comes from the next
-// capture either way.
-struct DeferredIslandAction final {
-    HWND island = nullptr;
-    int index = -1;
-    std::wstring name;
-    std::wstring action;
-};
-
 // Distinguishes a deferred island action from a tracked command in the posted
-// message's wParam, which is zero for every command.
+// message's wParam, which is zero for every command. Its LPARAM is an opaque token;
+// the agent owns the request until dispatch or cancellation, never the message.
 constexpr WPARAM kDeferredIslandAction = 1;
+constexpr WPARAM kDeferredMenuAction = 2;
+constexpr WPARAM kDeferredListViewActivation = 3;
+constexpr WPARAM kDeferredNativeAction = 4;
 
 struct Command final {
     std::atomic<long> references{ 1 };
@@ -102,17 +93,14 @@ struct Command final {
     DirectUiActionBinding directUiBinding;
     const DirectUiWindowProfile* profile = nullptr;
     HWND sibling = nullptr;
-    // The menu-bar toolbar and the 1-based accessible index of the button being read.
-    HWND menuBarToolbar = nullptr;
-    int menuBarIndex = 0;
-    bool menuBarSystemMenu = false;
-    bool menuBarNoPopup = false;
     DWORD menuBarPopupWaitMs = 0;
-    std::vector<MenuItemSnapshot> menuItems;
+    bool menuBarChanged = false;
     ActionOutcome outcome;
     bool captured = false;
     bool cloaked = false;
     uint64_t expectedFingerprint = 0;
+    WPARAM deferredActionKind = 0;
+    uint64_t deferredActionToken = 0;
     bool success = false;
     // The application ran the operation and declined it.  That is the application
     // working, not the projection failing, so the surface keeps its projection and
@@ -145,6 +133,25 @@ std::unordered_set<Command*> g_pendingCommands;
 std::vector<std::shared_ptr<SourceThreadAgent>> g_retainedAgents;
 std::atomic<UINT> g_nextMessage{ WM_APP + 0x4A1 };
 std::atomic<uint64_t> g_nextGeneration{ 1 };
+thread_local unsigned g_boundedSourceCommandDepth = 0;
+
+struct BoundedSourceCommandScope final {
+    BoundedSourceCommandScope() noexcept { ++g_boundedSourceCommandDepth; }
+    ~BoundedSourceCommandScope() {
+        if (--g_boundedSourceCommandDepth != 0) return;
+        // A provider can pump a posted native action while a bounded command is
+        // still capturing. Its message is consumed, then rearmed only after the
+        // outer command has called Complete. Reposting inside that provider's
+        // PeekMessage loop would keep the loop alive indefinitely.
+        try {
+            std::scoped_lock lock(g_agentsMutex);
+            for (const auto& [_, agent] : g_agents) {
+                if (agent && agent->ThreadId() == GetCurrentThreadId())
+                    agent->RearmDeferredActionsOnSourceThread();
+            }
+        } catch (...) {}
+    }
+};
 
 void AddRef(Command* command) noexcept {
     command->references.fetch_add(1, std::memory_order_relaxed);
@@ -159,6 +166,11 @@ void Release(Command* command) noexcept {
 }
 
 void Complete(Command* command) noexcept {
+    if (command->deferredActionToken != 0 &&
+        (!command->success || command->cancelled.load(std::memory_order_acquire))) {
+        command->agent->CancelDeferredActionOnSourceThread(
+            command->deferredActionKind, command->deferredActionToken);
+    }
     SetEvent(command->completed);
 }
 
@@ -236,22 +248,42 @@ bool IsTrackedCommand(Command* command, SourceThreadAgent* agent) noexcept {
     }
 }
 
-SourceThreadAgent* AgentForMessage(UINT message) noexcept {
+std::shared_ptr<SourceThreadAgent> AgentForMessage(UINT message) noexcept {
     try {
         std::scoped_lock lock(g_agentsMutex);
         const auto found = g_agents.find(message);
-        return found == g_agents.end() ? nullptr : found->second;
+        return found == g_agents.end() || !found->second
+            ? nullptr : found->second->weak_from_this().lock();
     } catch (...) {
         return nullptr;
     }
 }
 
-void MarkCurrentThreadAgentsDirty(HWND window = nullptr, UINT message = 0) noexcept {
+std::shared_ptr<SourceThreadAgent> AgentForSubclass(SourceThreadAgent* candidate) noexcept {
+    try {
+        // Subclass refData is only a registry key. Shutdown can remove this
+        // subclass while an earlier callback is inside a native modal loop.
+        std::scoped_lock lock(g_agentsMutex);
+        for (const auto& [_, agent] : g_agents) {
+            if (agent == candidate && agent) return agent->weak_from_this().lock();
+        }
+    } catch (...) {}
+    return nullptr;
+}
+
+void MarkCurrentThreadAgentsDirty(
+    HWND window = nullptr, UINT message = 0, bool menuChanged = false) noexcept {
     const DWORD threadId = GetCurrentThreadId();
     try {
         std::scoped_lock lock(g_agentsMutex);
         for (const auto& [_, agent] : g_agents) {
-            if (agent && agent->ThreadId() == threadId) agent->MarkDirty(window, message);
+            if (agent && agent->ThreadId() == threadId) {
+                if (message == WM_CANCELMODE && window &&
+                    (window == agent->Root() || GetAncestor(window, GA_ROOT) == agent->Root()))
+                    agent->CancelPopupOnSourceThread(true);
+                agent->MarkDirty(window, message);
+                if (menuChanged && !MenuBarReadInProgress()) agent->RequestMenuBarRefresh();
+            }
         }
     } catch (...) {}
 }
@@ -335,6 +367,7 @@ bool RelevantMessage(UINT message) noexcept {
     case LVM_INSERTITEMW:
     case LVM_DELETEITEM:
     case LVM_DELETEALLITEMS:
+    case LVM_SETITEMCOUNT:
     case LVM_SETCOLUMNA:
     case LVM_SETCOLUMNW:
     case LVM_INSERTCOLUMNA:
@@ -396,11 +429,45 @@ bool RelevantMessage(UINT message) noexcept {
     }
 }
 
+bool MenuMutationMessage(UINT message, LPARAM lParam) noexcept {
+    switch (message) {
+    case WM_COMMAND:
+    case WM_MDIACTIVATE:
+    case WM_MDICREATE:
+    case WM_MDIDESTROY:
+    case WM_MDIMAXIMIZE:
+    case WM_MDIRESTORE:
+    case WM_MDISETMENU:
+    case WM_MDINEXT:
+    case TVM_SELECTITEM:
+    case TVM_EXPAND:
+        return true;
+    case WM_NOTIFY: {
+        const auto* notification = reinterpret_cast<const NMHDR*>(lParam);
+        if (!notification) return false;
+        switch (notification->code) {
+        case TVN_SELCHANGEDA:
+        case TVN_SELCHANGEDW:
+        case TVN_ITEMEXPANDEDA:
+        case TVN_ITEMEXPANDEDW:
+        case LVN_ITEMCHANGED:
+        case TCN_SELCHANGE:
+            return true;
+        default:
+            return false;
+        }
+    }
+    default:
+        return false;
+    }
+}
+
 LRESULT CALLBACK ControlSubclassProc(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR subclassId, DWORD_PTR refData) {
     const bool statusBar = (refData & 1u) != 0;
-    auto* owner = reinterpret_cast<SourceThreadAgent*>(refData & ~DWORD_PTR{ 1 });
+    const auto owner = AgentForSubclass(
+        reinterpret_cast<SourceThreadAgent*>(refData & ~DWORD_PTR{ 1 }));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
     if (owner && (RelevantMessage(message) || (statusBar && message == SB_SETMINHEIGHT)))
         owner->MarkDirty(window, message);
@@ -413,7 +480,7 @@ LRESULT CALLBACK ControlSubclassProc(
 LRESULT CALLBACK RootSubclassProc(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR subclassId, DWORD_PTR refData) {
-    auto* owner = reinterpret_cast<SourceThreadAgent*>(refData);
+    const auto owner = AgentForSubclass(reinterpret_cast<SourceThreadAgent*>(refData));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
     if (message == WM_CLOSE) MarkWindowCloseCompleted(window);
     if (owner && RelevantMessage(message)) owner->MarkDirty(window, message);
@@ -490,6 +557,7 @@ bool ApplyActivate(Command* command, SourceThreadAgent* agent) {
 
 bool ApplyGeometry(Command* command, SourceThreadAgent* agent) {
     if (AbortIfCancelled(command)) return false;
+    agent->CancelPopupOnSourceThread();
     const RECT bounds = command->action.rect;
     command->success = SetWindowPos(agent->Root(), nullptr,
         bounds.left, bounds.top,
@@ -500,6 +568,7 @@ bool ApplyGeometry(Command* command, SourceThreadAgent* agent) {
 
 bool ApplyMinimize(Command* command, SourceThreadAgent* agent) {
     if (AbortIfCancelled(command)) return false;
+    agent->CancelPopupOnSourceThread();
     ShowWindow(agent->Root(), SW_MINIMIZE);
     command->success = IsIconic(agent->Root()) != FALSE;
     return true;
@@ -507,6 +576,7 @@ bool ApplyMinimize(Command* command, SourceThreadAgent* agent) {
 
 bool ApplyMaximize(Command* command, SourceThreadAgent* agent) {
     if (AbortIfCancelled(command)) return false;
+    agent->CancelPopupOnSourceThread();
     ShowWindow(agent->Root(), SW_MAXIMIZE);
     command->success = IsZoomed(agent->Root()) != FALSE;
     return true;
@@ -514,38 +584,43 @@ bool ApplyMaximize(Command* command, SourceThreadAgent* agent) {
 
 bool ApplyRestoreState(Command* command, SourceThreadAgent* agent) {
     if (AbortIfCancelled(command)) return false;
+    agent->CancelPopupOnSourceThread();
     ShowWindow(agent->Root(), SW_RESTORE);
     command->success = !IsIconic(agent->Root()) && !IsZoomed(agent->Root());
     return true;
 }
 
+bool QueueNativeAction(Command* command, SourceThreadAgent* agent, const ControlNode* node = nullptr) {
+    if (AbortIfCancelled(command)) return false;
+    command->deferredActionKind = kDeferredNativeAction;
+    command->success = agent->PostNativeAction(command->action, node,
+        command->refused, command->error, &command->deferredActionToken,
+        &command->outcome.closeSequence);
+    return true;
+}
+
 bool ApplyClose(Command* command, SourceThreadAgent* agent) {
     if (AbortIfCancelled(command)) return false;
-    // WM_CLOSE is allowed to enter an application-owned modal loop (for example
-    // an unsaved-document prompt).  Sending it from this bounded command would
-    // keep Invoke blocked until the user answers and make the Bridge tear down a
-    // healthy projection at its 2 s deadline.  Queue the request for the native
-    // message loop just as we do for buttons and menu commands.  Destruction is
-    // observed by the root subclass and the reconcile path; if the handler
-    // returns without destroying the root, reconcile reports closeRejected only
-    // after that complete modal/veto lifetime.
-    command->success = PostMessageW(agent->Root(), WM_CLOSE, 0, 0) != FALSE;
-    if (command->success) {
-        // This hook is executing on the source UI thread, so the posted message
-        // cannot reach RootSubclassProc until this command returns.  Registering
-        // after a successful post is therefore race-free.
-        command->outcome.closeSequence = agent->RegisterCloseRequest();
-    }
-    return true;
+    agent->CancelPopupOnSourceThread();
+    // A post-action capture can pump messages. Own the close until the bounded
+    // command succeeds, then run its complete native modal/veto lifetime.
+    return QueueNativeAction(command, agent);
 }
 
 bool ApplyMenuCommand(Command* command, SourceThreadAgent* agent) {
     if (AbortIfCancelled(command)) return false;
-    // Menu handlers may enter a modal loop.  Queue the validated WM_COMMAND so
-    // this bounded source-thread command can return; periodic reconciliation
-    // captures the resulting native state.
-    command->success = PostMessageW(agent->Root(), WM_COMMAND,
-        MAKEWPARAM(command->action.menuCommandId, 0), 0) != FALSE;
+    if (GetMenu(agent->Root())) return QueueNativeAction(command, agent);
+    command->deferredActionKind = kDeferredMenuAction;
+    command->success = agent->InvokeMenuCommandOnSourceThread(
+        command->action.menuCommandId, command->cancelled, command->error, &command->deferredActionToken);
+    command->refused = !command->success;
+    return true;
+}
+
+bool ApplyPopupCommand(Command* command, SourceThreadAgent* agent) {
+    if (AbortIfCancelled(command)) return false;
+    command->success = agent->CompletePopupOnSourceThread(command->action, command->error);
+    command->refused = !command->success;
     return true;
 }
 
@@ -565,6 +640,7 @@ constexpr std::array kWindowActions{
     WindowActionEntry{ L"restore", &ApplyRestoreState },
     WindowActionEntry{ L"close", &ApplyClose },
     WindowActionEntry{ L"menuCommand", &ApplyMenuCommand },
+    WindowActionEntry{ L"popupCommand", &ApplyPopupCommand },
 };
 
 WindowAction FindWindowAction(std::wstring_view action) noexcept {
@@ -575,16 +651,6 @@ WindowAction FindWindowAction(std::wstring_view action) noexcept {
 }
 
 // --- Node-level actions -----------------------------------------------------
-
-bool ClickButton(Command* command, HWND target) {
-    // A button handler is allowed to enter a synchronous MessageBox/TaskDialog.
-    // Queue BM_CLICK so this command can acknowledge within the bounded
-    // dispatcher deadline; the native message loop then runs the modal API
-    // normally after the hook returns.
-    if (AbortIfCancelled(command)) return false;
-    command->success = PostMessageW(target, BM_CLICK, 0, 0) != FALSE;
-    return true;
-}
 
 bool ActivateSysLink(Command* command, HWND target) {
     // The bounded SysLink adapter accepts exactly one link.  Let the native
@@ -615,9 +681,9 @@ bool ActivateSysLink(Command* command, HWND target) {
 }
 
 bool ApplyInvoke(
-    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
-    if (node.kind == ControlKind::Button) return ClickButton(command, target);
-    if (node.kind == ControlKind::SysLink) return ActivateSysLink(command, target);
+    Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if (node.kind == ControlKind::Button || node.kind == ControlKind::SysLink)
+        return QueueNativeAction(command, agent, &node);
     return true;
 }
 
@@ -739,8 +805,8 @@ bool ApplySetSelection(
             SendMessageW(target, LVM_GETNEXTITEM, previous, LVNI_SELECTED));
         if (selected < 0) break;
         if (selected <= previous ||
-            static_cast<size_t>(selected) >= node.rows.size() ||
-            actual.size() >= node.rows.size()) {
+            static_cast<size_t>(selected) >= ListViewItemCount(node) ||
+            actual.size() >= ListViewItemCount(node)) {
             return true;
         }
         actual.push_back(selected);
@@ -783,7 +849,7 @@ bool ApplySetItemCheck(
     Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
     if (node.kind != ControlKind::ListView || !node.checkBoxes) return true;
     const int index = command->action.itemIndex;
-    if (index < 0 || static_cast<size_t>(index) >= node.rows.size()) return true;
+    if (index < 0 || static_cast<size_t>(index) >= ListViewItemCount(node)) return true;
     if (AbortIfCancelled(command)) return false;
 
     const bool applied = SetListViewItemCheck(
@@ -794,12 +860,9 @@ bool ApplySetItemCheck(
 }
 
 bool ApplyToolbarCommand(
-    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
     if (node.kind != ControlKind::Toolbar) return true;
-    if (AbortIfCancelled(command)) return false;
-    command->success = PostMessageW(SyntheticNotificationTarget(agent->Root(), target), WM_COMMAND,
-        MAKEWPARAM(command->action.menuCommandId, 0), reinterpret_cast<LPARAM>(target)) != FALSE;
-    return true;
+    return QueueNativeAction(command, agent, &node);
 }
 
 bool ApplySetValue(
@@ -835,7 +898,7 @@ bool ApplySetItemText(
     if (!renamable) return true;
     const int index = command->action.itemIndex;
     const size_t itemCount = node.kind == ControlKind::TreeView
-        ? node.items.size() : node.rows.size();
+        ? node.items.size() : ListViewItemCount(node);
     if (index < 0 || static_cast<size_t>(index) >= itemCount) return true;
     if (AbortIfCancelled(command)) return false;
     // The rename opens and closes the control's own label session, so the
@@ -859,13 +922,25 @@ bool ApplyIslandInvoke(
     if (AbortIfCancelled(command)) return false;
     const int index = command->action.itemIndex;
     if (index < 0 || static_cast<size_t>(index) >= node.islandItems.size()) return true;
-    const auto& item = node.islandItems[static_cast<size_t>(index)];
     // The provider's default action may open a menu of its own, so it is queued to run
     // after this command returns rather than inside its deadline.  The published name
     // and action travel with it so the deferred handler can refuse an element that
     // moved.
-    command->success = agent->PostIslandAction(target, index, item.name, item.actionName);
-    if (!command->success) command->error = L"the island action could not be queued";
+    command->deferredActionKind = kDeferredIslandAction;
+    command->success = agent->PostIslandAction(node, index, command->refused, &command->deferredActionToken);
+    if (!command->success) command->error = command->refused
+        ? L"an island action is already pending"
+        : L"the island action could not be queued";
+    return true;
+}
+
+bool ApplyActivateItem(
+    Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView || !agent) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->deferredActionKind = kDeferredListViewActivation;
+    command->success = agent->PostListViewActivation(node, command->action.itemIndex,
+        command->refused, command->error, &command->deferredActionToken);
     return true;
 }
 
@@ -906,30 +981,9 @@ bool ApplySetSplit(
 }
 
 bool ApplyMdiCommand(
-    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
     if (node.kind != ControlKind::MdiChild) return true;
-    if (AbortIfCancelled(command)) return false;
-    const std::wstring& verb = command->action.text;
-    if (verb == L"activate") {
-        const HWND client = GetParent(target);
-        if (!client) return true;
-        // WM_MDIACTIVATE through the client is the documented activation path, so
-        // the application sees the same deactivate/activate pair a click produces.
-        command->success = PostMessageW(
-            client, WM_MDIACTIVATE, reinterpret_cast<WPARAM>(target), 0) != FALSE;
-        return true;
-    }
-    // Every caption command is posted as the system command the native caption
-    // button posts, so an application that vetoes or reinterprets one keeps doing
-    // so.  These may enter a modal loop, which is why they are posted.
-    WPARAM systemCommand = 0;
-    if (verb == L"close") systemCommand = SC_CLOSE;
-    else if (verb == L"minimize") systemCommand = SC_MINIMIZE;
-    else if (verb == L"maximize") systemCommand = SC_MAXIMIZE;
-    else if (verb == L"restore") systemCommand = SC_RESTORE;
-    else return true;
-    command->success = PostMessageW(target, WM_SYSCOMMAND, systemCommand, 0) != FALSE;
-    return true;
+    return QueueNativeAction(command, agent, &node);
 }
 
 using NodeAction = bool (*)(Command*, SourceThreadAgent*, HWND, const ControlNode&);
@@ -954,6 +1008,7 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"setSplit", &ApplySetSplit },
     NodeActionEntry{ L"setColumnOrder", &ApplySetColumnOrder },
     NodeActionEntry{ L"islandInvoke", &ApplyIslandInvoke },
+    NodeActionEntry{ L"activateItem", &ApplyActivateItem },
 };
 
 NodeAction FindNodeAction(std::wstring_view action) noexcept {
@@ -992,7 +1047,31 @@ bool ExecuteInvoke(Command* command) {
         command->error = captureError;
         return true;
     }
-    if (!ValidateActionForSnapshot(action, before, command->error)) return true;
+    if (action.action == L"menuCommand" && !agent->MenuBarCommandsCurrentOnSourceThread()) {
+        command->refused = true;
+        command->error = L"native menu changed and is awaiting refresh";
+        return true;
+    }
+    if (action.action == L"menuCommand" &&
+        action.expectedMenuBindingGeneration != before.menuBindingGeneration) {
+        command->refused = true;
+        command->error = L"native menu binding changed before selection";
+        return true;
+    }
+    if (action.action == L"activateItem" && (action.expectedNativeFingerprint == 0 ||
+            SnapshotFingerprint(before) != action.expectedNativeFingerprint)) {
+        command->refused = true;
+        command->error = L"native ListView revision changed before activation";
+        return true;
+    }
+    if (!ValidateActionForSnapshot(action, before, command->error)) {
+        // A menu can disappear or disable a command between the IPC snapshot and
+        // this source-thread capture. That stale click does not break the surface.
+        command->refused = action.action == L"menuCommand" || action.action == L"popupCommand" ||
+            action.action == L"activateItem" ||
+            before.popupMenu.has_value();
+        return true;
+    }
     if (AbortIfCancelled(command)) return false;
 
     if (const WindowAction apply = FindWindowAction(action.action)) {
@@ -1003,6 +1082,15 @@ bool ExecuteInvoke(Command* command) {
 
     if (command->success && (agent->IsDestroyed() || !IsWindow(agent->Root()))) {
         command->outcome.destroyed = true;
+    }
+    if (command->success && (action.action == L"menuCommand" ||
+            action.action == L"toolbarCommand" || action.action == L"mdiCommand" ||
+            action.action == L"invoke" || action.action == L"islandInvoke" ||
+            action.action == L"activateItem" ||
+            action.action == L"select" || action.action == L"setSelection" ||
+            action.action == L"setExpand" || action.action == L"setCheck" ||
+            action.action == L"setItemCheck" || action.action == L"setItemText")) {
+        agent->RequestMenuBarRefresh();
     }
     if (AbortIfCancelled(command)) return false;
     if (command->success && !command->outcome.destroyed) {
@@ -1025,10 +1113,12 @@ bool ExecuteInvoke(Command* command) {
 // before the command is finished.
 bool SetCloakAndVerify(
     Command* command, HWND root, bool cloaked, const wchar_t* failureReason) {
+    if (!cloaked) command->agent->CancelPopupOnSourceThread();
     BOOL value = cloaked ? TRUE : FALSE;
     const HRESULT applied = DwmSetWindowAttribute(root, DWMWA_CLOAK, &value, sizeof(value));
     if (command->cancelled.load(std::memory_order_acquire)) {
         if (cloaked) {
+            command->agent->CancelPopupOnSourceThread();
             value = FALSE;
             DwmSetWindowAttribute(root, DWMWA_CLOAK, &value, sizeof(value));
         }
@@ -1050,106 +1140,17 @@ bool ExecuteCloak(Command* command) {
         command, command->agent->Root(), command->cloaked, L"DWMWA_CLOAK failed");
 }
 
-// Arms popup interception and performs one menu-bar button's own default action.  The
-// application opens the popup after this returns, from its own loop, where the hook
-// records it.
-bool ExecuteMenuBarDrive(Command* command) {
+// The entire refresh, including discovery, cache publication and cleanup, runs on
+// the source thread. Cancellation completes the command only after the helper has
+// unwound its pump; no command field is touched after AbortIfCancelled returns true.
+bool ExecuteMenuBarRefresh(Command* command) {
     if (AbortIfCancelled(command)) return false;
-    command->success = DriveMenuBarButton(
-        command->menuBarToolbar, command->menuBarIndex, command->action.text,
-        command->error);
+    command->success = command->agent->RefreshMenuBarOnSourceThread(
+        command->menuBarPopupWaitMs, command->cancelled,
+        command->menuBarChanged, command->error);
+    if (AbortIfCancelled(command)) return false;
     return true;
 }
-
-// Drives one menu-bar button and waits, on the source thread, for the application to open
-// the popup it asked for.  The wait is a bounded pump of the application's own queue,
-// because that queue is what opens the popup: nothing else can make it happen, and a
-// time-based guess either misses the popup or lets it reach the screen after the bracket
-// has been given up on.  Bridge commands arriving during the pump are requeued.
-bool ExecuteMenuBarRead(Command* command) {
-    if (AbortIfCancelled(command)) return false;
-    auto* agent = command->agent;
-    command->menuItems.clear();
-    command->menuBarSystemMenu = false;
-    // comctl32 will not enter menu mode for a window that is not active, so the read has
-    // to make the native window active for as long as it takes to open one popup.  The
-    // window is cloaked and every popup is swallowed, so nothing of this is visible; the
-    // foreground is handed straight back to whoever held it.
-    const HWND previousForeground = GetForegroundWindow();
-    const HWND root = agent->Root();
-    const DWORD selfThread = GetCurrentThreadId();
-    const DWORD foreignThread = previousForeground
-        ? GetWindowThreadProcessId(previousForeground, nullptr) : 0;
-    const bool attached = foreignThread && foreignThread != selfThread &&
-        AttachThreadInput(selfThread, foreignThread, TRUE) != FALSE;
-    SetForegroundWindow(root);
-    SetActiveWindow(root);
-    const auto handBack = [&]() noexcept {
-        if (previousForeground && IsWindow(previousForeground)) {
-            SetForegroundWindow(previousForeground);
-        }
-        if (attached) AttachThreadInput(selfThread, foreignThread, FALSE);
-    };
-    if (!DriveMenuBarButton(command->menuBarToolbar, command->menuBarIndex,
-            command->action.text, command->error)) {
-        handBack();
-        command->success = false;
-        return true;
-    }
-    agent->SetDeferringCommands(true);
-    const ULONGLONG deadline = GetTickCount64() + command->menuBarPopupWaitMs;
-    while (!MenuPopupRecorded() && GetTickCount64() < deadline) {
-        if (command->cancelled.load(std::memory_order_acquire)) break;
-        MSG message{};
-        while (!MenuPopupRecorded() &&
-               PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-        if (MenuPopupRecorded()) break;
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, 16, QS_ALLINPUT);
-    }
-    agent->SetDeferringCommands(false);
-    std::wstring captureReason;
-    const bool recorded = TakeRecordedMenu(
-        command->menuItems, command->menuBarSystemMenu, captureReason);
-    DisarmPopupInterception();
-    // The bar's own tracking state has to be left as it was found, or the next button's
-    // click is read by the control as closing the menu it thinks is still open.  This runs
-    // while popup suppression still holds, so nothing can escape to the screen.
-    if (command->menuBarToolbar && IsWindow(command->menuBarToolbar)) {
-        SendMessageW(command->menuBarToolbar, WM_CANCELMODE, 0, 0);
-    }
-    if (IsWindow(root)) SendMessageW(root, WM_CANCELMODE, 0, 0);
-    handBack();
-    if (!recorded) {
-        command->success = false;
-        command->menuBarNoPopup = true;
-        command->error = L"menu-bar toolbar button opened no popup within the read window";
-        try {
-            FluentShell::Log(L"Menu-bar read: button " +
-                std::to_wstring(command->menuBarIndex) +
-                L" drove but opened no popup (suppression=" +
-                std::to_wstring(PopupSuppressionActive() ? 1 : 0) +
-                L", foreground=" +
-                std::to_wstring(GetForegroundWindow() == root ? 1 : 0) + L")");
-        } catch (...) {}
-        return true;
-    }
-    if (command->menuBarSystemMenu) {
-        // A window's system menu is the chrome the projection already draws on the
-        // window's own Fluent caption, so it is skipped rather than projected twice.
-        command->success = true;
-        return true;
-    }
-    command->success = !command->menuItems.empty();
-    if (!command->success) {
-        command->error = captureReason.empty()
-            ? std::wstring(L"intercepted menu had no projectable items") : captureReason;
-    }
-    return true;
-}
-
 bool ExecuteCaptureAndCloak(Command* command) {
     auto* agent = command->agent;
     if (AbortIfCancelled(command)) return false;
@@ -1626,6 +1627,7 @@ bool ExecuteDirectUiMove(Command* command) {
 bool ExecuteRestore(Command* command) {
     auto* agent = command->agent;
     if (AbortIfCancelled(command)) return false;
+    agent->CancelPopupOnSourceThread();
     if (!SetCloakAndVerify(command, agent->Root(), false,
             L"native window remained application-cloaked")) {
         return false;
@@ -1642,6 +1644,7 @@ bool ExecuteRestore(Command* command) {
 
 bool ExecuteShutdown(Command* command) {
     if (AbortIfCancelled(command)) return false;
+    command->agent->CancelPopupOnSourceThread();
     EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM) -> BOOL {
         RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
         RemovePropW(child, kNodeGenerationProperty);
@@ -1677,8 +1680,7 @@ CommandHandler HandlerFor(UINT kind) noexcept {
     case kCommandDirectUiNodeAction: return &ExecuteDirectUiNodeAction;
     case kCommandNavigateDirectUiProjected:
         return &ExecuteNavigateDirectUiProjected;
-    case kCommandMenuBarDrive: return &ExecuteMenuBarDrive;
-    case kCommandMenuBarRead: return &ExecuteMenuBarRead;
+    case kCommandMenuBarRefresh: return &ExecuteMenuBarRefresh;
     default: return nullptr;
     }
 }
@@ -1729,33 +1731,45 @@ void ExecuteCommand(Command* command) noexcept {
 LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code == HC_ACTION && wParam == PM_REMOVE && lParam) {
         auto* message = reinterpret_cast<MSG*>(lParam);
-        auto* agent = AgentForMessage(message->message);
+        // Every callback owns the agent before entering application code. A
+        // timed-out command can pump nested shutdown and outlive its surface.
+        const auto agent = AgentForMessage(message->message);
+        if (agent && message->message == agent->MessageId() &&
+            message->wParam == kDeferredNativeAction) {
+            const auto token = static_cast<uint64_t>(message->lParam);
+            message->message = WM_NULL;
+            agent->DispatchNativeActionOnSourceThread(token);
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        if (agent && message->message == agent->MessageId() &&
+            message->wParam == kDeferredListViewActivation) {
+            const auto token = static_cast<uint64_t>(message->lParam);
+            message->message = WM_NULL;
+            agent->DispatchListViewActivationOnSourceThread(token);
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        if (agent && message->message == agent->MessageId() &&
+            message->wParam == kDeferredMenuAction) {
+            const auto token = static_cast<uint64_t>(message->lParam);
+            message->message = WM_NULL;
+            agent->DispatchMenuActionOnSourceThread(token);
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
         if (agent && message->message == agent->MessageId() &&
             message->wParam == kDeferredIslandAction) {
-            // Fire and forget: the payload owns itself and the provider's action may
-            // spin a modal loop, so nothing waits on this.
-            auto* deferred = reinterpret_cast<DeferredIslandAction*>(message->lParam);
+            const auto token = static_cast<uint64_t>(message->lParam);
             message->message = WM_NULL;
-            if (deferred) {
-                std::wstring reason;
-                if (!InvokeAccessibleIslandItem(deferred->island, deferred->index,
-                        deferred->name, deferred->action, reason)) {
-                    try {
-                        FluentShell::Log(L"Island action did not run: " + reason);
-                    } catch (...) {}
-                }
-                delete deferred;
-            }
+            agent->DispatchIslandActionOnSourceThread(token);
             return CallNextHookEx(nullptr, code, wParam, lParam);
         }
         if (agent && message->message == agent->MessageId()) {
             auto* command = reinterpret_cast<Command*>(message->lParam);
-            if (IsTrackedCommand(command, agent)) {
+            if (IsTrackedCommand(command, agent.get())) {
                 // While a command is pumping the source thread's own messages -- which is
                 // how a menu bar's popup is waited for -- another command must not be
                 // dispatched re-entrantly.  It is put back on the queue instead, so its
                 // caller keeps waiting rather than being answered out of order.
-                if (agent->DeferringCommands()) {
+                if (MenuBarReadInProgress()) {
                     message->message = WM_NULL;
                     if (!PostThreadMessageW(agent->ThreadId(), agent->MessageId(),
                             message->wParam, message->lParam)) {
@@ -1770,8 +1784,11 @@ LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
                 UntrackCommand(command);
                 message->message = WM_NULL;
                 SetEvent(command->started);
-                if (!command->cancelled.load()) ExecuteCommand(command);
-                else Complete(command);
+                {
+                    const BoundedSourceCommandScope boundedCommand;
+                    if (!command->cancelled.load()) ExecuteCommand(command);
+                    else Complete(command);
+                }
                 Release(command);
             }
         }
@@ -1796,8 +1813,10 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code >= 0 && lParam) {
         const auto* message = reinterpret_cast<CWPRETSTRUCT*>(lParam);
-        if (RelevantMessage(message->message) || message->message == WM_NCDESTROY) {
-            MarkCurrentThreadAgentsDirty(message->hwnd, message->message);
+        const bool menuChanged = MenuMutationMessage(message->message, message->lParam);
+        if (RelevantMessage(message->message) || message->message == WM_NCDESTROY ||
+            message->message == WM_CANCELMODE || menuChanged) {
+            MarkCurrentThreadAgentsDirty(message->hwnd, message->message, menuChanged);
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -1845,10 +1864,30 @@ bool SourceThreadAgent::CaptureOnSourceThread(
     WindowSnapshot& snapshot,
     std::wstring& error) noexcept {
     try {
+        if (!popupCaptureError_.empty()) {
+            error = popupCaptureError_;
+            return false;
+        }
         captureContext_.surfaceId = surfaceId;
         captureContext_.generation = generation_;
         captureContext_.revision = revision;
-        return CaptureWindow(root_, captureContext_, snapshot, error);
+        if (!CaptureWindow(root_, captureContext_, snapshot, error)) return false;
+        snapshot.popupMenu = popupMenu_.Current();
+        if (snapshot.popupMenu) {
+            const auto& popup = *snapshot.popupMenu;
+            const auto anchor = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+                [&](const ControlNode& node) { return node.nodeId == popup.nodeId; });
+            if (anchor == snapshot.nodes.end() || anchor->kind != ControlKind::AccessibleIsland ||
+                popup.itemIndex < 0 || static_cast<size_t>(popup.itemIndex) >= anchor->islandItems.size() ||
+                !anchor->visible || !anchor->islandItems[popup.itemIndex].dropDown ||
+                !trackedIslandMenu_ || anchor->generation != trackedIslandMenu_->generation ||
+                anchor->islandItems[popup.itemIndex].name != trackedIslandMenu_->name ||
+                anchor->islandItems[popup.itemIndex].actionName != trackedIslandMenu_->action) {
+                CancelPopupOnSourceThread();
+                snapshot.popupMenu.reset();
+            }
+        }
+        return true;
     } catch (...) {
         try { error = L"source-thread capture exception"; } catch (...) {}
         return false;
@@ -2086,25 +2125,781 @@ bool SourceThreadAgent::Invoke(
 }
 
 bool SourceThreadAgent::PostIslandAction(
-    HWND island,
-    int index,
-    const std::wstring& expectedName,
-    const std::wstring& expectedAction) noexcept {
+    const ControlNode& node, int index, bool& refused, uint64_t* queuedToken) noexcept {
+    refused = false;
+    if (queuedToken) *queuedToken = 0;
     try {
-        auto* deferred = new (std::nothrow) DeferredIslandAction();
-        if (!deferred) return false;
-        deferred->island = island;
-        deferred->index = index;
-        deferred->name = expectedName;
-        deferred->action = expectedAction;
-        if (!PostThreadMessageW(threadId_, message_, kDeferredIslandAction,
-                reinterpret_cast<LPARAM>(deferred))) {
-            delete deferred;
+        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
+            index < 0 || static_cast<size_t>(index) >= node.islandItems.size() ||
+            nextIslandActionToken_ == 0) return false;
+        if (queuedIslandAction_ || queuedNativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+            (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
+            refused = true;
             return false;
+        }
+        const auto& item = node.islandItems[index];
+        IslandActionRequest deferred;
+        deferred.island = node.hwnd;
+        deferred.nodeId = node.nodeId;
+        deferred.generation = node.generation;
+        deferred.index = index;
+        deferred.name = item.name;
+        deferred.action = item.actionName;
+        deferred.dropDown = item.dropDown;
+        queuedIslandAction_ = std::move(deferred);
+        queuedIslandActionToken_ = nextIslandActionToken_;
+        rearmIslandAction_ = false;
+        nextIslandActionToken_ = nextIslandActionToken_ == std::numeric_limits<uint64_t>::max()
+            ? 0 : nextIslandActionToken_ + 1;
+        if (!PostThreadMessageW(threadId_, message_, kDeferredIslandAction,
+                static_cast<LPARAM>(queuedIslandActionToken_))) {
+            queuedIslandAction_.reset();
+            queuedIslandActionToken_ = 0;
+            return false;
+        }
+        if (queuedToken) *queuedToken = queuedIslandActionToken_;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void SourceThreadAgent::DispatchIslandActionOnSourceThread(uint64_t token) noexcept {
+    if (GetCurrentThreadId() != threadId_ || token == 0 ||
+        queuedIslandActionToken_ != token || !queuedIslandAction_) return;
+    if (g_boundedSourceCommandDepth != 0) {
+        rearmIslandAction_ = true;
+        return;
+    }
+    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
+        if (!PostThreadMessageW(threadId_, message_, kDeferredIslandAction,
+                static_cast<LPARAM>(token))) {
+            queuedIslandAction_.reset();
+            queuedIslandActionToken_ = 0;
+            try { popupCaptureError_ = L"deferred island action could not be reposted"; }
+            catch (...) {}
+            MarkDirty();
+        }
+        return;
+    }
+    // Remove the request before entering the provider. Nested rollback can clear
+    // queued state without destroying the request currently on this stack.
+    auto request = std::move(*queuedIslandAction_);
+    queuedIslandAction_.reset();
+    queuedIslandActionToken_ = 0;
+    rearmIslandAction_ = false;
+    RunIslandActionOnSourceThread(request);
+}
+
+namespace {
+bool IsApplicationCloaked(HWND root) noexcept {
+    DWORD cloak = 0;
+    return root && IsWindow(root) &&
+        SUCCEEDED(DwmGetWindowAttribute(root, DWMWA_CLOAKED, &cloak, sizeof(cloak))) &&
+        (cloak & DWM_CLOAKED_APP) != 0;
+}
+
+constexpr UINT kListViewActivationState = LVIS_SELECTED | LVIS_FOCUSED |
+    LVIS_CUT | LVIS_DROPHILITED | LVIS_STATEIMAGEMASK;
+constexpr DWORD kListViewActivationStyle = LVS_TYPEMASK | LVS_OWNERDATA | LVS_OWNERDRAWFIXED |
+    LVS_SINGLESEL | LVS_EDITLABELS;
+
+bool ListViewActivationReady(HWND root, const ListViewActivationRequest& request) noexcept {
+    if (!IsApplicationCloaked(root) || !IsWindowVisible(root) ||
+        !IsWindowVisible(request.listView) || !IsChild(root, request.listView) ||
+        GetWindowThreadProcessId(request.listView, nullptr) != GetCurrentThreadId() ||
+        reinterpret_cast<uintptr_t>(GetPropW(request.listView, kNodeGenerationProperty)) !=
+            request.generation) return false;
+    for (HWND current = request.listView; current; current = GetParent(current)) {
+        if (!IsWindowEnabled(current)) return false;
+        if (current == root) return true;
+    }
+    return false;
+}
+
+bool ReadListViewActivationIdentity(const ListViewActivationRequest& request,
+    UINT& state, std::wstring& error) {
+    const HWND list = request.listView;
+    const LRESULT view = SendMessageW(list, LVM_GETVIEW, 0, 0);
+    if (request.index < 0 || request.nativeId == UINT32_MAX ||
+        view < LV_VIEW_ICON || view > LV_VIEW_LIST ||
+        (view != LV_VIEW_ICON && static_cast<DWORD>(view) != (request.viewStyle & LVS_TYPEMASK)) ||
+        static_cast<size_t>(SendMessageW(list, LVM_GETITEMCOUNT, 0, 0)) != request.itemCount ||
+        (static_cast<DWORD>(GetWindowLongPtrW(list, GWL_STYLE)) & kListViewActivationStyle) !=
+            request.viewStyle ||
+        ResolveListViewItemByNativeId(list, request.nativeId) != request.index ||
+        static_cast<uint32_t>(SendMessageW(list, LVM_MAPINDEXTOID, request.index, 0)) != request.nativeId) {
+        error = L"ListView activation item moved, was replaced, or changed view";
+        return false;
+    }
+    // One extra character detects a renamed item sharing the old name's prefix.
+    std::vector<wchar_t> text(request.text.size() + 2, L'\0');
+    LVITEMW item{};
+    item.iSubItem = 0;
+    item.pszText = text.data();
+    item.cchTextMax = static_cast<int>(text.size());
+    const LRESULT copied = SendMessageW(list, LVM_GETITEMTEXTW,
+        request.index, reinterpret_cast<LPARAM>(&item));
+    if (copied < 0 || static_cast<size_t>(copied) != request.text.size() ||
+        request.text != text.data()) {
+        error = L"ListView activation item text changed";
+        return false;
+    }
+    state = static_cast<UINT>(SendMessageW(list, LVM_GETITEMSTATE,
+        request.index, kListViewActivationState));
+    return true;
+}
+
+struct AccessibleListViewItem final {
+    Microsoft::WRL::ComPtr<IAccessible> object;
+    VARIANT child{};
+};
+
+struct ListViewAccessibleString final {
+    BSTR value = nullptr;
+    ~ListViewAccessibleString() { if (value) SysFreeString(value); }
+};
+
+bool ReadListViewAccessibleAction(const ListViewActivationRequest& request,
+    AccessibleListViewItem& live, std::wstring& name, std::wstring& action,
+    long& state, std::wstring& error, IAccessible* sharedRoot = nullptr) {
+    if (!live.object) {
+        Microsoft::WRL::ComPtr<IAccessible> root;
+        if (sharedRoot) root = sharedRoot;
+        else if (FAILED(AccessibleObjectFromWindow(request.listView, OBJID_CLIENT,
+                IID_PPV_ARGS(root.GetAddressOf()))) || !root) {
+            error = L"ListView exposes no accessible item action";
+            return false;
+        }
+        live.child.vt = VT_I4;
+        live.child.lVal = request.index + 1;
+        Microsoft::WRL::ComPtr<IDispatch> childObject;
+        root->get_accChild(live.child, childObject.GetAddressOf());
+        if (childObject) {
+            if (FAILED(childObject.As(&live.object)) || !live.object) {
+                error = L"ListView child has no accessible item interface";
+                return false;
+            }
+            live.child.lVal = CHILDID_SELF;
+        } else {
+            live.object = std::move(root);
+        }
+    }
+    VARIANT role{};
+    const HRESULT roleResult = live.object->get_accRole(live.child, &role);
+    const bool itemRole = SUCCEEDED(roleResult) && role.vt == VT_I4 &&
+        role.lVal == ROLE_SYSTEM_LISTITEM;
+    VariantClear(&role);
+    VARIANT status{};
+    const HRESULT stateResult = live.object->get_accState(live.child, &status);
+    const bool itemState = SUCCEEDED(stateResult) && status.vt == VT_I4;
+    state = itemState ? status.lVal : 0;
+    VariantClear(&status);
+    if (!itemRole || !itemState || (state & (STATE_SYSTEM_UNAVAILABLE | STATE_SYSTEM_INVISIBLE)) != 0) {
+        error = L"ListView accessible item is unavailable or changed role";
+        return false;
+    }
+    ListViewAccessibleString rawName;
+    const HRESULT nameResult = live.object->get_accName(live.child, &rawName.value);
+    const UINT nameLength = rawName.value ? SysStringLen(rawName.value) : 0;
+    if (SUCCEEDED(nameResult) && rawName.value && nameLength <= Ipc::kMaxStringChars)
+        name.assign(rawName.value, nameLength);
+    ListViewAccessibleString rawAction;
+    const HRESULT actionResult = live.object->get_accDefaultAction(live.child, &rawAction.value);
+    const UINT actionLength = rawAction.value ? SysStringLen(rawAction.value) : 0;
+    if (SUCCEEDED(actionResult) && rawAction.value && actionLength <= Ipc::kMaxStringChars)
+        action.assign(rawAction.value, actionLength);
+    if (FAILED(nameResult) || name != request.text || nameLength > Ipc::kMaxStringChars ||
+        FAILED(actionResult) || action.empty() || actionLength > Ipc::kMaxStringChars) {
+        error = L"ListView accessible item name or default action is not current";
+        return false;
+    }
+    return true;
+}
+}
+
+namespace {
+uint64_t NativeMenuFingerprint(const std::vector<MenuItemSnapshot>& menu) {
+    WindowSnapshot witness;
+    witness.menu = menu;
+    return SnapshotFingerprint(witness);
+}
+
+HWND NativeActionOwner(HWND root, const ActionRequest& action, HWND source) noexcept {
+    if (!source) return root;
+    return action.action == L"toolbarCommand"
+        ? SyntheticNotificationTarget(root, source) : GetParent(source);
+}
+}
+
+bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const ControlNode* node,
+    bool& refused, std::wstring& error, uint64_t* queuedToken, uint64_t* closeSequence) noexcept {
+    refused = true;
+    if (queuedToken) *queuedToken = 0;
+    if (closeSequence) *closeSequence = 0;
+    try {
+        const bool nodeAction = node && action.nodeId == node->nodeId &&
+            ((action.action == L"invoke" &&
+                (node->kind == ControlKind::Button || node->kind == ControlKind::SysLink)) ||
+             (action.action == L"toolbarCommand" && node->kind == ControlKind::Toolbar) ||
+             (action.action == L"mdiCommand" && node->kind == ControlKind::MdiChild));
+        const bool rootAction = !node && !action.nodeId &&
+            (action.action == L"close" || action.action == L"menuCommand");
+        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || IsDestroyed() ||
+            (!nodeAction && !rootAction) || nextNativeActionToken_ == 0 ||
+            !IsApplicationCloaked(root_)) {
+            error = L"native action has no current projected source identity";
+            return false;
+        }
+        if (queuedNativeAction_ || nativeActionRunning_ || queuedIslandAction_ || queuedMenuAction_ ||
+            queuedListViewActivation_ || trackedPopup_ ||
+            (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
+            error = L"a native action is already pending";
+            return false;
+        }
+        NativeActionRequest request;
+        request.action = action;
+        if (node) {
+            request.source = node->hwnd;
+            request.nodeGeneration = node->generation;
+            request.kind = node->kind;
+            if (!IsChild(root_, request.source) ||
+                reinterpret_cast<uintptr_t>(GetPropW(request.source, kNodeGenerationProperty)) != node->generation) {
+                error = L"native action source control was replaced";
+                return false;
+            }
+        }
+        request.owner = NativeActionOwner(root_, action, request.source);
+        if (!request.owner || GetWindowThreadProcessId(request.owner, nullptr) != threadId_) return false;
+        if (action.action == L"menuCommand") {
+            std::vector<MenuItemSnapshot> menu;
+            request.menu = GetMenu(root_);
+            if (!request.menu || action.expectedMenuBindingGeneration != 0 ||
+                !CaptureTopLevelMenu(root_, menu, error)) return false;
+            request.menuFingerprint = NativeMenuFingerprint(menu);
+        }
+        queuedNativeAction_ = std::move(request);
+        queuedNativeActionToken_ = nextNativeActionToken_;
+        rearmNativeAction_ = false;
+        nextNativeActionToken_ = nextNativeActionToken_ == UINT64_MAX ? 0 : nextNativeActionToken_ + 1;
+        if (!PostThreadMessageW(threadId_, message_, kDeferredNativeAction,
+                static_cast<LPARAM>(queuedNativeActionToken_))) {
+            CancelNativeActionOnSourceThread();
+            error = L"native action could not be queued";
+            return false;
+        }
+        if (action.action == L"close") {
+            queuedNativeAction_->closeSequence = RegisterCloseRequest();
+            if (closeSequence) *closeSequence = queuedNativeAction_->closeSequence;
+        }
+        if (queuedToken) *queuedToken = queuedNativeActionToken_;
+        refused = false;
+        return true;
+    } catch (...) {
+        try { error = L"exception preparing deferred native action"; } catch (...) {}
+        return false;
+    }
+}
+
+void SourceThreadAgent::CancelNativeActionOnSourceThread() noexcept {
+    if (GetCurrentThreadId() != threadId_) return;
+    const bool cancelledClose = queuedNativeAction_ && queuedNativeAction_->closeSequence != 0;
+    queuedNativeAction_.reset();
+    queuedNativeActionToken_ = 0;
+    rearmNativeAction_ = false;
+    // A close already acknowledged by the renderer must eventually finish even
+    // when geometry/rollback cancels its queued token before WM_CLOSE is sent.
+    if (cancelledClose) MarkCloseRequestCompleted();
+}
+
+void SourceThreadAgent::DispatchNativeActionOnSourceThread(uint64_t token) noexcept {
+    if (GetCurrentThreadId() != threadId_ || token == 0 ||
+        token != queuedNativeActionToken_ || !queuedNativeAction_) return;
+    if (g_boundedSourceCommandDepth != 0) {
+        rearmNativeAction_ = true;
+        return;
+    }
+    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
+        if (!PostThreadMessageW(threadId_, message_, kDeferredNativeAction, static_cast<LPARAM>(token)))
+            CancelNativeActionOnSourceThread();
+        return;
+    }
+    auto request = std::move(*queuedNativeAction_);
+    queuedNativeAction_.reset();
+    queuedNativeActionToken_ = 0;
+    rearmNativeAction_ = false;
+    RunNativeActionOnSourceThread(request);
+}
+
+void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest& request) noexcept {
+    // This scope is deliberately outside BoundedSourceCommandScope. Sending the
+    // original message now enters the real HWND proc without leaving another raw
+    // message that a later bounded capture or rollback could accidentally drain.
+    struct RunningScope final {
+        SourceThreadAgent* agent;
+        bool close;
+        ~RunningScope() {
+            agent->nativeActionRunning_ = false;
+            if (close) agent->MarkCloseRequestCompleted();
+            agent->RequestMenuBarRefresh();
+            agent->MarkDirty();
+        }
+    } running{this, request.closeSequence != 0};
+    nativeActionRunning_ = true;
+    try {
+        const auto sourceCurrent = [&] {
+            if (!request.source) return true;
+            const auto identity = captureContext_.nodeIds.find(request.source);
+            return IsChild(root_, request.source) &&
+                GetWindowThreadProcessId(request.source, nullptr) == threadId_ &&
+                reinterpret_cast<uintptr_t>(GetPropW(request.source, kNodeGenerationProperty)) == request.nodeGeneration &&
+                identity != captureContext_.nodeIds.end() &&
+                identity->second.nodeId == request.action.nodeId && identity->second.generation == request.nodeGeneration &&
+                NativeActionOwner(root_, request.action, request.source) == request.owner;
+        };
+        const auto ready = [&] {
+            if (GetCurrentThreadId() != threadId_ || g_boundedSourceCommandDepth != 0 ||
+                shuttingDown_.load() || IsDestroyed() || trackedPopup_ ||
+                !IsApplicationCloaked(root_) || !IsWindowVisible(root_) || !sourceCurrent()) return false;
+            for (HWND current = request.source ? request.source : root_; current; current = GetParent(current)) {
+                if (!IsWindowVisible(current) || !IsWindowEnabled(current)) return false;
+                if (current == root_) return true;
+            }
+            return false;
+        };
+        if (!ready()) return;
+        WindowSnapshot current;
+        std::wstring error;
+        if (!CaptureOnSourceThread(request.action.surfaceId, request.action.expectedRevision, current, error) ||
+            !ValidateActionForSnapshot(request.action, current, error) || !ready()) return;
+        const auto node = std::find_if(current.nodes.begin(), current.nodes.end(), [&](const ControlNode& value) {
+            return request.action.nodeId == value.nodeId;
+        });
+        if (request.source && (node == current.nodes.end() || node->hwnd != request.source ||
+                node->generation != request.nodeGeneration || node->kind != request.kind)) return;
+        const auto& action = request.action;
+        if (action.action == L"close") {
+            SendMessageW(root_, WM_CLOSE, 0, 0);
+        } else if (action.action == L"menuCommand") {
+            if (current.menuBindingGeneration != action.expectedMenuBindingGeneration ||
+                GetMenu(root_) != request.menu || !IsMenu(request.menu) ||
+                NativeMenuFingerprint(current.menu) != request.menuFingerprint) return;
+            SendMessageW(root_, WM_COMMAND, MAKEWPARAM(action.menuCommandId, 0), 0);
+        } else if (action.action == L"toolbarCommand") {
+            if (!ApplyToolbarCheckState(request.source, *node, action.menuCommandId, error) || !ready()) return;
+            SendMessageW(request.owner, WM_COMMAND, MAKEWPARAM(action.menuCommandId, 0),
+                reinterpret_cast<LPARAM>(request.source));
+        } else if (action.action == L"mdiCommand") {
+            if (action.text == L"activate") {
+                SendMessageW(request.owner, WM_MDIACTIVATE, reinterpret_cast<WPARAM>(request.source), 0);
+            } else {
+                const WPARAM code = action.text == L"close" ? SC_CLOSE :
+                    action.text == L"minimize" ? SC_MINIMIZE :
+                    action.text == L"maximize" ? SC_MAXIMIZE : SC_RESTORE;
+                SendMessageW(request.source, WM_SYSCOMMAND, code, 0);
+            }
+        } else if (request.kind == ControlKind::Button) {
+            SendMessageW(request.source, BM_CLICK, 0, 0);
+        } else if (request.kind == ControlKind::SysLink) {
+            LITEM item{};
+            item.mask = LIF_ITEMINDEX | LIF_STATE;
+            item.iLink = 0;
+            item.stateMask = LIS_FOCUSED;
+            item.state = LIS_FOCUSED;
+            if (!SendMessageW(request.source, LM_SETITEM, 0, reinterpret_cast<LPARAM>(&item)) || !ready()) return;
+            SendMessageW(request.source, WM_SETFOCUS, 0, 0);
+            if (ready()) SendMessageW(request.source, WM_KEYDOWN, VK_RETURN, 1);
+            if (ready()) SendMessageW(request.source, WM_KEYUP, VK_RETURN, 1 | (1ll << 30) | (1ll << 31));
+            // Complete only the synthetic focus lifetime after a nested rollback;
+            // no further activation message is sent to a restored native window.
+            if (sourceCurrent()) SendMessageW(request.source, WM_KILLFOCUS, 0, 0);
+        }
+    } catch (...) {
+        // The request has already been consumed. Reconcile owns any fallback.
+    }
+}
+
+bool ListViewItemsHaveNativeDefaultActions(HWND listView, const ControlNode& node) noexcept {
+    try {
+        if (!listView || GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId() ||
+            node.kind != ControlKind::ListView || ListViewItemCount(node) == 0 ||
+            node.itemNativeIds.size() != ListViewItemCount(node)) return false;
+        Microsoft::WRL::ComPtr<IAccessible> root;
+        if (FAILED(AccessibleObjectFromWindow(listView, OBJID_CLIENT,
+                IID_PPV_ARGS(root.GetAddressOf()))) || !root) return false;
+        for (size_t index = 0; index < ListViewItemCount(node); ++index) {
+            ListViewActivationRequest request;
+            request.listView = listView;
+            request.index = static_cast<int>(index);
+            request.nativeId = node.itemNativeIds[index];
+            request.itemCount = ListViewItemCount(node);
+            request.viewStyle = static_cast<DWORD>(node.style) & kListViewActivationStyle;
+            request.text = node.items[index];
+            AccessibleListViewItem live;
+            std::wstring name;
+            std::wstring action;
+            std::wstring error;
+            UINT nativeState = 0;
+            long accessibleState = 0;
+            if (!ReadListViewActivationIdentity(request, nativeState, error) ||
+                !ReadListViewAccessibleAction(request, live, name, action, accessibleState, error, root.Get())) return false;
         }
         return true;
     } catch (...) {
         return false;
+    }
+}
+
+bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int index,
+    bool& refused, std::wstring& error, uint64_t* queuedToken) noexcept {
+    refused = true;
+    if (queuedToken) *queuedToken = 0;
+    try {
+        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
+            node.kind != ControlKind::ListView || !node.itemActivationSupported || index < 0 ||
+            static_cast<size_t>(index) >= ListViewItemCount(node) ||
+            node.itemNativeIds.size() != ListViewItemCount(node) ||
+            nextListViewActivationToken_ == 0) {
+            error = L"ListView activation has no current item identity";
+            return false;
+        }
+        if (queuedListViewActivation_ || queuedIslandAction_ || queuedMenuAction_ ||
+            queuedNativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+            (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
+            error = L"a native item action is already pending";
+            return false;
+        }
+        ListViewActivationRequest request;
+        request.listView = node.hwnd;
+        request.nodeId = node.nodeId;
+        request.generation = node.generation;
+        request.index = index;
+        request.nativeId = node.itemNativeIds[index];
+        request.itemCount = ListViewItemCount(node);
+        request.viewStyle = static_cast<DWORD>(node.style) & kListViewActivationStyle;
+        request.text = node.items[index];
+        if (!ListViewActivationReady(root_, request) ||
+            !ReadListViewActivationIdentity(request, request.nativeState, error)) return false;
+        const bool selected = std::find(node.selectedIndices.begin(), node.selectedIndices.end(), index) !=
+            node.selectedIndices.end();
+        const bool checked = std::find(node.checkedIndices.begin(), node.checkedIndices.end(), index) !=
+            node.checkedIndices.end();
+        if (((request.nativeState & LVIS_SELECTED) != 0) != selected ||
+            ((request.nativeState & LVIS_FOCUSED) != 0) != (node.focusedIndex == index) ||
+            (node.checkBoxes && (request.nativeState & LVIS_STATEIMAGEMASK) !=
+                INDEXTOSTATEIMAGEMASK(checked ? 2 : 1))) {
+            error = L"ListView activation selection, focus or check state changed";
+            return false;
+        }
+        AccessibleListViewItem live;
+        if (!ReadListViewAccessibleAction(request, live, request.accessibleName,
+                request.defaultAction, request.accessibleState, error)) return false;
+        UINT state = 0;
+        if (!ListViewActivationReady(root_, request) ||
+            !ReadListViewActivationIdentity(request, state, error) || state != request.nativeState) {
+            error = L"ListView item changed while its default action was read";
+            return false;
+        }
+        queuedListViewActivation_ = std::move(request);
+        queuedListViewActivationToken_ = nextListViewActivationToken_;
+        rearmListViewActivation_ = false;
+        nextListViewActivationToken_ = nextListViewActivationToken_ == UINT64_MAX
+            ? 0 : nextListViewActivationToken_ + 1;
+        if (!PostThreadMessageW(threadId_, message_, kDeferredListViewActivation,
+                static_cast<LPARAM>(queuedListViewActivationToken_))) {
+            queuedListViewActivation_.reset();
+            queuedListViewActivationToken_ = 0;
+            error = L"ListView default action could not be queued";
+            return false;
+        }
+        if (queuedToken) *queuedToken = queuedListViewActivationToken_;
+        refused = false;
+        return true;
+    } catch (...) {
+        try { error = L"exception preparing ListView default action"; } catch (...) {}
+        return false;
+    }
+}
+
+void SourceThreadAgent::DispatchListViewActivationOnSourceThread(uint64_t token) noexcept {
+    if (GetCurrentThreadId() != threadId_ || token == 0 ||
+        token != queuedListViewActivationToken_ || !queuedListViewActivation_) return;
+    if (g_boundedSourceCommandDepth != 0) {
+        rearmListViewActivation_ = true;
+        return;
+    }
+    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
+        if (!PostThreadMessageW(threadId_, message_, kDeferredListViewActivation,
+                static_cast<LPARAM>(token))) {
+            queuedListViewActivation_.reset();
+            queuedListViewActivationToken_ = 0;
+        }
+        return;
+    }
+    // Consume before entering COM. A modal handler can pump cancellation or a
+    // replayed message without reusing this action or invalidating its stack data.
+    auto request = std::move(*queuedListViewActivation_);
+    queuedListViewActivation_.reset();
+    queuedListViewActivationToken_ = 0;
+    rearmListViewActivation_ = false;
+    RunListViewActivationOnSourceThread(request);
+}
+
+void SourceThreadAgent::RearmDeferredActionsOnSourceThread() noexcept {
+    if (GetCurrentThreadId() != threadId_) return;
+    const auto rearm = [&](WPARAM kind, bool& consumed, auto& request, uint64_t& token) {
+        if (!consumed) return;
+        consumed = false;
+        if (!request || token == 0) return;
+        if (shuttingDown_.load() || !PostThreadMessageW(threadId_, message_, kind, static_cast<LPARAM>(token))) {
+            request.reset();
+            token = 0;
+            MarkDirty();
+        }
+    };
+    rearm(kDeferredIslandAction, rearmIslandAction_, queuedIslandAction_, queuedIslandActionToken_);
+    rearm(kDeferredMenuAction, rearmMenuAction_, queuedMenuAction_, queuedMenuActionToken_);
+    rearm(kDeferredListViewActivation, rearmListViewActivation_, queuedListViewActivation_, queuedListViewActivationToken_);
+    if (rearmNativeAction_) {
+        rearmNativeAction_ = false;
+        if (queuedNativeAction_ && queuedNativeActionToken_ != 0 &&
+            (shuttingDown_.load() || !PostThreadMessageW(threadId_, message_,
+                kDeferredNativeAction, static_cast<LPARAM>(queuedNativeActionToken_))))
+            CancelNativeActionOnSourceThread();
+    }
+}
+
+void SourceThreadAgent::CancelDeferredActionOnSourceThread(WPARAM kind, uint64_t token) noexcept {
+    if (GetCurrentThreadId() != threadId_ || token == 0) return;
+    const auto cancel = [&](auto& request, uint64_t& queuedToken, bool& consumed) {
+        if (token != queuedToken) return;
+        request.reset();
+        queuedToken = 0;
+        consumed = false;
+    };
+    if (kind == kDeferredIslandAction) cancel(queuedIslandAction_, queuedIslandActionToken_, rearmIslandAction_);
+    else if (kind == kDeferredMenuAction) cancel(queuedMenuAction_, queuedMenuActionToken_, rearmMenuAction_);
+    else if (kind == kDeferredListViewActivation)
+        cancel(queuedListViewActivation_, queuedListViewActivationToken_, rearmListViewActivation_);
+    else if (kind == kDeferredNativeAction && token == queuedNativeActionToken_)
+        CancelNativeActionOnSourceThread();
+}
+
+void SourceThreadAgent::RunListViewActivationOnSourceThread(const ListViewActivationRequest& request) noexcept {
+    try {
+        const auto identity = captureContext_.nodeIds.find(request.listView);
+        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || trackedPopup_ ||
+            identity == captureContext_.nodeIds.end() || identity->second.nodeId != request.nodeId ||
+            identity->second.generation != request.generation || !ListViewActivationReady(root_, request)) return;
+        UINT nativeState = 0;
+        std::wstring error;
+        AccessibleListViewItem live;
+        std::wstring name;
+        std::wstring action;
+        long state = 0;
+        if (!ReadListViewActivationIdentity(request, nativeState, error) ||
+            nativeState != request.nativeState ||
+            !ReadListViewAccessibleAction(request, live, name, action, state, error) ||
+            name != request.accessibleName || action != request.defaultAction || state != request.accessibleState ||
+            !ListViewActivationReady(root_, request) ||
+            !ReadListViewActivationIdentity(request, nativeState, error) || nativeState != request.nativeState) {
+            FluentShell::Log(L"ListView default action was stale or unavailable: " + error);
+            MarkDirty();
+            return;
+        }
+        // Re-read on the same live object that receives the action, after all native
+        // item-identity checks. No synthetic pointer, key, or guessed notification.
+        name.clear();
+        action.clear();
+        if (!ReadListViewAccessibleAction(request, live, name, action, state, error) ||
+            name != request.accessibleName || action != request.defaultAction || state != request.accessibleState ||
+            shuttingDown_.load() || !ListViewActivationReady(root_, request) ||
+            !ReadListViewActivationIdentity(request, nativeState, error) || nativeState != request.nativeState) {
+            MarkDirty();
+            return;
+        }
+        const HRESULT invoked = live.object->accDoDefaultAction(live.child);
+        if (FAILED(invoked)) FluentShell::Log(L"ListView provider refused its default action");
+        RequestMenuBarRefresh();
+        MarkDirty();
+    } catch (...) {
+        MarkDirty();
+    }
+}
+
+void SourceThreadAgent::RunIslandActionOnSourceThread(const IslandActionRequest& request) noexcept {
+    try {
+        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
+            !IsApplicationCloaked(root_) || trackedPopup_ ||
+            !IsChild(root_, request.island) || !IsWindowVisible(request.island) ||
+            reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) !=
+                request.generation) return;
+        for (HWND current = request.island; current; current = GetParent(current)) {
+            if (!IsWindowEnabled(current)) return;
+            if (current == root_) break;
+        }
+        pendingIslandMenu_.reset();
+        if (request.dropDown) {
+            pendingIslandMenu_ = request;
+            pendingIslandDeadline_ = GetTickCount64() + 2000;
+        }
+        std::wstring reason;
+        if (!InvokeAccessibleIslandItem(request.island, request.index,
+                request.name, request.action, reason)) {
+            pendingIslandMenu_.reset();
+            FluentShell::Log(L"Island action did not run: " + reason);
+        }
+        MarkDirty();
+    } catch (...) {
+        pendingIslandMenu_.reset();
+    }
+}
+
+void SourceThreadAgent::CancelPopupOnSourceThread(bool activeOnly) noexcept {
+    // EnableWindow(FALSE) sends WM_CANCELMODE. A provider can disable its opener
+    // before entering TrackPopupMenu; that does not cancel the pending open request.
+    if (activeOnly && !trackedPopup_) return;
+    CancelNativeActionOnSourceThread();
+    queuedListViewActivation_.reset();
+    queuedListViewActivationToken_ = 0;
+    rearmListViewActivation_ = false;
+    queuedMenuAction_.reset();
+    queuedMenuActionToken_ = 0;
+    rearmMenuAction_ = false;
+    queuedIslandAction_.reset();
+    queuedIslandActionToken_ = 0;
+    rearmIslandAction_ = false;
+    pendingIslandMenu_.reset();
+    popupDecision_.reset();
+    popupMenu_.Cancel();
+    popupCaptureError_.clear();
+    MarkDirty();
+}
+
+bool SourceThreadAgent::CompletePopupOnSourceThread(
+    const ActionRequest& action, std::wstring& error) {
+    PopupMenuDecision decision;
+    if (!trackedPopup_ || !IsApplicationCloaked(root_) ||
+        !popupMenu_.Resolve(action.popupId, action.popupItemId, decision)) {
+        error = L"popup is no longer active or its item is disabled";
+        return false;
+    }
+    MarkDirty();
+    if (!decision.IsDismissal()) {
+        std::vector<MenuItemSnapshot> live;
+        if (!IsWindow(trackedPopupOwner_) ||
+            !CaptureMenuHandle(trackedPopup_, L"", live, error) ||
+            !PopupMenuState::MatchLiveChoice(live, decision)) {
+            error = L"native popup command changed before selection";
+            return false;
+        }
+    }
+    popupDecision_ = std::move(decision);
+    return true;
+}
+
+bool SourceThreadAgent::TrackIslandPopupOnSourceThread(
+    HMENU menu, UINT flags, HWND owner, BOOL& result) {
+    result = FALSE;
+    if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || trackedPopup_ ||
+        !pendingIslandMenu_ || !IsApplicationCloaked(root_)) return false;
+    const auto request = *pendingIslandMenu_;
+    pendingIslandMenu_.reset();
+    if (GetTickCount64() > pendingIslandDeadline_ || !IsChild(root_, request.island) ||
+        reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) !=
+            request.generation) return true;
+
+    // Keep the HMENU on the application's own call stack. The supervisor and action
+    // commands can run in this modal pump, including the command that restores the
+    // complete native surface if any subsequent capture fails.
+    trackedPopup_ = menu;
+    trackedPopupOwner_ = owner;
+    trackedIslandMenu_ = request;
+    popupDecision_.reset();
+    bool quit = false;
+    int quitCode = 0;
+    struct Cleanup final {
+        SourceThreadAgent* agent;
+        ~Cleanup() {
+            agent->trackedPopup_ = nullptr;
+            agent->trackedPopupOwner_ = nullptr;
+            agent->trackedIslandMenu_.reset();
+            agent->CancelPopupOnSourceThread();
+            agent->RequestMenuBarRefresh();
+        }
+    } cleanup{ this };
+
+    if ((flags & TPM_NONOTIFY) == 0) {
+        SendMessageW(owner, WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu), 0);
+    }
+    std::vector<MenuItemSnapshot> items;
+    std::wstring reason;
+    if (!CaptureMenuHandle(menu, L"", items, reason) || items.empty() ||
+        popupMenu_.Begin(request.nodeId, request.index, std::move(items)) == 0) {
+        popupCaptureError_ = L"island popup cannot be projected: " + reason;
+        FluentShell::Log(popupCaptureError_);
+    } else {
+        FluentShell::Log(L"Island popup waiting for WinUI selection id=" +
+            std::to_wstring(popupMenu_.Current()->popupId));
+    }
+    MarkDirty();
+    while (!shuttingDown_.load() && !IsDestroyed() && IsApplicationCloaked(root_) &&
+           IsWindow(owner) && IsMenu(menu) &&
+           (popupMenu_.Current() || !popupCaptureError_.empty())) {
+        MSG message{};
+        if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                quit = true;
+                quitCode = static_cast<int>(message.wParam);
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        } else {
+            MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    }
+    if ((flags & TPM_NONOTIFY) == 0 && IsWindow(owner)) {
+        SendMessageW(owner, WM_UNINITMENUPOPUP, reinterpret_cast<WPARAM>(menu), 0);
+    }
+    // WM_UNINITMENUPOPUP is application code and can pump a restore, shutdown,
+    // or WM_CANCELMODE. Read the terminal choice only after that callback: a
+    // stack copy taken before it would resurrect the command cancellation revoked.
+    const auto decision = popupDecision_;
+    if (quit) PostQuitMessage(quitCode);
+    if (!quit && !shuttingDown_.load() && IsApplicationCloaked(root_) &&
+        IsWindow(owner) && decision && !decision->IsDismissal()) {
+        if ((flags & TPM_RETURNCMD) != 0) {
+            result = static_cast<BOOL>(decision->commandId);
+        } else if ((flags & TPM_NONOTIFY) == 0) {
+            // The actual tracking owner, not necessarily the top-level frame, owns
+            // the command. Post it because it may enter another application modal loop.
+            result = PostMessageW(owner, WM_COMMAND, MAKEWPARAM(decision->commandId, 0), 0);
+        } else {
+            result = TRUE;
+        }
+        FluentShell::Log(L"Island popup selected command=" + std::to_wstring(decision->commandId));
+    }
+    return true;
+}
+
+bool TryTrackIslandPopup(HMENU menu, UINT flags, HWND owner, BOOL& result) noexcept {
+    try {
+        const HWND root = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
+        std::shared_ptr<SourceThreadAgent> selected;
+        {
+            std::scoped_lock lock(g_agentsMutex);
+            for (const auto& [_, agent] : g_agents) {
+                if (agent && agent->Root() == root && agent->ThreadId() == GetCurrentThreadId()) {
+                    selected = agent->shared_from_this();
+                    break;
+                }
+            }
+        }
+        return selected && selected->TrackIslandPopupOnSourceThread(menu, flags, owner, result);
+    } catch (...) {
+        result = FALSE;
+        return true;
     }
 }
 
@@ -2323,101 +3118,186 @@ bool SourceThreadAgent::InvokeDirectUiNodeAction(
     return success;
 }
 
-// One menu bar drawn with a toolbar, read in the only order the application allows:
-// arm and drive one button, let the application's own loop run, then collect the popup it
-// opened.  The whole bar is read or none of it is, because a menu bar missing one of its
-// menus is worse than one that was never projected.
-bool SourceThreadAgent::ReadMenuBarToolbar(
-    HWND toolbar,
+bool SourceThreadAgent::RefreshMenuBarToolbar(
     DWORD popupWaitMs,
+    bool& changed,
     std::wstring& error,
     DWORD timeoutMs,
     HANDLE cancelEvent) {
-    const int buttons = MenuBarButtonCount(toolbar);
-    if (buttons <= 0) {
-        error = L"menu-bar toolbar publishes no accessible buttons";
+    changed = false;
+    Command* command = CreateCommand(kCommandMenuBarRefresh, this);
+    if (!command) {
+        error = L"source command allocation failed";
         return false;
     }
-    // Held for the whole read, not per button: an application opens its popup from its own
-    // message loop, so one that arrives after a button was given up on must still be
-    // swallowed rather than appearing over the projection.
-    PopupSuppressionScope suppression;
-    // Leaves the bar's own tracking state as it was found, while suppression still holds,
-    // so nothing can still be on its way out when the screen stops being protected.
-    const auto settleBar = [&]() noexcept {
-        if (IsWindow(toolbar)) SendMessageW(toolbar, WM_CANCELMODE, 0, 0);
-        if (IsWindow(root_)) SendMessageW(root_, WM_CANCELMODE, 0, 0);
-        Sleep(kMenuBarSettleMs);
-    };
+    command->menuBarPopupWaitMs = popupWaitMs;
+    const bool posted = Post(command, timeoutMs, cancelEvent);
+    // A timed-out callback can still be unwinding. Never read its mutable fields.
+    if (!posted) error = L"source UI thread did not acknowledge menu-bar refresh";
+    else {
+        changed = command->menuBarChanged;
+        error = command->error;
+    }
+    const bool success = posted && command->success;
+    Release(command);
+    return success;
+}
+
+bool SourceThreadAgent::RefreshMenuBarOnSourceThread(
+    DWORD popupWaitMs,
+    const std::atomic<bool>& cancelled,
+    bool& changed,
+    std::wstring& error) {
+    changed = false;
+    if (queuedMenuAction_ || queuedNativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+        (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_))
+        return true;
+    if (GetCurrentThreadId() != threadId_) {
+        error = L"menu-bar refresh requires its owning source thread";
+        return false;
+    }
+    ObserveMenuBarToolbar(root_, captureContext_);
+    auto& state = captureContext_;
+    const uint64_t now = GetTickCount64();
+    if (menuBarDirty_.exchange(false)) state.menuBarRefresh.Invalidate(now);
+    if (!state.menuBarToolbar || GetMenu(root_) ||
+        !state.menuBarRefresh.ShouldRead(now)) return true;
+    DWORD cloak = 0;
+    if (FAILED(DwmGetWindowAttribute(root_, DWMWA_CLOAKED, &cloak, sizeof(cloak))) ||
+        (cloak & DWM_CLOAKED_APP) == 0) {
+        error = L"menu-bar refresh requires a committed, cloaked native surface";
+        return false;
+    }
+    const HWND toolbar = state.menuBarToolbar;
+    const uint64_t generation = state.menuBarToolbarGeneration;
+    const auto buttons = state.menuBarButtons;
     std::vector<MenuItemSnapshot> menu;
-    for (int index = 1; index <= buttons; ++index) {
-        std::wstring name = MenuBarButtonName(toolbar, index);
-        if (name.empty()) {
-            error = L"menu-bar toolbar publishes an unnamed top-level menu";
-            return false;
-        }
-        MenuItemSnapshot top;
-        top.kind = MenuItemKind::Popup;
-        top.text = std::move(name);
-        top.enabled = true;
-        // Identity is the item's position in the *projected* menu, not in the native bar:
-        // a system menu is skipped, and the renderer admits a menu only when every path is
-        // its own index under its parent's.
-        top.itemId = std::to_wstring(menu.size());
-
-        Command* read = CreateCommand(kCommandMenuBarRead, this);
-        if (!read) {
-            error = L"source command allocation failed";
-            settleBar();
-            return false;
-        }
-        read->menuBarToolbar = toolbar;
-        read->menuBarIndex = index;
-        read->menuBarPopupWaitMs = popupWaitMs;
-        read->action.text = top.itemId;
-        const bool readPosted = Post(read, timeoutMs, cancelEvent);
-        const bool readOk = readPosted && read->success;
-        const bool systemMenu = readOk && read->menuBarSystemMenu;
-        // Told apart from a real failure: the command ran and the application simply
-        // opened no popup for that button.
-        const bool openedNothing = readPosted && !read->success && read->menuBarNoPopup;
-        if (!readOk) {
-            error = readPosted ? read->error
-                : std::wstring(L"source UI thread did not acknowledge the menu-bar read");
-        } else if (!systemMenu) {
-            top.items = std::move(read->menuItems);
-        }
-        Release(read);
-        if (!readOk && !openedNothing) {
-            settleBar();
-            return false;
-        }
-        if (systemMenu) continue;
-        // A top-level menu the application opens nothing for is a menu with nothing in it
-        // right now -- MMC's Window menu on a console with no snap-in windows is one.  The
-        // native bar still shows its title, so the projection shows the title too and
-        // leaves it with no items rather than dropping the menu or refusing the bar.
-        if (top.items.empty()) {
-            top.enabled = false;
-        }
-        menu.push_back(std::move(top));
-    }
-    settleBar();
-    if (menu.empty()) {
-        error = L"menu-bar toolbar has no projectable menus";
+    std::vector<MenuBarCommandBinding> commands;
+    const bool read = CaptureMenuBarToolbar(root_, toolbar, buttons, popupWaitMs,
+        6500, cancelled, menu, error, &commands);
+    if (cancelled.load(std::memory_order_acquire)) return false;
+    // The application's message pump may replace the bar while it is being read.
+    // Revalidate on the same source thread before publishing any cached commands.
+    ObserveMenuBarToolbar(root_, state);
+    if (toolbar != state.menuBarToolbar || generation != state.menuBarToolbarGeneration ||
+        buttons != state.menuBarButtons) {
+        changed = true;
+        error = L"menu-bar toolbar changed before refresh publication";
         return false;
     }
-    // Published into the capture context the source thread owns, so the next capture
-    // carries the menu and drops the toolbar node.
-    captureContext_.menuBarToolbarMenu = std::move(menu);
-    captureContext_.menuBarToolbar = toolbar;
-    return true;
+    state.menuBarRefresh.Complete(GetTickCount64(), read);
+    if (read) {
+        if (state.menuBarBindingGeneration == UINT64_MAX) {
+            state.menuBarToolbarCommands.clear();
+            for (auto& item : state.menuBarToolbarMenu) item.enabled = false;
+            changed = true;
+            error = L"menu binding generation exhausted";
+            return false;
+        }
+        ++state.menuBarBindingGeneration;
+        state.menuBarToolbarMenu = std::move(menu);
+        state.menuBarToolbarCommands = std::move(commands);
+        changed = true;
+        FluentShell::Log(L"Menu-bar toolbar refreshed as a real menu");
+    } else {
+        // Keep a previously projected bar's labels, but never dispatch its stale
+        // commands. Bounded retries can restore it without a duplicate toolbar.
+        for (auto& item : state.menuBarToolbarMenu) item.enabled = false;
+        state.menuBarToolbarCommands.clear();
+        changed = !state.menuBarToolbarMenu.empty();
+        FluentShell::Log(L"Menu-bar toolbar refresh deferred: " + error);
+    }
+    return read;
 }
 
-bool SourceThreadAgent::HasMenuBarToolbarMenu() const noexcept {
-    return !captureContext_.menuBarToolbarMenu.empty();
+bool SourceThreadAgent::InvokeMenuCommandOnSourceThread(uint32_t commandId,
+    const std::atomic<bool>& cancelled, std::wstring& error, uint64_t* queuedToken) {
+    if (queuedToken) *queuedToken = 0;
+    if (GetCurrentThreadId() != threadId_ || cancelled.load(std::memory_order_acquire)) return false;
+    if (GetMenu(root_)) {
+        error = L"ordinary native menu requires its owned deferred action";
+        return false;
+    }
+    if (!MenuBarCommandsCurrentOnSourceThread()) {
+        error = L"native menu changed and is awaiting refresh";
+        return false;
+    }
+    const auto& state = captureContext_;
+    const auto found = std::find_if(state.menuBarToolbarCommands.begin(),
+        state.menuBarToolbarCommands.end(), [commandId](const auto& binding) {
+            return binding.commandId == commandId;
+        });
+    if (found == state.menuBarToolbarCommands.end()) {
+        error = L"menu command has no current native toolbar binding";
+        return false;
+    }
+    // The native message pump can mutate capture state; own the selection and
+    // toolbar signature for the complete intercepted call.
+    if (queuedMenuAction_ || queuedNativeAction_ || nativeActionRunning_ ||
+        nextMenuActionToken_ == 0 || shuttingDown_.load()) {
+        error = L"native menu already has a queued selection";
+        return false;
+    }
+    MenuActionRequest request;
+    request.toolbar = state.menuBarToolbar;
+    request.toolbarGeneration = state.menuBarToolbarGeneration;
+    request.bindingGeneration = state.menuBarBindingGeneration;
+    request.binding = *found;
+    request.buttons = state.menuBarButtons;
+    queuedMenuAction_ = std::move(request);
+    queuedMenuActionToken_ = nextMenuActionToken_;
+    rearmMenuAction_ = false;
+    nextMenuActionToken_ = nextMenuActionToken_ == UINT64_MAX ? 0 : nextMenuActionToken_ + 1;
+    if (PostThreadMessageW(threadId_, message_, kDeferredMenuAction,
+            static_cast<LPARAM>(queuedMenuActionToken_))) {
+        if (queuedToken) *queuedToken = queuedMenuActionToken_;
+        return true;
+    }
+    queuedMenuAction_.reset();
+    queuedMenuActionToken_ = 0;
+    error = L"native menu selection could not be queued";
+    return false;
 }
 
+void SourceThreadAgent::DispatchMenuActionOnSourceThread(uint64_t token) noexcept {
+    if (GetCurrentThreadId() != threadId_ || token == 0 || token != queuedMenuActionToken_ ||
+        !queuedMenuAction_) return;
+    if (g_boundedSourceCommandDepth != 0) {
+        rearmMenuAction_ = true;
+        return;
+    }
+    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
+        if (!PostThreadMessageW(threadId_, message_, kDeferredMenuAction, static_cast<LPARAM>(token))) {
+            queuedMenuAction_.reset();
+            queuedMenuActionToken_ = 0;
+        }
+        return;
+    }
+    auto request = std::move(*queuedMenuAction_);
+    queuedMenuAction_.reset();
+    queuedMenuActionToken_ = 0;
+    rearmMenuAction_ = false;
+    try {
+        if (shuttingDown_.load() || !IsApplicationCloaked(root_) || !IsWindowEnabled(root_) ||
+            !IsWindowVisible(root_) || !IsWindowVisible(request.toolbar) ||
+            trackedPopup_ || GetMenu(root_)) return;
+        ObserveMenuBarToolbar(root_, captureContext_);
+        if (request.toolbar != captureContext_.menuBarToolbar ||
+            request.toolbarGeneration != captureContext_.menuBarToolbarGeneration ||
+            request.bindingGeneration != captureContext_.menuBarBindingGeneration ||
+            request.buttons != captureContext_.menuBarButtons) return;
+        std::wstring reason;
+        if (!InvokeMenuBarToolbarCommand(root_, request.toolbar, request.buttons,
+                request.binding, shuttingDown_, reason)) {
+            FluentShell::Log(L"Native menu selection was stale or refused: " + reason);
+        }
+        RequestMenuBarRefresh();
+        MarkDirty();
+    } catch (...) {
+        RequestMenuBarRefresh();
+        MarkDirty();
+    }
+}
 bool SourceThreadAgent::PlaceBehind(
     HWND sibling,
     std::wstring& error,

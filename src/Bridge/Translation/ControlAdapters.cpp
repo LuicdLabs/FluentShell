@@ -1,6 +1,9 @@
 #include "ControlAdapters.h"
+#include "PaintedPixel.h"
 
 #include "AccessibleIsland.h"
+#include "MmcHtmlDocument.h"
+#include "ListViewActivation.h"
 
 #include "../../Common/FluentShell.h"
 
@@ -11,6 +14,7 @@
 #include <cmath>
 #include <cwctype>
 #include <limits>
+#include <unordered_set>
 #include <utility>
 
 namespace FluentShell::Bridge::Translation {
@@ -121,7 +125,7 @@ bool RejectFlags(
     return false;
 }
 
-bool ProbeStatic(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+bool ProbeStatic(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     switch (style & SS_TYPEMASK) {
     case SS_LEFT:
     case SS_CENTER:
@@ -134,6 +138,25 @@ bool ProbeStatic(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
     case SS_ETCHEDVERT:
         kind = ControlKind::Separator;
         return true;
+    case SS_BLACKRECT:
+    case SS_GRAYRECT:
+    case SS_WHITERECT:
+    case SS_BLACKFRAME:
+    case SS_GRAYFRAME:
+    case SS_WHITEFRAME:
+    case SS_ETCHEDFRAME: {
+        if ((style & (SS_NOTIFY | WS_TABSTOP)) != 0)
+            return Reject(reason, L"interactive Static decoration is not supported");
+        constexpr DWORD acceptedStyle = WS_CHILD | WS_VISIBLE | WS_DISABLED |
+            WS_GROUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | SS_TYPEMASK | SS_SUNKEN;
+        constexpr DWORD acceptedExStyle = WS_EX_STATICEDGE | WS_EX_NOPARENTNOTIFY;
+        const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+        if ((style & WS_CHILD) == 0 || (style & ~acceptedStyle) != 0 ||
+            (exStyle & ~acceptedExStyle) != 0)
+            return Reject(reason, L"Static decoration has unsupported window chrome or composition");
+        kind = ControlKind::StaticDecoration;
+        return true;
+    }
     case SS_ICON:
         if ((style & (SS_NOTIFY | WS_TABSTOP)) != 0) {
             return Reject(reason, L"interactive Static icon is not supported");
@@ -248,12 +271,37 @@ bool ProbeSysLink(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
     return true;
 }
 
-bool ProbeListView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & LVS_TYPEMASK) != LVS_REPORT ||
-        (style & (LVS_OWNERDATA | LVS_OWNERDRAWFIXED)) != 0) {
-        return Reject(reason,
-            L"ListView is virtual, owner-draw, or not in report view");
+bool ReadListViewMode(HWND hwnd, DWORD style, std::wstring& mode, std::wstring& reason) {
+    const LRESULT view = SendMessageW(hwnd, LVM_GETVIEW, 0, 0);
+    if (view == LV_VIEW_TILE) return Reject(reason, L"tile ListView is not supported");
+    if (view < LV_VIEW_ICON || view > LV_VIEW_LIST)
+        return Reject(reason, L"ListView returned an unknown presentation mode");
+    const DWORD legacyView = style & LVS_TYPEMASK;
+    // Older common controls return zero for an unimplemented LVM_GETVIEW. The
+    // four original views remain represented by LVS_TYPEMASK. A modern control
+    // implements the stable-ID messages as well, whose invalid-index sentinel
+    // distinguishes its real icon-view zero from that legacy fallback. Prefer
+    // the current view so a menu's LVM_SETVIEW change is not inferred from style.
+    const bool modernView = view != LV_VIEW_ICON ||
+        static_cast<uint32_t>(SendMessageW(hwnd, LVM_MAPINDEXTOID,
+            static_cast<WPARAM>(-1), 0)) == std::numeric_limits<uint32_t>::max();
+    switch (modernView ? static_cast<DWORD>(view) : legacyView) {
+    case LVS_REPORT: mode = L"report"; break;
+    case LVS_ICON: mode = L"largeIcon"; break;
+    case LVS_SMALLICON: mode = L"smallIcon"; break;
+    case LVS_LIST: mode = L"list"; break;
+    default: return Reject(reason, L"ListView style has an unknown presentation mode");
     }
+    return true;
+}
+
+bool ProbeListView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if ((style & LVS_OWNERDATA) != 0)
+        return Reject(reason, L"virtual owner-data ListView is not supported (LVS_OWNERDATA)");
+    if ((style & LVS_OWNERDRAWFIXED) != 0)
+        return Reject(reason, L"owner-draw ListView is not supported (LVS_OWNERDRAWFIXED)");
+    std::wstring mode;
+    if (!ReadListViewMode(hwnd, style, mode, reason)) return false;
     if (SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0) != FALSE) {
         return Reject(reason, L"grouped ListView is not supported");
     }
@@ -744,15 +792,11 @@ public:
                 const size_t source = sourceOffset + static_cast<size_t>(column) * 4;
                 const size_t target =
                     (static_cast<size_t>(row) * width + column) * 4;
-                int showThrough = 0;
                 for (size_t channel = 0; channel < 3; ++channel) {
-                    const int over = static_cast<int>(white_[source + channel]);
-                    const int under = static_cast<int>(black_[source + channel]);
                     imageData[target + channel] = black_[source + channel];
-                    showThrough = std::max(showThrough, over - under);
                 }
-                imageData[target + 3] = static_cast<uint8_t>(
-                    std::clamp(255 - showThrough, 0, 255));
+                imageData[target + 3] = RecoverPaintAlpha(
+                    black_.data() + source, white_.data() + source);
             }
         }
         return true;
@@ -933,13 +977,15 @@ bool CaptureAccessibleIslandState(HWND hwnd, ControlNode& node, std::wstring& re
     for (const AccessibleIslandItem& item : items) {
         AccessibleIslandItemSnapshot published;
         published.kind = item.kind == AccessibleItemKind::Text ? L"text"
-            : item.kind == AccessibleItemKind::Link ? L"link" : L"button";
+            : item.kind == AccessibleItemKind::Link ? L"link"
+            : item.kind == AccessibleItemKind::PageTab ? L"pageTab" : L"button";
         published.rect = item.rect;
         published.name = item.name;
         published.description = item.description;
         published.actionName = item.actionName;
         published.enabled = item.enabled;
         published.dropDown = item.dropDown;
+        published.selected = item.selected;
         node.islandItems.push_back(std::move(published));
     }
     return true;
@@ -1119,27 +1165,62 @@ bool CaptureIconPixels(
     return true;
 }
 
-// Copies a control's own image list into bounded owned pixels.  Items then carry
-// only an index, so the same icon is never repeated in the payload.
-bool CaptureImageList(
+// Resolve the value returned by the native item provider before compacting it.
+// A missing list cannot draw an icon; otherwise an unresolved callback or an
+// index outside the native list must not become a silently missing image.
+bool ResolveItemImage(
+    int nativeIndex,
+    size_t imageCount,
+    int& resolved,
+    std::wstring& reason) {
+    if (imageCount == 0 || nativeIndex == I_IMAGENONE) {
+        resolved = -1;
+        return true;
+    }
+    if (nativeIndex == I_IMAGECALLBACK)
+        return Reject(reason, L"callback item image is not supported");
+    if (nativeIndex < 0 || static_cast<size_t>(nativeIndex) >= imageCount)
+        return Reject(reason, L"item image index is outside the native image list");
+    resolved = nativeIndex;
+    return true;
+}
+
+// Item providers have already been read exactly once. Copy only the native icons
+// those item values reference, then remap both arrays into this snapshot's owned
+// list. MMC keeps icons for unloaded snap-ins in the same HIMAGELIST; unused
+// entries do not consume the projection's count or decoded-pixel budget.
+bool CaptureReferencedImageList(
     HIMAGELIST images,
+    std::vector<int>& itemImages,
+    std::vector<int>* itemSelectedImages,
     std::vector<ImageListEntry>& imageList,
     std::wstring& reason) {
     imageList.clear();
-    if (!images) return true;
+    const int count = images ? ImageList_GetImageCount(images) : 0;
+    if (count < 0)
+        return Reject(reason, L"image list metadata is unavailable");
+    std::vector<int> references;
+    references.reserve(itemImages.size() +
+        (itemSelectedImages ? itemSelectedImages->size() : 0));
+    const auto collect = [&](std::vector<int>& indexes) {
+        for (int& index : indexes) {
+            if (!ResolveItemImage(index, static_cast<size_t>(count), index, reason))
+                return false;
+            if (index >= 0) references.push_back(index);
+        }
+        return true;
+    };
+    if (!collect(itemImages) ||
+        (itemSelectedImages && !collect(*itemSelectedImages))) return false;
+    std::sort(references.begin(), references.end());
+    references.erase(std::unique(references.begin(), references.end()), references.end());
+    if (references.empty()) return true;
+    if (references.size() > Ipc::kMaxImageListImages)
+        return Reject(reason, L"referenced image list exceeds the icon cap");
     int width = 0;
     int height = 0;
-    const int count = ImageList_GetImageCount(images);
-    if (count < 0 || !ImageList_GetIconSize(images, &width, &height))
+    if (!ImageList_GetIconSize(images, &width, &height))
         return Reject(reason, L"image list metadata is unavailable");
-    if (count == 0) return true;
-    if (static_cast<size_t>(count) > Ipc::kMaxImageListImages) {
-        wchar_t text[128]{};
-        swprintf_s(text, L"image list has %d icons, above the %zu icon cap",
-            count, Ipc::kMaxImageListImages);
-        reason = text;
-        return false;
-    }
     if (width <= 0 || height <= 0 ||
         width > static_cast<int>(Ipc::kMaxImageListDimension) ||
         height > static_cast<int>(Ipc::kMaxImageListDimension)) {
@@ -1149,8 +1230,11 @@ bool CaptureImageList(
         reason = text;
         return false;
     }
-    imageList.reserve(static_cast<size_t>(count));
-    for (int index = 0; index < count; ++index) {
+    const size_t iconBytes = static_cast<size_t>(width) * height * 4u;
+    if (references.size() > Ipc::kMaxImageListBytes / iconBytes)
+        return Reject(reason, L"referenced image list exceeds the decoded pixel budget");
+    imageList.reserve(references.size());
+    for (const int index : references) {
         HICON icon = ImageList_GetIcon(images, index, ILD_NORMAL);
         if (!icon) return Reject(reason, L"image list icon copy failed");
         ImageListEntry entry;
@@ -1161,27 +1245,20 @@ bool CaptureImageList(
             reason = L"image list icon: " + reason;
             return false;
         }
+        if (entry.imageWidth != static_cast<uint32_t>(width) ||
+            entry.imageHeight != static_cast<uint32_t>(height) ||
+            entry.imageData.size() != iconBytes)
+            return Reject(reason, L"image list icon dimensions changed during capture");
         imageList.push_back(std::move(entry));
     }
-    return true;
-}
-
-// One item's index into the captured image list, or -1.  An index outside the
-// list is refused rather than silently drawn as nothing.
-bool ResolveItemImage(
-    int nativeIndex,
-    size_t imageCount,
-    int& resolved,
-    std::wstring& reason) {
-    if (nativeIndex == I_IMAGECALLBACK)
-        return Reject(reason, L"callback item image is not supported");
-    if (nativeIndex == I_IMAGENONE || nativeIndex < 0 || imageCount == 0) {
-        resolved = -1;
-        return true;
-    }
-    if (static_cast<size_t>(nativeIndex) >= imageCount)
-        return Reject(reason, L"item image index is outside the captured image list");
-    resolved = nativeIndex;
+    const auto remap = [&](std::vector<int>& indexes) {
+        for (int& index : indexes) {
+            if (index >= 0) index = static_cast<int>(
+                std::lower_bound(references.begin(), references.end(), index) - references.begin());
+        }
+    };
+    remap(itemImages);
+    if (itemSelectedImages) remap(*itemSelectedImages);
     return true;
 }
 
@@ -1412,20 +1489,21 @@ bool ReadListViewColumnOrder(
     return true;
 }
 
-// Enumerates selected rows through the native LVM_GETNEXTITEM walk, rejecting
-// any enumeration that is not strictly increasing and inside `rowCount`.
+// Enumerates selected items through the native LVM_GETNEXTITEM walk, rejecting
+// any enumeration that is not strictly increasing and inside `itemCount`.
 bool ReadListViewSelection(
     HWND hwnd,
-    size_t rowCount,
+    size_t itemCount,
     std::vector<int>& selected,
     std::wstring& reason) {
+    selected.clear();
     int previous = -1;
     for (;;) {
         const int index = static_cast<int>(
             SendMessageW(hwnd, LVM_GETNEXTITEM, previous, LVNI_SELECTED));
         if (index < 0) return true;
-        if (index <= previous || static_cast<size_t>(index) >= rowCount ||
-            selected.size() >= rowCount) {
+        if (index <= previous || static_cast<size_t>(index) >= itemCount ||
+            selected.size() >= itemCount) {
             return Reject(reason, L"ListView selected index enumeration is invalid");
         }
         selected.push_back(index);
@@ -1454,28 +1532,32 @@ bool ReadListViewChecks(
 }
 
 bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    ControlKind admittedKind{};
+    // CaptureControlDetail is also used directly by native-backed adapters and
+    // tests, whose node may not yet carry the shared window facets. The HWND is
+    // authoritative for its current view, including a recent native mode change.
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    node.style = style;
+    if (!ProbeListView(hwnd, style, admittedKind, reason) ||
+        !ReadListViewMode(hwnd, style, node.listViewMode, reason)) return false;
+    const bool report = node.listViewMode == L"report";
     const LRESULT count = SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0);
     if (count < 0 || count > static_cast<LRESULT>(Ipc::kMaxListItems)) {
         return Reject(reason, L"invalid or excessive ListView item count");
     }
-    const HWND header = reinterpret_cast<HWND>(SendMessageW(hwnd, LVM_GETHEADER, 0, 0));
+    const HWND header = report
+        ? reinterpret_cast<HWND>(SendMessageW(hwnd, LVM_GETHEADER, 0, 0)) : nullptr;
     const int columnCount = header && IsWindow(header) ? Header_GetItemCount(header) : 0;
-    if (columnCount <= 0) {
+    if (report && columnCount <= 0) {
         return Reject(reason,
             L"ListView has no native report columns for faithful bounded projection");
     }
     if (static_cast<size_t>(columnCount) > kMaxListViewColumns) {
         return Reject(reason, L"ListView has excessive report columns");
     }
-    if (!ValidateListViewColumns(hwnd, header, columnCount, reason)) return false;
-    node.columnHeadersVisible =
-        (static_cast<DWORD>(node.style) & LVS_NOCOLUMNHEADER) == 0;
-    node.editableLabels = (static_cast<DWORD>(node.style) & LVS_EDITLABELS) != 0;
-    // Report view draws the small image list, so that is the one the projection
-    // carries.
-    if (!CaptureImageList(reinterpret_cast<HIMAGELIST>(
-            SendMessageW(hwnd, LVM_GETIMAGELIST, LVSIL_SMALL, 0)),
-            node.imageList, reason)) return false;
+    if (report && !ValidateListViewColumns(hwnd, header, columnCount, reason)) return false;
+    node.columnHeadersVisible = report && (style & LVS_NOCOLUMNHEADER) == 0;
+    node.editableLabels = (style & LVS_EDITLABELS) != 0;
     const auto extended = static_cast<DWORD>(
         SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
     node.checkBoxes = (extended & LVS_EX_CHECKBOXES) != 0;
@@ -1487,9 +1569,16 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         return Reject(reason, L"ListView text exceeds the bounded adapter payload");
     };
 
+    node.columns.clear();
+    node.columnWidths.clear();
+    node.columnOrder.clear();
+    node.rows.clear();
+    node.items.clear();
+    node.itemRects.clear();
+    node.itemNativeIds.clear();
     node.columns.reserve(static_cast<size_t>(columnCount));
     node.columnWidths.reserve(static_cast<size_t>(columnCount));
-    if (!ReadListViewColumnOrder(hwnd, columnCount, node.columnOrder, reason)) return false;
+    if (report && !ReadListViewColumnOrder(hwnd, columnCount, node.columnOrder, reason)) return false;
     const MessageGeometryScale geometry = MessageGeometryScale::For(hwnd);
     for (int column = 0; column < columnCount; ++column) {
         std::wstring label;
@@ -1500,14 +1589,33 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         node.columnWidths.push_back(geometry.Horizontal(width));
     }
 
-    node.rows.reserve(static_cast<size_t>(count));
+    if (report) node.rows.reserve(static_cast<size_t>(count));
+    else node.itemRects.reserve(static_cast<size_t>(count));
     node.items.reserve(static_cast<size_t>(count));
     node.itemImages.clear();
     node.itemImages.reserve(static_cast<size_t>(count));
+    const uint32_t invalidId = std::numeric_limits<uint32_t>::max();
+    const bool stableIds = count == 0 ||
+        (static_cast<uint32_t>(SendMessageW(hwnd, LVM_MAPINDEXTOID,
+            static_cast<WPARAM>(-1), 0)) == invalidId &&
+         static_cast<int>(SendMessageW(hwnd, LVM_MAPIDTOINDEX, invalidId, 0)) == -1);
+    // Older controls may lack this extension. Display and selection remain
+    // admissible, but an empty ID vector cannot authorize item activation.
+    if (stableIds) node.itemNativeIds.reserve(static_cast<size_t>(count));
+    std::unordered_set<uint32_t> nativeIds;
     for (int row = 0; row < count; ++row) {
+        if (stableIds) {
+            const auto nativeId = static_cast<uint32_t>(SendMessageW(
+                hwnd, LVM_MAPINDEXTOID, static_cast<WPARAM>(row), 0));
+            if (nativeId == invalidId || !nativeIds.insert(nativeId).second ||
+                ResolveListViewItemByNativeId(hwnd, nativeId) != row)
+                return Reject(reason, L"ListView stable item identity did not round-trip");
+            node.itemNativeIds.push_back(nativeId);
+        }
         std::vector<std::wstring> cells;
-        cells.reserve(static_cast<size_t>(columnCount));
-        for (int column = 0; column < columnCount; ++column) {
+        const int textColumns = report ? columnCount : 1;
+        cells.reserve(static_cast<size_t>(textColumns));
+        for (int column = 0; column < textColumns; ++column) {
             std::wstring text;
             if (!ReadListViewCell(hwnd, row, column, text, reason)) return false;
             if (!withinTextBudget(text.size())) return false;
@@ -1516,17 +1624,34 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         LVITEMW image{};
         image.mask = LVIF_IMAGE;
         image.iItem = row;
-        int resolved = -1;
-        if (!node.imageList.empty()) {
-            if (!SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&image)))
-                return Reject(reason, L"ListView item image read failed");
-            if (!ResolveItemImage(image.iImage, node.imageList.size(), resolved, reason))
-                return false;
+        image.iImage = I_IMAGENONE;
+        if (!SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&image)))
+            return Reject(reason, L"ListView item image read failed");
+        node.itemImages.push_back(image.iImage);
+        node.items.push_back(cells.front());
+        if (report) node.rows.push_back(std::move(cells));
+        else {
+            RECT bounds{ LVIR_BOUNDS };
+            if (!SendMessageW(hwnd, LVM_GETITEMRECT, static_cast<WPARAM>(row),
+                    reinterpret_cast<LPARAM>(&bounds)))
+                return Reject(reason, L"ListView item geometry read failed");
+            bounds = geometry.Rect(bounds);
+            const auto width = static_cast<int64_t>(bounds.right) - bounds.left;
+            const auto height = static_cast<int64_t>(bounds.bottom) - bounds.top;
+            if (width <= 0 || height <= 0 || width > Ipc::kMaxCoordinate ||
+                height > Ipc::kMaxCoordinate ||
+                bounds.left < -Ipc::kMaxCoordinate || bounds.left > Ipc::kMaxCoordinate ||
+                bounds.top < -Ipc::kMaxCoordinate || bounds.top > Ipc::kMaxCoordinate)
+                return Reject(reason, L"ListView item geometry exceeds the bounded projection");
+            node.itemRects.push_back(bounds);
         }
-        node.itemImages.push_back(resolved);
-        node.items.push_back(cells.empty() ? std::wstring() : cells.front());
-        node.rows.push_back(std::move(cells));
     }
+    // Read the current list after the item callbacks, which can populate it.
+    // Large icons use LVSIL_NORMAL; all other admitted views draw LVSIL_SMALL.
+    if (!CaptureReferencedImageList(reinterpret_cast<HIMAGELIST>(
+            SendMessageW(hwnd, LVM_GETIMAGELIST,
+                node.listViewMode == L"largeIcon" ? LVSIL_NORMAL : LVSIL_SMALL, 0)),
+            node.itemImages, nullptr, node.imageList, reason)) return false;
     const HWND editControl = reinterpret_cast<HWND>(
         SendMessageW(hwnd, LVM_GETEDITCONTROL, 0, 0));
     node.editingIndex = editControl && IsWindow(editControl)
@@ -1534,25 +1659,36 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
               hwnd, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_FOCUSED))
         : -1;
     if (node.editingIndex >= 0 &&
-        static_cast<size_t>(node.editingIndex) >= node.rows.size())
+        static_cast<size_t>(node.editingIndex) >= ListViewItemCount(node))
         return Reject(reason, L"ListView edit session names a row outside its items");
 
-    if (!ReadListViewSelection(hwnd, node.rows.size(), node.selectedIndices, reason)) {
+    if (!ReadListViewSelection(hwnd, ListViewItemCount(node), node.selectedIndices, reason)) {
         return false;
     }
     if (!ReadListViewChecks(
-            hwnd, node.rows.size(), node.checkBoxes, node.checkedIndices, reason)) {
+            hwnd, ListViewItemCount(node), node.checkBoxes, node.checkedIndices, reason)) {
         return false;
     }
     node.focusedIndex = static_cast<int>(SendMessageW(
         hwnd, LVM_GETNEXTITEM, static_cast<WPARAM>(-1), LVNI_FOCUSED));
     if (node.focusedIndex < -1 ||
         (node.focusedIndex >= 0 &&
-            static_cast<size_t>(node.focusedIndex) >= node.rows.size())) {
+            static_cast<size_t>(node.focusedIndex) >= ListViewItemCount(node))) {
         return Reject(reason, L"ListView focused index is outside the item range");
     }
     node.multiSelect = (static_cast<DWORD>(node.style) & LVS_SINGLESEL) == 0;
     node.selectedIndex = node.selectedIndices.empty() ? -1 : node.selectedIndices.front();
+    node.itemActivationSupported = stableIds &&
+        ListViewItemsHaveNativeDefaultActions(hwnd, node);
+    std::wstring finalMode;
+    if (SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0) != count ||
+        !ReadListViewMode(hwnd, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)),
+            finalMode, reason) || finalMode != node.listViewMode)
+        return Reject(reason, L"ListView item count or mode changed during capture");
+    for (size_t index = 0; index < node.itemNativeIds.size(); ++index) {
+        if (ResolveListViewItemByNativeId(hwnd, node.itemNativeIds[index]) != static_cast<int>(index))
+            return Reject(reason, L"ListView item identity changed during capture");
+    }
     return true;
 }
 
@@ -1833,6 +1969,40 @@ std::wstring ToolbarAccessibleName(HWND toolbar, int childIndex) noexcept {
     return AccessibleChildName(toolbar, childIndex);
 }
 
+bool DescribeToolbarButtonStyle(
+    BYTE style, ToolbarItemSnapshot& item, std::wstring& reason) {
+    if ((style & BTNS_SEP) != 0) {
+        if (style != BTNS_SEP)
+            return Reject(reason, L"ToolbarWindow32 separator has unsupported style semantics");
+        item.kind = ToolbarItemKind::Separator;
+        return true;
+    }
+    const bool toggle = (style & BTNS_CHECK) != 0;
+    const bool grouped = (style & BTNS_GROUP) != 0;
+    if (grouped && !toggle)
+        return Reject(reason,
+            L"ToolbarWindow32 BTNS_GROUP without BTNS_CHECK has no supported radio semantics");
+    constexpr BYTE acceptedButtonStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT | BTNS_CHECK |
+        BTNS_GROUP | BTNS_DROPDOWN | BTNS_WHOLEDROPDOWN;
+    if ((style & ~acceptedButtonStyle) != 0) {
+        wchar_t evidence[152]{};
+        swprintf_s(evidence,
+            L"ToolbarWindow32 custom button style 0x%02X is not supported",
+            static_cast<unsigned>(style));
+        return Reject(reason, evidence);
+    }
+    item.dropDown = (style & BTNS_DROPDOWN) != 0;
+    item.wholeDropDown = item.dropDown && (style & BTNS_WHOLEDROPDOWN) != 0;
+    if (!item.dropDown && (style & BTNS_WHOLEDROPDOWN) != 0)
+        return Reject(reason,
+            L"ToolbarWindow32 whole-dropdown button has no BTNS_DROPDOWN arrow");
+    if (toggle && item.dropDown)
+        return Reject(reason, L"ToolbarWindow32 button combines a latch with a dropdown arrow");
+    item.kind = grouped ? ToolbarItemKind::RadioButton
+        : toggle ? ToolbarItemKind::ToggleButton : ToolbarItemKind::PushButton;
+    return true;
+}
+
 bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const LRESULT rawCount = SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0);
     if (rawCount <= 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxToolbarItems))
@@ -1868,10 +2038,16 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     LONG bandBottom = 0;
     LONG previousRight = client.left;
     size_t totalText = 0;
+    int radioGroup = 0;
+    bool inRadioGroup = false;
+    bool groupHasCheckedItem = false;
+    std::vector<TBBUTTON> capturedButtons;
+    capturedButtons.reserve(static_cast<size_t>(rawCount));
     for (int index = 0; index < rawCount; ++index) {
         TBBUTTON button{};
         if (!SendMessageW(hwnd, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&button)))
             return Reject(reason, L"ToolbarWindow32 TB_GETBUTTON failed");
+        capturedButtons.push_back(button);
         // dwData is application-private storage that the control never interprets: the
         // projection posts the same WM_COMMAND a real click produces and the application
         // looks up its own data exactly as it always does.  Owner-draw semantics are
@@ -1899,40 +2075,30 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         item.enabled = (button.fsState & TBSTATE_ENABLED) != 0;
         item.hidden = (button.fsState & TBSTATE_HIDDEN) != 0;
         item.checked = (button.fsState & TBSTATE_CHECKED) != 0;
-        const BYTE type = button.fsStyle & (BTNS_SEP | BTNS_CHECK | BTNS_GROUP | BTNS_DROPDOWN);
-        if (type == BTNS_SEP) {
-            if ((button.fsStyle & ~BTNS_SEP) != 0)
-                return Reject(reason, L"ToolbarWindow32 separator has unsupported style semantics");
-            item.kind = ToolbarItemKind::Separator;
+        if (!DescribeToolbarButtonStyle(button.fsStyle, item, reason)) return false;
+        if (item.kind == ToolbarItemKind::Separator) {
+            inRadioGroup = false;
         } else {
             // A check-style button owns its latched state, and an application that
             // manages the latch itself sets TBSTATE_CHECKED on an ordinary button.  Both
             // are projected with the state the control currently reports; the projection
             // posts the same WM_COMMAND and reads back whatever the control settled on,
             // so neither the control nor the application loses ownership of it.
-            const bool toggle = (button.fsStyle & BTNS_CHECK) != 0;
-            constexpr BYTE acceptedButtonStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT | BTNS_CHECK |
-                BTNS_DROPDOWN | BTNS_WHOLEDROPDOWN;
-            if ((type & ~(BTNS_CHECK | BTNS_DROPDOWN)) != BTNS_BUTTON ||
-                (button.fsStyle & ~acceptedButtonStyle) != 0) {
-                wchar_t evidence[152]{};
-                swprintf_s(evidence,
-                    L"ToolbarWindow32 group or custom button style 0x%02X is not supported",
-                    static_cast<unsigned>(button.fsStyle));
-                return Reject(reason, evidence);
+            const bool grouped = item.kind == ToolbarItemKind::RadioButton;
+            if (grouped) {
+                // Native groups are consecutive GROUP-style buttons, even when
+                // a member is hidden. Any other button or separator ends a run.
+                if (!inRadioGroup) {
+                    ++radioGroup;
+                    groupHasCheckedItem = false;
+                }
+                item.radioGroup = radioGroup;
+                if (item.checked && groupHasCheckedItem)
+                    return Reject(reason,
+                        L"ToolbarWindow32 CHECKGROUP has multiple checked native members");
+                groupHasCheckedItem = groupHasCheckedItem || item.checked;
             }
-            item.dropDown = (button.fsStyle & BTNS_DROPDOWN) != 0;
-            item.wholeDropDown = item.dropDown &&
-                (button.fsStyle & BTNS_WHOLEDROPDOWN) == BTNS_WHOLEDROPDOWN;
-            if (!item.dropDown && (button.fsStyle & BTNS_WHOLEDROPDOWN) != 0) {
-                return Reject(reason,
-                    L"ToolbarWindow32 whole-dropdown button has no BTNS_DROPDOWN arrow");
-            }
-            if (toggle && item.dropDown) {
-                return Reject(reason,
-                    L"ToolbarWindow32 button combines a latch with a dropdown arrow");
-            }
-            item.kind = toggle ? ToolbarItemKind::ToggleButton : ToolbarItemKind::PushButton;
+            inRadioGroup = grouped;
             if (button.idCommand <= 0 || button.idCommand > 0xffff)
                 return Reject(reason, L"ToolbarWindow32 push button command ID is outside the 16-bit WM_COMMAND range");
             item.commandId = static_cast<uint32_t>(button.idCommand);
@@ -2105,6 +2271,19 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             }
         }
     }
+    // Accessible-name and paint callbacks can reenter application code. Publish
+    // group membership and checked state only if the native buttons still agree.
+    if (SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0) != rawCount)
+        return Reject(reason, L"ToolbarWindow32 button count changed during capture");
+    constexpr BYTE stableStates = TBSTATE_ENABLED | TBSTATE_HIDDEN | TBSTATE_CHECKED;
+    for (int index = 0; index < rawCount; ++index) {
+        TBBUTTON current{};
+        const auto& captured = capturedButtons[static_cast<size_t>(index)];
+        if (!SendMessageW(hwnd, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&current)) ||
+            current.idCommand != captured.idCommand || current.fsStyle != captured.fsStyle ||
+            (current.fsState & stableStates) != (captured.fsState & stableStates))
+            return Reject(reason, L"ToolbarWindow32 button identity or state changed during capture");
+    }
     return true;
 }
 
@@ -2182,9 +2361,6 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.itemHasChildren.reserve(handles.size());
     node.itemImages.reserve(handles.size());
     node.itemSelectedImages.reserve(handles.size());
-    if (!CaptureImageList(reinterpret_cast<HIMAGELIST>(
-            SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_NORMAL, 0)),
-            node.imageList, reason)) return false;
     node.editableLabels = (static_cast<DWORD>(node.style) & TVS_EDITLABELS) != 0;
     const HWND editControl = reinterpret_cast<HWND>(
         SendMessageW(hwnd, TVM_GETEDITCONTROL, 0, 0));
@@ -2223,23 +2399,26 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         if (totalText > kMaxStructuredTextChars - length)
             return Reject(reason, L"TreeView labels exceed the aggregate text cap");
         totalText += length;
-        int image = -1;
-        int selectedImage = -1;
-        if (!ResolveItemImage(item.iImage, node.imageList.size(), image, reason) ||
-            !ResolveItemImage(item.iSelectedImage, node.imageList.size(),
-                selectedImage, reason)) return false;
         node.items.emplace_back(buffer.data(), length);
         node.itemDepths.push_back(handles[index].depth);
         node.itemExpanded.push_back((item.state & TVIS_EXPANDED) != 0);
         node.itemHasChildren.push_back(item.cChildren > 0 ||
             TreeViewRelative(hwnd, TVGN_CHILD, handles[index].item) != nullptr);
-        node.itemImages.push_back(image);
-        node.itemSelectedImages.push_back(selectedImage);
+        // TreeView stores the no-image sentinel in an unsigned 16-bit slot on
+        // current comctl32 builds. TVM_GETITEM may therefore return 65534 for
+        // I_IMAGENONE; it is still an absent icon, not a native list reference.
+        const auto imageIndex = [](int value) {
+            return value == static_cast<unsigned short>(I_IMAGENONE) ? I_IMAGENONE : value;
+        };
+        node.itemImages.push_back(imageIndex(item.iImage));
+        node.itemSelectedImages.push_back(imageIndex(item.iSelectedImage));
         if (handles[index].item == selected) node.selectedIndex = static_cast<int>(index);
         if (editing && handles[index].item == editing)
             node.editingIndex = static_cast<int>(index);
     }
-    return true;
+    return CaptureReferencedImageList(reinterpret_cast<HIMAGELIST>(
+        SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_NORMAL, 0)),
+        node.itemImages, &node.itemSelectedImages, node.imageList, reason);
 }
 
 bool CaptureTrackbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
@@ -2293,6 +2472,16 @@ bool CaptureMdiChildState(HWND hwnd, ControlNode& node, std::wstring& reason) {
 
 using CaptureFn = bool (*)(HWND, ControlNode&, std::wstring&);
 
+bool CaptureStaticDecorationState(HWND, ControlNode& node, std::wstring& reason) {
+    if (node.tabStop || node.tabIndex != -1 || (node.dialogCode & ~DLGC_STATIC) != 0)
+        return Reject(reason, L"Static decoration reports interactive keyboard semantics");
+    // These built-in draw styles never render their window text or publish a
+    // label. Retain the native styles for their frame/fill and edge appearance.
+    node.text.clear();
+    node.automationName.clear();
+    return true;
+}
+
 // The explicit sentinel prevents table sizing from silently becoming stale when
 // another kind is appended before it.
 constexpr size_t kControlKindCount = static_cast<size_t>(ControlKind::Count);
@@ -2324,6 +2513,7 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
     at(ControlKind::MdiChild) = &CaptureMdiChildState;
     at(ControlKind::PaneContainer) = &CapturePaneContainerState;
     at(ControlKind::AccessibleIsland) = &CaptureAccessibleIslandState;
+    at(ControlKind::StaticDecoration) = &CaptureStaticDecorationState;
     // StaticText, Separator, GroupBox, DialogContainer, and MdiClient are fully
     // described by the common facets, so they need no reader of their own.
     return table;
@@ -2409,6 +2599,16 @@ bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
     reason.append(L" (");
     reason.append(containerReason);
     reason.append(L")");
+    wchar_t diagnostics[2]{};
+    if (GetEnvironmentVariableW(L"FLUENTSHELL_DIAG_ACCESSIBILITY", diagnostics, 2) == 1 &&
+        diagnostics[0] == L'1') {
+        reason.append(L" MSAA:");
+        reason.append(DescribeAccessibleIsland(hwnd));
+        if (FluentShell::EqualsIgnoreCase(className, L"Internet Explorer_Server")) {
+            reason.append(L" HTML:");
+            reason.append(DescribeMmcHtmlDocument(hwnd));
+        }
+    }
     return false;
 }
 
@@ -2505,9 +2705,121 @@ bool SetPaneSplit(HWND container, int index, int position) noexcept {
 // bitmap chrome items the MDI menu bar skips.  The evidence is deliberately
 // narrow: a leaf window in the frame band, no text, no bigger than three caption
 // buttons, and a maximized active MDI child to belong to.
+bool ApplyToolbarCheckState(
+    HWND toolbar, const ControlNode& node, uint32_t commandId, std::wstring& reason) {
+    if (!toolbar || !IsWindow(toolbar) || node.kind != ControlKind::Toolbar ||
+        !node.enabled || commandId == 0 || commandId > 0xffff ||
+        node.toolbarItems.empty() || node.toolbarItems.size() > Ipc::kMaxToolbarItems)
+        return Reject(reason, L"Toolbar command has no bounded native button collection");
+    wchar_t className[kMaxClassNameChars]{};
+    if (ClassNameOf(toolbar, className) != TOOLBARCLASSNAMEW)
+        return Reject(reason, L"Toolbar command target is no longer a native toolbar");
+    const auto count = static_cast<int>(node.toolbarItems.size());
+    if (SendMessageW(toolbar, TB_BUTTONCOUNT, 0, 0) != count)
+        return Reject(reason, L"Toolbar command button count changed");
+    const auto targetIndex = static_cast<int>(
+        SendMessageW(toolbar, TB_COMMANDTOINDEX, commandId, 0));
+    if (targetIndex < 0 || targetIndex >= count)
+        return Reject(reason, L"Toolbar command ID no longer resolves to a native button");
+
+    std::vector<TBBUTTON> buttons(static_cast<size_t>(count));
+    std::vector<bool> requestedChecks(static_cast<size_t>(count), false);
+    int radioGroup = 0;
+    bool inRadioGroup = false;
+    bool groupHasCheckedItem = false;
+    constexpr BYTE stableStates = TBSTATE_ENABLED | TBSTATE_HIDDEN | TBSTATE_CHECKED;
+    for (int index = 0; index < count; ++index) {
+        auto& button = buttons[static_cast<size_t>(index)];
+        if (!SendMessageW(toolbar, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&button)))
+            return Reject(reason, L"Toolbar command button read failed");
+        ToolbarItemSnapshot live;
+        if (!DescribeToolbarButtonStyle(button.fsStyle, live, reason)) return false;
+        const bool grouped = live.kind == ToolbarItemKind::RadioButton;
+        if (grouped) {
+            if (!inRadioGroup) {
+                ++radioGroup;
+                groupHasCheckedItem = false;
+            }
+            live.radioGroup = radioGroup;
+        }
+        inRadioGroup = grouped;
+        live.enabled = (button.fsState & TBSTATE_ENABLED) != 0;
+        live.hidden = (button.fsState & TBSTATE_HIDDEN) != 0;
+        live.checked = (button.fsState & TBSTATE_CHECKED) != 0;
+        if (grouped && live.checked && groupHasCheckedItem)
+            return Reject(reason, L"Toolbar command CHECKGROUP has multiple checked members");
+        if (grouped) groupHasCheckedItem = groupHasCheckedItem || live.checked;
+        const auto& expected = node.toolbarItems[static_cast<size_t>(index)];
+        if (live.kind != expected.kind || live.radioGroup != expected.radioGroup ||
+            live.dropDown != expected.dropDown || live.wholeDropDown != expected.wholeDropDown ||
+            live.enabled != expected.enabled || live.hidden != expected.hidden ||
+            live.checked != expected.checked ||
+            (live.kind != ToolbarItemKind::Separator &&
+                (button.idCommand <= 0 || button.idCommand > 0xffff ||
+                 static_cast<uint32_t>(button.idCommand) != expected.commandId ||
+                 SendMessageW(toolbar, TB_COMMANDTOINDEX, button.idCommand, 0) != index)))
+            return Reject(reason, L"Toolbar command identity, group, or state changed");
+        requestedChecks[static_cast<size_t>(index)] = live.checked;
+    }
+    const auto& target = node.toolbarItems[static_cast<size_t>(targetIndex)];
+    if (target.commandId != commandId || target.kind == ToolbarItemKind::Separator ||
+        !target.enabled || target.hidden)
+        return Reject(reason, L"Toolbar command names an unavailable button");
+    if (target.kind == ToolbarItemKind::RadioButton) {
+        for (int index = 0; index < count; ++index) {
+            if (node.toolbarItems[static_cast<size_t>(index)].radioGroup == target.radioGroup)
+                requestedChecks[static_cast<size_t>(index)] = index == targetIndex;
+        }
+    } else if (target.kind == ToolbarItemKind::ToggleButton) {
+        requestedChecks[static_cast<size_t>(targetIndex)] = !target.checked;
+    } else {
+        return true;
+    }
+
+    // TB_CHECKBUTTON documents one button's state, not automatic peer clearing.
+    // Clear only checked peers from this validated native group, then select the
+    // target. No WM_COMMAND is delivered until every requested bit is verified.
+    for (int index = 0; index < count; ++index) {
+        if (index == targetIndex || requestedChecks[static_cast<size_t>(index)] ||
+            (buttons[static_cast<size_t>(index)].fsState & TBSTATE_CHECKED) == 0) continue;
+        if (!SendMessageW(toolbar, TB_CHECKBUTTON,
+                node.toolbarItems[static_cast<size_t>(index)].commandId, MAKELONG(FALSE, 0)))
+            return Reject(reason, L"Toolbar native radio peer could not be unchecked");
+    }
+    if (requestedChecks[static_cast<size_t>(targetIndex)] != target.checked &&
+        !SendMessageW(toolbar, TB_CHECKBUTTON, commandId,
+            MAKELONG(requestedChecks[static_cast<size_t>(targetIndex)] ? TRUE : FALSE, 0)))
+        return Reject(reason, L"Toolbar native button check state could not be applied");
+    if (SendMessageW(toolbar, TB_BUTTONCOUNT, 0, 0) != count)
+        return Reject(reason, L"Toolbar button count changed while applying check state");
+    for (int index = 0; index < count; ++index) {
+        TBBUTTON current{};
+        const auto& original = buttons[static_cast<size_t>(index)];
+        const BYTE expectedState = static_cast<BYTE>((original.fsState & ~TBSTATE_CHECKED) |
+            (requestedChecks[static_cast<size_t>(index)] ? TBSTATE_CHECKED : 0));
+        if (!SendMessageW(toolbar, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&current)) ||
+            current.idCommand != original.idCommand || current.fsStyle != original.fsStyle ||
+            (current.fsState & stableStates) != (expectedState & stableStates))
+            return Reject(reason, L"Toolbar native check-state readback disagrees with its command");
+    }
+    return true;
+}
+
+int ResolveListViewItemByNativeId(HWND listView, uint32_t nativeId) noexcept {
+    if (!listView || nativeId == std::numeric_limits<uint32_t>::max()) return -1;
+    const auto index = static_cast<int>(SendMessageW(listView, LVM_MAPIDTOINDEX, nativeId, 0));
+    if (index < 0 || static_cast<size_t>(index) >= Ipc::kMaxListItems) return -1;
+    return static_cast<uint32_t>(SendMessageW(listView, LVM_MAPINDEXTOID,
+        static_cast<WPARAM>(index), 0)) == nativeId ? index : -1;
+}
+
 bool SetListViewColumnOrder(HWND listView, const std::vector<int>& order) noexcept {
     if (!listView || order.empty()) return false;
     try {
+        std::wstring mode;
+        std::wstring ignored;
+        if (!ReadListViewMode(listView, static_cast<DWORD>(GetWindowLongPtrW(listView, GWL_STYLE)),
+                mode, ignored) || mode != L"report") return false;
         const int columnCount = static_cast<int>(order.size());
         std::vector<bool> seen(order.size(), false);
         for (const int logical : order) {

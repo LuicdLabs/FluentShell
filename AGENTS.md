@@ -193,12 +193,14 @@ own HMENU menu bar uses, which the renderer already projects as a real XAML menu
 
 The read must not run inside a capture pass: the application opens its popup from its
 message loop, and driving a button while the native window owns the foreground costs the
-proxy the foreground slot the committed gate requires. It is a staged source-thread
-sequence (`SourceThreadAgent::ReadMenuBarToolbar`) that reconcile runs once per surface
-after the commit and cloak. Three things make it work: the wait is a bounded *pump* of the
-application's own queue rather than a delay (Bridge commands arriving during the pump are
-requeued, `DeferringCommands`); the cloaked native window is made active for the length of
-one popup because comctl32 will not enter menu mode otherwise, then the foreground is handed
+proxy the foreground slot the committed gate requires. A bounded source-thread command
+(`SourceThreadAgent::RefreshMenuBarToolbar`) refreshes the menu after commit and cloak.
+Capture observes toolbar identity and labels without opening menus; commands, selection
+changes, and toolbar replacement invalidate the cache, with debouncing and bounded retries.
+Discovery, popup capture, cleanup, and cache publication all run on the owning GUI thread.
+The wait is a bounded *pump* of the application's own queue rather than a delay (Bridge
+commands are requeued while `MenuBarReadInProgress`); the cloaked native window is made
+active for the read because comctl32 will not enter menu mode otherwise, then the foreground is handed
 straight back; and the popup is captured *inside* the hook, because the application frees
 the menu as soon as the tracking call answers. A leading document-icon button opens the
 window's system menu, whose `SC_*` commands the projected caption already offers, so that

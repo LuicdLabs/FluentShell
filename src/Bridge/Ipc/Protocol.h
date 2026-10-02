@@ -45,7 +45,13 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // A Bridge
 // Must not pair with a minor-0 renderer because that peer would treat the
 // pre-UIA provisional commit as interactive.
-inline constexpr uint16_t kProtocolMinor = 19;
+// Minor 20 adds a live island popup-menu snapshot and token-scoped popupCommand.
+// Minor 21 carries only referenced item icons, bounded by decoded bytes as well
+// as the maximum number of normal and selected-state item references.
+// It also adds inert staticDecoration nodes for built-in Static frames and fills.
+// Minor 22 adds MSAA page-tab islands with canonical selection state.
+// Minor 23 adds positioned ListView modes, revision-gated item activation, and toolbar radio groups.
+inline constexpr uint16_t kProtocolMinor = 23;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
@@ -69,6 +75,9 @@ inline constexpr size_t kMaxChromeRegionBytes = 1024 * 1024;
 // node, the way a Toolbar publishes its buttons.  A window with more elements than
 // this is not a bounded island the projection can describe.
 inline constexpr size_t kMaxIslandItems = 32;
+inline constexpr size_t kMaxMenuItems = 256;
+inline constexpr size_t kMaxMenuDepth = 8;
+inline constexpr size_t kMaxMenuItemPathChars = 64;
 // A container pane carries one entry per splitter between its child panes.  A
 // window with more than a handful of independently sized panes is not a frame the
 // projection can describe, so the cap is deliberately small.
@@ -76,11 +85,13 @@ inline constexpr size_t kMaxPaneSplits = 8;
 // Split positions are client coordinates, bounded by the same limit the protocol
 // already applies to window and control geometry.
 inline constexpr int kMaxCoordinate = 65535;
-// A control's own image list travels once per node and every item indexes into
-// it.  Both caps are deliberate: sixty-four icons at 64x64 is a megabyte of
-// pixels, which leaves the rest of the 4 MiB frame to the items themselves.
-inline constexpr size_t kMaxImageListImages = 64;
+// Only referenced native icons travel, shared by all items in the node. A tree
+// has at most two references per item. The decoded-byte budget retains the old
+// worst case of sixty-four 64x64 icons while admitting more small icons; the
+// complete serialized snapshot must still fit the 4 MiB frame.
+inline constexpr size_t kMaxImageListImages = kMaxListItems * 2;
 inline constexpr uint32_t kMaxImageListDimension = 64;
+inline constexpr size_t kMaxImageListBytes = 1024u * 1024u;
 inline constexpr uint32_t kMaxImageDimension = 96;
 inline constexpr size_t kMaxImageBytes =
     static_cast<size_t>(kMaxImageDimension) * kMaxImageDimension * 4;

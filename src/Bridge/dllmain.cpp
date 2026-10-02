@@ -2,6 +2,7 @@
 #include "../Common/ProcessPolicy.h"
 #include "Translation/DialogTranslator.h"
 #include "Translation/MenuBarCapture.h"
+#include "Translation/SourceThreadAgent.h"
 #include "Translation/RendererSession.h"
 
 #include "../../third_party/detours/src/detours.h"
@@ -149,8 +150,8 @@ HRESULT WINAPI HookTaskDialogIndirect(
 // A menu-bar toolbar opens its popup from the click itself, so the projection performs
 // that click through the control's own accessible default action and records the HMENU
 // here instead of letting the application's popup reach the screen.  Interception is
-// armed only around that one call, on that one thread: every other popup goes to the
-// real API untouched.
+// armed around the read. Late callbacks from a read owner remain suppressed while
+// that owner's native window is cloaked; restored/unrelated owners use the real API.
 BOOL WINAPI HookTrackPopupMenu(
     HMENU menu,
     UINT flags,
@@ -159,13 +160,14 @@ BOOL WINAPI HookTrackPopupMenu(
     int reserved,
     HWND owner,
     const RECT* rect) {
-    if (FluentShell::Bridge::Translation::PopupSuppressionActive()) {
-        FluentShell::Bridge::Translation::RecordInterceptedPopup(menu);
-        // Zero is what the real function answers when the user dismissed the menu
-        // without choosing anything, which is exactly what the application should
-        // believe happened.  Suppression is process-wide for the length of a menu-bar
-        // read, so a popup that arrives late still never reaches the screen.
-        return FALSE;
+    BOOL projectedResult = FALSE;
+    if (!FluentShell::Bridge::Translation::PopupSuppressionActive() &&
+        FluentShell::Bridge::Translation::TryTrackIslandPopup(menu, flags, owner, projectedResult))
+        return projectedResult;
+    if (FluentShell::Bridge::Translation::ShouldSuppressPopup(owner)) {
+        // Reads/late callbacks dismiss; an explicit projected selection is resolved
+        // against this live HMENU and preserves its owner and TPM_RETURNCMD contract.
+        return FluentShell::Bridge::Translation::RecordInterceptedPopup(menu, flags, owner);
     }
     if (!TrueTrackPopupMenu) return FALSE;
     return TrueTrackPopupMenu(menu, flags, x, y, reserved, owner, rect);
@@ -178,9 +180,12 @@ BOOL WINAPI HookTrackPopupMenuEx(
     int y,
     HWND owner,
     LPTPMPARAMS params) {
-    if (FluentShell::Bridge::Translation::PopupSuppressionActive()) {
-        FluentShell::Bridge::Translation::RecordInterceptedPopup(menu);
-        return FALSE;
+    BOOL projectedResult = FALSE;
+    if (!FluentShell::Bridge::Translation::PopupSuppressionActive() &&
+        FluentShell::Bridge::Translation::TryTrackIslandPopup(menu, flags, owner, projectedResult))
+        return projectedResult;
+    if (FluentShell::Bridge::Translation::ShouldSuppressPopup(owner)) {
+        return FluentShell::Bridge::Translation::RecordInterceptedPopup(menu, flags, owner);
     }
     if (!TrueTrackPopupMenuEx) return FALSE;
     return TrueTrackPopupMenuEx(menu, flags, x, y, owner, params);

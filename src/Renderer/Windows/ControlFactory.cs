@@ -32,6 +32,7 @@ internal sealed class ControlFactory
     private readonly Action<ControlNodeViewModel, string, object?> _action;
     private readonly Func<bool> _isApplyingCanonical;
     private readonly Func<bool> _isImeComposing;
+    private readonly PresentationLifetime _lifetime;
     private readonly IReadOnlyDictionary<string, string> _radioGroups;
     private readonly IReadOnlyDictionary<string, ControlNodeViewModel> _nodes;
 
@@ -40,11 +41,13 @@ internal sealed class ControlFactory
         IEnumerable<ControlNodeViewModel> nodes,
         Action<ControlNodeViewModel, string, object?> action,
         Func<bool> isApplyingCanonical,
-        Func<bool> isImeComposing)
+        Func<bool> isImeComposing,
+        PresentationLifetime lifetime)
     {
         _scale = 96.0 / dpi;
-        _action = action;
-        _isApplyingCanonical = isApplyingCanonical;
+        _lifetime = lifetime;
+        _action = (node, kind, value) => lifetime.Invoke(() => action(node, kind, value));
+        _isApplyingCanonical = () => !lifetime.IsActive || isApplyingCanonical();
         _isImeComposing = isImeComposing;
         var nodeArray = nodes.ToArray();
         _radioGroups = BuildRadioGroups(nodeArray);
@@ -57,6 +60,7 @@ internal sealed class ControlFactory
         {
             "static" => CreateStatic(viewModel),
             "staticIcon" => CreateStaticIcon(viewModel),
+            "staticDecoration" => CreateStaticDecoration(viewModel),
             "separator" => new Border { Height = 1, Background = new SolidColorBrush(Microsoft.UI.Colors.Gray) },
             "button" => CreateButton(viewModel),
             "checkBox" => CreateCheckBox(viewModel, false),
@@ -93,12 +97,12 @@ internal sealed class ControlFactory
         {
             Bind(element, Control.IsEnabledProperty, nameof(viewModel.Enabled), BindingMode.OneWay);
         }
-        else
+        else if (viewModel.Kind != "staticDecoration")
         {
             Bind(element, UIElement.IsHitTestVisibleProperty, nameof(viewModel.Enabled), BindingMode.OneWay);
         }
         ApplyBounds(element, viewModel);
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Rect)) ApplyBounds(element, viewModel);
             if (args.PropertyName == nameof(viewModel.AutomationName) ||
@@ -106,13 +110,13 @@ internal sealed class ControlFactory
             {
                 ApplyAutomationAndAccessKey(element, viewModel);
             }
-        };
+        });
         if (viewModel.ParentNodeId is { } parentNodeId && _nodes.TryGetValue(parentNodeId, out var parent))
         {
-            parent.PropertyChanged += (_, args) =>
+            _lifetime.Subscribe(parent, (_, args) =>
             {
                 if (args.PropertyName == nameof(parent.Rect)) ApplyBounds(element, viewModel);
-            };
+            });
         }
         // Native child enumeration is front to back, so the first node of a sibling
         // group is the one in front.  That only carries meaning where siblings
@@ -123,6 +127,67 @@ internal sealed class ControlFactory
             ? -viewModel.ZIndex
             : viewModel.ZIndex);
         return element;
+    }
+
+    private FrameworkElement CreateStaticDecoration(ControlNodeViewModel viewModel)
+    {
+        var surface = new Grid { IsHitTestVisible = false, IsTabStop = false };
+        AutomationProperties.SetAccessibilityView(surface, AccessibilityView.Raw);
+        void ApplyPresentation()
+        {
+            var presentation = StaticDecorationPresentation.FromStyles(viewModel.Style, viewModel.ExStyle);
+            surface.Children.Clear();
+            void Add(Border border)
+            {
+                border.IsHitTestVisible = false;
+                border.IsTabStop = false;
+                AutomationProperties.SetAccessibilityView(border, AccessibilityView.Raw);
+                surface.Children.Add(border);
+            }
+            if (presentation.FillTone is { } fill)
+            {
+                Add(new Border
+                {
+                    Margin = new Thickness(presentation.FillInset * _scale),
+                    Background = StaticDecorationBrush(fill),
+                });
+            }
+            foreach (var stroke in presentation.Strokes)
+            {
+                var leading = (stroke.Edges & StaticDecorationEdges.TopLeft) != 0 ? _scale : 0;
+                var trailing = (stroke.Edges & StaticDecorationEdges.BottomRight) != 0 ? _scale : 0;
+                Add(new Border
+                {
+                    Margin = new Thickness(stroke.Inset * _scale),
+                    BorderThickness = new Thickness(leading, leading, trailing, trailing),
+                    BorderBrush = StaticDecorationBrush(stroke.Tone),
+                    Background = null,
+                });
+            }
+        }
+        ApplyPresentation();
+        surface.ActualThemeChanged += (_, _) => ApplyPresentation();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Style) or nameof(viewModel.ExStyle))
+                ApplyPresentation();
+        });
+        return surface;
+    }
+
+    private static Brush StaticDecorationBrush(StaticDecorationTone tone)
+    {
+        var (key, fallback) = tone switch
+        {
+            StaticDecorationTone.Dark => ("TextFillColorPrimaryBrush", Microsoft.UI.Colors.Black),
+            StaticDecorationTone.Gray => ("TextFillColorSecondaryBrush", Microsoft.UI.Colors.Gray),
+            StaticDecorationTone.Light => ("SolidBackgroundFillColorBaseBrush", Microsoft.UI.Colors.White),
+            StaticDecorationTone.Shadow => ("ControlStrongStrokeColorDefaultBrush", Microsoft.UI.Colors.Gray),
+            _ => ("ControlStrokeColorOnAccentSecondaryBrush", Microsoft.UI.Colors.White),
+        };
+        return Application.Current?.Resources is { } resources &&
+            resources.TryGetValue(key, out var value) && value is Brush brush
+                ? brush : new SolidColorBrush(fallback);
     }
 
     private static ContentControl CreateStatic(ControlNodeViewModel viewModel)
@@ -159,7 +224,7 @@ internal sealed class ControlFactory
     internal static bool StaticIconUsesSemanticWrapper(string presentationVariant) =>
         presentationVariant is "bitmapDisplay" or "monitorPalette";
 
-    private static FrameworkElement CreateStaticIcon(ControlNodeViewModel viewModel)
+    private FrameworkElement CreateStaticIcon(ControlNodeViewModel viewModel)
     {
         var wrapped = StaticIconUsesSemanticWrapper(viewModel.PresentationVariant);
         var image = new Image
@@ -177,10 +242,10 @@ internal sealed class ControlFactory
             image.Source = bitmap;
         }
         ApplyPixels();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.ImageData)) ApplyPixels();
-        };
+        });
         // The unwrapped variant projects this Image as the node element itself, so it
         // must stay in the UIA control view: the Bridge's committed gate enumerates
         // with the control-view condition and a Raw element is simply absent there.
@@ -245,7 +310,7 @@ internal sealed class ControlFactory
         };
     }
 
-    private static SemanticProgressBarControl CreateProgressBar(ControlNodeViewModel viewModel)
+    private SemanticProgressBarControl CreateProgressBar(ControlNodeViewModel viewModel)
     {
         var control = new SemanticProgressBarControl
             { IsIndeterminate = viewModel.Indeterminate };
@@ -264,13 +329,13 @@ internal sealed class ControlFactory
             control.Value = viewModel.Position;
         }
         ApplyNativeState();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Indeterminate))
                 control.IsIndeterminate = viewModel.Indeterminate;
             else if (args.PropertyName is nameof(viewModel.Minimum) or nameof(viewModel.Maximum) or nameof(viewModel.Position))
                 ApplyNativeState();
-        };
+        });
         return control;
     }
 
@@ -344,10 +409,10 @@ internal sealed class ControlFactory
         control.Checked += changed;
         control.Unchecked += changed;
         control.Indeterminate += changed;
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Checked)) control.IsChecked = ToNullableBool(viewModel.Checked);
-        };
+        });
         return control;
     }
 
@@ -368,10 +433,10 @@ internal sealed class ControlFactory
                 AllowsAction(viewModel, "setCheck"))
                 _action(viewModel, "setCheck", 1);
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Checked)) control.IsChecked = viewModel.Checked == 1;
-        };
+        });
         return control;
     }
 
@@ -393,10 +458,10 @@ internal sealed class ControlFactory
             image.Source = bitmap;
         }
         ApplyPixels();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.ImageData)) ApplyPixels();
-        };
+        });
         var control = new SemanticBitmapSwitchControl
         {
             Content = image,
@@ -414,11 +479,11 @@ internal sealed class ControlFactory
                 AllowsAction(viewModel, "setCheck"))
                 _action(viewModel, "setCheck", 1);
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Checked))
                 control.IsChecked = viewModel.Checked == 1;
-        };
+        });
         return control;
     }
 
@@ -434,20 +499,24 @@ internal sealed class ControlFactory
             IsReadOnly = viewModel.ReadOnly,
         };
         Bind(control, TextBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
+        // A retained Value peer can still change a detached control. Remove its
+        // two-way source link before that edit can reach the replacement tree.
+        _lifetime.OnDispose(() => control.ClearValue(TextBox.TextProperty));
         var timer = control.DispatcherQueue.CreateTimer();
         timer.Interval = TimeSpan.FromMilliseconds(300);
         timer.IsRepeating = false;
+        _lifetime.OnDispose(timer.Stop);
         string? pendingText = null;
         void CommitDraft()
         {
             timer.Stop();
+            if (_isApplyingCanonical() || !AllowsAction(viewModel, "setText") ||
+                control.Text == viewModel.Text || control.Text == pendingText) return;
             if (_isImeComposing())
             {
                 timer.Start();
                 return;
             }
-            if (_isApplyingCanonical() || !AllowsAction(viewModel, "setText") ||
-                control.Text == viewModel.Text || control.Text == pendingText) return;
             pendingText = control.Text;
             _action(viewModel, "setText", control.Text);
         }
@@ -476,12 +545,12 @@ internal sealed class ControlFactory
             control.Select(start, length);
         }
         control.Loaded += (_, _) => ApplySelection();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.Text)) pendingText = null;
             if (args.PropertyName is nameof(viewModel.SelectionStart) or nameof(viewModel.SelectionLength))
                 ApplySelection();
-        };
+        });
         return control;
     }
 
@@ -496,14 +565,15 @@ internal sealed class ControlFactory
         };
         control.PasswordChanged += (_, _) =>
         {
+            if (!_lifetime.IsActive) return;
             viewModel.DraftText = control.Password;
             if (!_isApplyingCanonical() && AllowsAction(viewModel, "setText") &&
                 control.Password != viewModel.Text) _action(viewModel, "setText", control.Password);
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.DraftText) && control.Password != viewModel.DraftText) control.Password = viewModel.DraftText;
-        };
+        });
         return control;
     }
 
@@ -519,9 +589,11 @@ internal sealed class ControlFactory
             Text = viewModel.DraftText,
         };
         Bind(control, ComboBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
+        _lifetime.OnDispose(() => control.ClearValue(ComboBox.TextProperty));
         var retryTimer = control.DispatcherQueue.CreateTimer();
         retryTimer.Interval = TimeSpan.FromMilliseconds(100);
         retryTimer.IsRepeating = false;
+        _lifetime.OnDispose(retryTimer.Stop);
         string? pendingText = null;
         void CommitDraft()
         {
@@ -555,19 +627,20 @@ internal sealed class ControlFactory
                 _action(viewModel, "select", control.SelectedIndex);
             }
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.SelectedIndex = viewModel.SelectedIndex;
             if (args.PropertyName == nameof(viewModel.Editable)) control.IsEditable = viewModel.Editable;
             if (args.PropertyName == nameof(viewModel.DraftText) && control.Text != viewModel.DraftText)
                 control.Text = viewModel.DraftText;
             if (args.PropertyName == nameof(viewModel.Text)) pendingText = null;
-        };
+        });
         return control;
     }
 
     internal static bool AllowsAction(ControlNodeViewModel viewModel, string action) =>
-        string.IsNullOrEmpty(viewModel.AdapterId) || viewModel.SupportedActions.Contains(action);
+        viewModel.Kind != "staticDecoration" &&
+        (string.IsNullOrEmpty(viewModel.AdapterId) || viewModel.SupportedActions.Contains(action));
 
     private ListBox CreateListBox(ControlNodeViewModel viewModel)
     {
@@ -587,10 +660,10 @@ internal sealed class ControlFactory
             if (!_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
                 control.SelectedIndex != viewModel.SelectedIndex) _action(viewModel, "select", control.SelectedIndex);
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.SelectedIndex = viewModel.SelectedIndex;
-        };
+        });
         return control;
     }
 
@@ -632,10 +705,10 @@ internal sealed class ControlFactory
             text.Blocks.Add(paragraph);
         }
         RebuildText();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Text) or nameof(viewModel.Items)) RebuildText();
-        };
+        });
         return control;
     }
 
@@ -652,9 +725,134 @@ internal sealed class ControlFactory
             SelectionMode = SelectionModeFor(viewModel.MultiSelect),
             HorizontalContentAlignment = HorizontalAlignment.Left,
         };
+        var reportPanel = control.ItemsPanel;
+        var positionedPanel = (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
+            "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><Canvas/></ItemsPanelTemplate>");
+        var contentBounds = new PixelRect();
+        var pendingScroll = false;
+        void ApplyItemLayout()
+        {
+            if (!_lifetime.IsActive || viewModel.ListViewMode == "report" || control.ItemsPanelRoot is not Canvas canvas) return;
+            var scroll = FindScrollViewer(control);
+            var x = -contentBounds.X * _scale;
+            var y = -contentBounds.Y * _scale;
+            // Include the viewport after translating a negative native origin,
+            // even when the item extent is smaller than the visible viewport.
+            var width = Math.Max(contentBounds.Width * _scale, (scroll?.ViewportWidth ?? 0) + x);
+            var height = Math.Max(contentBounds.Height * _scale, (scroll?.ViewportHeight ?? 0) + y);
+            if (canvas.Width != width) canvas.Width = width;
+            if (canvas.Height != height) canvas.Height = height;
+            if (pendingScroll && scroll is not null)
+            {
+                // ChangeView can run before new canvas dimensions reach the
+                // ScrollViewer. Wait for the requested offset, not its return flag.
+                if (scroll.ViewportWidth <= 0 || scroll.ViewportHeight <= 0) return;
+                if (Math.Abs(scroll.HorizontalOffset - x) < 0.5 &&
+                    Math.Abs(scroll.VerticalOffset - y) < 0.5)
+                    pendingScroll = false;
+                else scroll.ChangeView(x, y, null, true);
+            }
+        }
+        control.Loaded += (_, _) => ApplyItemLayout();
+        control.LayoutUpdated += (_, _) => ApplyItemLayout();
         var applyingSelection = false;
         var rowChecks = new List<CheckBox>();
         var rowContents = new List<ProjectedItemContent>();
+        var selectionAnchor = -1;
+        long itemPresentationGeneration = 0;
+
+        int FocusedItemIndex()
+        {
+            if (control.XamlRoot is null) return control.SelectedIndex;
+            var focused = FocusManager.GetFocusedElement(control.XamlRoot) as DependencyObject;
+            while (focused is not null && focused != control && focused is not ListViewItem)
+                focused = VisualTreeHelper.GetParent(focused);
+            return focused is ListViewItem item ? control.IndexFromContainer(item) : control.SelectedIndex;
+        }
+
+        void ActivateItem(int index)
+        {
+            if (_isApplyingCanonical() || !viewModel.ItemActivationSupported ||
+                index < 0 || index >= control.Items.Count ||
+                rowContents.Any(content => content.IsEditing) || !AllowsAction(viewModel, "activateItem")) return;
+            _action(viewModel, "activateItem", index);
+        }
+
+        ActivatableListViewItem WrapItem(FrameworkElement content, int index, string name)
+        {
+            var generation = itemPresentationGeneration;
+            void InvokeCurrentItem()
+            {
+                if (generation == itemPresentationGeneration) ActivateItem(index);
+            }
+            var container = new ActivatableListViewItem
+            {
+                Content = content,
+                Activate = viewModel.ItemActivationSupported && AllowsAction(viewModel, "activateItem")
+                    ? InvokeCurrentItem : null,
+            };
+            AutomationProperties.SetName(container, name);
+            container.DoubleTapped += (_, args) =>
+            {
+                if (IsListItemEditor(args.OriginalSource as DependencyObject, container)) return;
+                InvokeCurrentItem();
+                args.Handled = viewModel.ItemActivationSupported && AllowsAction(viewModel, "activateItem");
+            };
+            return container;
+        }
+
+        FrameworkElement BuildIconItem(int index, ImageSource? icon)
+        {
+            var generation = itemPresentationGeneration;
+            var label = viewModel.Items[index];
+            var content = new ProjectedItemContent(requested =>
+            {
+                if (generation != itemPresentationGeneration || _isApplyingCanonical() || !viewModel.EditableLabels || requested.Length == 0 ||
+                    requested == label || !AllowsAction(viewModel, "setItemText")) return;
+                _action(viewModel, "setItemText", new ItemTextActionValue { Index = index, Text = requested });
+            }, largeIcon: viewModel.ListViewMode == "largeIcon") { Editable = viewModel.EditableLabels };
+            content.Apply(label, icon);
+            rowContents.Add(content);
+            FrameworkElement visual = content;
+            if (viewModel.CheckBoxes)
+            {
+                var check = new CheckBox
+                {
+                    IsChecked = viewModel.CheckedIndices.Contains(index), IsTabStop = false,
+                    MinWidth = 0, MinHeight = 0, Padding = new Thickness(0),
+                    VerticalAlignment = VerticalAlignment.Top,
+                };
+                AutomationProperties.SetName(check, label);
+                RoutedEventHandler changed = (_, _) =>
+                {
+                    if (generation != itemPresentationGeneration || applyingSelection || _isApplyingCanonical() || !AllowsAction(viewModel, "setItemCheck")) return;
+                    var requested = check.IsChecked == true;
+                    if (viewModel.CheckedIndices.Contains(index) != requested)
+                        _action(viewModel, "setItemCheck", new ListViewCheckActionValue { Index = index, Checked = requested });
+                };
+                check.Checked += changed;
+                check.Unchecked += changed;
+                rowChecks.Add(check);
+                var grid = new Grid();
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                grid.Children.Add(check);
+                Grid.SetColumn(content, 1);
+                grid.Children.Add(content);
+                visual = grid;
+            }
+            var container = WrapItem(visual, index, label);
+            var rect = viewModel.ItemRects[index];
+            container.MinWidth = container.MinHeight = 0;
+            container.Width = rect.Width * _scale;
+            container.Height = rect.Height * _scale;
+            container.Padding = container.Margin = new Thickness(0);
+            container.HorizontalContentAlignment = HorizontalAlignment.Stretch;
+            container.VerticalContentAlignment = VerticalAlignment.Stretch;
+            Canvas.SetLeft(container, (rect.X - contentBounds.X) * _scale);
+            Canvas.SetTop(container, (rect.Y - contentBounds.Y) * _scale);
+            return container;
+        }
 
         // Columns travel in the application's logical order and the header shows them
         // in its display order, so the projection permutes for presentation only.
@@ -694,6 +892,7 @@ internal sealed class ControlFactory
         Grid BuildCells(IReadOnlyList<string> cells, bool header, int rowIndex = -1,
             ImageSource? icon = null)
         {
+            var generation = itemPresentationGeneration;
             var grid = new Grid { HorizontalAlignment = HorizontalAlignment.Left };
             var display = DisplayOrder();
             for (var position = 0; position < display.Count; position++)
@@ -722,7 +921,7 @@ internal sealed class ControlFactory
                 {
                     var item = new ProjectedItemContent(requested =>
                     {
-                        if (_isApplyingCanonical() || !viewModel.EditableLabels ||
+                        if (generation != itemPresentationGeneration || _isApplyingCanonical() || !viewModel.EditableLabels ||
                             rowIndex < 0 || rowIndex >= viewModel.Rows.Count ||
                             requested.Length == 0 || requested == cells[0] ||
                             !AllowsAction(viewModel, "setItemText")) return;
@@ -754,7 +953,7 @@ internal sealed class ControlFactory
                     AutomationProperties.SetName(checkBox, string.Join(" ", cells));
                     RoutedEventHandler changed = (_, _) =>
                     {
-                        if (applyingSelection || _isApplyingCanonical()) return;
+                        if (generation != itemPresentationGeneration || applyingSelection || _isApplyingCanonical()) return;
                         var requested = checkBox.IsChecked == true;
                         if (viewModel.CheckedIndices.Contains(rowIndex) != requested &&
                             AllowsAction(viewModel, "setItemCheck"))
@@ -851,19 +1050,36 @@ internal sealed class ControlFactory
         void RebuildRows()
         {
             if (!HasRenderableListViewShape(viewModel)) return;
+            ++itemPresentationGeneration;
+            // Indexes can denote different native items after a rebuild. Start
+            // the next Shift gesture from its current focus instead of keeping
+            // an anchor that may now refer to a removed item.
+            selectionAnchor = -1;
             applyingSelection = true;
             try
             {
+                var report = viewModel.ListViewMode == "report";
+                control.ItemsPanel = report ? reportPanel : positionedPanel;
+                ScrollViewer.SetHorizontalScrollMode(control, ScrollMode.Enabled);
+                ScrollViewer.SetHorizontalScrollBarVisibility(control, ScrollBarVisibility.Auto);
                 control.Header = ShouldRenderListViewHeader(viewModel)
                     ? BuildCells(viewModel.Columns, header: true)
                     : null;
                 control.Items.Clear();
                 rowChecks.Clear();
                 rowContents.Clear();
-                var icons = ItemIcons(viewModel, viewModel.Rows.Count);
-                for (var index = 0; index < viewModel.Rows.Count; ++index)
-                    control.Items.Add(BuildCells(
-                        viewModel.Rows[index], header: false, index, icons[index]));
+                var count = report ? viewModel.Rows.Count : viewModel.Items.Count;
+                var icons = ItemIcons(viewModel, count);
+                // A Canvas needs the extent occupied by its items only. The
+                // ScrollViewer supplies its own viewport minimum after chrome.
+                if (!report) contentBounds = ListViewPresentation.ContentBounds(viewModel.ItemRects, new PixelRect());
+                for (var index = 0; index < count; ++index)
+                    control.Items.Add(report
+                        ? WrapItem(BuildCells(viewModel.Rows[index], header: false, index, icons[index]),
+                            index, string.Join(" ", viewModel.Rows[index]))
+                        : BuildIconItem(index, icons[index]));
+                pendingScroll = !report;
+                ApplyItemLayout();
             }
             finally
             {
@@ -883,9 +1099,11 @@ internal sealed class ControlFactory
                 AllowsAction(viewModel, "setSelection"))
                 _action(viewModel, "setSelection", selection);
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName is nameof(viewModel.Columns) or nameof(viewModel.ColumnWidths) or
+            if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects) or
+                nameof(viewModel.ListViewMode) or nameof(viewModel.ItemActivationSupported) or
+                nameof(viewModel.Columns) or nameof(viewModel.ColumnWidths) or
                 nameof(viewModel.ColumnOrder) or
                 nameof(viewModel.Rows) or nameof(viewModel.ColumnHeadersVisible) or
                 nameof(viewModel.CheckBoxes) or nameof(viewModel.ItemImages) or
@@ -900,22 +1118,68 @@ internal sealed class ControlFactory
                 ApplyCanonicalSelection();
             else if (args.PropertyName == nameof(viewModel.CheckedIndices))
                 ApplyCanonicalChecks();
-        };
+        });
         control.KeyDown += (_, args) =>
         {
+            if (!_lifetime.IsActive) return;
+            if (viewModel.ListViewMode != "report" && !args.Handled &&
+                args.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down or VirtualKey.Home or VirtualKey.End &&
+                !IsListItemEditor(args.OriginalSource as DependencyObject, control))
+            {
+                var current = FocusedItemIndex();
+                var next = ListViewPresentation.Navigate(viewModel.ItemRects, current, args.Key);
+                if (next >= 0 && control.ContainerFromIndex(next) is ListViewItem destination)
+                {
+                    var shift = (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift) &
+                        global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+                    var ctrl = (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Control) &
+                        global::Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+                    if (shift && viewModel.MultiSelect)
+                    {
+                        if (selectionAnchor < 0) selectionAnchor = Math.Max(0, current);
+                        applyingSelection = true;
+                        try
+                        {
+                            control.SelectedItems.Clear();
+                            foreach (var index in ListViewPresentation.SelectionRange(control.Items.Count, selectionAnchor, next))
+                                control.SelectedItems.Add(control.Items[index]);
+                        }
+                        finally { applyingSelection = false; }
+                        if (!_isApplyingCanonical() && AllowsAction(viewModel, "setSelection"))
+                            _action(viewModel, "setSelection", CanonicalSelectionIndices(control.SelectedItems.Cast<object>().Select(control.Items.IndexOf)));
+                    }
+                    else if (!ctrl)
+                    {
+                        selectionAnchor = next;
+                        control.SelectedIndex = next;
+                    }
+                    destination.Focus(FocusState.Keyboard);
+                    destination.StartBringIntoView();
+                }
+                args.Handled = true;
+                return;
+            }
+            if (args.Key == VirtualKey.Enter && !args.Handled &&
+                !IsListItemEditor(args.OriginalSource as DependencyObject, control))
+            {
+                var index = FocusedItemIndex();
+                ActivateItem(index);
+                args.Handled = viewModel.ItemActivationSupported && index >= 0 && AllowsAction(viewModel, "activateItem");
+                return;
+            }
             // F2 is the native in-place rename gesture; Space toggles the checkbox
             // column exactly as the native list does.
+            var focusedIndex = FocusedItemIndex();
             if (args.Key == VirtualKey.F2 && viewModel.EditableLabels &&
-                control.SelectedIndex >= 0 && control.SelectedIndex < rowContents.Count)
+                focusedIndex >= 0 && focusedIndex < rowContents.Count)
             {
                 args.Handled = true;
-                rowContents[control.SelectedIndex].BeginEdit();
+                rowContents[focusedIndex].BeginEdit();
                 return;
             }
             if (!viewModel.CheckBoxes || args.Key != VirtualKey.Space ||
-                control.SelectedIndex is < 0 || control.SelectedIndex >= rowChecks.Count) return;
-            rowChecks[control.SelectedIndex].IsChecked =
-                rowChecks[control.SelectedIndex].IsChecked != true;
+                focusedIndex is < 0 || focusedIndex >= rowChecks.Count) return;
+            rowChecks[focusedIndex].IsChecked = rowChecks[focusedIndex].IsChecked != true;
             args.Handled = true;
         };
         RebuildRows();
@@ -974,18 +1238,21 @@ internal sealed class ControlFactory
             $"statusBar layout requested={viewModel.Rect.Width}x{viewModel.Rect.Height} " +
             $"scale={_scale:F3} owner={control.ActualWidth:F1}x{control.ActualHeight:F1} " +
             $"grid={grid.ActualWidth:F1}x{grid.ActualHeight:F1} parts={viewModel.Items.Count}");
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ColumnWidths)) RebuildParts();
-        };
+        });
         return control;
     }
 
     private SemanticToolbarControl CreateToolbar(ControlNodeViewModel viewModel)
     {
         var control = new SemanticToolbarControl();
+        long presentationGeneration = 0;
         void Rebuild()
         {
+            var generation = ++presentationGeneration;
+            var radioGroups = new Dictionary<int, List<ToolbarRadioButton>>();
             control.ClearItems();
             foreach (var item in viewModel.ToolbarItems)
             {
@@ -1041,10 +1308,34 @@ internal sealed class ControlFactory
                     var commandId = item.CommandId;
                     void Emit()
                     {
-                        if (!_isApplyingCanonical() && AllowsAction(viewModel, "toolbarCommand"))
+                        if (generation == presentationGeneration && !_isApplyingCanonical() && AllowsAction(viewModel, "toolbarCommand"))
                             _action(viewModel, "toolbarCommand", commandId);
                     }
-                    if (item.Kind == "toggleButton" || item.Checked == true)
+                    if (item.Kind == "radioButton")
+                    {
+                        var groupId = item.RadioGroup!.Value;
+                        if (!radioGroups.TryGetValue(groupId, out var group))
+                            radioGroups[groupId] = group = [];
+                        ToolbarRadioButton? radio = null;
+                        radio = new ToolbarRadioButton
+                        {
+                            Content = content, MinWidth = 0, MinHeight = 0, Padding = new Thickness(0),
+                            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                            VerticalContentAlignment = VerticalAlignment.Stretch,
+                            IsEnabled = item.Enabled, IsTabStop = item.Enabled && !item.Hidden,
+                            IsChecked = item.Checked == true,
+                            SelectRequested = () =>
+                            {
+                                if (generation != presentationGeneration || _isApplyingCanonical()) return;
+                                foreach (var member in group) member.IsChecked = ReferenceEquals(member, radio);
+                                Emit();
+                            },
+                        };
+                        group.Add(radio);
+                        AutomationProperties.SetName(radio, Win32Mnemonic.DisplayText(item.Text));
+                        element = radio;
+                    }
+                    else if (item.Kind == "toggleButton" || item.Checked == true)
                     {
                         // A latched button keeps its state between clicks, and the control
                         // owns that state: the projection posts the same command and shows
@@ -1082,6 +1373,11 @@ internal sealed class ControlFactory
                         button.Click += (_, _) => Emit();
                         element = button;
                     }
+                    if (face is not null)
+                    {
+                        var tooltip = Win32Mnemonic.DisplayText(item.Text);
+                        if (tooltip.Length != 0) ToolTipService.SetToolTip(element, tooltip);
+                    }
                 }
                 element.Visibility = item.Hidden ? Visibility.Collapsed : Visibility.Visible;
                 Canvas.SetLeft(element, item.Rect.X * _scale);
@@ -1093,10 +1389,10 @@ internal sealed class ControlFactory
             }
         }
         Rebuild();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.ToolbarItems)) Rebuild();
-        };
+        });
         return control;
     }
 
@@ -1152,13 +1448,13 @@ internal sealed class ControlFactory
                 CanClose: (viewModel.Style & wsSysMenu) != 0));
         }
         Apply();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Text) or nameof(viewModel.Active) or
                 nameof(viewModel.WindowState) or nameof(viewModel.ClientRect) or
                 nameof(viewModel.Rect))
                 Apply();
-        };
+        });
         return control;
     }
 
@@ -1183,12 +1479,12 @@ internal sealed class ControlFactory
             control.ApplyChrome(viewModel.ChromeRegions, _scale);
         }
         Apply();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Splits) or nameof(viewModel.Rect) or
                 nameof(viewModel.ChromeRegions))
                 Apply();
-        };
+        });
         return control;
     }
 
@@ -1196,8 +1492,35 @@ internal sealed class ControlFactory
     // Fluent control for each one and drives it by asking the provider to perform that
     // element's own default action.  The action string is also the accessible
     // description, so what the projection promises is what the provider named.
-    private SemanticAccessibleIsland CreateAccessibleIsland(ControlNodeViewModel viewModel)
+    private FrameworkElement CreateAccessibleIsland(ControlNodeViewModel viewModel)
     {
+        if (viewModel.IslandItems.Count > 0 && viewModel.IslandItems[0].Kind == "pageTab")
+        {
+            var tabs = new SemanticTabControl(index =>
+            {
+                if (_isApplyingCanonical() || !AllowsAction(viewModel, "islandInvoke") ||
+                    index < 0 || index >= viewModel.IslandItems.Count) return;
+                var item = viewModel.IslandItems[index];
+                if (item.Enabled && !item.Selected) _action(viewModel, "islandInvoke", index);
+            });
+            void ApplyTabs()
+            {
+                var items = viewModel.IslandItems;
+                tabs.Rebuild(items.Select(item => item.Name).ToArray(),
+                    items.Select(item => item.Rect).ToArray(),
+                    items.Select((item, index) => (item, index)).Single(pair => pair.item.Selected).index,
+                    _scale, labelsHaveMnemonics: false, allowEdgeOverlap: true);
+                for (var index = 0; index < items.Count; ++index)
+                    tabs.Headers[index].IsEnabled = items[index].Enabled;
+            }
+            ApplyTabs();
+            _lifetime.Subscribe(viewModel, (_, args) =>
+            {
+                if (args.PropertyName is nameof(viewModel.IslandItems) or nameof(viewModel.Rect))
+                    ApplyTabs();
+            });
+            return tabs;
+        }
         var control = new SemanticAccessibleIsland(index =>
         {
             if (_isApplyingCanonical() || !AllowsAction(viewModel, "islandInvoke")) return;
@@ -1205,11 +1528,11 @@ internal sealed class ControlFactory
         });
         void Apply() => control.ApplyItems(viewModel.IslandItems, _scale);
         Apply();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.IslandItems) or nameof(viewModel.Rect))
                 Apply();
-        };
+        });
         return control;
     }
 
@@ -1243,13 +1566,13 @@ internal sealed class ControlFactory
                 $"itemRects=[{string.Join("; ", viewModel.ItemRects.Select(rect => $"{rect.X},{rect.Y} {rect.Width}x{rect.Height}"))}]");
         }
         control.LayoutUpdated += LogTabLayout;
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects))
                 RebuildHeaders();
             else if (args.PropertyName == nameof(viewModel.SelectedIndex))
                 control.ApplySelection(viewModel.SelectedIndex);
-        };
+        });
         return control;
     }
 
@@ -1303,7 +1626,7 @@ internal sealed class ControlFactory
                 viewModel.SelectedIndex);
         }
         Rebuild();
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemDepths) or
                 nameof(viewModel.ItemImages) or nameof(viewModel.EditableLabels))
@@ -1317,7 +1640,7 @@ internal sealed class ControlFactory
                     control.ApplyIcons(ItemIcons(
                         viewModel, viewModel.Items.Count, viewModel.SelectedIndex));
             }
-        };
+        });
         return control;
     }
 
@@ -1436,7 +1759,7 @@ internal sealed class ControlFactory
             if (requested != viewModel.Position && AllowsAction(viewModel, "setValue"))
                 _action(viewModel, "setValue", requested);
         };
-        viewModel.PropertyChanged += (_, args) =>
+        _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Minimum) or nameof(viewModel.Maximum) or
                 nameof(viewModel.Position) or nameof(viewModel.SmallChange) or
@@ -1448,7 +1771,7 @@ internal sealed class ControlFactory
                 control.Orientation = viewModel.Vertical ? Orientation.Vertical : Orientation.Horizontal;
                 control.IsDirectionReversed = viewModel.Reversed ^ viewModel.Vertical;
             }
-        };
+        });
         return control;
     }
 
@@ -1476,12 +1799,36 @@ internal sealed class ControlFactory
         multiSelect ? ListViewSelectionMode.Extended : ListViewSelectionMode.Single;
 
     internal static bool HasRenderableListViewShape(ControlNodeViewModel viewModel) =>
-        viewModel.Columns.Count != 0 &&
-        viewModel.ColumnWidths.Count == viewModel.Columns.Count &&
-        viewModel.Rows.All(row => row.Count == viewModel.Columns.Count);
+        viewModel.ListViewMode == "report"
+            ? viewModel.Columns.Count != 0 &&
+              viewModel.ColumnWidths.Count == viewModel.Columns.Count &&
+              viewModel.Rows.All(row => row.Count == viewModel.Columns.Count)
+            : viewModel.Columns.Count == 0 && viewModel.Rows.Count == 0 &&
+              viewModel.ItemRects.Count == viewModel.Items.Count;
 
     internal static bool ShouldRenderListViewHeader(ControlNodeViewModel viewModel) =>
-        viewModel.ColumnHeadersVisible;
+        viewModel.ListViewMode == "report" && viewModel.ColumnHeadersVisible;
+
+    private static bool IsListItemEditor(DependencyObject? source, DependencyObject boundary)
+    {
+        while (source is not null && source != boundary)
+        {
+            if (source is TextBox or CheckBox) return true;
+            source = VisualTreeHelper.GetParent(source);
+        }
+        return false;
+    }
+
+    private static ScrollViewer? FindScrollViewer(DependencyObject root)
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); ++index)
+        {
+            var child = VisualTreeHelper.GetChild(root, index);
+            if (child is ScrollViewer scroll) return scroll;
+            if (FindScrollViewer(child) is { } descendant) return descendant;
+        }
+        return null;
+    }
 
     internal static bool IsListViewRowChecked(ControlNodeViewModel viewModel, int index) =>
         viewModel.CheckBoxes && viewModel.CheckedIndices.Contains(index);
@@ -1502,7 +1849,8 @@ internal sealed class ControlFactory
         viewModel.ItemDepths[0] == 0 &&
         viewModel.SelectedIndex >= -1 && viewModel.SelectedIndex < viewModel.Items.Count;
 
-    internal static IReadOnlyList<TabHeaderRow> GroupTabHeaderRows(IReadOnlyList<PixelRect> rects)
+    internal static IReadOnlyList<TabHeaderRow> GroupTabHeaderRows(
+        IReadOnlyList<PixelRect> rects, bool allowEdgeOverlap = false)
     {
         var rows = new List<TabHeaderRow>();
         foreach (var group in rects
@@ -1516,7 +1864,12 @@ internal sealed class ControlFactory
                 throw new ArgumentException("Tab items sharing a row must have identical vertical geometry.", nameof(rects));
             for (var index = 1; index < items.Length; ++index)
             {
-                if ((long)items[index - 1].Rect.X + items[index - 1].Rect.Width > items[index].Rect.X)
+                var previous = items[index - 1].Rect;
+                var current = items[index].Rect;
+                var orderedEdges = previous.X < current.X &&
+                    (long)previous.X + previous.Width < (long)current.X + current.Width;
+                if ((long)previous.X + previous.Width > current.X &&
+                    (!allowEdgeOverlap || !orderedEdges))
                     throw new ArgumentException("Tab items in a row must be ordered without overlap.", nameof(rects));
             }
             var left = items[0].Rect.X;
@@ -1546,6 +1899,10 @@ internal sealed class ControlFactory
         "AccentFillColorDefaultBrush",
         "TextOnAccentFillColorPrimaryBrush",
         "TextFillColorPrimaryBrush",
+        "TextFillColorSecondaryBrush",
+        "SolidBackgroundFillColorBaseBrush",
+        "ControlStrongStrokeColorDefaultBrush",
+        "ControlStrokeColorOnAccentSecondaryBrush",
     ];
 
     internal static void WarmThemeResources()
@@ -1637,7 +1994,7 @@ internal sealed class ControlFactory
         element.Height = Math.Max(0, viewModel.Rect.Height * _scale);
         if (viewModel.Kind is "dialogContainer" or "tabControl" or "toolbar" or "treeView"
             or "mdiClient" or "mdiChild" or "paneContainer" or "accessibleIsland"
-            or "statusBar")
+            or "statusBar" or "staticDecoration")
         {
             element.Clip = new RectangleGeometry
             {
@@ -1889,7 +2246,9 @@ internal sealed class SemanticTabControl : ContentControl
         IReadOnlyList<string> labels,
         IReadOnlyList<PixelRect> rects,
         int selectedIndex,
-        double scale)
+        double scale,
+        bool labelsHaveMnemonics = true,
+        bool allowEdgeOverlap = false)
     {
         Children.Clear();
         _headers.Clear();
@@ -1910,7 +2269,7 @@ internal sealed class SemanticTabControl : ContentControl
             (unionRight - unionLeft) * scale,
             (unionBottom - unionTop) * scale);
         _headers.AddRange(Enumerable.Repeat<TabViewItem>(null!, labels.Count));
-        foreach (var row in ControlFactory.GroupTabHeaderRows(rects))
+        foreach (var row in ControlFactory.GroupTabHeaderRows(rects, allowEdgeOverlap))
         {
             // The row is deliberately unsized.  Constraining a TabView to the native
             // band height makes its own template clip the tab strip to a few pixels,
@@ -1932,7 +2291,8 @@ internal sealed class SemanticTabControl : ContentControl
             var previousRight = row.Bounds.X;
             foreach (var placement in row.Items)
             {
-                var text = Win32Mnemonic.DisplayText(labels[placement.Index]);
+                var text = labelsHaveMnemonics
+                    ? Win32Mnemonic.DisplayText(labels[placement.Index]) : labels[placement.Index];
                 var pillWidth = placement.Rect.Width * scale;
                 // The native control sized each pill by measuring its label with GDI, and
                 // WinUI's text metrics are wider at the same point size.  The label is
@@ -2164,15 +2524,29 @@ internal sealed class ProjectedItemContent : Grid
         TextTrimming = TextTrimming.CharacterEllipsis,
     };
     private readonly Action<string> _commit;
+    private readonly bool _largeIcon;
     private TextBox? _editor;
 
-    public ProjectedItemContent(Action<string> commit)
+    public ProjectedItemContent(Action<string> commit, bool largeIcon = false)
     {
         _commit = commit;
-        ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        Grid.SetColumn(_icon, 0);
-        Grid.SetColumn(_label, 1);
+        _largeIcon = largeIcon;
+        if (largeIcon)
+        {
+            RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid.SetRow(_label, 1);
+            _icon.HorizontalAlignment = HorizontalAlignment.Center;
+            _label.TextAlignment = TextAlignment.Center;
+            _label.TextWrapping = TextWrapping.Wrap;
+            _label.VerticalAlignment = VerticalAlignment.Top;
+        }
+        else
+        {
+            ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(_label, 1);
+        }
         Children.Add(_icon);
         Children.Add(_label);
         AutomationProperties.SetAccessibilityView(_icon, AccessibilityView.Raw);
@@ -2204,7 +2578,8 @@ internal sealed class ProjectedItemContent : Grid
     {
         _icon.Source = icon;
         _icon.Visibility = icon is null ? Visibility.Collapsed : Visibility.Visible;
-        _icon.Margin = icon is null ? new Thickness(0) : new Thickness(0, 0, 6, 0);
+        _icon.Margin = icon is null ? new Thickness(0)
+            : _largeIcon ? new Thickness(0, 0, 0, 2) : new Thickness(0, 0, 6, 0);
     }
 
     // Opens the projected editor.  Nothing native happens yet: the native control's
@@ -2238,7 +2613,8 @@ internal sealed class ProjectedItemContent : Grid
         };
         _editor.LostFocus += (_, _) => EndEdit(commit: true);
         _label.Visibility = Visibility.Collapsed;
-        Grid.SetColumn(_editor, 1);
+        if (_largeIcon) Grid.SetRow(_editor, 1);
+        else Grid.SetColumn(_editor, 1);
         Children.Add(_editor);
         _editor.SelectAll();
         _editor.Focus(FocusState.Programmatic);
@@ -2678,6 +3054,7 @@ internal sealed class SemanticAccessibleIsland : Canvas
                     Text = item.Name,
                     FontSize = ItemFontSize,
                     VerticalAlignment = VerticalAlignment.Center,
+                    TextWrapping = TextWrapping.Wrap,
                     TextTrimming = TextTrimming.CharacterEllipsis,
                 }
                 : BuildActionable(item, index);

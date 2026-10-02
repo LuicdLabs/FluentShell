@@ -16,6 +16,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     private int _focusedIndex = -1;
     private bool _multiSelect;
     private bool _columnHeadersVisible;
+    private string _listViewMode = "report";
+    private bool _itemActivationSupported;
     private bool _checkBoxes;
     private int _selectionStart;
     private int _selectionLength;
@@ -38,6 +40,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     private int _imageHeight;
     private string _imageFormat = string.Empty;
     private string _imageData = string.Empty;
+    private ulong _style;
+    private ulong _exStyle;
     private readonly Dictionary<string, string> _pendingEventIds = new(StringComparer.Ordinal);
 
     public string NodeId { get; private set; } = "0";
@@ -58,7 +62,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     // Native window style bits, already validated as canonical hex on admission.
     // The projection needs them where the native shape decides what a control
     // offers -- an MDI child's caption buttons are style bits, not content.
-    public ulong Style { get; private set; }
+    public ulong Style { get => _style; private set => SetProperty(ref _style, value); }
+    public ulong ExStyle { get => _exStyle; private set => SetProperty(ref _exStyle, value); }
     public bool Active { get => _active; private set => SetProperty(ref _active, value); }
     public string WindowState { get => _windowState; private set => SetProperty(ref _windowState, value); }
     public PixelRect ClientRect { get => _clientRect; private set => SetProperty(ref _clientRect, value); }
@@ -72,6 +77,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     public int FocusedIndex { get => _focusedIndex; private set => SetProperty(ref _focusedIndex, value); }
     public bool MultiSelect { get => _multiSelect; private set => SetProperty(ref _multiSelect, value); }
     public bool ColumnHeadersVisible { get => _columnHeadersVisible; private set => SetProperty(ref _columnHeadersVisible, value); }
+    public string ListViewMode { get => _listViewMode; private set => SetProperty(ref _listViewMode, value); }
+    public bool ItemActivationSupported { get => _itemActivationSupported; private set => SetProperty(ref _itemActivationSupported, value); }
     public bool CheckBoxes { get => _checkBoxes; private set => SetProperty(ref _checkBoxes, value); }
     public int SelectionStart { get => _selectionStart; private set => SetProperty(ref _selectionStart, value); }
     public int SelectionLength { get => _selectionLength; private set => SetProperty(ref _selectionLength, value); }
@@ -131,6 +138,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     {
         var previousText = Text;
         var matchingTextEcho = preserveTransient && IsPendingEcho("text", eventId);
+        var matchingToolbarEcho = preserveTransient && IsPendingEcho("toolbarCommand", eventId);
         var hasDraft = preserveTransient && !matchingTextEcho && DraftText != previousText;
         NodeId = node.NodeId;
         Generation = node.Generation;
@@ -170,6 +178,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         IsDefault = node.IsDefault ?? false;
         GroupStart = node.GroupStart ?? false;
         Style = ParseStyle(node.Style);
+        ExStyle = ParseStyle(node.ExStyle);
         Active = node.Active ?? false;
         WindowState = node.WindowState ?? "normal";
         ClientRect = node.ClientRect ?? new PixelRect();
@@ -186,13 +195,15 @@ public sealed class ControlNodeViewModel : ObservableObject
         EditableLabels = node.EditableLabels ?? false;
         EditingIndex = node.EditingIndex ?? -1;
         ReplaceItemRects(node.ItemRects ?? []);
+        ListViewMode = node.ListViewMode ?? "report";
+        ItemActivationSupported = node.ItemActivationSupported ?? false;
         ReplaceSelectedIndices(node.SelectedIndices);
         ReplaceCheckedIndices(node.CheckedIndices ?? []);
         ReplaceColumns(node.Columns);
         ReplaceColumnWidths(node.ColumnWidths);
         ReplaceColumnOrder(node.ColumnOrder ?? []);
         ReplaceRows(node.Rows);
-        ReplaceToolbarItems(node.ToolbarItems ?? []);
+        var toolbarChanged = ReplaceToolbarItems(node.ToolbarItems ?? []);
         ReplaceSplits(node.Splits ?? []);
         ReplaceChromeRegions(node.ChromeRegions ?? []);
         ReplaceIslandItems(node.IslandItems ?? []);
@@ -212,6 +223,11 @@ public sealed class ControlNodeViewModel : ObservableObject
                 _pendingEventIds.Remove(property);
             }
         }
+        // The projected button changes its own checked state while the native
+        // command runs. A veto can leave the canonical array unchanged, so the
+        // matching echo must still restore the native group's checked members.
+        if (matchingToolbarEcho && !toolbarChanged)
+            RaisePropertyChanged(nameof(ToolbarItems));
     }
 
     public void RegisterPending(string property, string eventId) => _pendingEventIds[property] = eventId;
@@ -228,6 +244,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         else if (property == "checkedIndices") RaisePropertyChanged(nameof(CheckedIndices));
         else if (property == "position") RaisePropertyChanged(nameof(Position));
         else if (property == "itemExpanded") RaisePropertyChanged(nameof(ItemDepths));
+        else if (property == "toolbarCommand") RaisePropertyChanged(nameof(ToolbarItems));
         // A refused split leaves the canonical geometry in place, and the projected
         // splitter follows it back.
         else if (property == "splits") RaisePropertyChanged(nameof(Splits));
@@ -235,7 +252,9 @@ public sealed class ControlNodeViewModel : ObservableObject
 
     public void AcceptPending(string property, string eventId)
     {
-        if (IsPendingEcho(property, eventId)) _pendingEventIds.Remove(property);
+        if (!IsPendingEcho(property, eventId)) return;
+        _pendingEventIds.Remove(property);
+        if (property == "toolbarCommand") RaisePropertyChanged(nameof(ToolbarItems));
     }
 
     public void ApplyCanonical(string property, System.Text.Json.JsonElement value, string? eventId)
@@ -257,6 +276,8 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "focusedIndex": FocusedIndex = value.GetInt32(); break;
             case "multiSelect": MultiSelect = value.GetBoolean(); break;
             case "columnHeadersVisible": ColumnHeadersVisible = value.GetBoolean(); break;
+            case "listViewMode": ListViewMode = value.GetString() ?? "report"; break;
+            case "itemActivationSupported": ItemActivationSupported = value.GetBoolean(); break;
             case "checkBoxes": CheckBoxes = value.GetBoolean(); break;
             case "checkedIndices": ReplaceCheckedIndices(value.Deserialize<List<int>>() ?? []); break;
             case "selectionStart": SelectionStart = value.GetInt32(); break;
@@ -391,12 +412,13 @@ public sealed class ControlNodeViewModel : ObservableObject
         RaisePropertyChanged(nameof(Rows));
     }
 
-    private void ReplaceToolbarItems(IEnumerable<ToolbarItemSnapshot> items)
+    private bool ReplaceToolbarItems(IEnumerable<ToolbarItemSnapshot> items)
     {
-        if (ToolbarItems.SequenceEqual(items)) return;
+        if (ToolbarItems.SequenceEqual(items)) return false;
         ToolbarItems.Clear();
         foreach (var item in items) ToolbarItems.Add(item);
         RaisePropertyChanged(nameof(ToolbarItems));
+        return true;
     }
 
     private void ReplaceSplits(IEnumerable<PaneSplit> splits)

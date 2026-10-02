@@ -188,9 +188,9 @@ private:
     // surface canonical barrier held, on the freshly captured snapshot, and may
     // replace it with the one the re-assertion produced.
     void ReassertRememberedSplits(ReconcilePass& pass);
-    // Reads a menu bar the application draws with a toolbar, once per surface, after the
-    // projection is committed and the native window is cloaked.
-    void ReadMenuBarToolbarOnce(ReconcilePass& pass);
+    // Refreshes a toolbar menu after commit. A failed recapture must not publish
+    // the snapshot taken before the native command bindings changed.
+    const wchar_t* RefreshMenuBarToolbar(ReconcilePass& pass);
     // Records the split a completed setSplit produced, or forgets it when the
     // container no longer describes one.  Requires surface->mutex.
     static void RememberSplitIntent(
