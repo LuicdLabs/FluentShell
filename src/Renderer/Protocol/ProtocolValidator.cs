@@ -427,9 +427,10 @@ internal static class ProtocolValidator
         {
             ["static"] = null,
             ["staticIcon"] = ValidateStaticIcon,
+            ["staticBitmap"] = ValidateStaticBitmap,
             ["staticDecoration"] = ValidateStaticDecoration,
             ["separator"] = null,
-            ["button"] = null,
+            ["button"] = ValidateButton,
             ["checkBox"] = null,
             ["threeState"] = null,
             ["radioButton"] = ValidateRadioButton,
@@ -444,6 +445,7 @@ internal static class ProtocolValidator
             ["treeView"] = ValidateTreeView,
             ["tabControl"] = ValidateTabControl,
             ["slider"] = ValidateSlider,
+            ["upDown"] = ValidateUpDown,
             ["dialogContainer"] = ValidateDialogContainer,
             ["mdiClient"] = ValidateMdiClient,
             ["mdiChild"] = ValidateMdiChild,
@@ -471,10 +473,10 @@ internal static class ProtocolValidator
             throw new ProtocolException("Control node state is outside the protocol range.");
         if (node.Editable && node.Kind != "comboBox")
             throw new ProtocolException("Only ComboBox nodes can be editable.");
-        if (node.Kind is not ("staticIcon" or "radioButton") &&
+        if (node.Kind is not ("staticIcon" or "staticBitmap" or "radioButton" or "button") &&
             (node.ImageWidth is not null || node.ImageHeight is not null ||
              node.ImageFormat is not null || node.ImageData is not null))
-            throw new ProtocolException("Only Static icon or BitmapSwitch nodes can carry image fields.");
+            throw new ProtocolException("Only Static icon, Static bitmap, picture Button, or BitmapSwitch nodes can carry image fields.");
         if (node.Kind != "listView" && node.ColumnHeadersVisible is not null)
             throw new ProtocolException("Only ListView nodes can carry columnHeadersVisible.");
         if (node.Kind != "listView" && (node.CheckBoxes is not null || node.CheckedIndices is not null))
@@ -864,31 +866,39 @@ internal static class ProtocolValidator
         var maxBase64 = largeBitmap
             ? ProtocolConstants.MaxDirectUiBitmapBase64Chars
             : ProtocolConstants.MaxImageBase64Chars;
-        if (node.ImageWidth is not { } width || node.ImageHeight is not { } height ||
-            width is <= 0 || height is <= 0 ||
-            width > maxDimension || height > maxDimension ||
-            node.ImageFormat != "bgra8-premultiplied" || node.ImageData is null ||
-            node.ImageData.Length > maxBase64)
+        if (node.ImageData?.Length > maxBase64)
             throw new ProtocolException("Static icon metadata is missing or outside the protocol cap.");
-        byte[] decoded;
-        try
-        {
-            decoded = Convert.FromBase64String(node.ImageData);
-        }
+        ValidatePixels("Static icon", node.ImageWidth, node.ImageHeight, node.ImageFormat,
+            node.ImageData, maxDimension, maxBytes);
+    }
+
+    // Every owned pixel buffer crosses the wire the same way: canonical base64 of
+    // premultiplied BGRA, exactly width x height x 4 bytes, inside a per-field cap.
+    // Returns the decoded byte count so callers can enforce an aggregate budget.
+    private static int ValidatePixels(string what, int? imageWidth, int? imageHeight,
+        string? format, string? data, int maxDimension, int maxBytes = int.MaxValue)
+    {
+        if (imageWidth is not { } width || imageHeight is not { } height ||
+            width is <= 0 || height is <= 0 || width > maxDimension || height > maxDimension ||
+            format != "bgra8-premultiplied" || data is null)
+            throw new ProtocolException($"{what} metadata is missing or outside the protocol cap.");
+        byte[] pixels;
+        try { pixels = Convert.FromBase64String(data); }
         catch (FormatException exception)
         {
-            throw new ProtocolException($"Static icon imageData is not base64: {exception.Message}");
+            throw new ProtocolException($"{what} imageData is not base64: {exception.Message}");
         }
-        if (decoded.Length != checked(width * height * 4) ||
-            decoded.Length > maxBytes ||
-            Convert.ToBase64String(decoded) != node.ImageData)
-            throw new ProtocolException("Static icon imageData is non-canonical or has the wrong decoded length.");
-        for (var offset = 0; offset < decoded.Length; offset += 4)
+        if (pixels.Length != checked(width * height * 4) || pixels.Length > maxBytes ||
+            Convert.ToBase64String(pixels) != data)
+            throw new ProtocolException(
+                $"{what} imageData is non-canonical or has the wrong decoded length.");
+        for (var offset = 0; offset < pixels.Length; offset += 4)
         {
-            var alpha = decoded[offset + 3];
-            if (decoded[offset] > alpha || decoded[offset + 1] > alpha || decoded[offset + 2] > alpha)
-            throw new ProtocolException("Static icon pixels are not premultiplied BGRA.");
+            var alpha = pixels[offset + 3];
+            if (pixels[offset] > alpha || pixels[offset + 1] > alpha || pixels[offset + 2] > alpha)
+                throw new ProtocolException($"{what} pixels are not premultiplied BGRA.");
         }
+        return pixels.Length;
     }
 
     private static void ValidateStaticIcon(ControlNode node)
@@ -897,6 +907,25 @@ internal static class ProtocolValidator
             throw new ProtocolException("Static icon must not be a tab stop.");
         ValidateOwnedPixels(node,
             node.PresentationVariant is "bitmapDisplay" or "monitorPalette");
+    }
+
+    // An SS_BITMAP picture: inert pixels at the size the control occupies, which is why
+    // it takes the large-bitmap cap rather than the icon cap.
+    private static void ValidateStaticBitmap(ControlNode node)
+    {
+        if (node.TabStop || node.TabIndex is not null and not -1)
+            throw new ProtocolException("Static bitmap must not be a tab stop.");
+        ValidateOwnedPixels(node, true);
+    }
+
+    // A BS_ICON / BS_BITMAP push button carries its picture under the icon cap; a
+    // text button carries none.
+    private static void ValidateButton(ControlNode node)
+    {
+        if (node.ImageWidth is null && node.ImageHeight is null &&
+            node.ImageFormat is null && node.ImageData is null) return;
+        ValidatePixels("Button picture", node.ImageWidth, node.ImageHeight, node.ImageFormat,
+            node.ImageData, ProtocolConstants.MaxImageDimension, ProtocolConstants.MaxImageBytes);
     }
 
     private static void ValidateRadioButton(ControlNode node)
@@ -909,8 +938,12 @@ internal static class ProtocolValidator
     // itself and drives each one through the provider's own default action.  An
     // element the projection would draw as actionable therefore has to carry that
     // action string, and an element that carries one may not be drawn as inert text.
+    // "heading" and "image" are inert like "text": a heading is text the host draws
+    // as a title, and an image is the region it painted for a graphic element.
     private static readonly HashSet<string> IslandItemKinds =
-        new(StringComparer.Ordinal) { "text", "button", "link", "pageTab" };
+        new(StringComparer.Ordinal) { "text", "heading", "image", "button", "link", "pageTab" };
+
+    private static bool IsInertIslandItem(string kind) => kind is "text" or "heading" or "image";
 
     private static void ValidateAccessibleIsland(ControlNode node)
     {
@@ -932,7 +965,14 @@ internal static class ProtocolValidator
             ValidateRect(item.Rect, "islandItem.rect");
             if (item.Rect.Width <= 0 || item.Rect.Height <= 0)
                 throw new ProtocolException("Accessible island item has no bounds.");
-            var actionable = item.Kind != "text";
+            var actionable = !IsInertIslandItem(item.Kind);
+            if (item.Kind == "image")
+                ValidatePixels("Accessible island image", item.ImageWidth, item.ImageHeight,
+                    item.ImageFormat, item.ImageData, ProtocolConstants.MaxImageDimension,
+                    ProtocolConstants.MaxImageBytes);
+            else if (item.ImageWidth is not null || item.ImageHeight is not null ||
+                     item.ImageFormat is not null || item.ImageData is not null)
+                throw new ProtocolException("Only an accessible island image item carries pixels.");
             if (actionable && item.Enabled && string.IsNullOrEmpty(item.ActionName) ||
                 !actionable && !string.IsNullOrEmpty(item.ActionName))
                 throw new ProtocolException(
@@ -1009,30 +1049,9 @@ internal static class ProtocolValidator
         }
     }
 
-    private static int ValidateChromeRegionPixels(ChromeRegion region)
-    {
-        if (region.ImageWidth is <= 0 or > ProtocolConstants.MaxChromeRegionDimension ||
-            region.ImageHeight is <= 0 or > ProtocolConstants.MaxChromeRegionDimension ||
-            region.ImageFormat != "bgra8-premultiplied" || region.ImageData is null)
-            throw new ProtocolException("Container chrome metadata is outside the protocol cap.");
-        byte[] pixels;
-        try { pixels = Convert.FromBase64String(region.ImageData); }
-        catch (FormatException exception)
-        {
-            throw new ProtocolException($"Container chrome is not base64: {exception.Message}");
-        }
-        if (pixels.Length != checked(region.ImageWidth * region.ImageHeight * 4) ||
-            Convert.ToBase64String(pixels) != region.ImageData)
-            throw new ProtocolException(
-                "Container chrome is non-canonical or has the wrong decoded length.");
-        for (var offset = 0; offset < pixels.Length; offset += 4)
-        {
-            var alpha = pixels[offset + 3];
-            if (pixels[offset] > alpha || pixels[offset + 1] > alpha || pixels[offset + 2] > alpha)
-                throw new ProtocolException("Container chrome pixels are not premultiplied BGRA.");
-        }
-        return pixels.Length;
-    }
+    private static int ValidateChromeRegionPixels(ChromeRegion region) =>
+        ValidatePixels("Container chrome", region.ImageWidth, region.ImageHeight,
+            region.ImageFormat, region.ImageData, ProtocolConstants.MaxChromeRegionDimension);
 
     private static void ValidateStaticDecoration(ControlNode node)
     {
@@ -1327,6 +1346,17 @@ internal static class ProtocolValidator
             throw new ProtocolException("Trackbar range, position, or step is invalid.");
     }
 
+    // An UpDown carries its range ordered (`reversed` says the up arrow decreases) and
+    // its arrow increment; a single-value range is legal, since the control allows it.
+    private static void ValidateUpDown(ControlNode node)
+    {
+        if (node.Minimum is not { } minimum || node.Maximum is not { } maximum ||
+            node.Position is not { } position || node.SmallChange is not { } smallChange)
+            throw new ProtocolException("UpDown range, position, or step is missing.");
+        if (maximum < minimum || position < minimum || position > maximum || smallChange <= 0)
+            throw new ProtocolException("UpDown range, position, or step is invalid.");
+    }
+
     // A control's image list travels once and every item indexes into it, so the
     // indexes and the list are validated against each other rather than trusted
     // separately.
@@ -1402,25 +1432,9 @@ internal static class ProtocolValidator
         return decodedBytes;
     }
 
-    private static void ValidateImageListEntry(ImageListEntry entry)
-    {
-        byte[] pixels;
-        try { pixels = Convert.FromBase64String(entry.ImageData); }
-        catch (FormatException exception)
-        {
-            throw new ProtocolException($"Image list icon is not base64: {exception.Message}");
-        }
-        if (pixels.Length != checked(entry.ImageWidth * entry.ImageHeight * 4) ||
-            Convert.ToBase64String(pixels) != entry.ImageData)
-            throw new ProtocolException(
-                "Image list icon is non-canonical or has the wrong decoded length.");
-        for (var offset = 0; offset < pixels.Length; offset += 4)
-        {
-            var alpha = pixels[offset + 3];
-            if (pixels[offset] > alpha || pixels[offset + 1] > alpha || pixels[offset + 2] > alpha)
-                throw new ProtocolException("Image list icon pixels are not premultiplied BGRA.");
-        }
-    }
+    private static void ValidateImageListEntry(ImageListEntry entry) =>
+        ValidatePixels("Image list icon", entry.ImageWidth, entry.ImageHeight,
+            entry.ImageFormat, entry.ImageData, ProtocolConstants.MaxImageListDimension);
 
     private static void ValidateStatusBar(ControlNode node)
     {
@@ -1515,25 +1529,9 @@ internal static class ProtocolValidator
         if (top is null) throw new ProtocolException("Toolbar requires visible one-row geometry.");
     }
 
-    private static void ValidateToolbarImage(ToolbarItemSnapshot item)
-    {
-        if (item.ImageWidth is not { } width || item.ImageHeight is not { } height ||
-            width is <= 0 or > ProtocolConstants.MaxImageDimension ||
-            height is <= 0 or > ProtocolConstants.MaxImageDimension ||
-            item.ImageFormat != "bgra8-premultiplied" || item.ImageData is null)
-            throw new ProtocolException("Toolbar push button image metadata is missing or outside the cap.");
-        byte[] pixels;
-        try { pixels = Convert.FromBase64String(item.ImageData); }
-        catch (FormatException exception) { throw new ProtocolException($"Toolbar imageData is not base64: {exception.Message}"); }
-        if (pixels.Length != checked(width * height * 4) || Convert.ToBase64String(pixels) != item.ImageData)
-            throw new ProtocolException("Toolbar imageData is non-canonical or has the wrong length.");
-        for (var offset = 0; offset < pixels.Length; offset += 4)
-        {
-            var alpha = pixels[offset + 3];
-            if (pixels[offset] > alpha || pixels[offset + 1] > alpha || pixels[offset + 2] > alpha)
-                throw new ProtocolException("Toolbar icon pixels are not premultiplied BGRA.");
-        }
-    }
+    private static void ValidateToolbarImage(ToolbarItemSnapshot item) =>
+        ValidatePixels("Toolbar icon", item.ImageWidth, item.ImageHeight,
+            item.ImageFormat, item.ImageData, ProtocolConstants.MaxImageDimension);
 
     // ---- Menu --------------------------------------------------------------
 
@@ -1830,8 +1828,8 @@ internal static class ProtocolValidator
                 throw new ProtocolException($"{context}.node carries ListView-only fields for a non-ListView kind.");
             }
             var imageFields = RequiredImageProperties.Count(name => node.TryGetProperty(name, out _));
-            if (kind == "staticIcon" ||
-                (kind == "radioButton" && imageFields != 0))
+            if (kind is "staticIcon" or "staticBitmap" ||
+                (kind is "radioButton" or "button" && imageFields != 0))
             {
                 RequireProperties(node, $"{context}.image", RequiredImageProperties);
             }
@@ -1889,9 +1887,9 @@ internal static class ProtocolValidator
                 foreach (var image in node.GetProperty("imageList").EnumerateArray())
                     RequireProperties(image, $"{context}.imageList.icon", RequiredImageProperties);
             }
-            if (kind == "slider")
+            if (kind is "slider" or "upDown")
             {
-                RequireProperties(node, $"{context}.slider", RequiredSliderProperties);
+                RequireProperties(node, $"{context}.{kind}", RequiredSliderProperties);
             }
             if (kind == "mdiChild")
             {

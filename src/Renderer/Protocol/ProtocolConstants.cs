@@ -48,7 +48,11 @@ public static class ProtocolConstants
     // Minor 25 projects TreeView state images beside the item. Overlay images are
     // composited into the existing item icons, and an empty tree is a valid snapshot.
     // Minor 26 carries stable native ListView item IDs for delayed activation.
-    public const ushort Minor = 26;
+    // Minor 27 adds inert heading and painted image island items (MMC message views).
+    // Minor 28 adds the staticBitmap kind (SS_BITMAP pictures under the large-bitmap cap)
+    // and the upDown kind (msctls_updown32 stepped through setValue); a BS_ICON/BS_BITMAP
+    // push button may carry its picture in the image fields.
+    public const ushort Minor = 28;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;

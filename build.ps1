@@ -70,11 +70,6 @@ Write-Host "Restoring native packages..."
     -PackagesDirectory (Join-Path $Root "packages") -NonInteractive
 if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
 
-# IslandDemo remains a manual diagnostic and still needs the runtime headers when built directly.
-& $nuget install Microsoft.WindowsAppSDK.Runtime -Version 2.3.1 `
-    -OutputDirectory (Join-Path $Root "packages") -NonInteractive | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Windows App SDK runtime restore failed" }
-
 Write-Host "Restoring renderer..."
 & dotnet restore $RendererProject -r win-x64
 if ($LASTEXITCODE -ne 0) { throw "renderer restore failed" }
@@ -150,5 +145,3 @@ Write-Host "Run the translation oracle:"
 Write-Host "  `$target = (Resolve-Path '$OutputRoot\LegacyDialogHost.exe').Path"
 Write-Host "  Start-Process `$target"
 Write-Host "  $OutputRoot\FluentShell.Injector.exe inject `$target"
-Write-Host ""
-Write-Host "IslandDemo is diagnostic-only and must be built explicitly from its project."

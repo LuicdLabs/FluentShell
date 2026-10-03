@@ -135,3 +135,6 @@ if ($usage -match "inject <pid\|exe>" -or
 }
 Write-Host "Injector CLI cutover gate passed."
 Write-Host "All available tests and production gates passed."
+# The CLI gate runs the Injector without arguments, which exits 1 by design; every
+# failure above has already thrown, so reaching here means success.
+exit 0

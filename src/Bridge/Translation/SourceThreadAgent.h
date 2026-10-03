@@ -5,6 +5,7 @@
 #include "PopupMenuState.h"
 
 #include <commctrl.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <string>
@@ -156,6 +157,50 @@ inline bool SetTrackbarPosition(
     return current() == position;
 }
 
+// An UpDown step follows the sequence the control itself runs for an arrow click:
+// UDN_DELTAPOS to its parent, which may veto the step or rewrite its delta; then the
+// position, which a UDS_SETBUDDYINT control also writes into its buddy; then the
+// WM_VSCROLL/WM_HSCROLL SB_THUMBPOSITION and SB_ENDSCROLL pair.  A veto leaves the
+// native state untouched and is reported as `refused`.
+inline bool SetUpDownPosition(HWND root, HWND upDown, int requested, bool& refused) noexcept {
+    refused = false;
+    if (!upDown) return false;
+    BOOL failed = FALSE;
+    const auto current = [&] {
+        return static_cast<int>(SendMessageW(upDown, UDM_GETPOS32, 0,
+            reinterpret_cast<LPARAM>(&failed)));
+    };
+    const int before = current();
+    if (before == requested) return true;
+    int low = 0;
+    int high = 0;
+    SendMessageW(upDown, UDM_GETRANGE32, reinterpret_cast<WPARAM>(&low),
+        reinterpret_cast<LPARAM>(&high));
+    NMUPDOWN change{};
+    change.hdr.hwndFrom = upDown;
+    change.hdr.idFrom = static_cast<UINT_PTR>(GetDlgCtrlID(upDown));
+    change.hdr.code = UDN_DELTAPOS;
+    change.iPos = before;
+    change.iDelta = requested - before;
+    const HWND parent = SyntheticNotificationTarget(root, upDown);
+    if (SendMessageW(parent, WM_NOTIFY, change.hdr.idFrom,
+            reinterpret_cast<LPARAM>(&change)) != 0) {
+        refused = true;
+        return false;
+    }
+    const long long stepped = static_cast<long long>(before) + change.iDelta;
+    const int target = static_cast<int>(std::clamp<long long>(
+        stepped, (std::min)(low, high), (std::max)(low, high)));
+    SendMessageW(upDown, UDM_SETPOS32, 0, target);
+    const UINT scroll = (GetWindowLongPtrW(upDown, GWL_STYLE) & UDS_HORZ) != 0
+        ? WM_HSCROLL : WM_VSCROLL;
+    SendMessageW(parent, scroll, MAKEWPARAM(SB_THUMBPOSITION, static_cast<WORD>(target)),
+        reinterpret_cast<LPARAM>(upDown));
+    SendMessageW(parent, scroll, MAKEWPARAM(SB_ENDSCROLL, static_cast<WORD>(target)),
+        reinterpret_cast<LPARAM>(upDown));
+    return current() == target;
+}
+
 // Both label-edit messages are documented to require the control to have the
 // focus.  The native window is cloaked and the renderer proxy owns the desktop
 // focus, so this moves only the *thread's* focus -- which is what the messages
@@ -236,6 +281,25 @@ inline bool RenameListViewItem(HWND listView, int index, const std::wstring& tex
     std::wstring reason;
     return ReadListViewItemText(listView, index, 0, actual, reason) && actual == text;
 }
+
+// One Bridge-owned action waiting on the source thread's queue.  The posted message
+// carries only `token`; the request stays here, so cancelling releases it even when
+// the message is never dispatched, and an old token can never run again.
+template <typename Request>
+struct DeferredSlot final {
+    uint64_t nextToken = 1;
+    uint64_t token = 0;
+    std::optional<Request> request;
+    // A bounded command consumed the message; the request is reposted after it ends.
+    bool rearm = false;
+
+    explicit operator bool() const noexcept { return request.has_value(); }
+    void Reset() noexcept {
+        request.reset();
+        token = 0;
+        rearm = false;
+    }
+};
 
 class SourceThreadAgent final : public std::enable_shared_from_this<SourceThreadAgent> {
 public:
@@ -485,11 +549,6 @@ private:
     };
     void RunNativeActionOnSourceThread(const NativeActionRequest& request) noexcept;
     void CancelNativeActionOnSourceThread() noexcept;
-    uint64_t nextNativeActionToken_ = 1;
-    uint64_t queuedNativeActionToken_ = 0;
-    std::optional<NativeActionRequest> queuedNativeAction_;
-    bool rearmNativeAction_ = false;
-    bool nativeActionRunning_ = false;
     struct MenuActionRequest final {
         HWND toolbar = nullptr;
         uint64_t toolbarGeneration = 0;
@@ -497,23 +556,23 @@ private:
         std::vector<MenuBarButton> buttons;
         MenuBarCommandBinding binding;
     };
-    uint64_t nextMenuActionToken_ = 1;
-    uint64_t queuedMenuActionToken_ = 0;
-    std::optional<MenuActionRequest> queuedMenuAction_;
-    bool rearmMenuAction_ = false;
-    uint64_t nextListViewActivationToken_ = 1;
-    uint64_t queuedListViewActivationToken_ = 0;
-    std::optional<ListViewActivationRequest> queuedListViewActivation_;
-    bool rearmListViewActivation_ = false;
-    uint64_t listViewActivationCancellation_ = 0;
+    // Publishes `request` under a fresh token and posts `kind` for it. Returns the token,
+    // or 0 when the post failed and the slot was cleared.
+    template <typename Request>
+    uint64_t QueueDeferred(DeferredSlot<Request>& slot, WPARAM kind, Request request) noexcept;
+    // Claims the request `token` names -- or defers it: a bounded command re-arms it and
+    // a menu-bar read in progress reposts it. `dropped` sees a request whose repost failed.
+    template <typename Request, typename Dropped>
+    std::optional<Request> TakeDeferred(
+        DeferredSlot<Request>& slot, WPARAM kind, uint64_t token, Dropped dropped) noexcept;
     // All of this state belongs to the source GUI thread. The native tracking call
     // keeps its HMENU alive while the renderer owns the visible flyout.
-    // Posted messages hold only a token. Cancelling/unhooking releases the request
-    // even when its message is never dispatched, and old tokens cannot run again.
-    uint64_t nextIslandActionToken_ = 1;
-    uint64_t queuedIslandActionToken_ = 0;
-    std::optional<IslandActionRequest> queuedIslandAction_;
-    bool rearmIslandAction_ = false;
+    DeferredSlot<NativeActionRequest> nativeAction_;
+    DeferredSlot<MenuActionRequest> menuAction_;
+    DeferredSlot<ListViewActivationRequest> listViewActivation_;
+    DeferredSlot<IslandActionRequest> islandAction_;
+    bool nativeActionRunning_ = false;
+    uint64_t listViewActivationCancellation_ = 0;
     std::optional<IslandActionRequest> pendingIslandMenu_;
     std::optional<IslandActionRequest> trackedIslandMenu_;
     ULONGLONG pendingIslandDeadline_ = 0;

@@ -34,9 +34,8 @@ gates that keep the architecture honest: Bridge import-table inspection (no `Mic
 `Microsoft.WindowsAppRuntime`, or `CoreMessagingXP`), Bridge export presence, forbidden-payload
 checks, and Injector CLI surface checks.
 
-**`test.ps1` leaves a nonzero exit code even when everything passes.** Its last gate runs the
-Injector with no arguments (which exits 1 by design) and the script never resets `$LASTEXITCODE`.
-Read the printed gate lines, not the exit code.
+`test.ps1` exits 0 only when every suite and gate passed; any failure throws first. (Its last gate
+runs the Injector with no arguments, which exits 1 by design, so the script ends with `exit 0`.)
 
 ### Faster inner loop
 
@@ -234,9 +233,8 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
 
 ## Repository Notes
 
-- `FluentShell.Island` (`src/IslandHost`) and `IslandDemo` are listed in the solution but **not
-  built** in either configuration. They are source-level diagnostics; build `IslandDemo.vcxproj`
-  explicitly with an `OutDir` outside the production folder if you ever need it.
+- The native projects restore only CppWinRT (`src/packages.config`); WinUI and the Windows App SDK
+  belong to the renderer's own `PackageReference`s and never to native code.
 - `src/Renderer.Dwm` is the cross-process DWM attribute layer behind the `l0` diagnostic; it is not
   part of the translation path.
 - Source files are CRLF and carry localized comments/diagnostics; `Directory.Build.props` forces

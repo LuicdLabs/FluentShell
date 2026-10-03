@@ -125,8 +125,25 @@ bool RejectFlags(
     return false;
 }
 
+// MMC draws its result pane's description bar itself: an owner-draw Static under its
+// own view window whose paint is exactly the window text on a caption band.  That is a
+// text label, so it projects as one; any other owner-draw Static keeps its refusal.
+bool IsMmcDescriptionBar(HWND hwnd, DWORD style) noexcept {
+    if ((style & (SS_NOTIFY | WS_TABSTOP)) != 0) return false;
+    const HWND parent = GetParent(hwnd);
+    wchar_t parentClass[32]{};
+    return parent && GetClassNameW(parent, parentClass, 32) > 0 &&
+        FluentShell::EqualsIgnoreCase(parentClass, L"MMCViewWindow") &&
+        WindowClassRegisteredBySystemModule(parent, L"mmc.exe");
+}
+
 bool ProbeStatic(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     switch (style & SS_TYPEMASK) {
+    case SS_OWNERDRAW:
+        if (!IsMmcDescriptionBar(hwnd, style))
+            return Reject(reason, L"unsupported Static draw style");
+        kind = ControlKind::StaticText;
+        return true;
     case SS_LEFT:
     case SS_CENTER:
     case SS_RIGHT:
@@ -157,6 +174,13 @@ bool ProbeStatic(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason
         kind = ControlKind::StaticDecoration;
         return true;
     }
+    case SS_BITMAP:
+        // A wizard's side art and similar pictures: inert pixels with no semantics of
+        // their own.  An interactive one would need a click contract.
+        if ((style & (SS_NOTIFY | WS_TABSTOP)) != 0)
+            return Reject(reason, L"interactive Static bitmap is not supported");
+        kind = ControlKind::StaticBitmap;
+        return true;
     case SS_ICON:
         if ((style & (SS_NOTIFY | WS_TABSTOP)) != 0) {
             return Reject(reason, L"interactive Static icon is not supported");
@@ -169,10 +193,17 @@ bool ProbeStatic(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason
 }
 
 bool ProbeButton(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & BS_TYPEMASK) == BS_OWNERDRAW || (style & (BS_BITMAP | BS_ICON)) != 0) {
+    // A push button may show an icon or a bitmap instead of its text; the picture is
+    // captured and the text stays its accessible name.  A check box or radio button
+    // drawn as a picture has no projected toggle contract.
+    const DWORD type = style & BS_TYPEMASK;
+    const DWORD picture = style & (BS_BITMAP | BS_ICON);
+    const bool pushButton = type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON;
+    if (type == BS_OWNERDRAW || picture == (BS_BITMAP | BS_ICON) ||
+        (picture != 0 && !pushButton)) {
         return Reject(reason, L"unsupported Button draw style");
     }
-    switch (style & BS_TYPEMASK) {
+    switch (type) {
     case BS_PUSHBUTTON:
     case BS_DEFPUSHBUTTON:
         kind = ControlKind::Button;
@@ -252,9 +283,10 @@ bool ProbeMonitorPalette(HWND, DWORD style, ControlKind& kind, std::wstring& rea
 }
 
 bool ProbeProgressBar(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & (PBS_VERTICAL | WS_TABSTOP)) != 0) {
-        return Reject(reason,
-            L"vertical or tab-stop ProgressBar is not supported");
+    // WS_TABSTOP is tolerated: a dialog template can flag a progress bar as a stop, but
+    // the control takes no keyboard input, so capture keeps it out of traversal.
+    if ((style & PBS_VERTICAL) != 0) {
+        return Reject(reason, L"vertical ProgressBar is not supported");
     }
     kind = ControlKind::ProgressBar;
     return true;
@@ -365,13 +397,15 @@ bool ProbeToolbar(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reaso
         return false;
     }
     const DWORD toolbarStyle = style & 0xffffu;
-    // CCS_NODIVIDER and CCS_NORESIZE only tell the control not to draw its top
-    // divider and not to resize itself with its parent; the projection lays the
-    // toolbar out from its native rectangle either way.  TBSTYLE_LIST puts the
-    // label beside the icon, which the projected button already does.
-    constexpr DWORD accepted = CCS_TOP | CCS_NODIVIDER | CCS_NORESIZE |
-        TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE | TBSTYLE_FLAT | TBSTYLE_TRANSPARENT |
-        TBSTYLE_LIST;
+    // CCS_NODIVIDER only drops the top divider, and the remaining CCS_* bits -- top or
+    // bottom alignment, NOMOVEY, NORESIZE, NOPARENTALIGN -- only say how the control
+    // places itself when its parent resizes; the projection lays the toolbar out from
+    // its native rectangle either way.  TBSTYLE_LIST puts the label beside the icon,
+    // which the projected button already does.  TBSTYLE_ALTDRAG only matters to a
+    // customizable (CCS_ADJUSTABLE) toolbar, which stays refused.
+    constexpr DWORD accepted = CCS_TOP | CCS_NOMOVEY | CCS_NODIVIDER | CCS_NORESIZE |
+        CCS_NOPARENTALIGN | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE | TBSTYLE_FLAT |
+        TBSTYLE_TRANSPARENT | TBSTYLE_LIST | TBSTYLE_ALTDRAG;
     if ((toolbarStyle & ~accepted) != 0) {
         wchar_t text[128]{};
         swprintf_s(text, L"ToolbarWindow32 has unsupported style bits 0x%04lX (style=0x%08lX)",
@@ -494,25 +528,44 @@ bool ProbeTreeView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reas
 
 // The bounded Trackbar subset: a plain range control whose value the projection
 // can both read and drive through the control's own notification.  A selection
-// range, a thumbless bar, control-owned tooltips, and pre-move veto snapping are
-// each contracts the projection would have to invent, so they stay native.
+// range, a thumbless bar, and pre-move veto snapping are each contracts the
+// projection would have to invent, so they stay native.  TBS_TOOLTIPS only shows
+// the position beside the thumb while dragging, which the projected Slider's thumb
+// tooltip reproduces; a tooltip control attached any other way is refused.
 bool ProbeTrackbar(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     constexpr DWORD acceptedStyle = TBS_AUTOTICKS | TBS_VERT | TBS_TOP | TBS_BOTH |
         TBS_NOTICKS | TBS_FIXEDLENGTH | TBS_REVERSED | TBS_DOWNISLEFT |
-        TBS_TRANSPARENTBKGND;
+        TBS_TRANSPARENTBKGND | TBS_TOOLTIPS;
     if (const DWORD rejected = style & 0xffffu & ~acceptedStyle; rejected != 0) {
         static constexpr NamedFlag flags[] = {
             { TBS_ENABLESELRANGE, L"TBS_ENABLESELRANGE" },
             { TBS_NOTHUMB, L"TBS_NOTHUMB" },
-            { TBS_TOOLTIPS, L"TBS_TOOLTIPS" },
             { TBS_NOTIFYBEFOREMOVE, L"TBS_NOTIFYBEFOREMOVE" },
         };
         return RejectFlags(reason, L"Trackbar has unsupported style bit(s) ",
             rejected, style, flags, std::size(flags));
     }
-    if (SendMessageW(hwnd, TBM_GETTOOLTIPS, 0, 0) != 0)
+    if ((style & TBS_TOOLTIPS) == 0 && SendMessageW(hwnd, TBM_GETTOOLTIPS, 0, 0) != 0)
         return Reject(reason, L"Trackbar tooltips are not supported");
     kind = ControlKind::Slider;
+    return true;
+}
+
+// The UpDown (spin) control: a pair of arrows that step a bounded position, usually
+// mirrored into a buddy Edit.  Every UDS_* bit is layout or behavior the control itself
+// carries out when it is stepped -- wrapping, buddy text, alignment beside the buddy,
+// orientation -- so none of them changes the contract the projection drives.
+bool ProbeUpDown(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+    constexpr DWORD accepted = UDS_WRAP | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ALIGNLEFT |
+        UDS_AUTOBUDDY | UDS_ARROWKEYS | UDS_HORZ | UDS_NOTHOUSANDS | UDS_HOTTRACK;
+    if (const DWORD rejected = style & 0xffffu & ~accepted; rejected != 0) {
+        wchar_t text[112]{};
+        swprintf_s(text, L"UpDown has unsupported style bits 0x%04lX (style=0x%08lX)",
+            rejected, style);
+        reason = text;
+        return false;
+    }
+    kind = ControlKind::UpDown;
     return true;
 }
 
@@ -987,11 +1040,30 @@ bool CaptureAccessibleIslandState(HWND hwnd, ControlNode& node, std::wstring& re
     if (!ReadAccessibleIslandItems(hwnd, items, reason)) return false;
     node.islandItems.clear();
     node.islandItems.reserve(items.size());
+    // A graphic element's provider describes it but owns no pixels, so its image is
+    // what the host itself painted there.  One render serves every graphic.  The host
+    // fills its background before painting the graphic, and the island never projects
+    // that background anywhere else, so pixels exactly matching it -- sampled from the
+    // client corner -- travel transparent instead of drawing a box around the image.
+    std::optional<PaintedClientSurface> paint;
+    std::vector<uint8_t> background;
+    const auto clearBackground = [&](std::vector<uint8_t>& pixels) {
+        if (background.size() != 4 || background[3] != 0xff) return;
+        for (size_t offset = 0; offset + 4 <= pixels.size(); offset += 4) {
+            if (std::equal(background.begin(), background.end(), pixels.begin() + offset))
+                std::fill_n(pixels.begin() + offset, 4, uint8_t{ 0 });
+        }
+    };
     for (const AccessibleIslandItem& item : items) {
         AccessibleIslandItemSnapshot published;
-        published.kind = item.kind == AccessibleItemKind::Text ? L"text"
-            : item.kind == AccessibleItemKind::Link ? L"link"
-            : item.kind == AccessibleItemKind::PageTab ? L"pageTab" : L"button";
+        switch (item.kind) {
+        case AccessibleItemKind::Text: published.kind = L"text"; break;
+        case AccessibleItemKind::Heading: published.kind = L"heading"; break;
+        case AccessibleItemKind::Image: published.kind = L"image"; break;
+        case AccessibleItemKind::Link: published.kind = L"link"; break;
+        case AccessibleItemKind::PageTab: published.kind = L"pageTab"; break;
+        case AccessibleItemKind::Button: published.kind = L"button"; break;
+        }
         published.rect = item.rect;
         published.name = item.name;
         published.description = item.description;
@@ -999,6 +1071,21 @@ bool CaptureAccessibleIslandState(HWND hwnd, ControlNode& node, std::wstring& re
         published.enabled = item.enabled;
         published.dropDown = item.dropDown;
         published.selected = item.selected;
+        if (item.kind == AccessibleItemKind::Image) {
+            if (!paint) {
+                paint.emplace(hwnd);
+                uint32_t width = 0, height = 0;
+                std::wstring format;
+                if (paint->Rendered() && !paint->Crop(RECT{ 0, 0, 1, 1 }, width, height,
+                        format, background)) background.clear();
+            }
+            if (!paint->Rendered() || !paint->Crop(item.rect, published.imageWidth,
+                    published.imageHeight, published.imageFormat, published.imageData)) {
+                node.islandItems.clear();
+                return Reject(reason, L"accessible island graphic could not be rendered");
+            }
+            clearBackground(published.imageData);
+        }
         node.islandItems.push_back(std::move(published));
     }
     return true;
@@ -1028,6 +1115,7 @@ constexpr std::array kClassAdapters{
     ClassAdapter{ WC_TREEVIEWW, &ProbeTreeView },
     ClassAdapter{ WC_TABCONTROLW, &ProbeTabControl },
     ClassAdapter{ TRACKBAR_CLASSW, &ProbeTrackbar },
+    ClassAdapter{ UPDOWN_CLASSW, &ProbeUpDown },
     ClassAdapter{ L"#32770", &ProbeDialogContainer },
     ClassAdapter{ L"MDIClient", &ProbeMdiClient },
     ClassAdapter{ STATUSCLASSNAMEW, &ProbeStatusBar },
@@ -1416,6 +1504,90 @@ bool CaptureStaticIconState(HWND hwnd, ControlNode& node, std::wstring& reason) 
     if (!icon) return Reject(reason, L"Static icon has no current HICON");
     return CaptureIconPixels(icon, node.imageWidth, node.imageHeight,
         node.imageFormat, node.imageData, reason);
+}
+
+// The 32-bit top-down BGRX pixels of an HBITMAP the control owns.  A bitmap a
+// control BitBlts carries no alpha, so callers treat every pixel as opaque.
+bool ReadBitmapPixels(HBITMAP bitmap, int& width, int& height,
+    std::vector<uint8_t>& pixels) noexcept {
+    try {
+        BITMAP source{};
+        if (GetObjectW(bitmap, sizeof(source), &source) != sizeof(source) ||
+            source.bmWidth <= 0 || source.bmHeight == 0 ||
+            source.bmWidth > static_cast<LONG>(Ipc::kMaxDirectUiBitmapDimension) ||
+            std::abs(source.bmHeight) > static_cast<LONG>(Ipc::kMaxDirectUiBitmapDimension))
+            return false;
+        width = source.bmWidth;
+        height = std::abs(source.bmHeight);
+        pixels.assign(static_cast<size_t>(width) * height * 4, 0);
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        HDC screen = GetDC(nullptr);
+        const int rows = screen ? GetDIBits(screen, bitmap, 0, static_cast<UINT>(height),
+            pixels.data(), &info, DIB_RGB_COLORS) : 0;
+        if (screen) ReleaseDC(nullptr, screen);
+        return rows == height;
+    } catch (...) {
+        return false;
+    }
+}
+
+// An SS_BITMAP control BitBlts its HBITMAP at the client origin and leaves the rest
+// of its client area to the background, so the projection carries exactly that: a
+// client-sized image with the bitmap's pixels opaque at (0,0) and nothing elsewhere.
+// With SS_CENTERIMAGE the bitmap is centered instead and the documented fill -- the
+// colour of the bitmap's top-left pixel -- covers the rest of the client area.
+// Scaling (SS_REALSIZECONTROL) is a layout the adapter does not model.
+bool CaptureStaticBitmapState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    if ((style & SS_REALSIZECONTROL) != 0)
+        return Reject(reason, L"scaled Static bitmap is not supported");
+    const bool centered = (style & SS_CENTERIMAGE) != 0;
+    const auto bitmap = reinterpret_cast<HBITMAP>(SendMessageW(hwnd, STM_GETIMAGE, IMAGE_BITMAP, 0));
+    int sourceWidth = 0;
+    int sourceHeight = 0;
+    std::vector<uint8_t> pixels;
+    if (!bitmap || !ReadBitmapPixels(bitmap, sourceWidth, sourceHeight, pixels))
+        return Reject(reason, L"Static bitmap has no readable HBITMAP within the bitmap cap");
+    RECT client{};
+    if (!GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0)
+        return Reject(reason, L"Static bitmap has no client area");
+    const int width = client.right;
+    const int height = client.bottom;
+    if (width > static_cast<int>(Ipc::kMaxDirectUiBitmapDimension) ||
+        height > static_cast<int>(Ipc::kMaxDirectUiBitmapDimension) ||
+        static_cast<size_t>(width) * height * 4 > Ipc::kMaxDirectUiBitmapBytes)
+        return Reject(reason, L"Static bitmap is larger than the bitmap cap");
+    node.imageWidth = static_cast<uint32_t>(width);
+    node.imageHeight = static_cast<uint32_t>(height);
+    node.imageFormat = L"bgra8-premultiplied";
+    node.imageData.assign(static_cast<size_t>(width) * height * 4, 0);
+    // Destination of the bitmap's (0,0); negative when a centered bitmap is larger
+    // than the control and is cropped on both sides.
+    const int left = centered ? (width - sourceWidth) / 2 : 0;
+    const int top = centered ? (height - sourceHeight) / 2 : 0;
+    for (int row = 0; row < height; ++row) {
+        for (int column = 0; column < width; ++column) {
+            const int sourceRow = row - top;
+            const int sourceColumn = column - left;
+            const bool inside = sourceRow >= 0 && sourceRow < sourceHeight &&
+                sourceColumn >= 0 && sourceColumn < sourceWidth;
+            if (!inside && !centered) continue;
+            const size_t from = inside
+                ? (static_cast<size_t>(sourceRow) * sourceWidth + sourceColumn) * 4 : 0;
+            const size_t to = (static_cast<size_t>(row) * width + column) * 4;
+            node.imageData[to] = pixels[from];
+            node.imageData[to + 1] = pixels[from + 1];
+            node.imageData[to + 2] = pixels[from + 2];
+            node.imageData[to + 3] = 0xff;
+        }
+    }
+    return true;
 }
 
 bool ReadStringItems(
@@ -1944,8 +2116,32 @@ bool CaptureSysLinkState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     return true;
 }
 
-bool CaptureButtonState(HWND, ControlNode& node, std::wstring&) {
-    node.isDefault = (static_cast<DWORD>(node.style) & BS_TYPEMASK) == BS_DEFPUSHBUTTON;
+// BS_ICON / BS_BITMAP push buttons draw their picture centred instead of their text.
+bool CaptureButtonState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    const auto style = static_cast<DWORD>(node.style);
+    node.isDefault = (style & BS_TYPEMASK) == BS_DEFPUSHBUTTON;
+    if ((style & BS_ICON) != 0) {
+        const auto icon = reinterpret_cast<HICON>(SendMessageW(hwnd, BM_GETIMAGE, IMAGE_ICON, 0));
+        if (!icon) return Reject(reason, L"icon Button has no current HICON");
+        return CaptureIconPixels(icon, node.imageWidth, node.imageHeight,
+            node.imageFormat, node.imageData, reason);
+    }
+    if ((style & BS_BITMAP) != 0) {
+        const auto bitmap = reinterpret_cast<HBITMAP>(SendMessageW(hwnd, BM_GETIMAGE, IMAGE_BITMAP, 0));
+        int width = 0;
+        int height = 0;
+        std::vector<uint8_t> pixels;
+        if (!bitmap || !ReadBitmapPixels(bitmap, width, height, pixels))
+            return Reject(reason, L"bitmap Button has no readable HBITMAP");
+        if (width > static_cast<int>(Ipc::kMaxImageDimension) ||
+            height > static_cast<int>(Ipc::kMaxImageDimension))
+            return Reject(reason, L"bitmap Button picture is larger than the image cap");
+        for (size_t offset = 3; offset < pixels.size(); offset += 4) pixels[offset] = 0xff;
+        node.imageWidth = static_cast<uint32_t>(width);
+        node.imageHeight = static_cast<uint32_t>(height);
+        node.imageFormat = L"bgra8-premultiplied";
+        node.imageData = std::move(pixels);
+    }
     return true;
 }
 
@@ -2568,6 +2764,32 @@ bool CaptureTrackbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     return true;
 }
 
+// The range may run backwards (the up arrow then decreases the value), so the
+// projection carries it ordered and flags the direction.  The position is the
+// control's own: with UDS_SETBUDDYINT it is parsed from the buddy, and a buddy that
+// does not parse still leaves the control's last position, which is what an arrow
+// steps from.  The first acceleration step is the arrow's increment.
+bool CaptureUpDownState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    int low = 0;
+    int high = 0;
+    SendMessageW(hwnd, UDM_GETRANGE32, reinterpret_cast<WPARAM>(&low),
+        reinterpret_cast<LPARAM>(&high));
+    BOOL failed = FALSE;
+    const int position = static_cast<int>(SendMessageW(hwnd, UDM_GETPOS32, 0,
+        reinterpret_cast<LPARAM>(&failed)));
+    node.reversed = low > high;
+    node.minimum = (std::min)(low, high);
+    node.maximum = (std::max)(low, high);
+    node.position = position;
+    node.vertical = (static_cast<DWORD>(node.style) & UDS_HORZ) == 0;
+    UDACCEL acceleration{};
+    node.smallChange = SendMessageW(hwnd, UDM_GETACCEL, 1, reinterpret_cast<LPARAM>(&acceleration)) > 0 &&
+        acceleration.nInc > 0 ? static_cast<int>(acceleration.nInc) : 1;
+    if (node.position < node.minimum || node.position > node.maximum)
+        return Reject(reason, L"UpDown position is outside its native range");
+    return true;
+}
+
 bool CaptureMdiChildState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const auto style = static_cast<DWORD>(node.style);
     const bool minimized = (style & WS_MINIMIZE) != 0;
@@ -2634,8 +2856,10 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
     at(ControlKind::ListView) = &CaptureListViewState;
     at(ControlKind::TreeView) = &CaptureTreeViewState;
     at(ControlKind::StaticIcon) = &CaptureStaticIconState;
+    at(ControlKind::StaticBitmap) = &CaptureStaticBitmapState;
     at(ControlKind::TabControl) = &CaptureTabControlState;
     at(ControlKind::Slider) = &CaptureTrackbarState;
+    at(ControlKind::UpDown) = &CaptureUpDownState;
     at(ControlKind::StatusBar) = &CaptureStatusBarState;
     at(ControlKind::Toolbar) = &CaptureToolbarState;
     at(ControlKind::MdiChild) = &CaptureMdiChildState;
@@ -2719,8 +2943,16 @@ bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
     std::wstring containerReason;
     if (IsAccessibleIslandClass(className)) {
         if (ProbeAccessibleIsland(hwnd, style, kind, containerReason)) return true;
-    } else if (ProbePaneContainer(hwnd, style, kind, containerReason)) {
-        return true;
+    } else {
+        // mmcndmgr.dll registers several ATL classes; only the message view's accessible
+        // shape sets it apart from the hosts that frame child windows, which remain
+        // ordinary geometric containers.
+        std::wstring messageViewReason;
+        if (IsMmcMessageView(hwnd) &&
+            ProbeAccessibleIsland(hwnd, style, kind, messageViewReason)) return true;
+        if (ProbePaneContainer(hwnd, style, kind, containerReason)) return true;
+        if (!messageViewReason.empty())
+            containerReason += L"; as an MMC message view: " + messageViewReason;
     }
     reason = L"unsupported visible control class: ";
     reason.append(className);

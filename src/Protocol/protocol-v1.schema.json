@@ -103,7 +103,7 @@
           "else": { "not": { "required": ["indeterminate"] } }
         },
         {
-          "if": { "properties": { "kind": { "const": "slider" } }, "required": ["kind"] },
+          "if": { "properties": { "kind": { "enum": ["slider", "upDown"] } }, "required": ["kind"] },
           "then": { "required": ["minimum", "maximum", "position", "smallChange", "largeChange"] }
         },
         {
@@ -151,7 +151,8 @@
         {
           "if": {
             "anyOf": [
-              { "properties": { "kind": { "const": "staticIcon" } }, "required": ["kind"] },
+              { "properties": { "kind": { "enum": ["staticIcon", "staticBitmap"] } }, "required": ["kind"] },
+              { "properties": { "kind": { "const": "button" } }, "required": ["kind", "imageData"] },
               { "properties": { "kind": { "const": "radioButton" }, "presentationVariant": { "const": "bitmapSwitch" } }, "required": ["kind", "presentationVariant"] }
             ]
           },
@@ -159,7 +160,12 @@
             "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"],
             "allOf": [
               {
-                "if": { "properties": { "presentationVariant": { "enum": ["bitmapDisplay", "bitmapSwitch", "monitorPalette"] } }, "required": ["presentationVariant"] },
+                "if": {
+                  "anyOf": [
+                    { "properties": { "kind": { "const": "staticBitmap" } }, "required": ["kind"] },
+                    { "properties": { "presentationVariant": { "enum": ["bitmapDisplay", "bitmapSwitch", "monitorPalette"] } }, "required": ["presentationVariant"] }
+                  ]
+                },
                 "then": {
                   "properties": {
                     "imageWidth": { "maximum": 1024 },
@@ -254,7 +260,7 @@
         "generation": { "$ref": "#/$defs/u64String" },
         "nativeHwnd": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hwndString" }] },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "staticIcon", "staticDecoration", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland"] },
+        "kind": { "enum": ["static", "staticIcon", "staticBitmap", "staticDecoration", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "upDown", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland"] },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -420,15 +426,23 @@
             "type": "object",
             "required": ["kind", "rect", "name", "description", "actionName", "enabled", "dropDown"],
             "properties": {
-              "kind": { "enum": ["text", "button", "link", "pageTab"] },
+              "kind": { "enum": ["text", "heading", "image", "button", "link", "pageTab"] },
               "rect": { "$ref": "#/$defs/rect" },
               "name": { "$ref": "#/$defs/text" },
               "description": { "$ref": "#/$defs/text" },
               "actionName": { "$ref": "#/$defs/text" },
               "enabled": { "type": "boolean" },
               "dropDown": { "type": "boolean" },
-              "selected": { "type": "boolean" }
-            }
+              "selected": { "type": "boolean" },
+              "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
+              "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
+              "imageFormat": { "const": "bgra8-premultiplied" },
+              "imageData": { "type": "string", "minLength": 8, "maxLength": 49152, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            },
+            "$comment": "Only an image item carries pixels: what the host painted for a graphic its provider describes.",
+            "if": { "properties": { "kind": { "const": "image" } }, "required": ["kind"] },
+            "then": { "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"] },
+            "else": { "not": { "anyOf": [{ "required": ["imageWidth"] }, { "required": ["imageHeight"] }, { "required": ["imageFormat"] }, { "required": ["imageData"] }] } }
           }
         }
       }

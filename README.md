@@ -39,10 +39,12 @@ meet only through the versioned `FLSH` frame and the JSON schema in
 `src/Protocol/protocol-v1.schema.json`, so neither reaches into the other's state directly.
 
 The current control boundary is bounded textual HMENU command bars, standard
-Static text and icons, Button/check/three-state/radio/GroupBox, Edit and
+Static text, icons and bitmaps, Button/check/three-state/radio/GroupBox (push
+buttons also as icon or bitmap pictures), Edit and
 password Edit, dropdown-list/editable dropdown ComboBox, ListBox, SysLink,
 report-mode SysListView32, SysTreeView32 with its hierarchy, textual top-tab
-SysTabControl32, msctls_trackbar32, one-row ToolbarWindow32, textual status bars,
+SysTabControl32, msctls_trackbar32, msctls_updown32 spin controls, one-row
+ToolbarWindow32, textual status bars,
 MDI frames with their client area and child frames, and determinate or marquee
 horizontal ProgressBar controls plus supported MessageBox and static TaskDialog
 shapes. A private container class is admitted geometrically rather than by name:
@@ -52,7 +54,9 @@ band the container paints itself is reproduced from the pixels it drew. A host w
 whose content owns no HWND at all -- DirectUI is the common one -- is projected as an
 accessible island: its elements are read through the accessibility contract the window
 answers and driven by asking the provider to perform each element's own default
-action. Toolbars carry icon-only, latched, dropdown, callback-image, and
+action. MMC's message view, the icon/title/body pane a snap-in shows for an
+informational or error message, is read the same way and projected as a heading,
+body text, and the icon pixels the view painted. Toolbars carry icon-only, latched, dropdown, callback-image, and
 custom-drawn buttons, naming an unlabelled button from the accessible name the control
 itself publishes. Tree and list
 items carry their real per-item icons, a report list carries its column display
@@ -89,7 +93,7 @@ processes are hard-denied, along with the FluentShell renderer and FluentShell's
 Process-name injection, system-wide discovery, and injection watch modes do not exist in the
 production Injector.
 
-The one-shot `l0` command is the only diagnostic exposed by the production Injector. `IslandDemo` remains a source-level diagnostic and is excluded from the default production build.
+The one-shot `l0` command is the only diagnostic exposed by the production Injector.
 
 ## Build And Test
 
@@ -150,7 +154,5 @@ Expected behavior:
 ```powershell
 .\FluentShell.Injector.exe l0
 ```
-
-The default solution lists `FluentShell.Island` and `IslandDemo` for manual research but does not build them. When that legacy diagnostic is needed, build `src\PoC\IslandDemo\IslandDemo.vcxproj` explicitly with an `OutDir` outside the production folder and run `IslandDemo.exe` there; it is not an Injector entry point.
 
 Reference source under `ref_src` is read-only. WinUIShell informs the server/IPC/lifetime shape; its reflection RPC layer is not copied. The GPL-licensed modernizer sample is behavioral research only and contributes no copied implementation.

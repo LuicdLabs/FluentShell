@@ -562,7 +562,9 @@ bool CaptureCommonNodeFacets(
     // caption, including while a modal dialog disables the owner; it must never
     // turn into a disabled dialog tab stop. Keep the raw style for caption
     // commands, and keep both structural MDI kinds outside dialog traversal.
-    if (node.kind == ControlKind::DialogContainer ||
+    // A progress bar takes no keyboard input; a WS_TABSTOP a dialog template gave it
+    // would only make Tab land on nothing.
+    if (node.kind == ControlKind::DialogContainer || node.kind == ControlKind::ProgressBar ||
         node.kind == ControlKind::MdiClient || node.kind == ControlKind::MdiChild) {
         node.tabStop = false;
         node.tabIndex = -1;
@@ -610,6 +612,66 @@ bool CaptureChildNode(
         CaptureControlDetail(child, node, reason);
 }
 
+// A WS_VISIBLE child draws nothing when its ancestors' client areas clip it away
+// entirely -- a collapsed pane, a control parked outside its parent.  It is skipped
+// like a hidden one, and its own children are clipped with it.  A minimized root has
+// no client area at all, so clipping is not evaluated against it.
+bool DrawsInsideRoot(HWND root, HWND child) noexcept {
+    if (IsIconic(root)) return true;
+    RECT visible{};
+    if (!GetWindowRect(child, &visible)) return false;
+    for (HWND ancestor = GetParent(child); ancestor; ancestor = GetParent(ancestor)) {
+        RECT client{};
+        POINT origin{ 0, 0 };
+        if (!GetClientRect(ancestor, &client) || !ClientToScreen(ancestor, &origin)) return false;
+        OffsetRect(&client, origin.x, origin.y);
+        if (!IntersectRect(&visible, &visible, &client)) return false;
+        if (ancestor == root) return true;
+    }
+    return false;
+}
+
+// True when a WS_CLIPSIBLINGS child lies entirely under one visible sibling that is
+// above it in z-order: it cannot paint over that sibling, so nothing of it shows.
+bool CoveredBySiblingAbove(HWND child) noexcept {
+    if ((GetWindowLongPtrW(child, GWL_STYLE) & WS_CLIPSIBLINGS) == 0) return false;
+    RECT own{};
+    if (!GetWindowRect(child, &own)) return false;
+    for (HWND above = GetWindow(child, GW_HWNDPREV); above; above = GetWindow(above, GW_HWNDPREV)) {
+        RECT covering{};
+        RECT joined{};
+        if (!IsWindowVisible(above) || !GetWindowRect(above, &covering)) continue;
+        if ((GetWindowLongPtrW(above, GWL_EXSTYLE) & (WS_EX_TRANSPARENT | WS_EX_LAYERED)) != 0)
+            continue;
+        if (UnionRect(&joined, &covering, &own) && EqualRect(&joined, &covering)) return true;
+    }
+    return false;
+}
+
+// A wizard-mode property sheet keeps its tab control visible but shows no tab: the
+// page above covers the strip, and under comctl32 v6 every item rectangle is empty
+// as well.  It draws nothing a projection could reproduce.  A tab control with real,
+// uncovered tabs keeps the ordinary contract.
+bool IsHiddenTabStrip(HWND child) noexcept {
+    wchar_t className[32]{};
+    if (GetClassNameW(child, className, 32) <= 0 ||
+        !FluentShell::EqualsIgnoreCase(className, WC_TABCONTROLW)) return false;
+    if (CoveredBySiblingAbove(child)) return true;
+    const auto count = static_cast<int>(SendMessageW(child, TCM_GETITEMCOUNT, 0, 0));
+    if (count <= 0) return false;
+    for (int index = 0; index < count; ++index) {
+        RECT item{};
+        if (SendMessageW(child, TCM_GETITEMRECT, index, reinterpret_cast<LPARAM>(&item)) &&
+            !IsRectEmpty(&item)) return false;
+    }
+    return true;
+}
+
+bool CapturedChild(HWND root, HWND child) noexcept {
+    return IsWindowVisible(child) && !IsCompositeImplementationChild(child) &&
+        DrawsInsideRoot(root, child) && !IsHiddenTabStrip(child);
+}
+
 bool CaptureChildNodes(
     HWND root,
     CaptureContext& context,
@@ -630,7 +692,7 @@ bool CaptureChildNodes(
     std::wstring firstRejection;
     size_t rejections = 0;
     for (const HWND child : enumeration.handles) {
-        if (!IsWindowVisible(child) || IsCompositeImplementationChild(child)) continue;
+        if (!CapturedChild(root, child)) continue;
         DWORD childProcess = 0;
         const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
         if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
@@ -665,7 +727,7 @@ bool CaptureChildNodes(
     scope.visibleNodeIds = &visibleNodeIds;
     scope.visibleNodeKinds = &visibleNodeKinds;
     for (const HWND child : enumeration.handles) {
-        if (!IsWindowVisible(child) || IsCompositeImplementationChild(child)) continue;
+        if (!CapturedChild(root, child)) continue;
         // The menu-bar toolbar is projected as the surface's menu, so it must not also
         // appear as a control: one native menu bar becomes one projected menu bar.
         if (child == context.menuBarToolbar && !context.menuBarToolbarMenu.empty()) continue;
@@ -1002,6 +1064,12 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, item.enabled);
             HashBytes(hash, item.dropDown);
             HashBytes(hash, item.selected);
+            HashBytes(hash, item.imageWidth);
+            HashBytes(hash, item.imageHeight);
+            HashString(hash, item.imageFormat);
+            HashBytes(hash, item.imageData.size());
+            if (!item.imageData.empty())
+                HashRange(hash, item.imageData.data(), item.imageData.size());
         }
         HashString(hash, node.pageId);
         HashString(hash, node.semanticKey);

@@ -62,7 +62,8 @@ internal sealed class ControlFactory
         FrameworkElement element = viewModel.Kind switch
         {
             "static" => CreateStatic(viewModel),
-            "staticIcon" => CreateStaticIcon(viewModel),
+            "staticIcon" or "staticBitmap" => CreateStaticIcon(viewModel),
+            "upDown" => CreateUpDown(viewModel),
             "staticDecoration" => CreateStaticDecoration(viewModel),
             "separator" => new Border { Height = 1, Background = new SolidColorBrush(Microsoft.UI.Colors.Gray) },
             "button" => CreateButton(viewModel),
@@ -222,41 +223,31 @@ internal sealed class ControlFactory
         };
     }
 
-    // A Static icon is projected as a bare Image unless its variant needs the
-    // stretched semantic wrapper. The wrapper republishes the node through its own
-    // peer; the bare Image *is* the node, so the two cases differ in whether the
-    // Image itself may leave the UIA control view.
-    internal static bool StaticIconUsesSemanticWrapper(string presentationVariant) =>
-        presentationVariant is "bitmapDisplay" or "monitorPalette";
+    // DirectUI bitmap variants are drawn stretched to their slot; a classic SS_ICON
+    // keeps its pixels at their own size.
+    internal static Stretch StaticIconStretch(string presentationVariant) =>
+        presentationVariant is "bitmapDisplay" or "monitorPalette" ? Stretch.Fill : Stretch.None;
 
+    // A Static icon is an Image inside a semantic wrapper whose peer republishes the
+    // node.  The wrapper is a Control, so it carries the native enabled state into UIA
+    // -- a bare Image always reports itself enabled, which a disabled window (an owner
+    // behind its modal dialog) contradicts.  The Image itself leaves the control view.
     private FrameworkElement CreateStaticIcon(ControlNodeViewModel viewModel)
     {
-        var wrapped = StaticIconUsesSemanticWrapper(viewModel.PresentationVariant);
         var image = new Image
         {
-            Stretch = wrapped ? Stretch.Fill : Stretch.None,
+            // A static bitmap's pixels already span its whole client area.
+            Stretch = viewModel.Kind == "staticBitmap"
+                ? Stretch.Fill : StaticIconStretch(viewModel.PresentationVariant),
             IsHitTestVisible = false,
         };
-        void ApplyPixels()
-        {
-            var pixels = DecodeImagePixels(viewModel);
-            var bitmap = new WriteableBitmap(viewModel.ImageWidth, viewModel.ImageHeight);
-            using var stream = bitmap.PixelBuffer.AsStream();
-            stream.Write(pixels, 0, pixels.Length);
-            bitmap.Invalidate();
-            image.Source = bitmap;
-        }
+        void ApplyPixels() => image.Source = BitmapFromPixels(
+            viewModel.ImageWidth, viewModel.ImageHeight, DecodeImagePixels(viewModel));
         ApplyPixels();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName == nameof(viewModel.ImageData)) ApplyPixels();
         });
-        // The unwrapped variant projects this Image as the node element itself, so it
-        // must stay in the UIA control view: the Bridge's committed gate enumerates
-        // with the control-view condition and a Raw element is simply absent there.
-        // Only the wrapped variants may hide their inner Image, because the wrapper's
-        // own peer republishes the node.
-        if (!wrapped) return image;
         AutomationProperties.SetAccessibilityView(image, AccessibilityView.Raw);
         return new SemanticStaticIconControl
         {
@@ -272,8 +263,8 @@ internal sealed class ControlFactory
 
     internal static byte[] DecodeImagePixels(ControlNodeViewModel viewModel)
     {
-        var maxDimension = viewModel.PresentationVariant is "bitmapDisplay" or "bitmapSwitch"
-            or "monitorPalette"
+        var maxDimension = viewModel.Kind == "staticBitmap" ||
+            viewModel.PresentationVariant is "bitmapDisplay" or "bitmapSwitch" or "monitorPalette"
             ? ProtocolConstants.MaxDirectUiBitmapDimension
             : ProtocolConstants.MaxImageDimension;
         if (viewModel.ImageFormat != "bgra8-premultiplied" ||
@@ -376,6 +367,22 @@ internal sealed class ControlFactory
             control.HorizontalContentAlignment = HorizontalAlignment.Left;
             control.Padding = new Thickness(10, 4, 10, 4);
         }
+        else if (!string.IsNullOrEmpty(viewModel.ImageData))
+        {
+            // A BS_ICON / BS_BITMAP button shows its picture, centred at its own size,
+            // instead of its text; the text stays the accessible name.
+            var picture = new Image { Stretch = Stretch.None, IsHitTestVisible = false };
+            void ApplyPicture() => picture.Source = BitmapFromBase64(
+                viewModel.ImageWidth, viewModel.ImageHeight, viewModel.ImageFormat, viewModel.ImageData);
+            ApplyPicture();
+            _lifetime.Subscribe(viewModel, (_, args) =>
+            {
+                if (args.PropertyName == nameof(viewModel.ImageData) &&
+                    !string.IsNullOrEmpty(viewModel.ImageData)) ApplyPicture();
+            });
+            AutomationProperties.SetAccessibilityView(picture, AccessibilityView.Raw);
+            control.Content = picture;
+        }
         else
         {
             Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
@@ -453,15 +460,8 @@ internal sealed class ControlFactory
             IsHitTestVisible = false,
         };
         AutomationProperties.SetAccessibilityView(image, AccessibilityView.Raw);
-        void ApplyPixels()
-        {
-            var pixels = DecodeImagePixels(viewModel);
-            var bitmap = new WriteableBitmap(viewModel.ImageWidth, viewModel.ImageHeight);
-            using var stream = bitmap.PixelBuffer.AsStream();
-            stream.Write(pixels, 0, pixels.Length);
-            bitmap.Invalidate();
-            image.Source = bitmap;
-        }
+        void ApplyPixels() => image.Source = BitmapFromPixels(
+            viewModel.ImageWidth, viewModel.ImageHeight, DecodeImagePixels(viewModel));
         ApplyPixels();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
@@ -1502,12 +1502,25 @@ internal sealed class ControlFactory
         if (item.ImageWidth is null && item.ImageHeight is null &&
             item.ImageFormat is null && item.ImageData is null)
             return null;
-        if (item.ImageWidth is not { } width || item.ImageHeight is not { } height ||
-            item.ImageFormat != "bgra8-premultiplied" || item.ImageData is null)
-            throw new InvalidOperationException("Validated Toolbar icon metadata is unavailable.");
-        var pixels = Convert.FromBase64String(item.ImageData);
-        if (pixels.Length != checked(width * height * 4))
-            throw new InvalidOperationException("Validated Toolbar icon pixel count changed.");
+        return BitmapFromBase64(item.ImageWidth, item.ImageHeight, item.ImageFormat, item.ImageData);
+    }
+
+    // Every owned pixel buffer arrives validated as canonical premultiplied BGRA. The
+    // size is rechecked here because a bitmap built from a short buffer would silently
+    // draw whatever memory followed it.
+    internal static WriteableBitmap BitmapFromBase64(
+        int? width, int? height, string? format, string? data)
+    {
+        if (width is not { } w || height is not { } h ||
+            format != "bgra8-premultiplied" || data is null)
+            throw new InvalidOperationException("Validated pixel metadata is unavailable.");
+        return BitmapFromPixels(w, h, Convert.FromBase64String(data));
+    }
+
+    internal static WriteableBitmap BitmapFromPixels(int width, int height, byte[] pixels)
+    {
+        if (width <= 0 || height <= 0 || pixels.Length != checked(width * height * 4))
+            throw new InvalidOperationException("Validated pixel count changed.");
         var bitmap = new WriteableBitmap(width, height);
         using var stream = bitmap.PixelBuffer.AsStream();
         stream.Write(pixels, 0, pixels.Length);
@@ -1797,32 +1810,14 @@ internal sealed class ControlFactory
             : viewModel.ItemImages[index];
     }
 
-    internal static WriteableBitmap BitmapForImageListEntry(ImageListEntry entry)
-    {
-        var pixels = Convert.FromBase64String(entry.ImageData);
-        if (pixels.Length != checked(entry.ImageWidth * entry.ImageHeight * 4))
-            throw new InvalidOperationException("Validated image list pixel count changed.");
-        var bitmap = new WriteableBitmap(entry.ImageWidth, entry.ImageHeight);
-        using var stream = bitmap.PixelBuffer.AsStream();
-        stream.Write(pixels, 0, pixels.Length);
-        bitmap.Invalidate();
-        return bitmap;
-    }
+    internal static WriteableBitmap BitmapForImageListEntry(ImageListEntry entry) =>
+        BitmapFromBase64(entry.ImageWidth, entry.ImageHeight, entry.ImageFormat, entry.ImageData);
 
     // A container's own painted band, reproduced from the pixels the native window
     // drew.  The projection cannot re-render what it never parsed, so it publishes
     // exactly those pixels rather than approximating the band.
-    internal static WriteableBitmap BitmapForChromeRegion(ChromeRegion region)
-    {
-        var pixels = Convert.FromBase64String(region.ImageData);
-        if (pixels.Length != checked(region.ImageWidth * region.ImageHeight * 4))
-            throw new InvalidOperationException("Validated chrome region pixel count changed.");
-        var bitmap = new WriteableBitmap(region.ImageWidth, region.ImageHeight);
-        using var stream = bitmap.PixelBuffer.AsStream();
-        stream.Write(pixels, 0, pixels.Length);
-        bitmap.Invalidate();
-        return bitmap;
-    }
+    internal static WriteableBitmap BitmapForChromeRegion(ChromeRegion region) =>
+        BitmapFromBase64(region.ImageWidth, region.ImageHeight, region.ImageFormat, region.ImageData);
 
     // A trackbar is projected as a stock Slider: integer steps, no invented ticks,
     // and no thumb tooltip, because the adapter captures a position and a range and
@@ -1831,11 +1826,14 @@ internal sealed class ControlFactory
     // TBS_REVERSED hint are combined into one direction.
     private Slider CreateSlider(ControlNodeViewModel viewModel)
     {
+        // TBS_TOOLTIPS: the native control shows its position beside the thumb while it
+        // is dragged, which is exactly what the Slider's thumb tooltip shows.
+        const ulong tbsTooltips = 0x0100;
         var control = new Slider
         {
             Orientation = viewModel.Vertical ? Orientation.Vertical : Orientation.Horizontal,
             IsDirectionReversed = viewModel.Reversed ^ viewModel.Vertical,
-            IsThumbToolTipEnabled = false,
+            IsThumbToolTipEnabled = (viewModel.Style & tbsTooltips) != 0,
             TickPlacement = TickPlacement.None,
             StepFrequency = 1,
             MinWidth = 0,
@@ -1889,6 +1887,53 @@ internal sealed class ControlFactory
                 control.Orientation = viewModel.Vertical ? Orientation.Vertical : Orientation.Horizontal;
                 control.IsDirectionReversed = viewModel.Reversed ^ viewModel.Vertical;
             }
+        });
+        return control;
+    }
+
+    private const ulong UdsWrap = 0x0001;
+
+    // Where one arrow step lands.  The up (or right) arrow moves toward the native
+    // upper bound, which is the lower end when the range runs backwards; UDS_WRAP
+    // carries a step past one end round to the other, and otherwise the end holds.
+    internal static int UpDownStepTarget(
+        int minimum, int maximum, int position, int step, bool reversed, bool wrap, bool up)
+    {
+        var delta = (long)step * ((up ^ reversed) ? 1 : -1);
+        var target = position + delta;
+        if (target > maximum) return wrap ? minimum : maximum;
+        if (target < minimum) return wrap ? maximum : minimum;
+        return (int)target;
+    }
+
+    private FrameworkElement CreateUpDown(ControlNodeViewModel viewModel)
+    {
+        var control = new SemanticUpDownControl(viewModel.Vertical);
+        void Step(bool up)
+        {
+            if (_isApplyingCanonical() || !AllowsAction(viewModel, "setValue")) return;
+            var target = UpDownStepTarget(viewModel.Minimum, viewModel.Maximum, viewModel.Position,
+                Math.Max(1, viewModel.SmallChange), viewModel.Reversed,
+                (viewModel.Style & UdsWrap) != 0, up);
+            if (target != viewModel.Position) _action(viewModel, "setValue", target);
+        }
+        void RequestValue(int value)
+        {
+            if (_isApplyingCanonical() || !AllowsAction(viewModel, "setValue")) return;
+            var target = Math.Clamp(value, viewModel.Minimum, viewModel.Maximum);
+            if (target != viewModel.Position) _action(viewModel, "setValue", target);
+        }
+        control.Stepped += Step;
+        control.ValueRequested += RequestValue;
+        void ApplyCanonical() =>
+            control.Apply(viewModel.Minimum, viewModel.Maximum, viewModel.Position,
+                Math.Max(1, viewModel.SmallChange));
+        ApplyCanonical();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Minimum) or nameof(viewModel.Maximum) or
+                nameof(viewModel.Position) or nameof(viewModel.SmallChange))
+                ApplyCanonical();
         });
         return control;
     }
@@ -2054,7 +2099,8 @@ internal sealed class ControlFactory
     internal static AutomationControlType AutomationControlTypeFor(string kind) => kind switch
     {
         "static" => AutomationControlType.Text,
-        "staticIcon" => AutomationControlType.Image,
+        "staticIcon" or "staticBitmap" => AutomationControlType.Image,
+        "upDown" => AutomationControlType.Spinner,
         "sysLink" => AutomationControlType.Pane,
         "listView" => AutomationControlType.List,
         "treeView" => AutomationControlType.Tree,
@@ -2223,6 +2269,123 @@ internal sealed class SemanticProgressBarControl : ContentControl
 
     protected override AutomationPeer OnCreateAutomationPeer() =>
         new SemanticProgressBarAutomationPeer(this);
+}
+
+// A projected UpDown: the two arrows the native control draws, stacked or side by
+// side as its orientation says.  It owns no value of its own -- each arrow or
+// keyboard step asks the Bridge to run the native step, and the canonical position
+// comes back through Apply.
+internal sealed class SemanticUpDownControl : ContentControl
+{
+    private readonly bool _vertical;
+
+    public SemanticUpDownControl(bool vertical)
+    {
+        _vertical = vertical;
+        var grid = new Grid();
+        var first = Arrow(vertical ? "" : "", up: vertical);
+        var second = Arrow(vertical ? "" : "", up: !vertical);
+        if (vertical)
+        {
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            Grid.SetRow(second, 1);
+        }
+        else
+        {
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            Grid.SetColumn(second, 1);
+        }
+        grid.Children.Add(first);
+        grid.Children.Add(second);
+        Content = grid;
+        MinWidth = 0;
+        MinHeight = 0;
+        Padding = new Thickness(0);
+        HorizontalContentAlignment = HorizontalAlignment.Stretch;
+        VerticalContentAlignment = VerticalAlignment.Stretch;
+    }
+
+    public event Action<bool>? Stepped;
+    public event Action<int>? ValueRequested;
+    public int Minimum { get; private set; }
+    public int Maximum { get; private set; }
+    public int Value { get; private set; }
+    public int SmallChange { get; private set; } = 1;
+
+    public void Apply(int minimum, int maximum, int value, int smallChange)
+    {
+        Minimum = minimum;
+        Maximum = maximum;
+        Value = value;
+        SmallChange = smallChange;
+    }
+
+    public void RequestValue(int value) => ValueRequested?.Invoke(value);
+
+    private RepeatButton Arrow(string glyph, bool up)
+    {
+        var button = new RepeatButton
+        {
+            Content = new FontIcon { Glyph = glyph, FontSize = 8 },
+            Padding = new Thickness(0),
+            MinWidth = 0,
+            MinHeight = 0,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            IsTabStop = false,
+        };
+        // The arrows are parts of the one spinner the native control is, so only the
+        // spinner itself appears to assistive technology.
+        AutomationProperties.SetAccessibilityView(button, AccessibilityView.Raw);
+        button.Click += (_, _) => Stepped?.Invoke(up);
+        return button;
+    }
+
+    protected override void OnKeyDown(Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
+    {
+        var up = args.Key switch
+        {
+            global::Windows.System.VirtualKey.Up => _vertical ? true : (bool?)null,
+            global::Windows.System.VirtualKey.Down => _vertical ? false : (bool?)null,
+            global::Windows.System.VirtualKey.Right => _vertical ? (bool?)null : true,
+            global::Windows.System.VirtualKey.Left => _vertical ? (bool?)null : false,
+            _ => null,
+        };
+        if (up is { } direction)
+        {
+            args.Handled = true;
+            Stepped?.Invoke(direction);
+            return;
+        }
+        base.OnKeyDown(args);
+    }
+
+    protected override AutomationPeer OnCreateAutomationPeer() =>
+        new SemanticUpDownAutomationPeer(this);
+}
+
+internal sealed class SemanticUpDownAutomationPeer(SemanticUpDownControl owner)
+    : FrameworkElementAutomationPeer(owner), IRangeValueProvider
+{
+    protected override AutomationControlType GetAutomationControlTypeCore() =>
+        ControlFactory.AutomationControlTypeFor("upDown");
+    protected override string GetClassNameCore() => "ProjectedUpDown";
+    protected override string GetNameCore() => AutomationProperties.GetName(owner);
+    protected override bool IsControlElementCore() => true;
+    protected override bool IsContentElementCore() => true;
+    protected override object GetPatternCore(PatternInterface patternInterface) =>
+        patternInterface == PatternInterface.RangeValue
+            ? this : base.GetPatternCore(patternInterface);
+
+    public bool IsReadOnly => !owner.IsEnabled;
+    public double Maximum => owner.Maximum;
+    public double Minimum => owner.Minimum;
+    public double Value => owner.Value;
+    public double SmallChange => owner.SmallChange;
+    public double LargeChange => owner.SmallChange;
+    public void SetValue(double value) => owner.RequestValue((int)Math.Round(value));
 }
 
 internal sealed class SemanticProgressBarAutomationPeer(SemanticProgressBarControl owner) :
@@ -3205,16 +3368,30 @@ internal sealed class SemanticAccessibleIsland : Canvas
         for (var index = 0; index < items.Count; ++index)
         {
             var item = items[index];
-            var element = item.Kind == "text"
-                ? (FrameworkElement)new TextBlock
+            FrameworkElement element = item.Kind switch
+            {
+                "text" or "heading" => new TextBlock
                 {
                     Text = item.Name,
                     FontSize = ItemFontSize,
-                    VerticalAlignment = VerticalAlignment.Center,
+                    FontWeight = item.Kind == "heading"
+                        ? Microsoft.UI.Text.FontWeights.SemiBold
+                        : Microsoft.UI.Text.FontWeights.Normal,
+                    VerticalAlignment = item.Kind == "heading"
+                        ? VerticalAlignment.Top : VerticalAlignment.Center,
                     TextWrapping = TextWrapping.Wrap,
-                    TextTrimming = TextTrimming.CharacterEllipsis,
-                }
-                : BuildActionable(item, index);
+                },
+                // The host painted this graphic itself; the projection draws exactly
+                // those pixels and names it with the provider's own description.
+                "image" => new Image
+                {
+                    Source = ControlFactory.BitmapFromBase64(
+                        item.ImageWidth, item.ImageHeight, item.ImageFormat, item.ImageData),
+                    Stretch = Stretch.Fill,
+                    IsHitTestVisible = false,
+                },
+                _ => BuildActionable(item, index),
+            };
             AutomationProperties.SetName(element, item.Name);
             // The provider's own action string is what the projection will perform, so it
             // is what an assistive client is told about.
@@ -3223,7 +3400,13 @@ internal sealed class SemanticAccessibleIsland : Canvas
             Canvas.SetLeft(element, item.Rect.X * scale);
             Canvas.SetTop(element, item.Rect.Y * scale);
             element.Width = Math.Max(0, item.Rect.Width * scale);
-            element.Height = Math.Max(0, item.Rect.Height * scale);
+            // XAML lays CJK text out a little taller than GDI did, so inert text keeps its
+            // native width and wraps at the same width but may grow downward rather than
+            // lose its last line to an ellipsis.
+            if (element is TextBlock)
+                element.MinHeight = Math.Max(0, item.Rect.Height * scale);
+            else
+                element.Height = Math.Max(0, item.Rect.Height * scale);
             Children.Add(element);
         }
     }

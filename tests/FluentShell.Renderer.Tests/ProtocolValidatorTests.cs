@@ -1,5 +1,7 @@
 using System.Text.Json;
 using FluentShell.Renderer.Protocol;
+using FluentShell.Renderer.Windows;
+using Microsoft.UI.Xaml.Automation.Peers;
 
 namespace FluentShell.Renderer.Tests;
 
@@ -14,9 +16,9 @@ public class ProtocolValidatorTests
     // the bounded adapters can currently produce.
     public static TheoryData<string> ProjectedKinds() =>
     [
-        "static", "staticIcon", "separator", "button", "checkBox", "threeState", "radioButton",
+        "static", "staticIcon", "staticBitmap", "separator", "button", "checkBox", "threeState", "radioButton",
         "edit", "password", "comboBox", "listBox", "groupBox", "progressBar",
-        "sysLink", "listView", "treeView", "tabControl", "slider", "dialogContainer",
+        "sysLink", "listView", "treeView", "tabControl", "slider", "upDown", "dialogContainer",
         "mdiClient", "statusBar", "toolbar", "paneContainer", "accessibleIsland",
     ];
 
@@ -467,6 +469,47 @@ public class ProtocolValidatorTests
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
     }
 
+    // A picture push button carries its icon under the icon cap; a text button carries
+    // no image fields at all.
+    [Fact]
+    public void PictureButtonCarriesItsIconUnderTheIconCap()
+    {
+        var snapshot = TestData.Snapshot();
+        var text = NodeOfKind("button");
+        snapshot.Nodes[0] = text;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+        var picture = text with
+        {
+            ImageWidth = 1, ImageHeight = 1, ImageFormat = "bgra8-premultiplied",
+            ImageData = Convert.ToBase64String([0x10, 0x20, 0x30, 0x40]),
+        };
+        snapshot.Nodes[0] = picture;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+        snapshot.Nodes[0] = picture with { ImageWidth = ProtocolConstants.MaxImageDimension + 1 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = picture with { ImageData = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+    }
+
+    // An SS_BITMAP picture carries wizard-sized pixels under the bitmap cap, but stays
+    // inert: never a tab stop, never beyond the cap, always canonical premultiplied BGRA.
+    [Fact]
+    public void StaticBitmapTakesTheBitmapCapButStaysInert()
+    {
+        var snapshot = TestData.Snapshot();
+        var valid = NodeOfKind("staticBitmap");
+        snapshot.Nodes[0] = valid;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        snapshot.Nodes[0] = valid with { TabStop = true, TabIndex = 0 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { ImageWidth = ProtocolConstants.MaxDirectUiBitmapDimension + 1 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = valid with { ImageData = null };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        Assert.Equal(AutomationControlType.Image, ControlFactory.AutomationControlTypeFor("staticBitmap"));
+    }
+
     [Fact]
     public void ImageFieldsAreRejectedOnOtherKindsByRequiredFieldGate()
     {
@@ -722,6 +765,16 @@ public class ProtocolValidatorTests
                 ImageFormat = "bgra8-premultiplied",
                 ImageData = Convert.ToBase64String([0x10, 0x20, 0x30, 0x40]),
             },
+            // Wider than the 96-pixel icon cap: a static bitmap takes the bitmap cap.
+            "staticBitmap" => node with
+            {
+                Text = string.Empty,
+                ImageWidth = 120,
+                ImageHeight = 1,
+                ImageFormat = "bgra8-premultiplied",
+                ImageData = Convert.ToBase64String(
+                    Enumerable.Repeat(new byte[] { 0x10, 0x20, 0x30, 0xff }, 120).SelectMany(pixel => pixel).ToArray()),
+            },
             "comboBox" => node with { Items = ["one", "two"], SelectedIndex = 1 },
             "sysLink" => node with { Text = "Open the report now", Items = ["the report"] },
             "listView" => node with
@@ -799,6 +852,15 @@ public class ProtocolValidatorTests
                 ItemStateImages = [-1, -1, -1],
                 EditableLabels = true,
                 EditingIndex = -1,
+            },
+            "upDown" => node with
+            {
+                Text = string.Empty,
+                Minimum = 0,
+                Maximum = 0,
+                Position = 0,
+                SmallChange = 1,
+                LargeChange = 0,
             },
             "slider" => node with
             {

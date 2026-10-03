@@ -1130,8 +1130,10 @@ TopLevelCensus EnumerateTopLevels() {
         wchar_t className[256]{};
         GetClassNameW(hwnd, className, static_cast<int>(std::size(className)));
         const wchar_t* filtered = nullptr;
+        RECT bounds{};
         if (GetAncestor(hwnd, GA_ROOT) != hwnd) filtered = L"not a root window";
         else if (!IsWindowVisible(hwnd)) filtered = L"hidden";
+        else if (!GetWindowRect(hwnd, &bounds) || IsRectEmpty(&bounds)) filtered = L"no screen area";
         else if (FluentShell::EqualsIgnoreCase(className, L"#32768")) {
             filtered = L"native menu popup";
         } else if (FluentShell::EqualsIgnoreCase(className, L"tooltips_class32") ||
@@ -1288,10 +1290,9 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
         return decision;
     }
     if (ownsVisibleTopLevel) {
-        // Discovery order follows desktop z-order, so an owned dialog can be
-        // visited before its root during startup.  Keep the root native until
-        // every owned top-level closes; otherwise the next pass could cloak it
-        // underneath the dialog that was already skipped.
+        // A modeless owned top-level has no projection contract, so the root stays
+        // native until every such window closes; cloaking it would cloak the owned
+        // window with it.
         decision.action = DiscoveryAction::DeferOwnerGraph;
         decision.firstDeferral = ownerGraphDeferrals_.try_emplace(window, 0).second;
         return decision;
@@ -1304,13 +1305,22 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
 
 void RendererSession::DiscoverTopLevelWindows() {
     const TopLevelCensus census = EnumerateTopLevels();
-    const std::vector<HWND>& candidates = census.candidates;
     LogDiscoveryCensus(census, discoveryCensusSignature_);
     PruneDiscoveryState();
+    // Desktop z-order puts an owned dialog above its owner, but an owned window can only
+    // be decided once its owner has been: classify every root before the windows it owns.
+    std::vector<HWND> candidates = census.candidates;
+    std::stable_partition(candidates.begin(), candidates.end(),
+        [](HWND candidate) { return EffectiveTopLevelOwner(candidate) == nullptr; });
     for (const HWND window : candidates) {
+        // A modal dialog does not hold its owner native: the owner projects first and
+        // the dialog follows it in this same pass as a modal surface of its own.  That
+        // is how a console that opens a dialog during startup ever projects.
         const bool ownsVisibleTopLevel = !EffectiveTopLevelOwner(window) &&
-            std::any_of(candidates.begin(), candidates.end(),
-                [window](HWND candidate) { return EffectiveTopLevelOwner(candidate) == window; });
+            std::any_of(candidates.begin(), candidates.end(), [window](HWND candidate) {
+                return EffectiveTopLevelOwner(candidate) == window &&
+                    !IsModalOwnedTopLevel(candidate);
+            });
         auto decision = ClassifyTopLevel(window, ownsVisibleTopLevel);
         if (decision.skipReason) {
             std::wstring line = L"Native window remains untranslated: ";

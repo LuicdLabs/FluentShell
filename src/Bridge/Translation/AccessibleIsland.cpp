@@ -382,6 +382,137 @@ std::wstring DescribeAccessibleIsland(HWND window) noexcept {
     }
 }
 
+bool WindowClassRegisteredBySystemModule(HWND window, std::wstring_view moduleName) noexcept {
+    try {
+        if (!window || !IsWindow(window)) return false;
+        const auto module = reinterpret_cast<HMODULE>(GetClassLongPtrW(window, GCLP_HMODULE));
+        wchar_t modulePath[MAX_PATH]{};
+        wchar_t systemPath[MAX_PATH]{};
+        const DWORD moduleLength = module
+            ? GetModuleFileNameW(module, modulePath, MAX_PATH) : 0;
+        const UINT systemLength = GetSystemDirectoryW(systemPath, MAX_PATH);
+        if (moduleLength == 0 || moduleLength >= MAX_PATH ||
+            systemLength == 0 || systemLength >= MAX_PATH) return false;
+        std::wstring expected(systemPath, systemLength);
+        expected += L'\\';
+        expected += moduleName;
+        return FluentShell::EqualsIgnoreCase(modulePath, expected);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool IsMmcMessageView(HWND window) noexcept {
+    wchar_t className[64]{};
+    return window && GetClassNameW(window, className, 64) >= 5 &&
+        std::wstring_view(className).substr(0, 4) == L"ATL:" &&
+        WindowClassRegisteredBySystemModule(window, L"mmcndmgr.dll");
+}
+
+namespace {
+
+bool ReadMessageViewParts(
+    HWND view,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) {
+    POINT origin{ 0, 0 };
+    RECT client{};
+    if (!view || !IsWindow(view) || !ClientToScreen(view, &origin) ||
+        !GetClientRect(view, &client)) {
+        return Reject(reason, L"message view window is unavailable");
+    }
+    AccessibleRef root;
+    if (!OpenIsland(view, root, reason)) return false;
+    long rootRole = 0;
+    if (!ReadRole(root.value, SelfId(), rootRole) || rootRole != ROLE_SYSTEM_PANE) {
+        return Reject(reason, L"message view accessible root is not a pane");
+    }
+    std::vector<IslandElement> elements;
+    if (!CollectElements(root.value, elements, reason)) return false;
+    const RECT screen{ origin.x, origin.y, origin.x, origin.y };
+    size_t texts = 0;
+    size_t graphics = 0;
+    for (const IslandElement& element : elements) {
+        IAccessible* target = element.Target(root.value);
+        long role = 0;
+        if (!ReadRole(target, element.id, role) ||
+            (role != ROLE_SYSTEM_STATICTEXT && role != ROLE_SYSTEM_GRAPHIC)) {
+            return Reject(reason, L"message view child is neither text nor a graphic");
+        }
+        BstrRef action;
+        if (SUCCEEDED(target->get_accDefaultAction(element.id, &action.value)) &&
+            !TrimmedText(action.Text()).empty()) {
+            return Reject(reason, L"message view child unexpectedly offers an action");
+        }
+        AccessibleIslandItem item;
+        long left = 0, top = 0, width = 0, height = 0;
+        if (FAILED(target->accLocation(&left, &top, &width, &height, element.id)) ||
+            width <= 0 || height <= 0) {
+            return Reject(reason, L"message view child has no accessible bounds");
+        }
+        item.rect = { left - screen.left, top - screen.top,
+            left - screen.left + width, top - screen.top + height };
+        if (item.rect.left < client.left || item.rect.top < client.top ||
+            item.rect.right > client.right || item.rect.bottom > client.bottom) {
+            return Reject(reason, L"message view child falls outside the view");
+        }
+        // The text children name themselves by their part ("Title", "Body") and carry
+        // the text the view draws as their value, so the value is what is projected.
+        BstrRef name;
+        BstrRef value;
+        if (FAILED(target->get_accName(element.id, &name.value))) {
+            return Reject(reason, L"message view child name is unavailable");
+        }
+        if (role == ROLE_SYSTEM_STATICTEXT) {
+            if (++texts > 2) return Reject(reason, L"message view has more than two text parts");
+            if (FAILED(target->get_accValue(element.id, &value.value))) {
+                return Reject(reason, L"message view text has no value");
+            }
+            item.kind = texts == 1 ? AccessibleItemKind::Heading : AccessibleItemKind::Text;
+            item.name = TrimmedText(value.Text());
+            item.description = TrimmedText(name.Text());
+            // An empty body draws nothing; an empty title means this is not the shape
+            // the adapter knows.
+            if (item.name.empty()) {
+                if (texts == 1) return Reject(reason, L"message view has no title");
+                continue;
+            }
+        } else {
+            if (++graphics > 1) return Reject(reason, L"message view has more than one graphic");
+            if (width > static_cast<long>(Ipc::kMaxImageDimension) ||
+                height > static_cast<long>(Ipc::kMaxImageDimension)) {
+                return Reject(reason, L"message view graphic is larger than the image cap");
+            }
+            item.kind = AccessibleItemKind::Image;
+            item.name = TrimmedText(name.Text());
+            if (item.name.empty()) return Reject(reason, L"message view graphic has no name");
+        }
+        if (item.name.size() > Ipc::kMaxStringChars ||
+            item.description.size() > Ipc::kMaxStringChars) {
+            return Reject(reason, L"message view text exceeds the protocol cap");
+        }
+        items.push_back(std::move(item));
+    }
+    return texts > 0 || Reject(reason, L"message view has no title");
+}
+
+}  // namespace
+
+bool ReadMmcMessageView(
+    HWND view,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) noexcept {
+    items.clear();
+    try {
+        if (ReadMessageViewParts(view, items, reason)) return true;
+    } catch (...) {
+        reason = L"message view accessible read raised an exception";
+    }
+    // A refusal never leaves the parts read before it behind.
+    items.clear();
+    return false;
+}
+
 bool ReadAccessibleIslandItems(
     HWND island,
     std::vector<AccessibleIslandItem>& items,
@@ -395,6 +526,7 @@ bool ReadAccessibleIslandItems(
         GetClassNameW(island, className, 64);
         if (FluentShell::EqualsIgnoreCase(className, L"Internet Explorer_Server"))
             return ReadMmcHtmlDocument(island, items, reason);
+        if (IsMmcMessageView(island)) return ReadMmcMessageView(island, items, reason);
         RECT screenRect{};
         if (!GetWindowRect(island, &screenRect)) {
             return Reject(reason, L"island bounds are unavailable");

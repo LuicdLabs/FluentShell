@@ -56,7 +56,11 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // composited into the existing item icons, and an empty tree is a valid snapshot.
 // Minor 26 carries stable native ListView item IDs so delayed activation cannot
 // target a replacement item with the same label and index.
-inline constexpr uint16_t kProtocolMinor = 26;
+// Minor 27 adds inert heading and painted image island items (MMC message views).
+// Minor 28 adds the staticBitmap kind (SS_BITMAP pictures under the large-bitmap cap)
+// and the upDown kind (msctls_updown32 stepped through setValue); a BS_ICON/BS_BITMAP
+// push button may carry its picture in the image fields.
+inline constexpr uint16_t kProtocolMinor = 28;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

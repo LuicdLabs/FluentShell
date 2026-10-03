@@ -65,9 +65,13 @@ cannot prove equivalent.
   One level is now implemented: a dialog the application runs modally against a
   projected owner (the owner is on screen and disabled for the dialog's lifetime)
   becomes a surface of its own, and its proxy inherits the real owner and blocks
-  it -- the same contract a translated MessageBox already met. A window whose whole
-  owner chain is hidden (the `StubWindow32` behind a control-panel property sheet)
-  counts as unowned. A modeless owned top-level, and a dialog nested deeper than
+  it -- the same contract a translated MessageBox already met. Discovery classifies
+  every root before the windows it owns, and a visible *modal* dialog does not hold
+  its owner native, so a console that opens a dialog during startup (`rsop.msc`)
+  projects the owner first and the dialog on top in the same pass. A window whose
+  whole owner chain is hidden (the `StubWindow32` behind a control-panel property
+  sheet) or has no area (odbcad32's zero-size `ODBCAdmClass64` popup) counts as
+  unowned. A modeless owned top-level, and a dialog nested deeper than
   one level, still resolve the whole graph back to native together: a nested dialog
   inherits DWM cloaking from its cloaked owner and the proxy cannot take the
   foreground slot the committed gate requires.
@@ -142,8 +146,10 @@ adapter.
 - A bounded `msctls_trackbar32` subset is implemented: range, position, line and
   page size, orientation, and the native reversed hint, driven through the
   control's own `WM_HSCROLL`/`WM_VSCROLL` notification and validated as UIA
-  RangeValue against canonical native state. Selection ranges, thumbless bars,
-  control-owned tooltips, and pre-move veto snapping remain native.
+  RangeValue against canonical native state. `TBS_TOOLTIPS` (the position shown
+  beside the thumb while dragging) projects as the Slider's thumb tooltip. Selection
+  ranges, thumbless bars, other attached tooltips, and pre-move veto snapping remain
+  native.
 - Add nonvirtual, non-owner/custom-draw Header, DateTimePicker, MonthCalendar,
   UpDown, and tooltip subsets.
 - Model selection, expansion, grouping, sorting, and notifications as typed
@@ -746,6 +752,48 @@ Primary references:
 - https://learn.microsoft.com/windows/win32/controls/wm-drawitem
 - https://learn.microsoft.com/windows/win32/controls/about-custom-draw
 - https://learn.microsoft.com/windows/win32/winauto/uiauto-controlpatternsoverview
+
+## System Tool Survey (2026-10-03)
+
+Startup projection of classic System32 tools at ordinary integrity, injected after a
+settled launch with no input. Projected: `winver`, `dxdiag`, `eudcedit`, `dccw`,
+`cttune`, `rekeywiz`, `SystemPropertiesComputerName`, `odbcad32` (after zero-size
+owners stopped holding the graph) and `msinfo32` (after fully clipped children stopped
+being captured). Still native, with the blocker each one names first:
+
+| Tool | First blocker |
+| --- | --- |
+| `charmap` | `CharGridWClass` custom grid; owner-draw font ComboBox; RichEdit |
+| `mstsc` | Owner-draw ComboBox; toolbar hot/disabled image lists |
+| `SndVol` | `Volume Flood` custom meter; `TBSTYLE_CUSTOMERASE` toolbar; nested non-control dialog |
+| `colorcpl` | Grouped ListView; `Link Window` |
+| `iexpress` | `SS_BITMAP` wizard art (larger than the generic 96 px image cap); `msctls_updown32` |
+| `fsquirt` | DirectUI host that also owns `CtrlNotifySink` children with custom regions |
+| `WFS` | `TVS_INFOTIP` tree; MFC scrolling preview view |
+
+Follow-up the same day (protocol minor 28) added three adapter rows from that list:
+
+- `staticBitmap`: an `SS_BITMAP` Static carries its `HBITMAP` pixels at the client
+  size under the 1024 px bitmap cap, at the origin or centred over the documented
+  top-left-pixel fill (`SS_CENTERIMAGE`); `SS_REALSIZECONTROL` scaling stays native.
+- `upDown`: `msctls_updown32` carries its ordered range, a `reversed` flag, its
+  position and its first acceleration step, projects as a UIA Spinner with
+  RangeValue, and is driven by `setValue` through the control's own arrow sequence
+  (`UDN_DELTAPOS`, which the parent may veto or rewrite, then `UDM_SETPOS32` and the
+  `SB_THUMBPOSITION`/`SB_ENDSCROLL` pair). A veto is a rejected action, not a rollback.
+- `BS_ICON`/`BS_BITMAP` push buttons carry their picture (icon cap) in the image
+  fields and keep their text as the accessible name; picture check boxes and radio
+  buttons stay native.
+
+Capture also skips a wizard-mode property sheet's tab control: it lies under the page
+(`WS_CLIPSIBLINGS`, fully covered by a sibling above it) and under comctl32 v6 lays out
+no item rectangle at all. With these, `sigverif`, `cliconfg` and `iexpress`'s first page
+project. `eudcedit` stays native because its visible MDI frame (a ComboBox inside its
+status bar, MFC control bars) is unsupported, so its startup dialog stays native with it.
+
+The remaining recurring Win32 gaps are owner-draw ComboBox, grouped ListView and toolbar
+image-list variants; each needs its own adapter row under the contract above rather
+than a wider class allowlist.
 
 ## Completion Rule
 

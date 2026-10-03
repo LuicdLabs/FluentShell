@@ -28,6 +28,11 @@ namespace FluentShell::Bridge::Translation {
 // whose accessible role is outside it refuses the whole island.
 enum class AccessibleItemKind {
     Text,
+    // Inert text the host draws as a title.
+    Heading,
+    // Inert graphic.  The provider describes it but owns no pixels, so the capture
+    // crops what the host painted inside `rect`.
+    Image,
     Button,
     Link,
     PageTab,
@@ -61,6 +66,27 @@ struct AccessibleIslandItem final {
 std::wstring AccessibleChildName(HWND window, int childIndex) noexcept;
 
 bool IsAccessibleIslandClass(std::wstring_view className) noexcept;
+
+// True when the window's class was registered by `moduleName` loaded from System32.
+// A class name an application can reuse proves nothing; the registering module of a
+// Windows-owned class does.
+bool WindowClassRegisteredBySystemModule(HWND window, std::wstring_view moduleName) noexcept;
+
+// MMC's message view (mmcndmgr.dll): the ATL window a snap-in shows in its result pane
+// for an informational or error message -- an icon, a title, and a body.  Its class
+// name is ATL:<address>, so a candidate is identified by the module that registered the
+// class rather than by name; mmcndmgr.dll registers other ATL hosts too, so only
+// ReadMmcMessageView's shape check makes a candidate a message view.
+bool IsMmcMessageView(HWND window) noexcept;
+
+// Reads a message view through the accessibility contract it publishes: a pane whose
+// only children are a title and a body (static text carrying the text as its value) and
+// one graphic.  Fails closed on any other shape, on an actionable element, or on text
+// that does not fit the protocol.
+bool ReadMmcMessageView(
+    HWND view,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) noexcept;
 
 // Opt-in field diagnostics for an unadmitted HWND. Never invokes provider actions.
 // The tree is capped by depth, node count, and text length.

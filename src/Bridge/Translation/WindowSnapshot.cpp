@@ -297,8 +297,9 @@ JsonObject NodeToJson(const ControlNode& node) {
         result.Insert(L"editableLabels", JsonValue::CreateBooleanValue(node.editableLabels));
         result.Insert(L"editingIndex", JsonValue::CreateNumberValue(node.editingIndex));
     }
-    if (node.kind == ControlKind::StaticIcon ||
-        (node.kind == ControlKind::RadioButton && !node.imageData.empty())) {
+    if (node.kind == ControlKind::StaticIcon || node.kind == ControlKind::StaticBitmap ||
+        ((node.kind == ControlKind::RadioButton || node.kind == ControlKind::Button) &&
+         !node.imageData.empty())) {
         result.Insert(L"imageWidth", JsonValue::CreateNumberValue(node.imageWidth));
         result.Insert(L"imageHeight", JsonValue::CreateNumberValue(node.imageHeight));
         result.Insert(L"imageFormat", JsonValue::CreateStringValue(node.imageFormat));
@@ -371,6 +372,13 @@ JsonObject NodeToJson(const ControlNode& node) {
             value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
             value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
             value.Insert(L"selected", JsonValue::CreateBooleanValue(item.selected));
+            if (!item.imageData.empty()) {
+                value.Insert(L"imageWidth", JsonValue::CreateNumberValue(item.imageWidth));
+                value.Insert(L"imageHeight", JsonValue::CreateNumberValue(item.imageHeight));
+                value.Insert(L"imageFormat", JsonValue::CreateStringValue(item.imageFormat));
+                value.Insert(L"imageData",
+                    JsonValue::CreateStringValue(Base64Encode(item.imageData)));
+            }
             islandItems.Append(value);
         }
         result.Insert(L"islandItems", islandItems);
@@ -846,6 +854,8 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::StaticText: return L"static";
     case ControlKind::StaticIcon: return L"staticIcon";
     case ControlKind::StaticDecoration: return L"staticDecoration";
+    case ControlKind::StaticBitmap: return L"staticBitmap";
+    case ControlKind::UpDown: return L"upDown";
     case ControlKind::Separator: return L"separator";
     case ControlKind::Button: return L"button";
     case ControlKind::CheckBox: return L"checkBox";
@@ -889,10 +899,15 @@ bool IsProjectedContainerKind(ControlKind kind) noexcept {
     }
 }
 
+// An owner holds the screen only while it is visible and has area.  A zero-size
+// visible popup is the classic invisible owner (odbcad32's ODBCAdmClass64), so it is
+// skipped exactly like a hidden one.
 HWND EffectiveTopLevelOwner(HWND window) noexcept {
     HWND owner = window ? GetWindow(window, GW_OWNER) : nullptr;
     for (size_t depth = 0; owner && depth < 256; ++depth) {
-        if (IsWindowVisible(owner)) return owner;
+        RECT bounds{};
+        if (IsWindowVisible(owner) && GetWindowRect(owner, &bounds) && !IsRectEmpty(&bounds))
+            return owner;
         const HWND next = GetWindow(owner, GW_OWNER);
         if (next == owner) break;
         owner = next;
@@ -1395,12 +1410,12 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"setValue") {
-        if (node.kind != ControlKind::Slider) {
-            error = L"setValue requires a Trackbar node";
+        if (node.kind != ControlKind::Slider && node.kind != ControlKind::UpDown) {
+            error = L"setValue requires a Trackbar or UpDown node";
             return false;
         }
         if (action.integerValue < node.minimum || action.integerValue > node.maximum) {
-            error = L"setValue is outside the Trackbar range";
+            error = L"setValue is outside the control's range";
             return false;
         }
         return true;

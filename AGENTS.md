@@ -34,9 +34,8 @@ gates that keep the architecture honest: Bridge import-table inspection (no `Mic
 `Microsoft.WindowsAppRuntime`, or `CoreMessagingXP`), Bridge export presence, forbidden-payload
 checks, and Injector CLI surface checks.
 
-**`test.ps1` leaves a nonzero exit code even when everything passes.** Its last gate runs the
-Injector with no arguments (which exits 1 by design) and the script never resets `$LASTEXITCODE`.
-Read the printed gate lines, not the exit code.
+`test.ps1` exits 0 only when every suite and gate passed; any failure throws first. (Its last gate
+runs the Injector with no arguments, which exits 1 by design, so the script ends with `exit 0`.)
 
 ### Faster inner loop
 
@@ -236,7 +235,10 @@ own content there. A host window whose content owns no HWND at all is admitted a
 MSAA (`AccessibleObjectFromWindow`/`accDefaultAction`) rather than UIA, because DirectUI's menu rows
 expose no actionable UIA pattern, and MSAA is answered inline on the window's own thread. Those
 elements travel as typed `islandItems` on the island's HWND-backed node, so no node on a generic
-surface ever becomes virtual. Only a container kind may be named as a node's parent
+surface ever becomes virtual. MMC's message view (`ATL:<address>`, identified by its class being
+registered by System32 `mmcndmgr.dll`) is read the same way by `ReadMmcMessageView`: its
+static-text children carry the title and body as their *value*, so they travel as inert `heading`
+and `text` items, and its graphic travels as an `image` item carrying the pixels the view painted. Only a container kind may be named as a node's parent
 (`IsProjectedContainerKind`, mirrored by `ProtocolValidator`); a control nested inside anything else
 is refused at capture with the parent's kind in the evidence, rather than becoming a snapshot the
 renderer must fault. Capture logs every rejection in the tree, not just the first.
@@ -305,9 +307,8 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
 
 ## Repository Notes
 
-- `FluentShell.Island` (`src/IslandHost`) and `IslandDemo` are listed in the solution but **not
-  built** in either configuration. They are source-level diagnostics; build `IslandDemo.vcxproj`
-  explicitly with an `OutDir` outside the production folder if you ever need it.
+- The native projects restore only CppWinRT (`src/packages.config`); WinUI and the Windows App SDK
+  belong to the renderer's own `PackageReference`s and never to native code.
 - `src/Renderer.Dwm` is the cross-process DWM attribute layer behind the `l0` diagnostic; it is not
   part of the translation path.
 - Source files are CRLF and carry localized comments/diagnostics; `Directory.Build.props` forces

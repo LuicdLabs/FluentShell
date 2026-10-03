@@ -82,6 +82,12 @@ public sealed record AccessibleIslandItem
     public bool Enabled { get; init; }
     public bool DropDown { get; init; }
     public bool Selected { get; init; }
+    // Only an "image" item carries pixels: the region its host painted for an element
+    // the provider describes as a graphic.
+    public int? ImageWidth { get; init; }
+    public int? ImageHeight { get; init; }
+    public string? ImageFormat { get; init; }
+    public string? ImageData { get; init; }
 }
 
 public sealed record ControlNode

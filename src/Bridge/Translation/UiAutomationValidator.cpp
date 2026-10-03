@@ -360,7 +360,8 @@ int ExpectedControlType(const ControlNode& node) noexcept {
     if (IsAccessibleTabList(node)) return UIA_TabControlTypeId;
     switch (node.kind) {
     case ControlKind::StaticText: return UIA_TextControlTypeId;
-    case ControlKind::StaticIcon: return UIA_ImageControlTypeId;
+    case ControlKind::StaticIcon:
+    case ControlKind::StaticBitmap: return UIA_ImageControlTypeId;
     case ControlKind::Separator: return UIA_SeparatorControlTypeId;
     case ControlKind::Button: return UIA_ButtonControlTypeId;
     case ControlKind::CheckBox:
@@ -376,6 +377,7 @@ int ExpectedControlType(const ControlNode& node) noexcept {
     case ControlKind::ListView: return UIA_ListControlTypeId;
     case ControlKind::TreeView: return UIA_TreeControlTypeId;
     case ControlKind::Slider: return UIA_SliderControlTypeId;
+    case ControlKind::UpDown: return UIA_SpinnerControlTypeId;
     case ControlKind::DialogContainer: return UIA_PaneControlTypeId;
     case ControlKind::MdiClient: return UIA_PaneControlTypeId;
     // A private container is a frame around other windows, which is exactly what a
@@ -407,7 +409,8 @@ RequiredPattern PatternFor(const ControlNode& node) noexcept {
     case ControlKind::ListBox: return RequiredPattern::Selection;
     case ControlKind::ListView: return RequiredPattern::Selection;
     case ControlKind::TreeView: return RequiredPattern::Selection;
-    case ControlKind::Slider: return RequiredPattern::RangeValue;
+    case ControlKind::Slider:
+    case ControlKind::UpDown: return RequiredPattern::RangeValue;
     case ControlKind::TabControl: return RequiredPattern::Selection;
     case ControlKind::ProgressBar:
         return node.indeterminate ? RequiredPattern::None : RequiredPattern::RangeValue;
@@ -1195,8 +1198,11 @@ bool ValidateOnMta(
         }
         RECT expectedBounds{};
         if (!ComputeVisibleUiaBounds(
-                node.rect, contentOrigin, rootViewport, parentVisibleBounds, expectedBounds))
-            return Fail(error, L"visible native control is fully clipped in the proxy viewport");
+                node.rect, contentOrigin, rootViewport, parentVisibleBounds, expectedBounds)) {
+            return Fail(error, std::wstring(
+                L"visible native control is fully clipped in the proxy viewport: kind=") +
+                ControlKindName(node.kind) + L" node=" + std::to_wstring(node.nodeId));
+        }
         expectedNodeBounds.emplace(node.nodeId, expectedBounds);
         size_t match = elements.size();
         for (size_t index = 0; index < elements.size(); ++index) {
@@ -1263,8 +1269,12 @@ bool ValidateOnMta(
         matchedNodes.emplace(node.nodeId, matched.element);
         if (!matched.isControl)
             return Fail(error, L"proxy UIA node is not a control element");
-        if (matched.isEnabled != (node.enabled ? TRUE : FALSE))
-            return Fail(error, L"proxy UIA control enabled state does not match native state");
+        if (matched.isEnabled != (node.enabled ? TRUE : FALSE)) {
+            return Fail(error, std::wstring(
+                L"proxy UIA control enabled state does not match native state: kind=") +
+                ControlKindName(node.kind) + L" node=" + std::to_wstring(node.nodeId) +
+                L" native=" + (node.enabled ? L"enabled" : L"disabled"));
+        }
         if (!snapshot.adapterId.empty() &&
             (matched.helpText != node.helpText || matched.accessKey != node.accessKey))
             return Fail(error, L"application-adapter HelpText or AccessKey mismatch");
@@ -1276,7 +1286,8 @@ bool ValidateOnMta(
         if (node.tabStop && node.enabled && node.kind != ControlKind::SysLink &&
             !matched.isKeyboardFocusable)
             return Fail(error, L"tab-stop native control is not keyboard focusable in XAML");
-        if (node.kind == ControlKind::StaticIcon && matched.isKeyboardFocusable)
+        if ((node.kind == ControlKind::StaticIcon || node.kind == ControlKind::StaticBitmap) &&
+            matched.isKeyboardFocusable)
             return Fail(error, L"Static icon projection is unexpectedly keyboard focusable");
         if (!HasPattern(matched.element.Get(), PatternFor(node), progress, node.nodeId, error))
             return false;
@@ -1288,7 +1299,7 @@ bool ValidateOnMta(
                 options.rendererProcessId, progress, error)) return false;
         if (node.kind == ControlKind::ListView &&
             !ValidateListViewSelectionCapability(matched.element.Get(), node, error)) return false;
-        if (node.kind == ControlKind::Slider &&
+        if ((node.kind == ControlKind::Slider || node.kind == ControlKind::UpDown) &&
             !ValidateSliderRangeValue(matched.element.Get(), node, error)) return false;
         if (node.kind == ControlKind::ListView &&
             !ValidateListViewCheckboxes(

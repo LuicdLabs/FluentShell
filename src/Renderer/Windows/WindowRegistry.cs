@@ -134,7 +134,10 @@ public sealed class WindowRegistry
         _modalOwners.Clear();
         _modalOwnerBlockCounts.Clear();
         _modalOwnerWasBlocked.Clear();
-        foreach (var (surfaceId, window) in _windows.ToArray())
+        // Modal surfaces close before their owners: destroying an owner proxy first lets
+        // Win32 destroy the owned proxy underneath its WinUI Window, which then stalls the
+        // application's exit.
+        foreach (var (surfaceId, window) in _windows.OrderByDescending(pair => pair.Value.ViewModel.Modal).ToArray())
         {
             _retiredSurfaces.Remember(surfaceId);
             window.CloseFromBridge();

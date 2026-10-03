@@ -4,6 +4,7 @@ using FluentShell.Renderer.Windows;
 using Microsoft.UI.Xaml.Automation.Peers;
 using Microsoft.UI.Xaml.Automation.Provider;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 
 namespace FluentShell.Renderer.Tests;
 
@@ -407,20 +408,19 @@ public sealed class ControlFactoryTests
         Assert.Equal(new global::Windows.Foundation.Rect(178, 203, 353, 379), expanded);
     }
 
-    // The Bridge's committed UIA gate enumerates the proxy with the control-view
-    // condition, so whichever element carries the node identity must remain in that
-    // view. Only a variant that wraps the Image in a peer-publishing ContentControl
-    // may drop the Image itself to the raw view.
+    // Every Static icon is republished by a semantic wrapper; only DirectUI bitmap
+    // variants stretch their pixels to the slot.
     [Theory]
     [InlineData("standard", false)]
     [InlineData("mainIcon", false)]
     [InlineData("", false)]
     [InlineData("bitmapDisplay", true)]
     [InlineData("monitorPalette", true)]
-    public void StaticIconHidesItsImageOnlyWhenASemanticWrapperRepublishesIt(
-        string presentationVariant, bool wrapped)
+    public void StaticIconStretchesOnlyDirectUiBitmapVariants(
+        string presentationVariant, bool stretched)
     {
-        Assert.Equal(wrapped, ControlFactory.StaticIconUsesSemanticWrapper(presentationVariant));
+        Assert.Equal(stretched ? Stretch.Fill : Stretch.None,
+            ControlFactory.StaticIconStretch(presentationVariant));
     }
 
     [Fact]

@@ -331,6 +331,10 @@ bool RelevantMessage(UINT message) noexcept {
         message == TBM_SETSEL || message == TBM_SETSELSTART ||
         message == TBM_SETSELEND || message == TBM_CLEARSEL ||
         message == TBM_SETBUDDY || message == TBM_SETTOOLTIPS) return true;
+    // UpDown range, position, step and buddy mutators.
+    if (message == UDM_SETPOS || message == UDM_SETPOS32 || message == UDM_SETRANGE ||
+        message == UDM_SETRANGE32 || message == UDM_SETACCEL || message == UDM_SETBASE ||
+        message == UDM_SETBUDDY) return true;
     switch (message) {
     case WM_SETTEXT:
     case WM_ENABLE:
@@ -893,12 +897,19 @@ bool ApplyToolbarCommand(
 
 bool ApplySetValue(
     Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
-    if (node.kind != ControlKind::Slider) return true;
+    if (node.kind != ControlKind::Slider && node.kind != ControlKind::UpDown) return true;
     const int requested = command->action.integerValue;
     if (requested < node.minimum || requested > node.maximum) return true;
     if (AbortIfCancelled(command)) return false;
-    command->success = SetTrackbarPosition(
-        agent->Root(), target, node.vertical, requested);
+    if (node.kind == ControlKind::Slider) {
+        command->success = SetTrackbarPosition(
+            agent->Root(), target, node.vertical, requested);
+        return true;
+    }
+    bool refused = false;
+    command->success = SetUpDownPosition(agent->Root(), target, requested, refused);
+    command->refused = refused;
+    if (refused) command->error = L"the application vetoed the UpDown step";
     return true;
 }
 
@@ -2175,6 +2186,44 @@ bool SourceThreadAgent::Invoke(
     return success;
 }
 
+template <typename Request>
+uint64_t SourceThreadAgent::QueueDeferred(
+    DeferredSlot<Request>& slot, WPARAM kind, Request request) noexcept {
+    if (slot.nextToken == 0) return 0;
+    slot.request = std::move(request);
+    slot.token = slot.nextToken;
+    slot.rearm = false;
+    slot.nextToken = slot.nextToken == UINT64_MAX ? 0 : slot.nextToken + 1;
+    if (PostThreadMessageW(threadId_, message_, kind, static_cast<LPARAM>(slot.token)))
+        return slot.token;
+    slot.Reset();
+    return 0;
+}
+
+template <typename Request, typename Dropped>
+std::optional<Request> SourceThreadAgent::TakeDeferred(
+    DeferredSlot<Request>& slot, WPARAM kind, uint64_t token, Dropped dropped) noexcept {
+    if (GetCurrentThreadId() != threadId_ || token == 0 || token != slot.token || !slot)
+        return std::nullopt;
+    if (g_boundedSourceCommandDepth != 0) {
+        slot.rearm = true;
+        return std::nullopt;
+    }
+    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
+        if (!PostThreadMessageW(threadId_, message_, kind, static_cast<LPARAM>(token))) {
+            std::optional<Request> lost = std::move(slot.request);
+            slot.Reset();
+            dropped(*lost);
+        }
+        return std::nullopt;
+    }
+    // Consume before running: a modal handler can pump cancellation or a replayed
+    // message without reusing this request or invalidating it on the caller's stack.
+    std::optional<Request> taken = std::move(slot.request);
+    slot.Reset();
+    return taken;
+}
+
 bool SourceThreadAgent::PostIslandAction(
     const ControlNode& node, int index, bool& refused, uint64_t* queuedToken) noexcept {
     refused = false;
@@ -2182,8 +2231,8 @@ bool SourceThreadAgent::PostIslandAction(
     try {
         if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
             index < 0 || static_cast<size_t>(index) >= node.islandItems.size() ||
-            nextIslandActionToken_ == 0) return false;
-        if (queuedIslandAction_ || queuedNativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+            islandAction_.nextToken == 0) return false;
+        if (islandAction_ || nativeAction_ || nativeActionRunning_ || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
             refused = true;
             return false;
@@ -2197,49 +2246,24 @@ bool SourceThreadAgent::PostIslandAction(
         deferred.name = item.name;
         deferred.action = item.actionName;
         deferred.dropDown = item.dropDown;
-        queuedIslandAction_ = std::move(deferred);
-        queuedIslandActionToken_ = nextIslandActionToken_;
-        rearmIslandAction_ = false;
-        nextIslandActionToken_ = nextIslandActionToken_ == std::numeric_limits<uint64_t>::max()
-            ? 0 : nextIslandActionToken_ + 1;
-        if (!PostThreadMessageW(threadId_, message_, kDeferredIslandAction,
-                static_cast<LPARAM>(queuedIslandActionToken_))) {
-            queuedIslandAction_.reset();
-            queuedIslandActionToken_ = 0;
-            return false;
-        }
-        if (queuedToken) *queuedToken = queuedIslandActionToken_;
-        return true;
+        const uint64_t token = QueueDeferred(islandAction_, kDeferredIslandAction, std::move(deferred));
+        if (queuedToken) *queuedToken = token;
+        return token != 0;
     } catch (...) {
         return false;
     }
 }
 
 void SourceThreadAgent::DispatchIslandActionOnSourceThread(uint64_t token) noexcept {
-    if (GetCurrentThreadId() != threadId_ || token == 0 ||
-        queuedIslandActionToken_ != token || !queuedIslandAction_) return;
-    if (g_boundedSourceCommandDepth != 0) {
-        rearmIslandAction_ = true;
-        return;
-    }
-    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
-        if (!PostThreadMessageW(threadId_, message_, kDeferredIslandAction,
-                static_cast<LPARAM>(token))) {
-            queuedIslandAction_.reset();
-            queuedIslandActionToken_ = 0;
+    // The request leaves its slot before the provider runs: nested rollback can clear
+    // queued state without destroying the request currently on this stack.
+    auto request = TakeDeferred(islandAction_, kDeferredIslandAction, token,
+        [this](const IslandActionRequest&) {
             try { popupCaptureError_ = L"deferred island action could not be reposted"; }
             catch (...) {}
             MarkDirty();
-        }
-        return;
-    }
-    // Remove the request before entering the provider. Nested rollback can clear
-    // queued state without destroying the request currently on this stack.
-    auto request = std::move(*queuedIslandAction_);
-    queuedIslandAction_.reset();
-    queuedIslandActionToken_ = 0;
-    rearmIslandAction_ = false;
-    RunIslandActionOnSourceThread(request);
+        });
+    if (request) RunIslandActionOnSourceThread(*request);
 }
 
 namespace {
@@ -2439,13 +2463,13 @@ bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const Cont
         const bool rootAction = !node && !action.nodeId &&
             (action.action == L"close" || action.action == L"menuCommand");
         if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || IsDestroyed() ||
-            (!nodeAction && !rootAction) || nextNativeActionToken_ == 0 ||
+            (!nodeAction && !rootAction) || nativeAction_.nextToken == 0 ||
             !IsApplicationCloaked(root_)) {
             error = L"native action has no current projected source identity";
             return false;
         }
-        if (queuedNativeAction_ || nativeActionRunning_ || queuedIslandAction_ || queuedMenuAction_ ||
-            queuedListViewActivation_ || trackedPopup_ ||
+        if (nativeAction_ || nativeActionRunning_ || islandAction_ || menuAction_ ||
+            listViewActivation_ || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
             error = L"a native action is already pending";
             return false;
@@ -2471,21 +2495,16 @@ bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const Cont
                 !CaptureTopLevelMenu(root_, menu, error)) return false;
             request.menuFingerprint = NativeMenuFingerprint(menu);
         }
-        queuedNativeAction_ = std::move(request);
-        queuedNativeActionToken_ = nextNativeActionToken_;
-        rearmNativeAction_ = false;
-        nextNativeActionToken_ = nextNativeActionToken_ == UINT64_MAX ? 0 : nextNativeActionToken_ + 1;
-        if (!PostThreadMessageW(threadId_, message_, kDeferredNativeAction,
-                static_cast<LPARAM>(queuedNativeActionToken_))) {
-            CancelNativeActionOnSourceThread();
+        const uint64_t token = QueueDeferred(nativeAction_, kDeferredNativeAction, std::move(request));
+        if (token == 0) {
             error = L"native action could not be queued";
             return false;
         }
         if (action.action == L"close") {
-            queuedNativeAction_->closeSequence = RegisterCloseRequest();
-            if (closeSequence) *closeSequence = queuedNativeAction_->closeSequence;
+            nativeAction_.request->closeSequence = RegisterCloseRequest();
+            if (closeSequence) *closeSequence = nativeAction_.request->closeSequence;
         }
-        if (queuedToken) *queuedToken = queuedNativeActionToken_;
+        if (queuedToken) *queuedToken = token;
         refused = false;
         return true;
     } catch (...) {
@@ -2494,34 +2513,21 @@ bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const Cont
     }
 }
 
+// A close already acknowledged by the renderer must eventually finish even when
+// geometry/rollback drops its queued token before WM_CLOSE is sent.
 void SourceThreadAgent::CancelNativeActionOnSourceThread() noexcept {
     if (GetCurrentThreadId() != threadId_) return;
-    const bool cancelledClose = queuedNativeAction_ && queuedNativeAction_->closeSequence != 0;
-    queuedNativeAction_.reset();
-    queuedNativeActionToken_ = 0;
-    rearmNativeAction_ = false;
-    // A close already acknowledged by the renderer must eventually finish even
-    // when geometry/rollback cancels its queued token before WM_CLOSE is sent.
+    const bool cancelledClose = nativeAction_ && nativeAction_.request->closeSequence != 0;
+    nativeAction_.Reset();
     if (cancelledClose) MarkCloseRequestCompleted();
 }
 
 void SourceThreadAgent::DispatchNativeActionOnSourceThread(uint64_t token) noexcept {
-    if (GetCurrentThreadId() != threadId_ || token == 0 ||
-        token != queuedNativeActionToken_ || !queuedNativeAction_) return;
-    if (g_boundedSourceCommandDepth != 0) {
-        rearmNativeAction_ = true;
-        return;
-    }
-    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
-        if (!PostThreadMessageW(threadId_, message_, kDeferredNativeAction, static_cast<LPARAM>(token)))
-            CancelNativeActionOnSourceThread();
-        return;
-    }
-    auto request = std::move(*queuedNativeAction_);
-    queuedNativeAction_.reset();
-    queuedNativeActionToken_ = 0;
-    rearmNativeAction_ = false;
-    RunNativeActionOnSourceThread(request);
+    auto request = TakeDeferred(nativeAction_, kDeferredNativeAction, token,
+        [this](const NativeActionRequest& lost) {
+            if (lost.closeSequence != 0) MarkCloseRequestCompleted();
+        });
+    if (request) RunNativeActionOnSourceThread(*request);
 }
 
 void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest& request) noexcept {
@@ -2652,12 +2658,12 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             node.kind != ControlKind::ListView || !node.itemActivationSupported || index < 0 ||
             static_cast<size_t>(index) >= ListViewItemCount(node) ||
             node.itemNativeIds.size() != ListViewItemCount(node) ||
-            nextListViewActivationToken_ == 0) {
+            listViewActivation_.nextToken == 0) {
             error = L"ListView activation has no current item identity";
             return false;
         }
-        if (queuedListViewActivation_ || queuedIslandAction_ || queuedMenuAction_ ||
-            queuedNativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+        if (listViewActivation_ || islandAction_ || menuAction_ ||
+            nativeAction_ || nativeActionRunning_ || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
             error = L"a native item action is already pending";
             return false;
@@ -2710,19 +2716,13 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             error = L"ListView item or activation lifetime changed while its default action was read";
             return false;
         }
-        queuedListViewActivation_ = std::move(request);
-        queuedListViewActivationToken_ = nextListViewActivationToken_;
-        rearmListViewActivation_ = false;
-        nextListViewActivationToken_ = nextListViewActivationToken_ == UINT64_MAX
-            ? 0 : nextListViewActivationToken_ + 1;
-        if (!PostThreadMessageW(threadId_, message_, kDeferredListViewActivation,
-                static_cast<LPARAM>(queuedListViewActivationToken_))) {
-            queuedListViewActivation_.reset();
-            queuedListViewActivationToken_ = 0;
+        const uint64_t token = QueueDeferred(
+            listViewActivation_, kDeferredListViewActivation, std::move(request));
+        if (token == 0) {
             error = L"ListView default action could not be queued";
             return false;
         }
-        if (queuedToken) *queuedToken = queuedListViewActivationToken_;
+        if (queuedToken) *queuedToken = token;
         refused = false;
         return true;
     } catch (...) {
@@ -2732,66 +2732,39 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
 }
 
 void SourceThreadAgent::DispatchListViewActivationOnSourceThread(uint64_t token) noexcept {
-    if (GetCurrentThreadId() != threadId_ || token == 0 ||
-        token != queuedListViewActivationToken_ || !queuedListViewActivation_) return;
-    if (g_boundedSourceCommandDepth != 0) {
-        rearmListViewActivation_ = true;
-        return;
-    }
-    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
-        if (!PostThreadMessageW(threadId_, message_, kDeferredListViewActivation,
-                static_cast<LPARAM>(token))) {
-            queuedListViewActivation_.reset();
-            queuedListViewActivationToken_ = 0;
-        }
-        return;
-    }
-    // Consume before entering COM. A modal handler can pump cancellation or a
-    // replayed message without reusing this action or invalidating its stack data.
-    auto request = std::move(*queuedListViewActivation_);
-    queuedListViewActivation_.reset();
-    queuedListViewActivationToken_ = 0;
-    rearmListViewActivation_ = false;
-    RunListViewActivationOnSourceThread(request);
+    auto request = TakeDeferred(listViewActivation_, kDeferredListViewActivation, token,
+        [](const ListViewActivationRequest&) {});
+    if (request) RunListViewActivationOnSourceThread(*request);
 }
 
 void SourceThreadAgent::RearmDeferredActionsOnSourceThread() noexcept {
     if (GetCurrentThreadId() != threadId_) return;
-    const auto rearm = [&](WPARAM kind, bool& consumed, auto& request, uint64_t& token) {
-        if (!consumed) return;
-        consumed = false;
-        if (!request || token == 0) return;
-        if (shuttingDown_.load() || !PostThreadMessageW(threadId_, message_, kind, static_cast<LPARAM>(token))) {
-            request.reset();
-            token = 0;
+    const auto rearm = [&](WPARAM kind, auto& slot) {
+        if (!slot.rearm) return;
+        slot.rearm = false;
+        if (!slot || slot.token == 0) return;
+        if (!shuttingDown_.load() &&
+            PostThreadMessageW(threadId_, message_, kind, static_cast<LPARAM>(slot.token))) return;
+        if constexpr (std::is_same_v<std::decay_t<decltype(slot)>, DeferredSlot<NativeActionRequest>>) {
+            CancelNativeActionOnSourceThread();
+        } else {
+            slot.Reset();
             MarkDirty();
         }
     };
-    rearm(kDeferredIslandAction, rearmIslandAction_, queuedIslandAction_, queuedIslandActionToken_);
-    rearm(kDeferredMenuAction, rearmMenuAction_, queuedMenuAction_, queuedMenuActionToken_);
-    rearm(kDeferredListViewActivation, rearmListViewActivation_, queuedListViewActivation_, queuedListViewActivationToken_);
-    if (rearmNativeAction_) {
-        rearmNativeAction_ = false;
-        if (queuedNativeAction_ && queuedNativeActionToken_ != 0 &&
-            (shuttingDown_.load() || !PostThreadMessageW(threadId_, message_,
-                kDeferredNativeAction, static_cast<LPARAM>(queuedNativeActionToken_))))
-            CancelNativeActionOnSourceThread();
-    }
+    rearm(kDeferredIslandAction, islandAction_);
+    rearm(kDeferredMenuAction, menuAction_);
+    rearm(kDeferredListViewActivation, listViewActivation_);
+    rearm(kDeferredNativeAction, nativeAction_);
 }
 
 void SourceThreadAgent::CancelDeferredActionOnSourceThread(WPARAM kind, uint64_t token) noexcept {
     if (GetCurrentThreadId() != threadId_ || token == 0) return;
-    const auto cancel = [&](auto& request, uint64_t& queuedToken, bool& consumed) {
-        if (token != queuedToken) return;
-        request.reset();
-        queuedToken = 0;
-        consumed = false;
-    };
-    if (kind == kDeferredIslandAction) cancel(queuedIslandAction_, queuedIslandActionToken_, rearmIslandAction_);
-    else if (kind == kDeferredMenuAction) cancel(queuedMenuAction_, queuedMenuActionToken_, rearmMenuAction_);
-    else if (kind == kDeferredListViewActivation)
-        cancel(queuedListViewActivation_, queuedListViewActivationToken_, rearmListViewActivation_);
-    else if (kind == kDeferredNativeAction && token == queuedNativeActionToken_)
+    if (kind == kDeferredIslandAction && token == islandAction_.token) islandAction_.Reset();
+    else if (kind == kDeferredMenuAction && token == menuAction_.token) menuAction_.Reset();
+    else if (kind == kDeferredListViewActivation && token == listViewActivation_.token)
+        listViewActivation_.Reset();
+    else if (kind == kDeferredNativeAction && token == nativeAction_.token)
         CancelNativeActionOnSourceThread();
 }
 
@@ -2950,15 +2923,9 @@ void SourceThreadAgent::CancelPopupOnSourceThread(bool activeOnly) noexcept {
     if (activeOnly && !trackedPopup_) return;
     ++listViewActivationCancellation_;
     CancelNativeActionOnSourceThread();
-    queuedListViewActivation_.reset();
-    queuedListViewActivationToken_ = 0;
-    rearmListViewActivation_ = false;
-    queuedMenuAction_.reset();
-    queuedMenuActionToken_ = 0;
-    rearmMenuAction_ = false;
-    queuedIslandAction_.reset();
-    queuedIslandActionToken_ = 0;
-    rearmIslandAction_ = false;
+    listViewActivation_.Reset();
+    menuAction_.Reset();
+    islandAction_.Reset();
     pendingIslandMenu_.reset();
     popupDecision_.reset();
     popupMenu_.Cancel();
@@ -3339,7 +3306,7 @@ bool SourceThreadAgent::RefreshMenuBarOnSourceThread(
     bool& changed,
     std::wstring& error) {
     changed = false;
-    if (queuedMenuAction_ || queuedNativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+    if (menuAction_ || nativeAction_ || nativeActionRunning_ || trackedPopup_ ||
         (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_))
         return true;
     if (GetCurrentThreadId() != threadId_) {
@@ -3423,8 +3390,8 @@ bool SourceThreadAgent::InvokeMenuCommandOnSourceThread(uint32_t commandId,
     }
     // The native message pump can mutate capture state; own the selection and
     // toolbar signature for the complete intercepted call.
-    if (queuedMenuAction_ || queuedNativeAction_ || nativeActionRunning_ ||
-        nextMenuActionToken_ == 0 || shuttingDown_.load()) {
+    if (menuAction_ || nativeAction_ || nativeActionRunning_ ||
+        menuAction_.nextToken == 0 || shuttingDown_.load()) {
         error = L"native menu already has a queued selection";
         return false;
     }
@@ -3434,39 +3401,18 @@ bool SourceThreadAgent::InvokeMenuCommandOnSourceThread(uint32_t commandId,
     request.bindingGeneration = state.menuBarBindingGeneration;
     request.binding = *found;
     request.buttons = state.menuBarButtons;
-    queuedMenuAction_ = std::move(request);
-    queuedMenuActionToken_ = nextMenuActionToken_;
-    rearmMenuAction_ = false;
-    nextMenuActionToken_ = nextMenuActionToken_ == UINT64_MAX ? 0 : nextMenuActionToken_ + 1;
-    if (PostThreadMessageW(threadId_, message_, kDeferredMenuAction,
-            static_cast<LPARAM>(queuedMenuActionToken_))) {
-        if (queuedToken) *queuedToken = queuedMenuActionToken_;
-        return true;
-    }
-    queuedMenuAction_.reset();
-    queuedMenuActionToken_ = 0;
+    const uint64_t token = QueueDeferred(menuAction_, kDeferredMenuAction, std::move(request));
+    if (queuedToken) *queuedToken = token;
+    if (token != 0) return true;
     error = L"native menu selection could not be queued";
     return false;
 }
 
 void SourceThreadAgent::DispatchMenuActionOnSourceThread(uint64_t token) noexcept {
-    if (GetCurrentThreadId() != threadId_ || token == 0 || token != queuedMenuActionToken_ ||
-        !queuedMenuAction_) return;
-    if (g_boundedSourceCommandDepth != 0) {
-        rearmMenuAction_ = true;
-        return;
-    }
-    if (MenuBarReadInProgress() && !shuttingDown_.load()) {
-        if (!PostThreadMessageW(threadId_, message_, kDeferredMenuAction, static_cast<LPARAM>(token))) {
-            queuedMenuAction_.reset();
-            queuedMenuActionToken_ = 0;
-        }
-        return;
-    }
-    auto request = std::move(*queuedMenuAction_);
-    queuedMenuAction_.reset();
-    queuedMenuActionToken_ = 0;
-    rearmMenuAction_ = false;
+    auto taken = TakeDeferred(menuAction_, kDeferredMenuAction, token,
+        [](const MenuActionRequest&) {});
+    if (!taken) return;
+    const MenuActionRequest& request = *taken;
     try {
         if (shuttingDown_.load() || !IsApplicationCloaked(root_) || !IsWindowEnabled(root_) ||
             !IsWindowVisible(root_) || !IsWindowVisible(request.toolbar) ||

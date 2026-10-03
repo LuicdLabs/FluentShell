@@ -101,6 +101,9 @@ void Check(bool condition, const char* message) {
 #include "MdiCaptureRegressionTests.h"
 #include "StaticDecorationRegressionTests.h"
 #include "SiblingZOrderCaptureTests.h"
+#include "MmcMessageViewTests.h"
+#include "CaptureVisibilityTests.h"
+#include "UpDownAdapterTests.h"
 
 std::string ReadFixture(const wchar_t* name) {
     const auto path = std::filesystem::current_path() / L"tests" / L"ProtocolFixtures" / name;
@@ -1440,7 +1443,8 @@ void TestControlAdapterRegistry() {
     const AdapterCase cases[] = {
         { L"Static", SS_LEFT, true, ControlKind::StaticText, "left Static" },
         { L"Static", SS_ETCHEDHORZ, true, ControlKind::Separator, "etched Static" },
-        { L"Static", SS_BITMAP, false, ControlKind::StaticText, "bitmap Static" },
+        { L"Static", SS_BITMAP, true, ControlKind::StaticBitmap, "bitmap Static" },
+        { L"Static", SS_BITMAP | SS_NOTIFY, false, ControlKind::StaticBitmap, "clickable bitmap Static" },
         { L"Button", BS_PUSHBUTTON, true, ControlKind::Button, "push Button" },
         { L"Button", BS_AUTOCHECKBOX, true, ControlKind::CheckBox, "check Button" },
         { L"Button", BS_AUTO3STATE, true, ControlKind::ThreeState, "3-state Button" },
@@ -1449,7 +1453,9 @@ void TestControlAdapterRegistry() {
         { L"Button", BS_GROUPBOX | WS_TABSTOP, false, ControlKind::GroupBox,
           "tab-stop GroupBox" },
         { L"Button", BS_OWNERDRAW, false, ControlKind::Button, "owner-draw Button" },
-        { L"Button", BS_PUSHBUTTON | BS_ICON, false, ControlKind::Button, "icon Button" },
+        { L"Button", BS_PUSHBUTTON | BS_ICON, true, ControlKind::Button, "icon Button" },
+        { L"Button", BS_PUSHBUTTON | BS_BITMAP, true, ControlKind::Button, "bitmap Button" },
+        { L"Button", BS_AUTOCHECKBOX | BS_ICON, false, ControlKind::CheckBox, "icon check Button" },
         { L"Edit", 0, true, ControlKind::Edit, "Edit" },
         { L"Edit", ES_PASSWORD, true, ControlKind::Password, "password Edit" },
         { L"ComboBox", CBS_DROPDOWNLIST, true, ControlKind::ComboBox, "dropdown-list ComboBox" },
@@ -1460,7 +1466,7 @@ void TestControlAdapterRegistry() {
         { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
         { PROGRESS_CLASSW, PBS_MARQUEE, true, ControlKind::ProgressBar, "marquee ProgressBar" },
         { PROGRESS_CLASSW, PBS_VERTICAL, false, ControlKind::ProgressBar, "vertical ProgressBar" },
-        { PROGRESS_CLASSW, WS_TABSTOP, false, ControlKind::ProgressBar, "tab-stop ProgressBar" },
+        { PROGRESS_CLASSW, WS_TABSTOP, true, ControlKind::ProgressBar, "tab-stop ProgressBar" },
         { STATUSCLASSNAMEW, 0, true, ControlKind::StatusBar, "StatusBar" },
         { STATUSCLASSNAMEW, WS_TABSTOP, false, ControlKind::StatusBar, "tab-stop StatusBar" },
         { WC_TREEVIEWW, TVS_HASBUTTONS | TVS_HASLINES, true, ControlKind::TreeView, "TreeView" },
@@ -1471,7 +1477,7 @@ void TestControlAdapterRegistry() {
         { TRACKBAR_CLASSW, TBS_VERT | TBS_BOTH, true, ControlKind::Slider, "vertical Trackbar" },
         { TRACKBAR_CLASSW, TBS_ENABLESELRANGE, false, ControlKind::Slider,
           "selection-range Trackbar" },
-        { TRACKBAR_CLASSW, TBS_TOOLTIPS, false, ControlKind::Slider, "tooltip Trackbar" },
+        { TRACKBAR_CLASSW, TBS_TOOLTIPS, true, ControlKind::Slider, "tooltip Trackbar" },
         { TRACKBAR_CLASSW, TBS_NOTHUMB, false, ControlKind::Slider, "thumbless Trackbar" },
         { TRACKBAR_CLASSW, TBS_NOTIFYBEFOREMOVE, false, ControlKind::Slider,
           "veto-snapping Trackbar" },
@@ -2054,9 +2060,21 @@ void TestStaticIconCaptureBoundary() {
         "mask-based STM_SETICON replacement was not captured transparently");
     if (replacement) DestroyIcon(replacement);
 
+    // Clearing the icon sizes a plain SS_ICON to nothing, so it draws nothing and is
+    // no longer captured; one that keeps its size with no image is still refused.
     SendMessageW(iconControl, STM_SETICON, 0, 0);
     context.revision = 3;
     Translation::WindowSnapshot missing;
+    RECT emptied{};
+    GetWindowRect(iconControl, &emptied);
+    if (IsRectEmpty(&emptied)) {
+        Check(Translation::CaptureWindow(window, context, missing, error) &&
+              std::none_of(missing.nodes.begin(), missing.nodes.end(),
+                  [&](const auto& node) { return node.hwnd == iconControl; }),
+            "an emptied SS_ICON that draws nothing was still captured");
+        SetWindowPos(iconControl, nullptr, 0, 0, 32, 32,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     Check(!Translation::CaptureWindow(window, context, missing, error) &&
           error.find(L"no current HICON") != std::wstring::npos,
         "SS_ICON without an image was accepted");
@@ -2075,8 +2093,9 @@ void TestStaticIconCaptureBoundary() {
     std::wstring reason;
     HWND bitmap = CreateWindowExW(0, L"Static", nullptr, WS_CHILD | SS_BITMAP,
         0, 0, 10, 10, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
-    Check(bitmap && !Translation::ClassifyControl(bitmap, kind, reason),
-        "SS_BITMAP was accepted by the SS_ICON adapter");
+    Check(bitmap && Translation::ClassifyControl(bitmap, kind, reason) &&
+        kind == Translation::ControlKind::StaticBitmap,
+        "SS_BITMAP was not classified as its own staticBitmap kind");
     if (bitmap) DestroyWindow(bitmap);
 }
 
@@ -4340,6 +4359,14 @@ int wmain() {
     TestOverlappingSiblingZOrderCapture();
     TestAccessibleIslandBoundary();
     TestAccessiblePageTabs();
+    TestMmcMessageViewAdapter();
+    TestMmcDescriptionBarIdentity();
+    TestTabStopProgressBarLeavesTraversal();
+    TestFullyClippedChildIsNotCaptured();
+    TestStaticBitmapCapture();
+    TestUpDownAdapter();
+    TestWizardSheetTabStripIsNotCaptured();
+    TestIconButtonCapture();
     FluentShell::Tests::TestUiAutomationProjectionScope(Check);
     FluentShell::Tests::TestMmcHtmlDocumentAdmission(Check);
     FluentShell::Tests::TestListViewModes(Check);

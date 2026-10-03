@@ -42,6 +42,8 @@ enum class ControlKind {
     PaneContainer,
     AccessibleIsland,
     StaticDecoration,
+    StaticBitmap,
+    UpDown,
     Count,
 };
 
@@ -90,6 +92,12 @@ struct AccessibleIslandItemSnapshot final {
     bool enabled = true;
     bool dropDown = false;
     bool selected = false;
+    // Only an "image" item carries pixels: the region the host painted for an element
+    // its provider describes as a graphic.
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
 };
 
 struct ToolbarItemSnapshot final {

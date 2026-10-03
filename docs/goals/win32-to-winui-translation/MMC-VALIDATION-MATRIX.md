@@ -157,17 +157,24 @@ The 2026-09-28 batch is in `build/mmc-startup-20260928-195729/`. It predates the
 latest HTML guards, viewport and menu fixes. Native tests overlapped the
 `DevModeRunAsUserConfig` observation; the 2026-10-02 sequential runs supersede it.
 
+The 2026-10-03 all-console run after the minor-27 message-view adapter, the MMC
+description bar, startup modal-dialog ordering and tab-stop progress bars is
+`build/mmc-startup-20261003-122510/`: **17 stable startups with Renderer cleanup**
+(up from 13 in `build/mmc-startup-20261003-113713/` the same morning) and 5 capture
+rejections (`diskmgmt`, `eventvwr`, `perfmon`, `taskschd`, `tpm`). Rows below are
+updated from those runs.
+
 | Console | Last observed startup result |
 | --- | --- |
 | Empty MMC, `gpedit`, `compmgmt`, `certlm`, `certmgr`, `fsmgmt`, `lusrmgr`, `printmanagement` | Stable startup and Renderer cleanup on 2026-10-02 |
 | `secpol`, `devmgmt`, `comexp`, `DevModeRunAsUserConfig` | Stable startup and Renderer cleanup on 2026-10-02 |
-| `services` | Latest extended/standard attempts stop at source-thread capture-and-cloak acknowledgement; earlier builds timed out in committed UIA enumeration and Renderer heartbeat |
-| `azman`, `WmiMgmt` | ATL document/information pane rejected; MSAA exposes a document with text and graphic children |
-| `diskmgmt` | Ordinary-integrity launch has an owned startup dialog, so owner-graph admission stops before the normal disk view; older elevated evidence also names the custom disk view/legend |
-| `eventvwr`, `taskschd`, `WF` | Embedded Windows Forms child belongs to another UI thread |
+| `services` | Stable startup on 2026-10-03 (`build/mmc-startup-20261003-113713/`); earlier attempts stopped at source-thread capture-and-cloak acknowledgement, so it is intermittent rather than fixed |
+| `azman`, `WmiMgmt` | Stable startup and Renderer cleanup on 2026-10-03 (`build/mmc-startup-20261003-115543/`) through the MMC message-view adapter (minor 27) |
+| `diskmgmt` | The owner now projects before its startup dialog, which exposes the real blocker: the MFC graphical disk view (`AfxWnd42u`, scrolling custom paint) has no adapter |
+| `eventvwr`, `taskschd`, `tpm` | Embedded Windows Forms child belongs to another UI thread |
+| `WF` | Stable startup on 2026-10-03 (`build/mmc-startup-20261003-120242/`) at ordinary integrity: its access-denied message view and MMC's owner-drawn description bar (`Static` under an mmc.exe-registered `MMCViewWindow`, projected as its text) are both admitted. Later runs the same afternoon (`build/mmc-startup-20261003-172543/`) instead loaded the snap-in's Windows Forms view, which lives on another UI thread and keeps the window native like `eventvwr`. The elevated rule views are unverified |
 | `perfmon` | HTML host mixes semantic content and a native performance report control |
-| `rsop` | Ordinary-integrity startup shows an owned Group Policy error dialog; owner graph remains native |
-| `tpm` | ATL pane, disabled Actions entries, and owner-drawn Static need coverage |
+| `rsop` | Stable startup and Renderer cleanup on 2026-10-03 (`build/mmc-startup-20261003-122436/`, two repetitions): the processing dialog projects, then its modal Group Policy error dialog on top. Later runs (`build/mmc-startup-20261003-172543/`) caught the processing dialog while its UI thread was still busy (even `WM_GETTEXT` timed out), so the source-thread attach timed out and it stayed native; the result depends on how long RSoP processing takes |
 
 Individual projection logs, including `build/mmc-gpedit-tabs-html.log`, establish
 that the committed gate succeeded. They do not establish every nested page or
