@@ -5,14 +5,19 @@ param(
     [Parameter(Mandatory = $true)][string] $ProcessName,
     [string] $RootClass = '',
     [int] $MaxDepth = 6,
-    [int] $MaxNodes = 200
+    [int] $MaxNodes = 200,
+    [int] $ProcessId = 0
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
-$process = Get-Process -Name $ProcessName -ErrorAction Stop | Select-Object -First 1
+$process = if ($ProcessId -ne 0) { Get-Process -Id $ProcessId -ErrorAction Stop } else {
+    $matches = @(Get-Process -Name $ProcessName -ErrorAction Stop)
+    if ($matches.Count -ne 1) { throw 'More than one matching process exists; pass -ProcessId.' }
+    $matches[0]
+}
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $window = $root.FindFirst([System.Windows.Automation.TreeScope]::Children,
     (New-Object System.Windows.Automation.PropertyCondition(

@@ -193,8 +193,31 @@ JsonObject NodeToJson(const ControlNode& node) {
         items.Append(JsonValue::CreateStringValue(item));
     }
     result.Insert(L"items", items);
+    if (node.ownerDrawCombo) {
+        const auto imageJson = [](const ImageListEntry& image) {
+            JsonObject value;
+            value.Insert(L"imageWidth", JsonValue::CreateNumberValue(image.imageWidth));
+            value.Insert(L"imageHeight", JsonValue::CreateNumberValue(image.imageHeight));
+            value.Insert(L"imageFormat", JsonValue::CreateStringValue(image.imageFormat));
+            value.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(image.imageData)));
+            return value;
+        };
+        JsonObject painted;
+        painted.Insert(L"mode", JsonValue::CreateStringValue(node.ownerDrawCombo->mode));
+        JsonArray faces;
+        for (const auto& item : node.ownerDrawCombo->items) {
+            JsonObject value;
+            value.Insert(L"normal", imageJson(item.normal));
+            value.Insert(L"selected", imageJson(item.selected));
+            faces.Append(value);
+        }
+        painted.Insert(L"items", faces);
+        if (node.ownerDrawCombo->selectionFace)
+            painted.Insert(L"selectionFace", imageJson(*node.ownerDrawCombo->selectionFace));
+        result.Insert(L"ownerDrawCombo", painted);
+    }
     if (node.kind == ControlKind::TabControl ||
-        (node.kind == ControlKind::ListView && node.listViewMode != L"report")) {
+        (node.kind == ControlKind::ListView && (node.listViewMode != L"report" || node.groupViewEnabled))) {
         JsonArray itemRects;
         for (const auto& rect : node.itemRects) itemRects.Append(RectToJson(rect));
         result.Insert(L"itemRects", itemRects);
@@ -225,6 +248,27 @@ JsonObject NodeToJson(const ControlNode& node) {
             itemNativeIds.Append(JsonValue::CreateStringValue(std::to_wstring(nativeId)));
         }
         result.Insert(L"itemNativeIds", itemNativeIds);
+        result.Insert(L"groupViewEnabled", JsonValue::CreateBooleanValue(node.groupViewEnabled));
+        JsonArray groups;
+        for (const auto& group : node.listViewGroups) {
+            JsonObject item;
+            item.Insert(L"groupId", JsonValue::CreateStringValue(std::to_wstring(group.groupId)));
+            item.Insert(L"header", JsonValue::CreateStringValue(group.header));
+            item.Insert(L"footer", JsonValue::CreateStringValue(group.footer));
+            item.Insert(L"headerAlignment", JsonValue::CreateStringValue(group.headerAlignment));
+            item.Insert(L"footerAlignment", JsonValue::CreateStringValue(group.footerAlignment));
+            item.Insert(L"collapsible", JsonValue::CreateBooleanValue(group.collapsible));
+            item.Insert(L"collapsed", JsonValue::CreateBooleanValue(group.collapsed));
+            item.Insert(L"hidden", JsonValue::CreateBooleanValue(group.hidden));
+            item.Insert(L"headerRect", RectToJson(group.headerRect));
+            item.Insert(L"footerRect", RectToJson(group.footerRect));
+            groups.Append(item);
+        }
+        result.Insert(L"listViewGroups", groups);
+        JsonArray memberships;
+        for (int id : node.itemGroupIds)
+            memberships.Append(JsonValue::CreateStringValue(std::to_wstring(id)));
+        result.Insert(L"itemGroupIds", memberships);
         JsonArray columnOrder;
         for (const int logical : node.columnOrder) {
             columnOrder.Append(JsonValue::CreateNumberValue(logical));
@@ -331,6 +375,19 @@ JsonObject NodeToJson(const ControlNode& node) {
                 value.Insert(L"imageFormat", JsonValue::CreateStringValue(item.imageFormat));
                 value.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(item.imageData)));
             }
+            const auto appendVariant = [&](const wchar_t* name,
+                const std::optional<ImageListEntry>& image) {
+                if (!image) return;
+                JsonObject pixels;
+                pixels.Insert(L"imageWidth", JsonValue::CreateNumberValue(image->imageWidth));
+                pixels.Insert(L"imageHeight", JsonValue::CreateNumberValue(image->imageHeight));
+                pixels.Insert(L"imageFormat", JsonValue::CreateStringValue(image->imageFormat));
+                pixels.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(image->imageData)));
+                value.Insert(name, pixels);
+            };
+            appendVariant(L"hotImage", item.hotImage);
+            appendVariant(L"disabledImage", item.disabledImage);
+            appendVariant(L"pressedImage", item.pressedImage);
             toolbarItems.Append(value);
         }
         result.Insert(L"toolbarItems", toolbarItems);
@@ -359,6 +416,22 @@ JsonObject NodeToJson(const ControlNode& node) {
             chromeRegions.Append(value);
         }
         result.Insert(L"chromeRegions", chromeRegions);
+        if (!node.scrollBars.empty()) {
+            JsonArray scrollBars;
+            for (const auto& bar : node.scrollBars) {
+                JsonObject value;
+                value.Insert(L"vertical", JsonValue::CreateBooleanValue(bar.vertical));
+                value.Insert(L"enabled", JsonValue::CreateBooleanValue(bar.enabled));
+                value.Insert(L"minimum", JsonValue::CreateNumberValue(bar.minimum));
+                value.Insert(L"maximum", JsonValue::CreateNumberValue(bar.maximum));
+                value.Insert(L"page", JsonValue::CreateNumberValue(bar.page));
+                value.Insert(L"position", JsonValue::CreateNumberValue(bar.position));
+                value.Insert(L"rect", RectToJson(bar.rect));
+                scrollBars.Append(value);
+            }
+            result.Insert(L"scrollBars", scrollBars);
+            result.Insert(L"clientRect", RectToJson(node.clientRect));
+        }
     }
     if (node.kind == ControlKind::AccessibleIsland) {
         JsonArray islandItems;
@@ -382,6 +455,85 @@ JsonObject NodeToJson(const ControlNode& node) {
             islandItems.Append(value);
         }
         result.Insert(L"islandItems", islandItems);
+    }
+    if (node.kind == ControlKind::DiskView && node.diskView) {
+        const auto& view = *node.diskView;
+        JsonObject value;
+        value.Insert(L"name", JsonValue::CreateStringValue(view.name));
+        value.Insert(L"clientRect", RectToJson(view.clientRect));
+        value.Insert(L"scrollRect", RectToJson(view.scrollRect));
+        value.Insert(L"scrollMinimum", JsonValue::CreateNumberValue(view.scrollMinimum));
+        value.Insert(L"scrollMaximum", JsonValue::CreateNumberValue(view.scrollMaximum));
+        value.Insert(L"scrollPosition", JsonValue::CreateNumberValue(view.scrollPosition));
+        value.Insert(L"scrollPage", JsonValue::CreateNumberValue(view.scrollPage));
+        JsonArray entries;
+        for (const auto& source : view.items) {
+            JsonObject item;
+            item.Insert(L"itemId", JsonValue::CreateStringValue(std::to_wstring(source.itemId)));
+            item.Insert(L"diskId", JsonValue::CreateStringValue(std::to_wstring(source.diskId)));
+            item.Insert(L"kind", JsonValue::CreateStringValue(source.kind));
+            item.Insert(L"rect", RectToJson(source.rect));
+            item.Insert(L"name", JsonValue::CreateStringValue(source.name));
+            item.Insert(L"value", JsonValue::CreateStringValue(source.value));
+            item.Insert(L"enabled", JsonValue::CreateBooleanValue(source.enabled));
+            item.Insert(L"selected", JsonValue::CreateBooleanValue(source.selected));
+            item.Insert(L"focused", JsonValue::CreateBooleanValue(source.focused));
+            entries.Append(item);
+        }
+        value.Insert(L"items", entries);
+        result.Insert(L"diskView", value);
+    }
+    if (node.kind == ControlKind::NativeDocument && node.document) {
+        const auto& document = *node.document;
+        JsonObject content;
+        content.Insert(L"documentId", JsonValue::CreateStringValue(document.documentId));
+        JsonArray regions;
+        for (const auto& region : document.regions) {
+            JsonObject value;
+            value.Insert(L"key", JsonValue::CreateStringValue(region.key));
+            value.Insert(L"kind", JsonValue::CreateStringValue(region.kind));
+            value.Insert(L"rect", RectToJson(region.rect));
+            value.Insert(L"contentWidth", JsonValue::CreateNumberValue(region.contentWidth));
+            value.Insert(L"contentHeight", JsonValue::CreateNumberValue(region.contentHeight));
+            value.Insert(L"maximumX", JsonValue::CreateNumberValue(region.maximumX));
+            value.Insert(L"maximumY", JsonValue::CreateNumberValue(region.maximumY));
+            value.Insert(L"offsetX", JsonValue::CreateNumberValue(region.offsetX));
+            value.Insert(L"offsetY", JsonValue::CreateNumberValue(region.offsetY));
+            regions.Append(value);
+        }
+        content.Insert(L"regions", regions);
+        JsonArray items;
+        for (const auto& item : document.items) {
+            JsonObject value;
+            value.Insert(L"key", JsonValue::CreateStringValue(item.key));
+            value.Insert(L"kind", JsonValue::CreateStringValue(item.kind));
+            value.Insert(L"rect", RectToJson(item.rect));
+            value.Insert(L"regionIndex", JsonValue::CreateNumberValue(item.regionIndex));
+            value.Insert(L"reportRegionIndex", JsonValue::CreateNumberValue(item.reportRegionIndex));
+            value.Insert(L"name", JsonValue::CreateStringValue(item.name));
+            value.Insert(L"actionIdentity", JsonValue::CreateStringValue(item.actionIdentity));
+            value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
+            if (item.image) {
+                JsonObject image;
+                image.Insert(L"imageWidth", JsonValue::CreateNumberValue(item.image->imageWidth));
+                image.Insert(L"imageHeight", JsonValue::CreateNumberValue(item.image->imageHeight));
+                image.Insert(L"imageFormat", JsonValue::CreateStringValue(item.image->imageFormat));
+                image.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(item.image->imageData)));
+                value.Insert(L"image", image);
+            }
+            JsonArray rows;
+            for (const auto& row : item.reportRows) {
+                JsonObject entry;
+                entry.Insert(L"path", JsonValue::CreateStringValue(row.path));
+                entry.Insert(L"value", JsonValue::CreateNumberValue(row.value));
+                entry.Insert(L"available", JsonValue::CreateBooleanValue(row.available));
+                rows.Append(entry);
+            }
+            value.Insert(L"reportRows", rows);
+            items.Append(value);
+        }
+        content.Insert(L"items", items);
+        result.Insert(L"document", content);
     }
     if (!node.adapterId.empty()) {
         result.Insert(L"adapterId", JsonValue::CreateStringValue(node.adapterId));
@@ -681,27 +833,29 @@ bool ParseActionValue(
         }
         return true;
     }
-    if (action.action == L"setItemText") {
+    // contextMenu carries the item's label as a witness: the request is rebased onto
+    // the current revision and refused if that index now names a different item.
+    if (action.action == L"setItemText" || action.action == L"contextMenu") {
         if (value.ValueType() != JsonValueType::Object) {
-            error = L"setItemText requires an object value";
+            error = action.action + L" requires an object value";
             return false;
         }
         const auto object = value.GetObject();
         if (object.Size() != 2 || !object.HasKey(L"index") || !object.HasKey(L"text") ||
             object.GetNamedValue(L"text").ValueType() != JsonValueType::String) {
-            error = L"setItemText requires exactly an integer index and string text";
+            error = action.action + L" requires exactly an integer index and string text";
             return false;
         }
         LONG index = -1;
         if (!JsonInteger(object, L"index", index) || index < 0 ||
             static_cast<size_t>(index) >= Ipc::kMaxListItems) {
-            error = L"setItemText index is outside range";
+            error = action.action + L" index is outside range";
             return false;
         }
         action.itemIndex = index;
         action.text = object.GetNamedString(L"text");
         if (action.text.size() > Ipc::kMaxStringChars) {
-            error = L"setItemText value exceeds limit";
+            error = action.action + L" value exceeds limit";
             return false;
         }
         return true;
@@ -729,6 +883,70 @@ bool ParseActionValue(
         action.popupItemId = item.GetString();
         return true;
     }
+    if (action.action == L"diskSelect" || action.action == L"diskContext") {
+        if (value.ValueType() != JsonValueType::Object) return false;
+        const auto object = value.GetObject();
+        uint64_t id = 0;
+        if (object.Size() != 1 || object.GetNamedValue(L"itemId").ValueType() != JsonValueType::String ||
+            !Ipc::TryParseUInt64(object.GetNamedString(L"itemId"), id) || !id || id > INT32_MAX)
+            return false;
+        action.diskItemId = static_cast<uint32_t>(id);
+        return true;
+    }
+    if (action.action == L"diskScroll") {
+        LONG position = 0;
+        if (value.ValueType() != JsonValueType::Object || value.GetObject().Size() != 1 ||
+            !JsonInteger(value.GetObject(), L"position", position) || position < 0 || position > 65535)
+            return false;
+        action.integerValue = position;
+        return true;
+    }
+    if (action.action == L"htmlInvoke") {
+        if (value.ValueType() != JsonValueType::Object) return false;
+        const auto object = value.GetObject();
+        LONG index = -1;
+        uint64_t identity = 0;
+        if (object.Size() != 4 || !JsonInteger(object, L"index", index) || index < 0 || index >= 256 ||
+            object.GetNamedValue(L"documentId").ValueType() != JsonValueType::String ||
+            object.GetNamedValue(L"key").ValueType() != JsonValueType::String ||
+            object.GetNamedValue(L"actionIdentity").ValueType() != JsonValueType::String ||
+            !Ipc::TryParseUInt64(object.GetNamedString(L"actionIdentity"), identity) || identity == 0) {
+            error = L"htmlInvoke requires a bounded document item and its canonical action identity";
+            return false;
+        }
+        action.itemIndex = index;
+        action.nativeDocumentId = object.GetNamedString(L"documentId");
+        action.nativeDocumentItemKey = object.GetNamedString(L"key");
+        action.nativeDocumentActionIdentity = object.GetNamedString(L"actionIdentity");
+        if (action.nativeDocumentId.empty() || action.nativeDocumentItemKey.empty() ||
+            action.nativeDocumentId.find(L'\0') != std::wstring::npos ||
+            action.nativeDocumentItemKey.find(L'\0') != std::wstring::npos ||
+            action.nativeDocumentId.size() > Ipc::kMaxStringChars || action.nativeDocumentItemKey.size() > Ipc::kMaxStringChars) return false;
+        return true;
+    }
+    if (action.action == L"htmlScroll") {
+        if (value.ValueType() != JsonValueType::Object) return false;
+        const auto object = value.GetObject();
+        LONG index = -1, x = -1, y = -1;
+        if (object.Size() != 5 || !JsonInteger(object, L"index", index) ||
+            !JsonInteger(object, L"x", x) || !JsonInteger(object, L"y", y) ||
+            object.GetNamedValue(L"documentId").ValueType() != JsonValueType::String ||
+            object.GetNamedValue(L"key").ValueType() != JsonValueType::String ||
+            index < 0 || index >= 16 || x < 0 || y < 0 ||
+            x > Ipc::kMaxCoordinate || y > Ipc::kMaxCoordinate) {
+            error = L"htmlScroll requires a bounded scrollport and absolute offsets";
+            return false;
+        }
+        action.itemIndex = index;
+        action.integerValues = {x, y};
+        action.nativeDocumentId = object.GetNamedString(L"documentId");
+        action.nativeDocumentItemKey = object.GetNamedString(L"key");
+        if (action.nativeDocumentId.empty() || action.nativeDocumentItemKey.empty() ||
+            action.nativeDocumentId.find(L'\0') != std::wstring::npos ||
+            action.nativeDocumentItemKey.find(L'\0') != std::wstring::npos ||
+            action.nativeDocumentId.size() > Ipc::kMaxStringChars || action.nativeDocumentItemKey.size() > Ipc::kMaxStringChars) return false;
+        return true;
+    }
     if (action.action == L"islandInvoke") {
         if (value.ValueType() != JsonValueType::Number) {
             error = L"islandInvoke requires an integer item index";
@@ -742,6 +960,27 @@ bool ParseActionValue(
             return false;
         }
         action.itemIndex = index;
+        return true;
+    }
+    if (action.action == L"setGroupExpanded") {
+        if (value.ValueType() != JsonValueType::Object) {
+            error = L"setGroupExpanded requires a groupId and expanded state"; return false;
+        }
+        const auto object = value.GetObject();
+        if (object.Size() != 2 || !object.HasKey(L"groupId") || !object.HasKey(L"expanded") ||
+            object.GetNamedValue(L"groupId").ValueType() != JsonValueType::String ||
+            object.GetNamedValue(L"expanded").ValueType() != JsonValueType::Boolean) {
+            error = L"setGroupExpanded requires exactly a groupId and expanded state"; return false;
+        }
+        const std::wstring id(object.GetNamedString(L"groupId"));
+        try {
+            const long long parsed = std::stoll(id);
+            if (parsed < INT_MIN || parsed > INT_MAX || id != std::to_wstring(parsed) || parsed == -1 || parsed == -2) {
+                error = L"setGroupExpanded groupId is not a canonical native ID"; return false;
+            }
+            action.groupId = static_cast<int>(parsed);
+        } catch (...) { error = L"setGroupExpanded groupId is invalid"; return false; }
+        action.booleanValue = object.GetNamedBoolean(L"expanded");
         return true;
     }
     if (action.action == L"setColumnOrder") {
@@ -802,6 +1041,31 @@ bool ParseActionValue(
         }
         action.itemIndex = index;
         action.integerValue = position;
+        return true;
+    }
+    if (action.action == L"setScroll") {
+        if (value.ValueType() != JsonValueType::Object) {
+            error = L"setScroll requires an object value";
+            return false;
+        }
+        const auto object = value.GetObject();
+        const bool byPosition = object.HasKey(L"position");
+        const bool byLines = object.HasKey(L"lines");
+        if (object.Size() != 2 || !object.HasKey(L"vertical") || byPosition == byLines ||
+            object.GetNamedValue(L"vertical").ValueType() != JsonValueType::Boolean) {
+            error = L"setScroll requires vertical and exactly one of position or lines";
+            return false;
+        }
+        LONG amount = 0;
+        if (!JsonInteger(object, byLines ? L"lines" : L"position", amount) ||
+            (byLines ? (amount == 0 || amount < -Ipc::kMaxScrollLines || amount > Ipc::kMaxScrollLines)
+                     : (amount < -Ipc::kMaxCoordinate || amount > Ipc::kMaxCoordinate))) {
+            error = L"setScroll amount is outside range";
+            return false;
+        }
+        action.booleanValue = object.GetNamedBoolean(L"vertical");
+        action.scrollByLines = byLines;
+        action.integerValue = amount;
         return true;
     }
     if (action.action == L"setItemCheck" || action.action == L"setExpand") {
@@ -879,6 +1143,8 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::Toolbar: return L"toolbar";
     case ControlKind::PaneContainer: return L"paneContainer";
     case ControlKind::AccessibleIsland: return L"accessibleIsland";
+    case ControlKind::NativeDocument: return L"nativeDocument";
+    case ControlKind::DiskView: return L"diskView";
     }
     return L"static";
 }
@@ -893,6 +1159,8 @@ bool IsProjectedContainerKind(ControlKind kind) noexcept {
     case ControlKind::MdiClient:
     case ControlKind::MdiChild:
     case ControlKind::PaneContainer:
+    // Windows Forms parents its TabPage windows to the tab control itself.
+    case ControlKind::TabControl:
         return true;
     default:
         return false;
@@ -1163,7 +1431,8 @@ bool ParseActionInvoke(
         static constexpr std::wstring_view kActions[] = {
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
             L"setSelection", L"setFocusedIndex", L"setItemCheck", L"setItemText", L"activateItem", L"scrollBy", L"setValue", L"setExpand",
-            L"setSplit", L"setColumnOrder", L"islandInvoke",
+            L"setSplit", L"setColumnOrder", L"setGroupExpanded", L"islandInvoke", L"htmlInvoke", L"htmlScroll",
+            L"diskSelect", L"diskContext", L"diskScroll", L"contextMenu", L"setScroll",
             L"menuCommand", L"popupCommand", L"toolbarCommand", L"mdiCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
@@ -1180,7 +1449,10 @@ bool ParseActionInvoke(
             action.action == L"setValue" || action.action == L"setExpand" ||
             action.action == L"setSplit" ||
             action.action == L"setColumnOrder" ||
-            action.action == L"islandInvoke" ||
+            action.action == L"setGroupExpanded" ||
+            action.action == L"islandInvoke" || action.action == L"htmlInvoke" || action.action == L"htmlScroll" ||
+            action.action == L"diskSelect" || action.action == L"diskContext" || action.action == L"diskScroll" ||
+            action.action == L"contextMenu" || action.action == L"setScroll" ||
             action.action == L"toolbarCommand" || action.action == L"mdiCommand";
         if (requiresNode != action.nodeId.has_value()) {
             error = L"action.invoke nodeId does not match action semantics";
@@ -1420,6 +1692,15 @@ bool ValidateActionForSnapshot(
         }
         return true;
     }
+    if (action.action == L"setGroupExpanded") {
+        const auto group = std::find_if(node.listViewGroups.begin(), node.listViewGroups.end(),
+            [&](const auto& entry) { return entry.groupId == action.groupId; });
+        if (node.kind != ControlKind::ListView || !node.groupViewEnabled ||
+            group == node.listViewGroups.end() || !group->collapsible || group->hidden) {
+            error = L"setGroupExpanded requires a visible collapsible native ListView group"; return false;
+        }
+        return true;
+    }
     if (action.action == L"setExpand") {
         if (node.kind != ControlKind::TreeView) {
             error = L"setExpand requires a TreeView node";
@@ -1436,6 +1717,38 @@ bool ValidateActionForSnapshot(
         // evidence rather than a count of captured descendants.
         if (!node.itemHasChildren[static_cast<size_t>(action.itemIndex)]) {
             error = L"setExpand references a TreeView leaf";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setScroll") {
+        const auto bar = std::find_if(node.scrollBars.begin(), node.scrollBars.end(),
+            [&](const ScrollBarSnapshot& candidate) { return candidate.vertical == action.booleanValue; });
+        if (node.kind != ControlKind::PaneContainer || bar == node.scrollBars.end() || !bar->enabled) {
+            error = L"setScroll requires an enabled scroll bar of a scrolling container";
+            return false;
+        }
+        if (!action.scrollByLines &&
+            (action.integerValue < bar->minimum || action.integerValue > bar->maximum)) {
+            error = L"setScroll position is outside the scroll range";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"contextMenu") {
+        const bool tree = node.kind == ControlKind::TreeView;
+        const size_t count = tree ? node.items.size()
+            : node.kind == ControlKind::ListView ? ListViewItemCount(node) : 0;
+        // Only a real comctl32 control answers the selection and WM_CONTEXTMENU
+        // messages; a DirectUI-backed node has no such HWND contract.
+        if ((!tree && node.kind != ControlKind::ListView) || !node.adapterId.empty() || action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= count ||
+            static_cast<size_t>(action.itemIndex) >= node.items.size()) {
+            error = L"contextMenu requires a TreeView or ListView item index";
+            return false;
+        }
+        if (node.items[static_cast<size_t>(action.itemIndex)] != action.text) {
+            error = L"contextMenu item changed before the request";
             return false;
         }
         return true;
@@ -1477,7 +1790,7 @@ bool ValidateActionForSnapshot(
     if (action.action == L"scrollBy") {
         if (node.kind != ControlKind::ListView ||
             (node.listViewMode != L"largeIcon" && node.listViewMode != L"smallIcon" &&
-                node.listViewMode != L"list") ||
+                node.listViewMode != L"list" && !(node.listViewMode == L"report" && node.groupViewEnabled)) ||
             action.integerValue < -Ipc::kMaxCoordinate || action.integerValue > Ipc::kMaxCoordinate ||
             action.itemIndex < -Ipc::kMaxCoordinate || action.itemIndex > Ipc::kMaxCoordinate) {
             error = L"scrollBy requires bounded deltas on a non-report ListView";
@@ -1505,6 +1818,35 @@ bool ValidateActionForSnapshot(
             return false;
         }
         return true;
+    }
+    if (action.action == L"diskSelect" || action.action == L"diskContext" || action.action == L"diskScroll") {
+        if (node.kind != ControlKind::DiskView || !node.diskView) return false;
+        const auto& view = *node.diskView;
+        if (action.action == L"diskScroll")
+            return action.integerValue >= view.scrollMinimum && action.integerValue <= view.scrollMaximum;
+        return std::any_of(view.items.begin(), view.items.end(), [&](const auto& item) {
+            return item.itemId == action.diskItemId && item.enabled;
+        });
+    }
+    if (action.action == L"htmlInvoke" || action.action == L"htmlScroll") {
+        if (node.kind != ControlKind::NativeDocument || !node.document || action.itemIndex < 0) {
+            error = L"HTML action requires a native document";
+            return false;
+        }
+        const auto& document = *node.document;
+        if (document.documentId != action.nativeDocumentId) return false;
+        if (action.action == L"htmlInvoke") {
+            if (static_cast<size_t>(action.itemIndex) >= document.items.size()) return false;
+            const auto& item = document.items[action.itemIndex];
+            return item.kind == L"link" && item.enabled && !item.actionIdentity.empty() &&
+                item.key == action.nativeDocumentItemKey && item.actionIdentity == action.nativeDocumentActionIdentity;
+        }
+        if (static_cast<size_t>(action.itemIndex) >= document.regions.size() ||
+            action.integerValues.size() != 2) return false;
+        const auto& region = document.regions[action.itemIndex];
+        return region.key == action.nativeDocumentItemKey &&
+            action.integerValues[0] >= 0 && action.integerValues[0] <= region.maximumX &&
+            action.integerValues[1] >= 0 && action.integerValues[1] <= region.maximumY;
     }
     if (action.action == L"islandInvoke") {
         if (node.kind != ControlKind::AccessibleIsland) {
@@ -1643,7 +1985,9 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
         action == L"setSplit" ||
         action == L"setColumnOrder" ||
         action == L"scrollBy" ||
-        action == L"islandInvoke" || action == L"popupCommand" ||
+        action == L"diskScroll" ||
+        action == L"islandInvoke" || action == L"htmlInvoke" || action == L"htmlScroll" || action == L"popupCommand" ||
+        action == L"contextMenu" || action == L"setScroll" ||
         action == L"mdiCommand";
 }
 

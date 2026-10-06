@@ -2,6 +2,7 @@
 
 #include "../../Common/FluentShell.h"
 #include "WindowCapture.h"
+#include "GuiThreadDispatch.h"
 
 #include <oleacc.h>
 #include <wrl/client.h>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <optional>
+#include <memory>
 #include <unordered_set>
 
 namespace FluentShell::Bridge::Translation {
@@ -22,6 +24,7 @@ using Microsoft::WRL::ComPtr;
 // A menu bar is small by construction: a bar with more top-level menus than this is
 // not the shape this lane exists for.
 constexpr int kMaxMenuBarButtons = 24;
+constexpr DWORD kSilentMenuButtonWaitMs = 150;
 constexpr size_t kMaxProjectedMenuItems = 256;
 constexpr size_t kMaxProjectedMenuDepth = 8;
 constexpr UINT kTrackingCommandFlags = TPM_RETURNCMD | TPM_NONOTIFY;
@@ -58,7 +61,9 @@ std::atomic<int> g_suppressionDepth{ 0 };
 bool ToolbarAccessible(HWND toolbar, ComPtr<IAccessible>& accessible, long& children) noexcept {
     accessible.Reset();
     children = 0;
-    if (!toolbar || !IsWindow(toolbar)) return false;
+    DWORD process = 0;
+    if (!toolbar || GetWindowThreadProcessId(toolbar, &process) != GetCurrentThreadId() ||
+        process != GetCurrentProcessId() || GuiThreadOperationCancelled()) return false;
     if (FAILED(AccessibleObjectFromWindow(toolbar, OBJID_CLIENT,
             IID_PPV_ARGS(accessible.GetAddressOf()))) || !accessible) {
         return false;
@@ -92,11 +97,19 @@ std::wstring ChildName(IAccessible* accessible, long child) noexcept {
 }
 
 bool MenuBarAncestorsReady(HWND root, HWND toolbar) noexcept {
-    if (!IsWindowVisible(root) || !IsWindowVisible(toolbar)) return false;
-    for (HWND current = toolbar; current; current = GetParent(current)) {
-        if (!IsWindowEnabled(current)) return false;
-        if (current == root) return true;
-    }
+    try {
+        struct Ancestor final { HWND parent = nullptr; bool ready = false; };
+        for (HWND current = toolbar; current;) {
+            auto state = std::make_shared<Ancestor>();
+            std::wstring error;
+            if (!DispatchToWindowThread(current, [current, state] {
+                    state->ready = IsWindowVisible(current) && IsWindowEnabled(current);
+                    state->parent = GetParent(current);
+                }, error) || !state->ready) return false;
+            if (current == root) return true;
+            current = state->parent;
+        }
+    } catch (...) {}
     return false;
 }
 
@@ -183,12 +196,17 @@ bool PopupSuppressionActive() noexcept {
 bool ShouldSuppressPopup(HWND owner) noexcept {
     if (PopupSuppressionActive()) return true;
     const HWND root = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
-    DWORD process = 0;
-    if (!root || GetWindowThreadProcessId(root, &process) != GetCurrentThreadId() ||
-        process != GetCurrentProcessId() || !GetPropW(root, kReadOwnerProperty)) return false;
-    DWORD cloaked = 0;
-    return SUCCEEDED(DwmGetWindowAttribute(root, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
-        (cloaked & DWM_CLOAKED_APP) != 0;
+    if (!root) return false;
+    try {
+        auto suppress = std::make_shared<bool>(false);
+        std::wstring error;
+        return DispatchToWindowThread(root, [root, suppress] {
+            DWORD cloaked = 0;
+            *suppress = GetPropW(root, kReadOwnerProperty) &&
+                SUCCEEDED(DwmGetWindowAttribute(root, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) &&
+                (cloaked & DWM_CLOAKED_APP) != 0;
+        }, error) && *suppress;
+    } catch (...) { return false; }
 }
 
 PopupSuppressionScope::PopupSuppressionScope() noexcept {
@@ -311,6 +329,16 @@ bool TakeRecordedMenu(
 bool ReadMenuBarButtons(HWND toolbar, std::vector<MenuBarButton>& buttons) noexcept {
     try {
         buttons.clear();
+        if (GetWindowThreadProcessId(toolbar, nullptr) != GetCurrentThreadId()) {
+            struct Read final { std::vector<MenuBarButton> buttons; bool success = false; };
+            auto read = std::make_shared<Read>();
+            std::wstring error;
+            if (!DispatchToWindowThread(toolbar, [toolbar, read] {
+                    read->success = ReadMenuBarButtons(toolbar, read->buttons);
+                }, error) || !read->success) return false;
+            buttons = std::move(read->buttons);
+            return true;
+        }
         ComPtr<IAccessible> accessible;
         long children = 0;
         if (!ToolbarAccessible(toolbar, accessible, children) ||
@@ -392,6 +420,15 @@ bool DriveMenuBarButton(
 }
 
 bool IsMenuBarToolbar(HWND toolbar) noexcept {
+    if (GetWindowThreadProcessId(toolbar, nullptr) != GetCurrentThreadId()) {
+        try {
+            auto result = std::make_shared<bool>(false);
+            std::wstring error;
+            return DispatchToWindowThread(toolbar, [toolbar, result] {
+                *result = IsMenuBarToolbar(toolbar);
+            }, error) && *result;
+        } catch (...) { return false; }
+    }
     ComPtr<IAccessible> accessible;
     long children = 0;
     if (!ToolbarAccessible(toolbar, accessible, children)) return false;
@@ -434,19 +471,28 @@ bool IsWindowSystemMenu(HMENU menu) noexcept {
 }
 
 HWND FindMenuBarToolbar(HWND root) noexcept {
-    struct Search final {
-        HWND found = nullptr;
-    } search;
-    EnumChildWindows(root, [](HWND child, LPARAM param) -> BOOL {
-        if (!IsWindowVisible(child)) return TRUE;
-        wchar_t buffer[64]{};
-        GetClassNameW(child, buffer, static_cast<int>(std::size(buffer)));
-        if (_wcsicmp(buffer, TOOLBARCLASSNAMEW) != 0) return TRUE;
-        if (!IsMenuBarToolbar(child)) return TRUE;
-        reinterpret_cast<Search*>(param)->found = child;
-        return FALSE;
-    }, reinterpret_cast<LPARAM>(&search));
-    return search.found;
+    try {
+        auto found = std::make_shared<HWND>(nullptr);
+        std::wstring error;
+        if (!DispatchToWindowThread(root, [root, found] {
+            EnumChildWindows(root, [](HWND child, LPARAM raw) -> BOOL {
+                try {
+                    auto candidate = std::make_shared<bool>(false);
+                    std::wstring reason;
+                    if (!DispatchToWindowThread(child, [child, candidate] {
+                        if (!IsWindowVisible(child)) return;
+                        wchar_t buffer[64]{};
+                        GetClassNameW(child, buffer, static_cast<int>(std::size(buffer)));
+                        *candidate = _wcsicmp(buffer, TOOLBARCLASSNAMEW) == 0 && IsMenuBarToolbar(child);
+                    }, reason)) return FALSE;
+                    if (!*candidate) return TRUE;
+                    *reinterpret_cast<HWND*>(raw) = child;
+                    return FALSE;
+                } catch (...) { return FALSE; }
+            }, reinterpret_cast<LPARAM>(found.get()));
+        }, error)) return nullptr;
+        return *found;
+    } catch (...) { return nullptr; }
 }
 
 static bool ReadOrInvokeMenuBarToolbar(
@@ -459,7 +505,8 @@ static bool ReadOrInvokeMenuBarToolbar(
     std::vector<MenuItemSnapshot>& menu,
     std::wstring& reason,
     std::vector<MenuBarCommandBinding>* commands,
-    const MenuBarCommandBinding* selection) noexcept {
+    const MenuBarCommandBinding* selection,
+    std::vector<bool>* silentButtons = nullptr) noexcept {
     // This scope outlives every pump, including cancellation/quit cleanup. Menus that
     // arrive late are swallowed while WM_CANCELMODE unwinds application tracking.
     struct ReadScope final {
@@ -475,8 +522,18 @@ static bool ReadOrInvokeMenuBarToolbar(
         bool accepted = false;
         std::optional<PopupSuppressionScope> suppression{std::in_place};
 
-        ReadScope(HWND rootWindow, HWND bar) : root(rootWindow), toolbar(bar) {
+        // A passive read never activates the cloaked native root: MMC opens and
+        // answers its menu-bar popups without it, and taking the foreground from
+        // the proxy for the whole read (seconds, after every navigation) closed
+        // any WinUI flyout the user had open and sent keystrokes to the hidden
+        // window. Executing a chosen command still activates the root, as a
+        // native click would, and restores the previous foreground afterwards.
+        ReadScope(HWND rootWindow, HWND bar, bool activate) : root(rootWindow), toolbar(bar) {
             g_menuBarReadInProgress = true;
+            if (!activate) {
+                foreground = active = nullptr;
+                return;
+            }
             const DWORD thread = GetCurrentThreadId();
             attached = foreignThread && foreignThread != thread &&
                 AttachThreadInput(thread, foreignThread, TRUE) != FALSE;
@@ -554,7 +611,7 @@ static bool ReadOrInvokeMenuBarToolbar(
             return false;
         }
         const ULONGLONG deadline = GetTickCount64() + totalWaitMs;
-        ReadScope scope(root, toolbar);
+        ReadScope scope(root, toolbar, selection != nullptr);
         // The inner drain checks both bounds for every message. A stream of posted
         // messages (including requeued Bridge commands) cannot extend the deadline.
         const auto pump = [&](ULONGLONG until, bool stopOnPopup) {
@@ -622,7 +679,13 @@ static bool ReadOrInvokeMenuBarToolbar(
                 if (!DriveMenuBarButton(toolbar, static_cast<int>(index + 1),
                         top.itemId, reason)) return false;
                 if (scope.accepted) return true;
-                if (!pump(std::min(deadline, GetTickCount64() + popupWaitMs), true)) {
+                // An enabled button that opened nothing last time (MMC's Favorites
+                // and snap-in placeholders) gets a short wait instead of the full one;
+                // real popups arrive within ~150 ms, so a newly populated one is kept.
+                const bool silentBefore = silentButtons && silentButtons->size() == buttons.size() &&
+                    (*silentButtons)[index];
+                const DWORD wait = silentBefore ? std::min<DWORD>(popupWaitMs, kSilentMenuButtonWaitMs) : popupWaitMs;
+                if (!pump(std::min(deadline, GetTickCount64() + wait), true)) {
                     if (scope.accepted) return true;
                     reason = scope.quit ? L"menu-bar read interrupted by WM_QUIT"
                         : L"menu-bar read cancelled";
@@ -631,6 +694,10 @@ static bool ReadOrInvokeMenuBarToolbar(
                 if (scope.accepted) return true;
                 std::wstring captureReason;
                 const bool recorded = TakeRecordedMenu(top.items, systemMenu, captureReason);
+                if (silentButtons && !selection) {
+                    if (silentButtons->size() != buttons.size()) silentButtons->assign(buttons.size(), false);
+                    (*silentButtons)[index] = !recorded;
+                }
                 const bool accepted = g_selectionAccepted;
                 const HWND owner = g_recordedOwner;
                 const UINT flags = g_recordedFlags;
@@ -690,9 +757,10 @@ bool CaptureMenuBarToolbar(
     HWND root, HWND toolbar, const std::vector<MenuBarButton>& buttons,
     DWORD popupWaitMs, DWORD totalWaitMs, const std::atomic<bool>& cancelled,
     std::vector<MenuItemSnapshot>& menu, std::wstring& reason,
-    std::vector<MenuBarCommandBinding>* commands) noexcept {
+    std::vector<MenuBarCommandBinding>* commands,
+    std::vector<bool>* silentButtons) noexcept {
     return ReadOrInvokeMenuBarToolbar(root, toolbar, buttons, popupWaitMs, totalWaitMs,
-        cancelled, menu, reason, commands, nullptr);
+        cancelled, menu, reason, commands, nullptr, silentButtons);
 }
 
 bool InvokeMenuBarToolbarCommand(

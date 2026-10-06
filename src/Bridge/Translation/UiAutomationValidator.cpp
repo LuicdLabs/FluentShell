@@ -386,6 +386,8 @@ int ExpectedControlType(const ControlNode& node) noexcept {
     // An accessible island frames a set of elements the projection renders itself, so
     // it reports the role a set of related controls has.
     case ControlKind::AccessibleIsland: return UIA_GroupControlTypeId;
+    case ControlKind::NativeDocument: return UIA_GroupControlTypeId;
+    case ControlKind::DiskView: return UIA_GroupControlTypeId;
     // A native MDI child is a window inside a window and UIA reports it as one,
     // so the projection keeps that role rather than inventing a pane.
     case ControlKind::MdiChild: return UIA_WindowControlTypeId;
@@ -602,14 +604,36 @@ bool ValidateListViewCheckboxes(
     if (FAILED(findResult) || !matches || FAILED(matches->get_Length(&length)))
         return FailHr(error, L"ListView checkbox enumeration failed", findResult);
     const int rowCount = static_cast<int>(ListViewItemCount(node));
+    const int exposedRows = node.groupViewEnabled
+        ? static_cast<int>(std::count_if(node.itemRects.begin(), node.itemRects.end(), [](const RECT& rect) {
+            return !IsRectEmpty(&rect);
+        })) : rowCount;
     if ((!node.checkBoxes && length != 0) ||
-        (node.checkBoxes && rowCount != 0 && (length <= 0 || length > rowCount))) {
+        (node.checkBoxes && exposedRows != 0 && (length <= 0 || length > exposedRows))) {
         return Fail(error, L"ListView checkbox descendants do not match native capability");
     }
+    std::unordered_set<int> seen;
     for (int index = 0; index < length; ++index) {
         ComPtr<IUIAutomationElement> checkBox;
         if (FAILED(matches->GetElement(index, &checkBox)) || !checkBox)
             return Fail(error, L"ListView checkbox descendant is unavailable");
+        BSTR rawId = nullptr;
+        const HRESULT idResult = checkBox->get_CurrentAutomationId(&rawId);
+        const std::wstring id = rawId ? rawId : L"";
+        SysFreeString(rawId);
+        constexpr std::wstring_view prefix = L"fls-item-check-";
+        if (FAILED(idResult) || !id.starts_with(prefix) || id.size() <= prefix.size())
+            return Fail(error, L"ListView row checkbox lacks canonical item identity");
+        int row = 0;
+        for (size_t digit = prefix.size(); digit < id.size(); ++digit) {
+            if (id[digit] < L'0' || id[digit] > L'9' || row > rowCount)
+                return Fail(error, L"ListView row checkbox has invalid item identity");
+            row = row * 10 + id[digit] - L'0';
+        }
+        if (row >= rowCount || !seen.insert(row).second ||
+            (node.groupViewEnabled && (static_cast<size_t>(row) >= node.itemRects.size() ||
+                IsRectEmpty(&node.itemRects[row]))))
+            return Fail(error, L"ListView row checkbox identity is duplicated or hidden");
         ComPtr<IUIAutomationTogglePattern> toggle;
         const HRESULT patternResult = checkBox->GetCurrentPatternAs(
             UIA_TogglePatternId, IID_IUIAutomationTogglePattern,
@@ -620,7 +644,7 @@ bool ValidateListViewCheckboxes(
         if (FAILED(toggle->get_CurrentToggleState(&state)))
             return Fail(error, L"ListView row checkbox state is unavailable");
         const bool checked = std::binary_search(
-            node.checkedIndices.begin(), node.checkedIndices.end(), index);
+            node.checkedIndices.begin(), node.checkedIndices.end(), row);
         if (state != (checked ? ToggleState_On : ToggleState_Off))
             return Fail(error, L"ListView row checkbox UIA state does not match native state");
     }
@@ -1169,7 +1193,12 @@ bool ValidateOnMta(
     std::unordered_set<std::wstring> expectedAutomationIds;
     std::unordered_map<uint64_t, ComPtr<IUIAutomationElement>> matchedNodes;
     std::unordered_map<uint64_t, std::unordered_set<std::wstring>> containerDescendants;
-    std::unordered_map<uint64_t, RECT> expectedNodeBounds;
+    // The clip each validated node imposes on its children's expected bounds. XAML
+    // reports an element's own rectangle regardless of any ancestor's Clip (only the
+    // window viewport bounds it), so below a scrolling container, whose children
+    // legitimately extend past every ancestor, no ancestor clip applies.
+    std::unordered_map<uint64_t, std::optional<RECT>> childClips;
+    std::unordered_set<uint64_t> unclippedSubtree;
     for (const auto& node : snapshot.nodes) {
         progress.Begin(L"node identity", node.nodeId);
         const auto expectedId = L"FluentShell.Node." + std::to_wstring(node.nodeId) +
@@ -1190,27 +1219,40 @@ bool ValidateOnMta(
         if (!expectedType) return Fail(error, L"snapshot contains an unknown UIA control kind");
         const auto expectedName = DisplayText(node.automationName);
         const RECT* parentVisibleBounds = nullptr;
+        std::optional<RECT> inheritedClip;
         if (node.parentNodeId) {
-            const auto parentBounds = expectedNodeBounds.find(*node.parentNodeId);
-            if (parentBounds == expectedNodeBounds.end())
+            const auto parentBounds = childClips.find(*node.parentNodeId);
+            if (parentBounds == childClips.end())
                 return Fail(error, L"snapshot UIA parent does not precede its child");
-            parentVisibleBounds = &parentBounds->second;
+            inheritedClip = parentBounds->second;
+            if (inheritedClip) parentVisibleBounds = &*inheritedClip;
         }
         RECT expectedBounds{};
-        if (!ComputeVisibleUiaBounds(
+        // Below a scrolling container XAML is inconsistent about clipping (panels
+        // report their whole rectangle, text its clipped rendering). The container's
+        // own bounds are validated and its Clip confines everything inside it, so its
+        // descendants are matched by identity, type and name, not by rectangle.
+        const bool scrolled = node.parentNodeId && unclippedSubtree.contains(*node.parentNodeId);
+        if (scrolled) unclippedSubtree.insert(node.nodeId);
+        if (!node.scrollBars.empty()) unclippedSubtree.insert(node.nodeId);
+        if (scrolled) {
+            expectedBounds = { contentOrigin.x + node.rect.left, contentOrigin.y + node.rect.top,
+                contentOrigin.x + node.rect.right, contentOrigin.y + node.rect.bottom };
+        } else if (!ComputeVisibleUiaBounds(
                 node.rect, contentOrigin, rootViewport, parentVisibleBounds, expectedBounds)) {
             return Fail(error, std::wstring(
                 L"visible native control is fully clipped in the proxy viewport: kind=") +
                 ControlKindName(node.kind) + L" node=" + std::to_wstring(node.nodeId));
         }
-        expectedNodeBounds.emplace(node.nodeId, expectedBounds);
+        childClips.emplace(node.nodeId, node.scrollBars.empty()
+            ? std::optional<RECT>(expectedBounds) : std::nullopt);
         size_t match = elements.size();
         for (size_t index = 0; index < elements.size(); ++index) {
             const auto& candidate = elements[index];
             if (used[index] || candidate.processId != static_cast<int>(options.rendererProcessId) ||
             candidate.controlType != expectedType || candidate.framework != L"XAML" ||
                 candidate.automationId != expectedId || candidate.name != expectedName ||
-                (options.requireVisible && !RectClose(candidate.bounds, expectedBounds))) continue;
+                (options.requireVisible && !scrolled && !RectClose(candidate.bounds, expectedBounds))) continue;
             match = index;
             break;
         }
@@ -1278,11 +1320,6 @@ bool ValidateOnMta(
         if (!snapshot.adapterId.empty() &&
             (matched.helpText != node.helpText || matched.accessKey != node.accessKey))
             return Fail(error, L"application-adapter HelpText or AccessKey mismatch");
-        if (snapshot.adapterId == L"microsoft.mdsched.directui" &&
-            node.kind == ControlKind::StaticIcon &&
-            ((matched.bounds.right - matched.bounds.left) != 32 ||
-             (matched.bounds.bottom - matched.bounds.top) != 32))
-            return Fail(error, L"application-adapter Image is not exactly 32x32 physical pixels");
         if (node.tabStop && node.enabled && node.kind != ControlKind::SysLink &&
             !matched.isKeyboardFocusable)
             return Fail(error, L"tab-stop native control is not keyboard focusable in XAML");

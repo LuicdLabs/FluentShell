@@ -52,7 +52,14 @@ public static class ProtocolConstants
     // Minor 28 adds the staticBitmap kind (SS_BITMAP pictures under the large-bitmap cap)
     // and the upDown kind (msctls_updown32 stepped through setValue); a BS_ICON/BS_BITMAP
     // push button may carry its picture in the image fields.
-    public const ushort Minor = 28;
+    // Minor 29 retires exact application pages in favor of capability-derived DirectUI
+    // semantics and adds owned toolbar hot, disabled, and pressed image variants.
+    // Minor 31 adds the native Disk Management MSAA table and semantic actions.
+    // Minor 32 adds the contextMenu action for TreeView and ListView items.
+    public const ushort Minor = 32;
+    // Minor 32 also lets a container carry its scroll bars; one setScroll moves at
+    // most this many application line steps.
+    public const int MaxScrollLines = 100;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;

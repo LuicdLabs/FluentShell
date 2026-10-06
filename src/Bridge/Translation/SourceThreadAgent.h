@@ -7,7 +7,9 @@
 #include <commctrl.h>
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,8 @@ struct IslandActionRequest final {
     std::wstring name;
     std::wstring action;
     bool dropDown = false;
+    ControlKind kind = ControlKind::AccessibleIsland;
+    std::optional<DiskViewSnapshot> diskView;
 };
 
 struct ListViewActivationRequest final {
@@ -56,6 +60,18 @@ struct ActionOutcome final {
     WindowSnapshot snapshot;
     std::wstring error;
 };
+
+// Prefix of the capture error raised when a surface spanning several GUI threads
+// kept changing across both confirmation passes (a snap-in still loading).
+inline constexpr wchar_t kCaptureBarrierUnstable[] =
+    L"native controls changed across their GUI-thread capture barrier";
+
+// Whether a message delivered to `window` can change what capture observes. The
+// WM_USER-range control codes are judged by the receiving window's class, because
+// the families share numbers (a toolbar read can alias a trackbar mutator).
+// A WM_NOTIFY (lParam is its NMHDR) that only queries display data or reports
+// painting/hovering is not a mutation.
+bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam = 0) noexcept;
 
 // Virtual item indices identify only the published ordering. These actions must
 // not run, or automatically replay, after that native snapshot has changed.
@@ -303,7 +319,11 @@ struct DeferredSlot final {
 
 class SourceThreadAgent final : public std::enable_shared_from_this<SourceThreadAgent> {
 public:
-    static std::shared_ptr<SourceThreadAgent> Attach(HWND root, HMODULE module);
+    // transientFailure (optional) reports whether a failed initial capture was a
+    // timing condition worth retrying later: the GUI thread did not answer within the
+    // deadline, or a multi-thread surface kept changing across its capture barrier.
+    static std::shared_ptr<SourceThreadAgent> Attach(
+        HWND root, HMODULE module, bool* transientFailure = nullptr);
     ~SourceThreadAgent();
 
     SourceThreadAgent(const SourceThreadAgent&) = delete;
@@ -507,10 +527,6 @@ public:
     void PoisonDirectUiUia() noexcept { directUiUiaPoisoned_.store(true); }
     const DirectUiWindowProfile* DirectUiProfile() const noexcept { return directUiProfile_; }
     bool GenericDirectUiCandidate() const noexcept { return genericDirectUiCandidate_; }
-    // Lets an exact-profile surface degrade to the capability-derived lane once the
-    // application navigates past the page its declarative row describes. Returns
-    // false when the process itself is not eligible for generic admission.
-    bool EnableGenericDirectUiCandidate() noexcept;
     void AdoptDirectUiProfile(std::shared_ptr<DirectUiOwnedProfile> profile) noexcept;
 
 private:
@@ -519,6 +535,21 @@ private:
     void UnhookAll() noexcept;
     void RunIslandActionOnSourceThread(const IslandActionRequest& request) noexcept;
     void RunListViewActivationOnSourceThread(const ListViewActivationRequest& request) noexcept;
+    struct RemotePopupState final {
+        std::mutex mutex;
+        PopupMenuState menu;
+        std::optional<PopupMenuDecision> decision;
+        IslandActionRequest request;
+        std::wstring error;
+    };
+    bool TrackRemoteIslandPopup(const IslandActionRequest& request,
+        const std::shared_ptr<RemotePopupState>& state,
+        const std::shared_ptr<std::atomic<bool>>& cancelled,
+        HMENU menu, UINT flags, HWND owner, BOOL& result);
+    void RunListViewActivationOnOwner(const ListViewActivationRequest& request,
+        uint64_t cancellation, const std::shared_ptr<std::atomic<bool>>& cancelled) noexcept;
+    bool PostRemoteAction(HWND target, std::function<void(const std::shared_ptr<std::atomic<bool>>&)> work,
+        std::wstring& error);
 
     HWND root_ = nullptr;
     HMODULE module_ = nullptr;
@@ -546,8 +577,11 @@ private:
         HMENU menu = nullptr;
         uint64_t menuFingerprint = 0;
         uint64_t closeSequence = 0;
+        std::optional<NativeDocumentSnapshot> document;
     };
     void RunNativeActionOnSourceThread(const NativeActionRequest& request) noexcept;
+    void RunNativeActionOnOwner(const NativeActionRequest& request, const ControlNode& node,
+        const std::shared_ptr<std::atomic<bool>>& cancelled) noexcept;
     void CancelNativeActionOnSourceThread() noexcept;
     struct MenuActionRequest final {
         HWND toolbar = nullptr;
@@ -572,7 +606,14 @@ private:
     DeferredSlot<ListViewActivationRequest> listViewActivation_;
     DeferredSlot<IslandActionRequest> islandAction_;
     bool nativeActionRunning_ = false;
-    uint64_t listViewActivationCancellation_ = 0;
+    std::atomic<uint64_t> listViewActivationCancellation_{0};
+    std::atomic<unsigned> remoteActions_{0};
+    std::mutex remoteSubmissionMutex_;
+    std::atomic<bool> restoring_{false};
+    std::shared_ptr<std::atomic<bool>> remoteCancellation_;
+    std::shared_ptr<RemotePopupState> remotePopup_;
+    std::atomic<uint64_t> nextPopupId_{1};
+    uint64_t AllocatePopupId() noexcept;
     std::optional<IslandActionRequest> pendingIslandMenu_;
     std::optional<IslandActionRequest> trackedIslandMenu_;
     ULONGLONG pendingIslandDeadline_ = 0;

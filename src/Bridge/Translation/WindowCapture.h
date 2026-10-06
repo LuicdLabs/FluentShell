@@ -28,6 +28,8 @@ struct CaptureContext final {
     HWND menuBarToolbar = nullptr;
     uint64_t menuBarToolbarGeneration = 0;
     std::vector<MenuBarButton> menuBarButtons;
+    // Buttons whose last read opened no popup; cleared whenever the buttons change.
+    std::vector<bool> menuBarSilentButtons;
     MenuBarRefreshPolicy menuBarRefresh;
 };
 
@@ -59,5 +61,9 @@ bool CaptureMenuHandle(
     bool requireUniqueCommands = true) noexcept;
 
 uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept;
+
+// Diagnostic only: the first observable difference between two captures of the same
+// window (node count, then per node class, geometry, text and state), or empty.
+std::wstring DescribeSnapshotDifference(const WindowSnapshot& before, const WindowSnapshot& after);
 
 } // namespace FluentShell::Bridge::Translation

@@ -27,28 +27,6 @@ namespace FluentShell {
 inline constexpr wchar_t kBridgeDllName[] = L"FluentShell.Bridge.dll";
 inline constexpr wchar_t kLogPrefix[] = L"[FluentShell] ";
 
-enum class Backdrop : uint32_t {
-    Auto = 0,
-    None = 1,
-    Mica = 2,
-    MicaAlt = 3,
-    Acrylic = 4,
-};
-
-struct DwmStyle {
-    bool darkMode = true;
-    Backdrop backdrop = Backdrop::Mica;
-    bool roundCorners = true;
-    bool extendFrame = false;
-};
-
-struct MatchRule {
-    std::wstring exe;      // empty = any
-    std::wstring className; // empty = any
-    std::wstring title;     // empty = any; substring match
-    DwmStyle dwm{};
-};
-
 // Diagnostics are the only view into a projection that failed inside an injected
 // process, so this must never lose or truncate a record: rejection reasons carry
 // several hundred characters of HWND/style evidence.

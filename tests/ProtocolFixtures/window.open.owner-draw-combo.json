@@ -1,0 +1,94 @@
+{
+  "messageType": "window.open",
+  "sessionNonce": "00112233445566778899aabbccddeeff",
+  "window": {
+    "surfaceId": "4f17d4bb-b2bf-42b8-a334-2f9ad8d54d42",
+    "surfaceKind": "window",
+    "modal": false,
+    "canCancel": true,
+    "icon": "none",
+    "generation": "1",
+    "revision": "7",
+    "nativeHwnd": "0x00000000000100AA",
+    "ownerHwnd": null,
+    "title": "Legacy Dialog Host",
+    "dpi": 144,
+    "bounds": {
+      "x": 100,
+      "y": 80,
+      "width": 780,
+      "height": 480
+    },
+    "clientBounds": {
+      "x": 0,
+      "y": 0,
+      "width": 760,
+      "height": 430
+    },
+    "windowStyle": "0x00000000CF0000",
+    "windowExStyle": "0x00000000000000",
+    "visible": true,
+    "enabled": true,
+    "state": "normal",
+    "showInTaskbar": true,
+    "rtl": false,
+    "nodes": [
+      {
+        "nodeId": "1",
+        "generation": "1",
+        "nativeHwnd": "0x31",
+        "kind": "comboBox",
+        "controlId": 731,
+        "zIndex": 0,
+        "tabIndex": -1,
+        "rect": {
+          "width": 180,
+          "height": 28,
+          "x": 10,
+          "y": 10
+        },
+        "style": "0x50010053",
+        "visible": true,
+        "enabled": true,
+        "tabStop": false,
+        "dialogCode": 0,
+        "text": "First",
+        "editable": false,
+        "selectedIndex": 0,
+        "selectedIndices": [],
+        "columns": [],
+        "columnWidths": [],
+        "rows": [],
+        "items": [
+          "First"
+        ],
+        "ownerDrawCombo": {
+          "items": [
+            {
+              "normal": {
+                "imageHeight": 1,
+                "imageFormat": "bgra8-premultiplied",
+                "imageWidth": 2,
+                "imageData": "IAAA/yAAAP8="
+              },
+              "selected": {
+                "imageHeight": 1,
+                "imageFormat": "bgra8-premultiplied",
+                "imageWidth": 2,
+                "imageData": "IAAA/yAAAP8="
+              }
+            }
+          ],
+          "selectionFace": {
+            "imageHeight": 1,
+            "imageFormat": "bgra8-premultiplied",
+            "imageWidth": 2,
+            "imageData": "IAAA/yAAAP8="
+          },
+          "mode": "fixed"
+        }
+      }
+    ],
+    "menu": []
+  }
+}

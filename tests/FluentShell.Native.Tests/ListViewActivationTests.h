@@ -15,7 +15,7 @@ enum class ListActivationProbe : WPARAM {
 // Activate v6 only on this fixture's STA, where stable ListView IDs are required.
 class ListActivationCommonControls final {
 public:
-    ListActivationCommonControls() {
+    explicit ListActivationCommonControls(DWORD classes = ICC_LISTVIEW_CLASSES) {
         wchar_t directory[MAX_PATH]{};
         const DWORD length = GetTempPathW(MAX_PATH, directory);
         if (length == 0 || length >= MAX_PATH || !GetTempFileNameW(directory, L"fsl", 0, manifest_)) return;
@@ -43,7 +43,7 @@ public:
         commonControls_ = LoadLibraryW(L"comctl32.dll");
         const auto initialize = commonControls_ ? reinterpret_cast<BOOL(WINAPI*)(const INITCOMMONCONTROLSEX*)>(
             GetProcAddress(commonControls_, "InitCommonControlsEx")) : nullptr;
-        INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_LISTVIEW_CLASSES };
+        INITCOMMONCONTROLSEX controls{ sizeof(controls), classes };
         ready_ = initialize && initialize(&controls) != FALSE;
     }
     ~ListActivationCommonControls() {

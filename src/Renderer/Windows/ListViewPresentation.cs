@@ -23,9 +23,11 @@ internal static class ListViewPresentation
     internal static int Navigate(IReadOnlyList<PixelRect> items, int current, VirtualKey key)
     {
         if (items.Count == 0) return -1;
-        if (key == VirtualKey.Home) return 0;
-        if (key == VirtualKey.End) return items.Count - 1;
-        if (current < 0 || current >= items.Count) return 0;
+        var visible = Enumerable.Range(0, items.Count).Where(index => items[index].Width > 0 && items[index].Height > 0).ToArray();
+        if (visible.Length == 0) return -1;
+        if (key == VirtualKey.Home) return visible[0];
+        if (key == VirtualKey.End) return visible[^1];
+        if (current < 0 || current >= items.Count || items[current].Width <= 0 || items[current].Height <= 0) return visible[0];
         if (key is not (VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down)) return current;
         var horizontal = key is VirtualKey.Left or VirtualKey.Right;
         var forward = key is VirtualKey.Right or VirtualKey.Down;
@@ -39,6 +41,7 @@ internal static class ListViewPresentation
         {
             if (index == current) continue;
             var candidate = items[index];
+            if (candidate.Width <= 0 || candidate.Height <= 0) continue;
             var delta = (Center(candidate, horizontal) - along) * (forward ? 1 : -1);
             if (delta <= 0) continue;
             var start = horizontal ? candidate.Y : candidate.X;

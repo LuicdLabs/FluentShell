@@ -17,6 +17,9 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _multiSelect;
     private bool _columnHeadersVisible;
     private string _listViewMode = "report";
+    private bool _groupViewEnabled;
+    private IReadOnlyList<ListViewGroupSnapshot> _listViewGroups = [];
+    private IReadOnlyList<string> _itemGroupIds = [];
     private bool _itemActivationSupported;
     private bool _checkBoxes;
     private int _selectionStart;
@@ -30,6 +33,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _reversed;
     private bool _indeterminate;
     private bool _editable;
+    private OwnerDrawComboSnapshot? _ownerDrawCombo;
     private bool _active;
     private string _windowState = "normal";
     private PixelRect _clientRect = new();
@@ -44,6 +48,11 @@ public sealed class ControlNodeViewModel : ObservableObject
     private ulong _exStyle;
     private readonly Dictionary<string, string> _pendingEventIds = new(StringComparer.Ordinal);
 
+    // Where the last projected context request on this node happened, in DIPs
+    // relative to the node's own element. Renderer-only: the native popup that
+    // answers it is placed here, because the native menu has no projected anchor.
+    internal (double X, double Y)? ContextMenuAnchor { get; set; }
+
     public string NodeId { get; private set; } = "0";
     public string Generation { get; private set; } = "0";
     public string? NativeHwnd { get; private set; } = "0x0";
@@ -57,6 +66,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool ReadOnly { get; private set; }
     public bool Multiline { get; private set; }
     public bool Editable { get => _editable; private set => SetProperty(ref _editable, value); }
+    public OwnerDrawComboSnapshot? OwnerDrawCombo { get => _ownerDrawCombo; private set => SetProperty(ref _ownerDrawCombo, value); }
     public bool IsDefault { get; private set; }
     public bool GroupStart { get; private set; }
     // Native window style bits, already validated as canonical hex on admission.
@@ -78,6 +88,9 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool MultiSelect { get => _multiSelect; private set => SetProperty(ref _multiSelect, value); }
     public bool ColumnHeadersVisible { get => _columnHeadersVisible; private set => SetProperty(ref _columnHeadersVisible, value); }
     public string ListViewMode { get => _listViewMode; private set => SetProperty(ref _listViewMode, value); }
+    public bool GroupViewEnabled { get => _groupViewEnabled; private set => SetProperty(ref _groupViewEnabled, value); }
+    public IReadOnlyList<ListViewGroupSnapshot> ListViewGroups => _listViewGroups;
+    public IReadOnlyList<string> ItemGroupIds => _itemGroupIds;
     public bool ItemActivationSupported { get => _itemActivationSupported; private set => SetProperty(ref _itemActivationSupported, value); }
     public bool CheckBoxes { get => _checkBoxes; private set => SetProperty(ref _checkBoxes, value); }
     public int SelectionStart { get => _selectionStart; private set => SetProperty(ref _selectionStart, value); }
@@ -117,6 +130,11 @@ public sealed class ControlNodeViewModel : ObservableObject
     public ObservableCollection<ToolbarItemSnapshot> ToolbarItems { get; } = [];
     public ObservableCollection<PaneSplit> Splits { get; } = [];
     public ObservableCollection<ChromeRegion> ChromeRegions { get; } = [];
+    public ObservableCollection<ScrollBarSnapshot> ScrollBars { get; } = [];
+    private NativeDocumentSnapshot? _document;
+    public NativeDocumentSnapshot? Document { get => _document; private set => SetProperty(ref _document, value); }
+    private DiskViewSnapshot? _diskView;
+    public DiskViewSnapshot? DiskView { get => _diskView; private set => SetProperty(ref _diskView, value); }
     public ObservableCollection<AccessibleIslandItem> IslandItems { get; } = [];
     public string AdapterId { get; private set; } = string.Empty;
     public string PageId { get; private set; } = string.Empty;
@@ -199,7 +217,15 @@ public sealed class ControlNodeViewModel : ObservableObject
         EditableLabels = node.EditableLabels ?? false;
         EditingIndex = node.EditingIndex ?? -1;
         ReplaceItemRects(node.ItemRects ?? []);
+        OwnerDrawCombo = node.OwnerDrawCombo;
         ListViewMode = node.ListViewMode ?? "report";
+        // Publish this coupled group state together before any notification.
+        var groupsChanged = !_listViewGroups.SequenceEqual(node.ListViewGroups ?? []) ||
+            !_itemGroupIds.SequenceEqual(node.ItemGroupIds ?? []) || _groupViewEnabled != (node.GroupViewEnabled ?? false);
+        _groupViewEnabled = node.GroupViewEnabled ?? false;
+        _listViewGroups = node.ListViewGroups?.ToArray() ?? [];
+        _itemGroupIds = node.ItemGroupIds?.ToArray() ?? [];
+        if (groupsChanged) RaisePropertyChanged(nameof(ListViewGroups));
         ItemActivationSupported = node.ItemActivationSupported ?? false;
         ReplaceItemNativeIds(node.ItemNativeIds ?? []);
         ReplaceSelectedIndices(node.SelectedIndices);
@@ -211,7 +237,10 @@ public sealed class ControlNodeViewModel : ObservableObject
         var toolbarChanged = ReplaceToolbarItems(node.ToolbarItems ?? []);
         ReplaceSplits(node.Splits ?? []);
         ReplaceChromeRegions(node.ChromeRegions ?? []);
+        ReplaceScrollBars(node.ScrollBars ?? []);
         ReplaceIslandItems(node.IslandItems ?? []);
+        Document = node.Document;
+        DiskView = node.DiskView;
         ApplyImageState(
             node.ImageWidth ?? 0,
             node.ImageHeight ?? 0,
@@ -273,6 +302,9 @@ public sealed class ControlNodeViewModel : ObservableObject
         // A refused split leaves the canonical geometry in place, and the projected
         // splitter follows it back.
         else if (property == "splits") RaisePropertyChanged(nameof(Splits));
+        else if (property == "scrollBars") RaisePropertyChanged(nameof(ScrollBars));
+        else if (property == "document") RaisePropertyChanged(nameof(Document));
+        else if (property == "diskView") RaisePropertyChanged(nameof(DiskView));
         PendingActionsChanged?.Invoke();
     }
 
@@ -469,6 +501,14 @@ public sealed class ControlNodeViewModel : ObservableObject
         Splits.Clear();
         foreach (var split in splits) Splits.Add(split);
         RaisePropertyChanged(nameof(Splits));
+    }
+
+    private void ReplaceScrollBars(IEnumerable<ScrollBarSnapshot> bars)
+    {
+        if (ScrollBars.SequenceEqual(bars)) return;
+        ScrollBars.Clear();
+        foreach (var bar in bars) ScrollBars.Add(bar);
+        RaisePropertyChanged(nameof(ScrollBars));
     }
 
     private void ReplaceChromeRegions(IEnumerable<ChromeRegion> regions)

@@ -1,19 +1,26 @@
 #include "ControlAdapters.h"
 #include "PaintedPixel.h"
+#include "OwnerDrawComboBox.h"
+#include "GuiThreadDispatch.h"
 
 #include "AccessibleIsland.h"
+#include "NativeDocument.h"
+#include "DiskView.h"
 #include "MmcHtmlDocument.h"
 #include "ListViewActivation.h"
 
 #include "../../Common/FluentShell.h"
 
 #include <commctrl.h>
+#include <oleacc.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cwctype>
 #include <limits>
+#include <memory>
 #include <unordered_set>
 #include <utility>
 
@@ -79,6 +86,10 @@ struct MessageGeometryScale final {
         return IsIdentity() ? value : static_cast<int>(std::lround(value * x));
     }
 
+    int Vertical(int value) const noexcept {
+        return IsIdentity() ? value : static_cast<int>(std::lround(value * y));
+    }
+
     RECT Rect(const RECT& rect) const noexcept {
         if (IsIdentity()) return rect;
         return RECT{
@@ -137,10 +148,91 @@ bool IsMmcDescriptionBar(HWND hwnd, DWORD style) noexcept {
         WindowClassRegisteredBySystemModule(parent, L"mmc.exe");
 }
 
+// Windows Forms registers per-AppDomain subclasses of the standard controls
+// ("WindowsForms10.STATIC.app.0.<hash>"). With the default FlatStyle.Standard a
+// Label or Button is owner-drawn at the Win32 level and painted by WinForms itself,
+// so its style bits no longer say what it is. WinForms publishes that through the
+// window's own MSAA object, which is the evidence these adapters rely on.
+bool IsWindowsFormsWindow(HWND hwnd) noexcept {
+    wchar_t raw[kMaxClassNameChars]{};
+    const int length = GetClassNameW(hwnd, raw, static_cast<int>(kMaxClassNameChars));
+    return length > 0 && std::wstring_view(raw, static_cast<size_t>(length)).starts_with(L"WindowsForms10.");
+}
+
+bool ReadWindowAccessible(HWND hwnd, long& role, long& state) noexcept {
+    role = state = 0;
+    DWORD process = 0;
+    if (!hwnd || GetWindowThreadProcessId(hwnd, &process) != GetCurrentThreadId() ||
+        process != GetCurrentProcessId()) return false;
+    Microsoft::WRL::ComPtr<IAccessible> accessible;
+    if (FAILED(AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, IID_PPV_ARGS(accessible.GetAddressOf()))) ||
+        !accessible) return false;
+    VARIANT self{};
+    self.vt = VT_I4;
+    self.lVal = CHILDID_SELF;
+    VARIANT roleValue{};
+    VARIANT stateValue{};
+    const bool read = SUCCEEDED(accessible->get_accRole(self, &roleValue)) && roleValue.vt == VT_I4 &&
+        SUCCEEDED(accessible->get_accState(self, &stateValue)) && stateValue.vt == VT_I4;
+    if (read) {
+        role = roleValue.lVal;
+        state = stateValue.lVal;
+    }
+    VariantClear(&roleValue);
+    VariantClear(&stateValue);
+    return read;
+}
+
+// A leaf Windows Forms surface (Panel, PictureBox) that hosts nothing, is no tab stop
+// and offers no accessible action: a header strip, a separator or an icon. Its own
+// painted pixels are all it contributes, like Disk Management's legend. A tab-stop or
+// actionable custom control keeps its refusal.
+constexpr int kMaxInertSurfaceWidth = 1024;
+constexpr int kMaxInertSurfaceHeight = 256;
+
+bool IsWindowsFormsInertSurface(HWND hwnd, DWORD style) noexcept {
+    wchar_t raw[kMaxClassNameChars]{};
+    const int length = GetClassNameW(hwnd, raw, static_cast<int>(kMaxClassNameChars));
+    if (length <= 0 || !std::wstring_view(raw, static_cast<size_t>(length)).starts_with(L"WindowsForms10.Window."))
+        return false;
+    RECT client{};
+    if ((style & (WS_TABSTOP | WS_HSCROLL | WS_VSCROLL)) != 0 || GetWindow(hwnd, GW_CHILD) ||
+        !GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0 ||
+        client.right > kMaxInertSurfaceWidth || client.bottom > kMaxInertSurfaceHeight) return false;
+    long role = 0;
+    long state = 0;
+    // WinForms reports STATE_SYSTEM_FOCUSABLE for every visible, enabled control, so
+    // keyboard participation is judged by WS_TABSTOP above (a TabStop control, such as
+    // a collapsible section header, keeps its refusal).
+    if (!ReadWindowAccessible(hwnd, role, state) ||
+        (role != ROLE_SYSTEM_CLIENT && role != ROLE_SYSTEM_GRAPHIC && role != ROLE_SYSTEM_PANE) ||
+        (state & STATE_SYSTEM_LINKED) != 0) return false;
+    Microsoft::WRL::ComPtr<IAccessible> accessible;
+    if (FAILED(AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, IID_PPV_ARGS(accessible.GetAddressOf()))) ||
+        !accessible) return false;
+    VARIANT self{};
+    self.vt = VT_I4;
+    self.lVal = CHILDID_SELF;
+    BSTR action = nullptr;
+    const bool actionable = SUCCEEDED(accessible->get_accDefaultAction(self, &action)) &&
+        action && SysStringLen(action) != 0;
+    if (action) SysFreeString(action);
+    return !actionable;
+}
+
+// A WinForms Label paints exactly its window text; LinkLabel and other STATIC
+// subclasses report a different role and keep their refusal.
+bool IsWindowsFormsLabel(HWND hwnd, DWORD style) noexcept {
+    long role = 0;
+    long state = 0;
+    return (style & WS_TABSTOP) == 0 && IsWindowsFormsWindow(hwnd) && !GetWindow(hwnd, GW_CHILD) &&
+        ReadWindowAccessible(hwnd, role, state) && role == ROLE_SYSTEM_STATICTEXT;
+}
+
 bool ProbeStatic(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     switch (style & SS_TYPEMASK) {
     case SS_OWNERDRAW:
-        if (!IsMmcDescriptionBar(hwnd, style))
+        if (!IsMmcDescriptionBar(hwnd, style) && !IsWindowsFormsLabel(hwnd, style))
             return Reject(reason, L"unsupported Static draw style");
         kind = ControlKind::StaticText;
         return true;
@@ -192,13 +284,29 @@ bool ProbeStatic(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason
     }
 }
 
-bool ProbeButton(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+bool ProbeButton(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     // A push button may show an icon or a bitmap instead of its text; the picture is
     // captured and the text stays its accessible name.  A check box or radio button
     // drawn as a picture has no projected toggle contract.
     const DWORD type = style & BS_TYPEMASK;
     const DWORD picture = style & (BS_BITMAP | BS_ICON);
     const bool pushButton = type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON;
+    if (type == BS_OWNERDRAW && picture == 0 && IsWindowsFormsWindow(hwnd)) {
+        // WinForms Button, CheckBox and RadioButton are all BS_OWNERDRAW here; the
+        // role tells them apart and the check state is read from the same object.
+        long role = 0;
+        long state = 0;
+        if (!ReadWindowAccessible(hwnd, role, state))
+            return Reject(reason, L"owner-draw WinForms button publishes no accessible role");
+        switch (role) {
+        case ROLE_SYSTEM_PUSHBUTTON: kind = ControlKind::Button; return true;
+        case ROLE_SYSTEM_CHECKBUTTON:
+            kind = (state & STATE_SYSTEM_MIXED) != 0 ? ControlKind::ThreeState : ControlKind::CheckBox;
+            return true;
+        case ROLE_SYSTEM_RADIOBUTTON: kind = ControlKind::RadioButton; return true;
+        default: return Reject(reason, L"owner-draw WinForms button has an unsupported accessible role");
+        }
+    }
     if (type == BS_OWNERDRAW || picture == (BS_BITMAP | BS_ICON) ||
         (picture != 0 && !pushButton)) {
         return Reject(reason, L"unsupported Button draw style");
@@ -237,14 +345,13 @@ bool ProbeEdit(HWND, DWORD style, ControlKind& kind, std::wstring&) {
 }
 
 bool ProbeComboBox(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE)) != 0) {
-        return Reject(reason, L"owner-draw ComboBox");
-    }
+    const DWORD ownerDraw = style & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE);
+    if (ownerDraw == (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE))
+        return Reject(reason, L"owner-draw ComboBox has conflicting fixed and variable styles");
     const DWORD type = style & 0x0003u;
-    if (type != CBS_DROPDOWNLIST &&
-        (type != CBS_DROPDOWN || (style & CBS_HASSTRINGS) == 0)) {
+    if (type != CBS_DROPDOWNLIST && type != CBS_DROPDOWN) {
         return Reject(reason,
-            L"ComboBox is simple, non-string-backed, or has an unsupported type");
+            L"ComboBox is simple or has an unsupported type");
     }
     kind = ControlKind::ComboBox;
     return true;
@@ -332,9 +439,8 @@ bool ProbeListView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reas
         return Reject(reason, L"owner-draw ListView is not supported (LVS_OWNERDRAWFIXED)");
     std::wstring mode;
     if (!ReadListViewMode(hwnd, style, mode, reason)) return false;
-    if (SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0) != FALSE) {
-        return Reject(reason, L"grouped ListView is not supported");
-    }
+    if ((style & LVS_OWNERDATA) != 0 && SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0))
+        return Reject(reason, L"owner-data groups require an application-owned group membership contract");
     // LVS_EX_HEADERDRAGDROP only says the user may reorder the columns.  The
     // projection captures the display order and offers the same reordering, so the
     // flag is evidence to carry rather than a reason to refuse.
@@ -420,11 +526,6 @@ bool ProbeToolbar(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reaso
         reason = text;
         return false;
     }
-    if (SendMessageW(hwnd, TB_GETHOTIMAGELIST, 0, 0) != 0 ||
-        SendMessageW(hwnd, TB_GETDISABLEDIMAGELIST, 0, 0) != 0 ||
-        SendMessageW(hwnd, TB_GETPRESSEDIMAGELIST, 0, 0) != 0) {
-        return Reject(reason, L"ToolbarWindow32 has unsupported hot, disabled, or pressed image lists");
-    }
     kind = ControlKind::Toolbar;
     return true;
 }
@@ -453,7 +554,9 @@ bool ProbeTabControl(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& re
         SendMessageW(hwnd, TCM_GETTOOLTIPS, 0, 0) != 0)
         return Reject(reason, L"TabControl tooltips are not supported");
 
-    constexpr DWORD accepted = TCS_MULTILINE | TCS_HOTTRACK;
+    // TCS_RAGGEDRIGHT (WinForms' default) only changes how a multiline row is
+    // justified, and the projection uses each tab's native rectangle anyway.
+    constexpr DWORD accepted = TCS_MULTILINE | TCS_HOTTRACK | TCS_RAGGEDRIGHT;
     const DWORD unsupported = tabStyle & ~accepted;
     if (unsupported != 0) {
         wchar_t text[128]{};
@@ -941,12 +1044,56 @@ bool HasVisibleChildWindow(HWND hwnd) noexcept {
     return found;
 }
 
+// The standard window scroll bars of a container that scrolls its child windows,
+// in the container's own window-relative coordinates. A bar the application hid
+// (ShowScrollBar keeps the style bit on some frameworks) is skipped.
+bool ReadContainerScrollBars(HWND hwnd, DWORD style, std::vector<ScrollBarSnapshot>& bars,
+    std::wstring& reason) {
+    bars.clear();
+    RECT window{};
+    if (!GetWindowRect(hwnd, &window)) return Reject(reason, L"scrolling container bounds are unavailable");
+    for (const bool vertical : { true, false }) {
+        if ((style & (vertical ? WS_VSCROLL : WS_HSCROLL)) == 0) continue;
+        SCROLLBARINFO info{ sizeof(info) };
+        if (!GetScrollBarInfo(hwnd, vertical ? OBJID_VSCROLL : OBJID_HSCROLL, &info))
+            return Reject(reason, L"container scroll bar geometry is unavailable");
+        if ((info.rgstate[0] & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN)) != 0) continue;
+        SCROLLINFO scroll{ sizeof(scroll), SIF_ALL };
+        if (!GetScrollInfo(hwnd, vertical ? SB_VERT : SB_HORZ, &scroll))
+            return Reject(reason, L"container scroll range is unavailable");
+        ScrollBarSnapshot bar;
+        bar.vertical = vertical;
+        bar.enabled = (info.rgstate[0] & STATE_SYSTEM_UNAVAILABLE) == 0;
+        bar.minimum = scroll.nMin;
+        bar.maximum = scroll.nMax;
+        bar.page = static_cast<int>(std::min<UINT>(scroll.nPage, static_cast<UINT>(Ipc::kMaxCoordinate)));
+        bar.position = scroll.nPos;
+        bar.rect = { info.rcScrollBar.left - window.left, info.rcScrollBar.top - window.top,
+            info.rcScrollBar.right - window.left, info.rcScrollBar.bottom - window.top };
+        const auto outside = [](int64_t value) { return value < -Ipc::kMaxCoordinate || value > Ipc::kMaxCoordinate; };
+        if (bar.maximum < bar.minimum || outside(bar.minimum) || outside(bar.maximum) ||
+            bar.position < bar.minimum || bar.position > bar.maximum ||
+            bar.rect.right <= bar.rect.left || bar.rect.bottom <= bar.rect.top ||
+            bar.rect.left < 0 || bar.rect.top < 0 ||
+            bar.rect.right > window.right - window.left || bar.rect.bottom > window.bottom - window.top)
+            return Reject(reason, L"container scroll bar state is outside the projection's bounds");
+        bars.push_back(bar);
+    }
+    return true;
+}
+
 bool ProbePaneContainer(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     if ((style & WS_CHILD) == 0) {
         return Reject(reason, L"private container is not a child window");
     }
     if ((style & (WS_HSCROLL | WS_VSCROLL)) != 0) {
-        return Reject(reason, L"private container scrolls content beyond its client area");
+        // A container whose application scrolls its child windows (a WinForms
+        // AutoScroll panel) projects its bars; the native handler moves the children.
+        std::vector<ScrollBarSnapshot> bars;
+        std::wstring scrollReason;
+        if (!ReadContainerScrollBars(hwnd, style, bars, scrollReason))
+            return Reject(reason, (L"private container scrolls content beyond its client area: " +
+                scrollReason).c_str());
     }
     const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
     constexpr DWORD unsupportedExStyle = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_COMPOSITED;
@@ -984,6 +1131,19 @@ bool CapturePaneContainerState(HWND hwnd, ControlNode& node, std::wstring& reaso
     if (!GetClientRect(hwnd, &client)) {
         return Reject(reason, L"private container has no client area");
     }
+    if (!ReadContainerScrollBars(hwnd, static_cast<DWORD>(node.style), node.scrollBars, reason))
+        return false;
+    node.clientRect = {};
+    if (!node.scrollBars.empty()) {
+        // The viewport the scrolled children are clipped to, beside the bars.
+        RECT window{};
+        POINT origin{ client.left, client.top };
+        if (!GetWindowRect(hwnd, &window) || !ClientToScreen(hwnd, &origin))
+            return Reject(reason, L"scrolling container viewport is unavailable");
+        node.clientRect = { origin.x - window.left, origin.y - window.top,
+            origin.x - window.left + client.right - client.left,
+            origin.y - window.top + client.bottom - client.top };
+    }
     PaneSurface surface;
     if (!CollectPaneSurface(hwnd, client, surface, reason)) return false;
     if (!CaptureContainerChrome(hwnd, client, surface.chrome, node.chromeRegions, reason)) {
@@ -1005,6 +1165,11 @@ bool CapturePaneContainerState(HWND hwnd, ControlNode& node, std::wstring& reaso
         split.maximum = (gap.vertical ? neighbours.afterRect.right : neighbours.afterRect.bottom) -
             kMinPaneExtent - split.thickness;
         if (split.maximum < split.minimum) continue;
+        // A pane the application already laid out narrower than the drag minimum
+        // still has its split where it is; the range includes that position so the
+        // published split is valid and can be dragged back out.
+        split.minimum = std::min(split.minimum, split.position);
+        split.maximum = std::max(split.maximum, split.position);
         node.splits.push_back(split);
     }
     return true;
@@ -1025,13 +1190,63 @@ bool ProbeAccessibleIsland(HWND hwnd, DWORD style, ControlKind& kind, std::wstri
     // contract for: its HWND children would be projected while its accessible elements
     // were read from the same surface, with no rule for how they interleave.
     for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
-        if (IsWindowVisible(child)) {
+        if (IsWindowVisible(child) && !IsDirectUiScrollChrome(child)) {
             return Reject(reason, L"accessible island also owns visible child windows");
         }
     }
     std::vector<AccessibleIslandItem> items;
     if (!ReadAccessibleIslandItems(hwnd, items, reason)) return false;
     kind = ControlKind::AccessibleIsland;
+    return true;
+}
+
+bool ProbeNativeDocument(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if ((style & WS_CHILD) == 0) return Reject(reason, L"native document is not a child window");
+    NativeDocumentSnapshot document;
+    if (ReadNativeDocument(hwnd, document, reason)) {
+        kind = ControlKind::NativeDocument;
+        return true;
+    }
+    // Preserve the existing, narrower MMC extended-view resource contract.
+    std::wstring legacyReason;
+    if (ProbeAccessibleIsland(hwnd, style, kind, legacyReason)) return true;
+    return false;
+}
+
+bool CaptureNativeDocumentState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    NativeDocumentSnapshot document;
+    if (!ReadNativeDocument(hwnd, document, reason)) return false;
+    node.document = std::move(document);
+    node.text.clear();
+    node.automationName.clear();
+    node.tabStop = false;
+    node.tabIndex = -1;
+    return true;
+}
+
+bool ProbeDiskManagement(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if (IsDiskManagementView(hwnd)) {
+        DiskViewSnapshot view;
+        if (!ReadDiskView(hwnd, view, reason)) return false;
+        kind = ControlKind::DiskView;
+        return true;
+    }
+    if (IsDiskManagementLegend(hwnd) && (style & (WS_TABSTOP | WS_HSCROLL | WS_VSCROLL)) == 0 &&
+        !GetWindow(hwnd, GW_CHILD)) {
+        kind = ControlKind::StaticBitmap;
+        return true;
+    }
+    return ProbePaneContainer(hwnd, style, kind, reason);
+}
+
+bool CaptureDiskViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    DiskViewSnapshot view;
+    if (!ReadDiskView(hwnd, view, reason)) return false;
+    node.text.clear();
+    node.automationName = view.name;
+    node.diskView = std::move(view);
+    node.tabStop = false;
+    node.tabIndex = -1;
     return true;
 }
 
@@ -1101,6 +1316,8 @@ struct ClassAdapter final {
 // The registry. Class names select a candidate adapter; only its probe can
 // establish support.
 constexpr std::array kClassAdapters{
+    ClassAdapter{ L"AfxWnd42u", &ProbeDiskManagement },
+    ClassAdapter{ L"Internet Explorer_Server", &ProbeNativeDocument },
     ClassAdapter{ L"Static", &ProbeStatic },
     ClassAdapter{ L"BitmapDisplayClass", &ProbeBitmapDisplay },
     ClassAdapter{ L"BitmapSwitchClass", &ProbeBitmapSwitch },
@@ -1544,7 +1761,25 @@ bool ReadBitmapPixels(HBITMAP bitmap, int& width, int& height,
 // colour of the bitmap's top-left pixel -- covers the rest of the client area.
 // Scaling (SS_REALSIZECONTROL) is a layout the adapter does not model.
 bool CaptureStaticBitmapState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    if (IsDiskManagementLegend(hwnd)) {
+        RECT client{};
+        if (!GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0 ||
+            client.right > 1024 || client.bottom > 128)
+            return Reject(reason, L"Disk Management legend exceeds its inert painted band bound");
+        PaintedClientSurface paint(hwnd);
+        return paint.Rendered() && paint.Crop(client, node.imageWidth, node.imageHeight,
+            node.imageFormat, node.imageData) ? true :
+            Reject(reason, L"Disk Management legend could not render its owned pixels");
+    }
     const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    if (IsWindowsFormsInertSurface(hwnd, style)) {
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        PaintedClientSurface paint(hwnd);
+        return paint.Rendered() && paint.Crop(client, node.imageWidth, node.imageHeight,
+            node.imageFormat, node.imageData) ? true :
+            Reject(reason, L"Windows Forms surface could not render its owned pixels");
+    }
     if ((style & SS_REALSIZECONTROL) != 0)
         return Reject(reason, L"scaled Static bitmap is not supported");
     const bool centered = (style & SS_CENTERIMAGE) != 0;
@@ -1790,6 +2025,104 @@ bool ReadListViewChecks(
     return true;
 }
 
+bool ReadListViewGroups(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    node.groupViewEnabled = SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0) != FALSE;
+    node.listViewGroups.clear();
+    node.itemGroupIds.clear();
+    if (!node.groupViewEnabled) return true;
+    const auto count = SendMessageW(hwnd, LVM_GETGROUPCOUNT, 0, 0);
+    if (count < 0 || count > 256) return Reject(reason, L"ListView group count exceeds 256");
+    const auto geometry = MessageGeometryScale::For(hwnd);
+    std::unordered_set<int> ids;
+    size_t textSize = 0;
+    for (int index = 0; index < count; ++index) {
+        std::vector<wchar_t> header(Ipc::kMaxStringChars + 2, L'\0');
+        std::vector<wchar_t> footer(header.size(), L'\0');
+        LVGROUP native{ sizeof(native) };
+        // LVGF_SUBTITLE and LVGF_TASK are deliberately not requested: comctl32 v6
+        // (10.0.26100) dereferences a null string when a group has neither, which
+        // would crash the target application, and a zero-length buffer returns no
+        // evidence either way. MMC never sets them.
+        native.mask = LVGF_GROUPID | LVGF_HEADER | LVGF_FOOTER | LVGF_STATE |
+            LVGF_ALIGN | LVGF_TITLEIMAGE | LVGF_EXTENDEDIMAGE;
+        native.pszHeader = header.data(); native.cchHeader = static_cast<int>(header.size());
+        native.pszFooter = footer.data(); native.cchFooter = static_cast<int>(footer.size());
+        native.iTitleImage = native.iExtendedImage = -1;
+        native.stateMask = ~0u;
+        if (!SendMessageW(hwnd, LVM_GETGROUPINFOBYINDEX, index, reinterpret_cast<LPARAM>(&native)))
+            return Reject(reason, L"ListView group read failed");
+        header.back() = footer.back() = L'\0';
+        if (native.iGroupId == I_GROUPIDCALLBACK || native.iGroupId == I_GROUPIDNONE ||
+            !ids.insert(native.iGroupId).second)
+            return Reject(reason, L"ListView group identity is invalid or duplicated");
+        if (native.iTitleImage >= 0 || native.iExtendedImage >= 0 ||
+            // LVGS_SELECTED only mirrors the selected row's group highlight.
+            (native.state & (LVGS_SUBSETED | LVGS_SUBSETLINKFOCUSED))) {
+            reason = L"ListView group requires image or subset semantics (state=" +
+                std::to_wstring(native.state) + L" titleImage=" + std::to_wstring(native.iTitleImage) +
+                L" extendedImage=" + std::to_wstring(native.iExtendedImage) + L")";
+            return false;
+        }
+        ListViewGroupSnapshot group;
+        group.groupId = native.iGroupId;
+        group.header = header.data(); group.footer = footer.data();
+        group.headerAlignment = native.uAlign & LVGA_HEADER_CENTER ? L"center" :
+            native.uAlign & LVGA_HEADER_RIGHT ? L"right" : L"left";
+        group.footerAlignment = native.uAlign & LVGA_FOOTER_CENTER ? L"center" :
+            native.uAlign & LVGA_FOOTER_RIGHT ? L"right" : L"left";
+        textSize += group.header.size() + group.footer.size();
+        if (group.header.size() > Ipc::kMaxStringChars || group.footer.size() > Ipc::kMaxStringChars ||
+            textSize > kMaxStructuredTextChars)
+            return Reject(reason, L"ListView group text exceeds protocol limits");
+        group.collapsible = (native.state & LVGS_COLLAPSIBLE) != 0;
+        group.collapsed = (native.state & LVGS_COLLAPSED) != 0;
+        group.hidden = (native.state & LVGS_HIDDEN) != 0;
+        if ((native.state & LVGS_NOHEADER) != 0) group.header.clear();
+        // Each band remains in the native display order and physical position.
+        auto readRect = [&](int part, RECT& target) {
+            if (group.hidden) { target = {}; return true; }
+            RECT rect{}; rect.top = part;
+            if (!SendMessageW(hwnd, LVM_GETGROUPRECT, group.groupId, reinterpret_cast<LPARAM>(&rect)))
+                return Reject(reason, L"ListView group geometry read failed");
+            target = geometry.Rect(rect);
+            return target.right >= target.left && target.bottom >= target.top &&
+                std::abs(static_cast<int64_t>(target.left)) <= Ipc::kMaxCoordinate &&
+                std::abs(static_cast<int64_t>(target.top)) <= Ipc::kMaxCoordinate &&
+                static_cast<int64_t>(target.right) - target.left <= Ipc::kMaxCoordinate &&
+                static_cast<int64_t>(target.bottom) - target.top <= Ipc::kMaxCoordinate;
+        };
+        if (!readRect(LVGGR_HEADER, group.headerRect))
+            return Reject(reason, L"ListView group bounds exceed the bounded projection");
+        if (!group.hidden && !group.collapsed && !group.footer.empty()) {
+            // The documented rectangle selectors expose the whole group and its
+            // header, but no footer selector. Reserve the footer's native font
+            // extent at the bottom of the group, inside its border metrics.
+            RECT whole{};
+            if (!readRect(LVGGR_GROUP, whole))
+                return Reject(reason, L"ListView whole-group bounds are unavailable");
+            LVGROUPMETRICS metrics{ sizeof(metrics), LVGMF_BORDERSIZE };
+            SendMessageW(hwnd, LVM_GETGROUPMETRICS, 0, reinterpret_cast<LPARAM>(&metrics));
+            if (metrics.Bottom > Ipc::kMaxCoordinate)
+                return Reject(reason, L"ListView group footer border exceeds coordinate limits");
+            HDC dc = GetDC(hwnd);
+            if (!dc) return Reject(reason, L"ListView footer font measurement failed");
+            const HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
+            const HGDIOBJ old = font ? SelectObject(dc, font) : nullptr;
+            TEXTMETRICW textMetrics{};
+            const bool measured = GetTextMetricsW(dc, &textMetrics) != FALSE;
+            if (old && old != HGDI_ERROR) SelectObject(dc, old);
+            ReleaseDC(hwnd, dc);
+            if (!measured) return Reject(reason, L"ListView footer font measurement failed");
+            const LONG bottom = std::max(group.headerRect.bottom,
+                whole.bottom - geometry.Vertical(static_cast<int>(metrics.Bottom)));
+            group.footerRect = { whole.left, std::max(group.headerRect.bottom,
+                bottom - geometry.Vertical(textMetrics.tmHeight)), whole.right, bottom };
+        }
+        node.listViewGroups.push_back(std::move(group));
+    }
+    return true;
+}
+
 bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     ControlKind admittedKind{};
     // CaptureControlDetail is also used directly by native-backed adapters and
@@ -1820,6 +2153,7 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const auto extended = static_cast<DWORD>(
         SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0));
     node.checkBoxes = (extended & LVS_EX_CHECKBOXES) != 0;
+    if (!ReadListViewGroups(hwnd, node, reason)) return false;
 
     size_t totalText = 0;
     const auto withinTextBudget = [&](size_t added) {
@@ -1884,15 +2218,42 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             cells.push_back(std::move(text));
         }
         LVITEMW image{};
-        image.mask = LVIF_IMAGE;
+        image.mask = LVIF_IMAGE | (node.groupViewEnabled ? LVIF_GROUPID : 0);
         image.iItem = row;
         image.iImage = I_IMAGENONE;
         if (!SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&image)))
             return Reject(reason, L"ListView item image read failed");
+        if (image.iImage == I_IMAGECALLBACK) {
+            // The control resolves a callback icon by asking its parent while it
+            // paints and draws nothing when the parent leaves it unanswered (Windows
+            // Forms stores ImageIndex -1 this way). Ask the same question.
+            LVITEMW lookup{};
+            lookup.mask = LVIF_PARAM;
+            lookup.iItem = row;
+            SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&lookup));
+            NMLVDISPINFOW query{};
+            query.hdr = { hwnd, static_cast<UINT_PTR>(GetDlgCtrlID(hwnd)), static_cast<UINT>(LVN_GETDISPINFOW) };
+            query.item.mask = LVIF_IMAGE;
+            query.item.iItem = row;
+            query.item.lParam = lookup.lParam;
+            query.item.iImage = I_IMAGECALLBACK;
+            SendMessageW(GetParent(hwnd), WM_NOTIFY, query.hdr.idFrom, reinterpret_cast<LPARAM>(&query));
+            image.iImage = query.item.iImage == I_IMAGECALLBACK ? I_IMAGENONE : query.item.iImage;
+        }
         node.itemImages.push_back(image.iImage);
+        bool groupVisible = true;
+        if (node.groupViewEnabled) {
+            node.itemGroupIds.push_back(image.iGroupId);
+            const auto group = std::find_if(node.listViewGroups.begin(), node.listViewGroups.end(),
+                [&](const auto& entry) { return entry.groupId == image.iGroupId; });
+            if (group == node.listViewGroups.end() && image.iGroupId != I_GROUPIDNONE)
+                return Reject(reason, L"ListView item names an unknown group");
+            groupVisible = group != node.listViewGroups.end() && !group->collapsed && !group->hidden;
+        }
         node.items.push_back(cells.front());
         if (report) node.rows.push_back(std::move(cells));
-        else {
+        if (!report || node.groupViewEnabled) {
+            if (!groupVisible) { node.itemRects.push_back({}); continue; }
             RECT bounds{ LVIR_BOUNDS };
             if (!SendMessageW(hwnd, LVM_GETITEMRECT, static_cast<WPARAM>(row),
                     reinterpret_cast<LPARAM>(&bounds)))
@@ -1956,6 +2317,27 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     for (size_t index = 0; index < node.itemNativeIds.size(); ++index) {
         if (ResolveListViewItemByNativeId(hwnd, node.itemNativeIds[index]) != static_cast<int>(index))
             return Reject(reason, L"ListView item identity changed during capture");
+    }
+    if (node.groupViewEnabled) {
+        ControlNode finalGroups;
+        if (!ReadListViewGroups(hwnd, finalGroups, reason) || !finalGroups.groupViewEnabled ||
+            finalGroups.listViewGroups.size() != node.listViewGroups.size())
+            return Reject(reason, L"ListView group structure changed during capture");
+        for (size_t index = 0; index < node.listViewGroups.size(); ++index) {
+            const auto& before = node.listViewGroups[index];
+            const auto& after = finalGroups.listViewGroups[index];
+            if (before.groupId != after.groupId || before.header != after.header || before.footer != after.footer ||
+                before.headerAlignment != after.headerAlignment || before.footerAlignment != after.footerAlignment ||
+                before.collapsible != after.collapsible || before.collapsed != after.collapsed || before.hidden != after.hidden ||
+                !EqualRect(&before.headerRect, &after.headerRect) || !EqualRect(&before.footerRect, &after.footerRect))
+                return Reject(reason, L"ListView group state changed during capture");
+        }
+        for (int index = 0; index < count; ++index) {
+            LVITEMW item{}; item.mask = LVIF_GROUPID; item.iItem = index;
+            if (!SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item)) ||
+                item.iGroupId != node.itemGroupIds[index])
+                return Reject(reason, L"ListView group membership changed during capture");
+        }
     }
     return true;
 }
@@ -2120,6 +2502,15 @@ bool CaptureSysLinkState(HWND hwnd, ControlNode& node, std::wstring& reason) {
 bool CaptureButtonState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const auto style = static_cast<DWORD>(node.style);
     node.isDefault = (style & BS_TYPEMASK) == BS_DEFPUSHBUTTON;
+    if ((style & BS_TYPEMASK) == BS_OWNERDRAW) {
+        // A WinForms form's AcceptButton is reported as the default through MSAA.
+        long role = 0;
+        long state = 0;
+        if (!ReadWindowAccessible(hwnd, role, state) || role != ROLE_SYSTEM_PUSHBUTTON)
+            return Reject(reason, L"owner-draw WinForms button changed its accessible role");
+        node.isDefault = (state & STATE_SYSTEM_DEFAULT) != 0;
+        return true;
+    }
     if ((style & BS_ICON) != 0) {
         const auto icon = reinterpret_cast<HICON>(SendMessageW(hwnd, BM_GETIMAGE, IMAGE_ICON, 0));
         if (!icon) return Reject(reason, L"icon Button has no current HICON");
@@ -2145,8 +2536,9 @@ bool CaptureButtonState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     return true;
 }
 
-bool CaptureToggleState(HWND hwnd, ControlNode& node, std::wstring&) {
-    node.checked = static_cast<int>(SendMessageW(hwnd, BM_GETCHECK, 0, 0));
+bool CaptureToggleState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    node.checked = ReadButtonCheckState(hwnd);
+    if (node.checked < 0) return Reject(reason, L"owner-draw WinForms toggle state is unavailable");
     return true;
 }
 
@@ -2165,6 +2557,8 @@ bool CaptureTextEntryState(HWND hwnd, ControlNode& node, std::wstring&) {
 
 bool CaptureStringListState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const bool combo = node.kind == ControlKind::ComboBox;
+    if (combo && (static_cast<DWORD>(node.style) & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE)))
+        return CaptureOwnerDrawComboBox(hwnd, node, reason);
     node.editable = combo && (static_cast<DWORD>(node.style) & 0x0003u) == CBS_DROPDOWN;
     if (!ReadStringItems(hwnd, combo, node.items, reason)) return false;
     node.selectedIndex = static_cast<int>(
@@ -2199,6 +2593,16 @@ bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) 
     if (!GetClientRect(hwnd, &client) || client.right <= 0 || client.bottom <= 0)
         return Reject(reason, L"TabControl client geometry is unavailable");
     const MessageGeometryScale geometry = MessageGeometryScale::For(hwnd);
+    // comctl32 scrolls an overflowing single-line strip with an up-down it creates
+    // as the control's own visible child; that is the only overflow admitted.
+    bool scrollingStrip = false;
+    if ((static_cast<DWORD>(node.style) & TCS_MULTILINE) == 0) {
+        for (HWND child = GetWindow(hwnd, GW_CHILD); child && !scrollingStrip; child = GetWindow(child, GW_HWNDNEXT)) {
+            wchar_t childClass[32]{};
+            scrollingStrip = IsWindowVisible(child) && GetClassNameW(child, childClass, 32) > 0 &&
+                FluentShell::EqualsIgnoreCase(childClass, UPDOWN_CLASSW);
+        }
+    }
     node.items.clear();
     node.itemRects.clear();
     node.items.reserve(count);
@@ -2237,8 +2641,11 @@ bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) 
         if (!SendMessageW(hwnd, TCM_GETITEMRECT, index, reinterpret_cast<LPARAM>(&rect)))
             return Reject(reason, L"TabControl item rectangle is malformed or outside client bounds");
         rect = geometry.Rect(rect);
-        if (rect.left < 0 || rect.top < 0 || rect.right <= rect.left ||
-            rect.bottom <= rect.top || rect.right > client.right || rect.bottom > client.bottom)
+        // A single-line strip wider than the control scrolls with its own up-down;
+        // tabs scrolled out lie beyond either side but stay in the strip's band.
+        const bool horizontalOverflow = rect.left < 0 || rect.right > client.right;
+        if (rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top ||
+            rect.bottom > client.bottom || (horizontalOverflow && !scrollingStrip))
             return Reject(reason, L"TabControl item rectangle is malformed or outside client bounds");
         for (const RECT& previous : node.itemRects) {
             if (rect.left < previous.right && rect.right > previous.left &&
@@ -2295,7 +2702,35 @@ bool DescribeToolbarButtonStyle(
     return true;
 }
 
+bool CaptureToolbarImageVariant(HWND hwnd, UINT message, int listId, int imageIndex,
+    uint32_t normalWidth, uint32_t normalHeight, std::optional<ImageListEntry>& image,
+    std::wstring& reason) {
+    image.reset();
+    const auto list = reinterpret_cast<HIMAGELIST>(
+        SendMessageW(hwnd, message, static_cast<WPARAM>(listId), 0));
+    if (!list) return true;
+    int width = 0;
+    int height = 0;
+    if (imageIndex >= ImageList_GetImageCount(list) ||
+        !ImageList_GetIconSize(list, &width, &height) ||
+        width != static_cast<int>(normalWidth) || height != static_cast<int>(normalHeight))
+        return Reject(reason, L"ToolbarWindow32 state image list has no matching normal icon geometry or index");
+    HICON icon = ImageList_GetIcon(list, imageIndex, ILD_NORMAL);
+    if (!icon) return Reject(reason, L"ToolbarWindow32 state image-list icon copy failed");
+    ImageListEntry pixels;
+    const bool copied = CaptureIconPixels(icon, pixels.imageWidth, pixels.imageHeight,
+        pixels.imageFormat, pixels.imageData, reason);
+    DestroyIcon(icon);
+    if (!copied) return false;
+    image = std::move(pixels);
+    return true;
+}
+
 bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    const auto toolbarStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    constexpr std::array<UINT, 4> imageQueries = {
+        TB_GETIMAGELIST, TB_GETHOTIMAGELIST, TB_GETDISABLEDIMAGELIST, TB_GETPRESSEDIMAGELIST };
+    std::unordered_map<int, std::array<HIMAGELIST, 4>> observedLists;
     const LRESULT rawCount = SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0);
     if (rawCount <= 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxToolbarItems))
         return Reject(reason, L"ToolbarWindow32 button count is empty, invalid, or exceeds 64");
@@ -2480,6 +2915,13 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
                 const auto raw = static_cast<DWORD>(button.iBitmap);
                 const int listId = static_cast<int>(HIWORD(raw));
                 const int imageIndex = static_cast<int>(LOWORD(raw));
+                std::array<HIMAGELIST, 4> currentLists{};
+                for (size_t state = 0; state < imageQueries.size(); ++state)
+                    currentLists[state] = reinterpret_cast<HIMAGELIST>(
+                        SendMessageW(hwnd, imageQueries[state], listId, 0));
+                const auto [observed, inserted] = observedLists.emplace(listId, currentLists);
+                if (!inserted && observed->second != currentLists)
+                    return Reject(reason, L"ToolbarWindow32 image lists changed during capture");
                 int listWidth = 0;
                 int listHeight = 0;
                 int listCount = 0;
@@ -2489,6 +2931,10 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
                 // default index of zero, and a control that custom-draws its faces keeps
                 // an empty list.  Both are reproduced from the control's own paint.
                 if (!list || imageIndex >= listCount) {
+                    if (SendMessageW(hwnd, TB_GETHOTIMAGELIST, listId, 0) ||
+                        SendMessageW(hwnd, TB_GETDISABLEDIMAGELIST, listId, 0) ||
+                        SendMessageW(hwnd, TB_GETPRESSEDIMAGELIST, listId, 0))
+                        return Reject(reason, L"ToolbarWindow32 state image has no normal image");
                     item.paintedFace = !drawsItsOwnLabel;
                 } else if (listWidth <= 0 || listHeight <= 0 ||
                            listWidth > static_cast<int>(Ipc::kMaxImageDimension) ||
@@ -2509,6 +2955,12 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
                         reason = L"ToolbarWindow32 normal image-list icon: " + reason;
                         return false;
                     }
+                    if (!CaptureToolbarImageVariant(hwnd, TB_GETHOTIMAGELIST, listId, imageIndex,
+                            item.imageWidth, item.imageHeight, item.hotImage, reason) ||
+                        !CaptureToolbarImageVariant(hwnd, TB_GETDISABLEDIMAGELIST, listId, imageIndex,
+                            item.imageWidth, item.imageHeight, item.disabledImage, reason) ||
+                        !CaptureToolbarImageVariant(hwnd, TB_GETPRESSEDIMAGELIST, listId, imageIndex,
+                            item.imageWidth, item.imageHeight, item.pressedImage, reason)) return false;
                 }
             }
         }
@@ -2563,16 +3015,33 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             }
         }
     }
+    // Keep the original toolbar pixel budget across all states, rather than
+    // multiplying it by four when a control supplies alternate image lists.
+    size_t pixelBytes = 0;
+    for (const auto& item : node.toolbarItems) {
+        pixelBytes += item.imageData.size();
+        for (const auto* variant : { &item.hotImage, &item.disabledImage, &item.pressedImage })
+            if (*variant) pixelBytes += (*variant)->imageData.size();
+    }
+    if (pixelBytes > Ipc::kMaxToolbarItems * Ipc::kMaxImageBytes)
+        return Reject(reason, L"ToolbarWindow32 state images exceed the aggregate pixel budget");
     // Accessible-name and paint callbacks can reenter application code. Publish
     // group membership and checked state only if the native buttons still agree.
     if (SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0) != rawCount)
         return Reject(reason, L"ToolbarWindow32 button count changed during capture");
+    if (static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)) != toolbarStyle)
+        return Reject(reason, L"ToolbarWindow32 style changed during capture");
+    for (const auto& [listId, images] : observedLists)
+        for (size_t state = 0; state < imageQueries.size(); ++state)
+            if (reinterpret_cast<HIMAGELIST>(SendMessageW(hwnd, imageQueries[state], listId, 0)) != images[state])
+                return Reject(reason, L"ToolbarWindow32 image lists changed during capture");
     constexpr BYTE stableStates = TBSTATE_ENABLED | TBSTATE_HIDDEN | TBSTATE_CHECKED;
     for (int index = 0; index < rawCount; ++index) {
         TBBUTTON current{};
         const auto& captured = capturedButtons[static_cast<size_t>(index)];
         if (!SendMessageW(hwnd, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&current)) ||
             current.idCommand != captured.idCommand || current.fsStyle != captured.fsStyle ||
+            current.iBitmap != captured.iBitmap ||
             (current.fsState & stableStates) != (captured.fsState & stableStates))
             return Reject(reason, L"ToolbarWindow32 button identity or state changed during capture");
     }
@@ -2865,6 +3334,8 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
     at(ControlKind::MdiChild) = &CaptureMdiChildState;
     at(ControlKind::PaneContainer) = &CapturePaneContainerState;
     at(ControlKind::AccessibleIsland) = &CaptureAccessibleIslandState;
+    at(ControlKind::NativeDocument) = &CaptureNativeDocumentState;
+    at(ControlKind::DiskView) = &CaptureDiskViewState;
     at(ControlKind::StaticDecoration) = &CaptureStaticDecorationState;
     // StaticText, Separator, GroupBox, DialogContainer, and MdiClient are fully
     // described by the common facets, so they need no reader of their own.
@@ -2900,9 +3371,18 @@ bool CaptureOwnedWindowPixels(
 
 std::wstring_view ClassNameOf(HWND hwnd, wchar_t (&buffer)[kMaxClassNameChars]) noexcept {
     const int length = GetClassNameW(hwnd, buffer, static_cast<int>(kMaxClassNameChars));
-    return length > 0
-        ? std::wstring_view(buffer, static_cast<size_t>(length))
-        : std::wstring_view();
+    if (length <= 0) return {};
+    const std::wstring_view observed(buffer, static_cast<size_t>(length));
+    // Windows Forms gives standard native subclasses per-AppDomain names.
+    // The native class token still has to pass its normal registry probe;
+    // custom Window.* classes get no additional admission from this prefix.
+    constexpr std::wstring_view prefix = L"WindowsForms10.";
+    if (observed.starts_with(prefix)) {
+        const auto end = observed.find(L".app.", prefix.size());
+        if (end != std::wstring_view::npos && end > prefix.size() && end + 5 < observed.size())
+            return observed.substr(prefix.size(), end - prefix.size());
+    }
+    return observed;
 }
 
 bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
@@ -2951,6 +3431,10 @@ bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
         if (IsMmcMessageView(hwnd) &&
             ProbeAccessibleIsland(hwnd, style, kind, messageViewReason)) return true;
         if (ProbePaneContainer(hwnd, style, kind, containerReason)) return true;
+        if (IsWindowsFormsInertSurface(hwnd, style)) {
+            kind = ControlKind::StaticBitmap;
+            return true;
+        }
         if (!messageViewReason.empty())
             containerReason += L"; as an MMC message view: " + messageViewReason;
     }
@@ -3011,6 +3495,14 @@ int ProportionalSplitTarget(
 bool SetPaneSplit(HWND container, int index, int position) noexcept {
     if (!container || index < 0) return false;
     try {
+        if (GetWindowThreadProcessId(container, nullptr) != GetCurrentThreadId()) {
+            auto moved = std::make_shared<bool>(false);
+            std::wstring reason;
+            return DispatchToWindowThread(container, [container, index, position, moved] {
+                *moved = SetPaneSplit(container, index, position);
+            }, reason) && *moved;
+        }
+        if (GuiThreadOperationCancelled()) return false;
         RECT client{};
         if (!GetClientRect(container, &client)) return false;
         std::vector<PaneGap> gaps;
@@ -3043,14 +3535,20 @@ bool SetPaneSplit(HWND container, int index, int position) noexcept {
                 before.bottom = position;
                 after.top = position + thickness;
             }
-            const UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-            const bool movedBefore = SetWindowPos(neighbours.before, nullptr,
-                before.left, before.top, before.right - before.left, before.bottom - before.top,
-                flags) != FALSE;
-            const bool movedAfter = SetWindowPos(neighbours.after, nullptr,
-                after.left, after.top, after.right - after.left, after.bottom - after.top,
-                flags) != FALSE;
-            return movedBefore && movedAfter;
+            const auto move = [container](HWND child, RECT target) {
+                auto moved = std::make_shared<bool>(false);
+                std::wstring reason;
+                return DispatchToWindowThread(child, [container, child, target, moved] {
+                    if (GuiThreadOperationCancelled() || GetParent(child) != container) return;
+                    *moved = SetWindowPos(child, nullptr, target.left, target.top,
+                        target.right - target.left, target.bottom - target.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER) != FALSE;
+                }, reason) && *moved;
+            };
+            // Stop on the first refusal. The caller restores the complete native
+            // surface on failure; a cancelled operation must not move its peer later.
+            return move(neighbours.before, before) && !GuiThreadOperationCancelled() &&
+                move(neighbours.after, after);
         }
         return false;
     } catch (...) {
@@ -3242,6 +3740,136 @@ bool SetListViewFocusedIndex(HWND listView, int index) noexcept {
     }
 }
 
+bool ScrollPaneContainer(HWND container, bool vertical, bool byLines, int amount) noexcept {
+    if (!container || GetWindowThreadProcessId(container, nullptr) != GetCurrentThreadId()) return false;
+    try {
+        const UINT message = vertical ? WM_VSCROLL : WM_HSCROLL;
+        const int bar = vertical ? SB_VERT : SB_HORZ;
+        const auto read = [&](SCROLLINFO& info) {
+            info = { sizeof(info), SIF_POS | SIF_PAGE | SIF_RANGE };
+            return GetScrollInfo(container, bar, &info) != FALSE;
+        };
+        SCROLLINFO info{};
+        if (!read(info)) return false;
+        const int start = info.nPos;
+        // Only the application's own line/page handling moves its children; a
+        // synthetic SB_THUMBPOSITION is ignored by frameworks that read nTrackPos.
+        if (byLines) {
+            for (int step = 0; step < std::abs(amount) && !GuiThreadOperationCancelled(); ++step)
+                SendMessageW(container, message, MAKEWPARAM(amount > 0 ? SB_LINEDOWN : SB_LINEUP, 0), 0);
+        } else {
+            int current = start;
+            for (int step = 0; step < 512 && current != amount && !GuiThreadOperationCancelled(); ++step) {
+                const int distance = amount - current;
+                const bool page = info.nPage > 0 && static_cast<UINT>(std::abs(distance)) >= info.nPage;
+                const int code = distance > 0 ? (page ? SB_PAGEDOWN : SB_LINEDOWN)
+                    : (page ? SB_PAGEUP : SB_LINEUP);
+                SendMessageW(container, message, MAKEWPARAM(code, 0), 0);
+                if (!read(info) || info.nPos == current) break;
+                // A line step may not land exactly; stop where it crosses the target.
+                const bool crossed = (distance > 0) != (amount - info.nPos > 0) && info.nPos != amount;
+                current = info.nPos;
+                if (crossed) break;
+            }
+        }
+        SendMessageW(container, message, MAKEWPARAM(SB_ENDSCROLL, 0), 0);
+        return read(info) && info.nPos != start;
+    } catch (...) {
+        return false;
+    }
+}
+
+int ReadButtonCheckState(HWND button) noexcept {
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(button, GWL_STYLE));
+    if ((style & BS_TYPEMASK) != BS_OWNERDRAW)
+        return static_cast<int>(SendMessageW(button, BM_GETCHECK, 0, 0));
+    long role = 0;
+    long state = 0;
+    if (!IsWindowsFormsWindow(button) || !ReadWindowAccessible(button, role, state) ||
+        (role != ROLE_SYSTEM_CHECKBUTTON && role != ROLE_SYSTEM_RADIOBUTTON)) return -1;
+    if ((state & STATE_SYSTEM_MIXED) != 0) return BST_INDETERMINATE;
+    return (state & STATE_SYSTEM_CHECKED) != 0 ? BST_CHECKED : BST_UNCHECKED;
+}
+
+bool RequestItemContextMenu(HWND control, ControlKind kind, int index,
+    const std::wstring& expectedText, std::wstring& reason) noexcept {
+    try {
+        if (!control || index < 0 || GetWindowThreadProcessId(control, nullptr) != GetCurrentThreadId())
+            return Reject(reason, L"context-menu owner is not on this GUI thread");
+        if (kind == ControlKind::TreeView) {
+            const HTREEITEM item = ResolveTreeViewItem(control, index);
+            if (!item) return Reject(reason, L"TreeView item no longer exists");
+            std::vector<wchar_t> buffer(kMaxTreeLabelChars + 1, L'\0');
+            TVITEMW read{};
+            read.mask = TVIF_HANDLE | TVIF_TEXT;
+            read.hItem = item;
+            read.pszText = buffer.data();
+            read.cchTextMax = static_cast<int>(buffer.size());
+            if (!SendMessageW(control, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&read)) ||
+                expectedText != std::wstring(buffer.data(), wcsnlen_s(buffer.data(), buffer.size())))
+                return Reject(reason, L"TreeView item changed before its context menu");
+            // TVM_SELECTITEM raises the TVN_SELCHANGING/TVN_SELCHANGED pair a click
+            // would, so the application may veto the selection like any other.
+            if (TreeViewRelative(control, TVGN_CARET, nullptr) != item)
+                SendMessageW(control, TVM_SELECTITEM, TVGN_CARET, reinterpret_cast<LPARAM>(item));
+            if (TreeViewRelative(control, TVGN_CARET, nullptr) != item)
+                return Reject(reason, L"the application refused the TreeView selection");
+            SendMessageW(control, TVM_ENSUREVISIBLE, 0, reinterpret_cast<LPARAM>(item));
+        } else if (kind == ControlKind::ListView) {
+            std::wstring text;
+            if (!ReadListViewItemText(control, index, 0, text, reason)) return false;
+            if (text != expectedText) return Reject(reason, L"ListView item changed before its context menu");
+            // A right-click on an unselected row selects only that row; on a selected
+            // row it keeps the existing (possibly multiple) selection.
+            const bool selected = (SendMessageW(control, LVM_GETITEMSTATE, static_cast<WPARAM>(index),
+                LVIS_SELECTED) & LVIS_SELECTED) != 0;
+            LVITEMW state{};
+            if (!selected) {
+                state.stateMask = LVIS_SELECTED;
+                state.state = 0;
+                SendMessageW(control, LVM_SETITEMSTATE, static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(&state));
+            }
+            state.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+            state.state = LVIS_SELECTED | LVIS_FOCUSED;
+            SendMessageW(control, LVM_SETITEMSTATE, static_cast<WPARAM>(index), reinterpret_cast<LPARAM>(&state));
+            if ((SendMessageW(control, LVM_GETITEMSTATE, static_cast<WPARAM>(index), LVIS_SELECTED) &
+                    LVIS_SELECTED) == 0)
+                return Reject(reason, L"the application refused the ListView selection");
+            SendMessageW(control, LVM_ENSUREVISIBLE, static_cast<WPARAM>(index), FALSE);
+        } else {
+            return Reject(reason, L"context menus are offered only for TreeView and ListView items");
+        }
+        if (GuiThreadOperationCancelled()) return Reject(reason, L"context-menu request was cancelled");
+        // A right-click focuses the control it lands on, and MMC answers the
+        // keyboard form for whichever pane holds focus (Task Scheduler's focus
+        // otherwise rests in its Windows Forms view).
+        if (GetFocus() != control) SetFocus(control);
+        // The keyboard form names the selection. MMC hit-tests the cursor rather
+        // than this message's point, so a coordinate cannot name the projected item.
+        SendMessageW(control, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(control), MAKELPARAM(-1, -1));
+        return true;
+    } catch (...) {
+        reason = L"context-menu request failed";
+        return false;
+    }
+}
+
+bool SetListViewGroupExpanded(HWND listView, int groupId, bool expanded) noexcept {
+    if (!listView || GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId() ||
+        !SendMessageW(listView, LVM_ISGROUPVIEWENABLED, 0, 0)) return false;
+    LVGROUP group{ sizeof(group) };
+    group.mask = LVGF_STATE;
+    group.stateMask = LVGS_COLLAPSIBLE | LVGS_HIDDEN;
+    if (SendMessageW(listView, LVM_GETGROUPINFO, groupId, reinterpret_cast<LPARAM>(&group)) == -1 ||
+        (group.state & LVGS_COLLAPSIBLE) == 0 || (group.state & LVGS_HIDDEN) != 0) return false;
+    group.stateMask = LVGS_COLLAPSED;
+    group.state = expanded ? 0 : LVGS_COLLAPSED;
+    if (SendMessageW(listView, LVM_SETGROUPINFO, groupId, reinterpret_cast<LPARAM>(&group)) == -1) return false;
+    group.state = 0;
+    return SendMessageW(listView, LVM_GETGROUPINFO, groupId, reinterpret_cast<LPARAM>(&group)) != -1 &&
+        ((group.state & LVGS_COLLAPSED) == 0) == expanded;
+}
+
 bool ScrollListViewBy(HWND listView, int dx, int dy) noexcept {
     if (!listView || GetWindowThreadProcessId(listView, nullptr) != GetCurrentThreadId()) return false;
     if (dx < -Ipc::kMaxCoordinate || dx > Ipc::kMaxCoordinate ||
@@ -3250,7 +3878,8 @@ bool ScrollListViewBy(HWND listView, int dx, int dy) noexcept {
         std::wstring mode;
         std::wstring ignored;
         if (!ReadListViewMode(listView, static_cast<DWORD>(GetWindowLongPtrW(listView, GWL_STYLE)),
-                mode, ignored) || mode.empty() || mode == L"report") return false;
+                mode, ignored) || mode.empty() || (mode == L"report" &&
+                !SendMessageW(listView, LVM_ISGROUPVIEWENABLED, 0, 0))) return false;
         if (dx == 0 && dy == 0) return true;
         return SendMessageW(listView, LVM_SCROLL, static_cast<WPARAM>(dx),
             static_cast<LPARAM>(dy)) != FALSE;
@@ -3285,39 +3914,83 @@ bool IsMaximizedMdiCaptionCluster(HWND hwnd, HWND parent) noexcept {
 }
 
 bool IsCompositeImplementationChild(HWND hwnd) noexcept {
-    const HWND parent = GetParent(hwnd);
-    if (!parent) return false;
-    if (IsMaximizedMdiCaptionCluster(hwnd, parent)) return true;
-    wchar_t parentBuffer[kMaxClassNameChars]{};
-    const auto parentClass = ClassNameOf(parent, parentBuffer);
-    if (FluentShell::EqualsIgnoreCase(parentClass, L"ComboBox")) {
-        COMBOBOXINFO info{sizeof(info)};
-        return GetComboBoxInfo(parent, &info) &&
-            (hwnd == info.hwndItem || hwnd == info.hwndList);
-    }
-    // An open label-edit session belongs to the control that owns it: the native
-    // edit control is part of the tree's or list's own contract, and the
-    // projection drives it through that control rather than projecting it as a
-    // separate text box.
-    if (FluentShell::EqualsIgnoreCase(parentClass, WC_TREEVIEWW)) {
-        return hwnd == reinterpret_cast<HWND>(
-            SendMessageW(parent, TVM_GETEDITCONTROL, 0, 0));
-    }
-    wchar_t childBuffer[kMaxClassNameChars]{};
-    if (FluentShell::EqualsIgnoreCase(parentClass, L"MonitorPaletteClass")) {
-        return FluentShell::EqualsIgnoreCase(
-            ClassNameOf(hwnd, childBuffer), L"MonitorPaletteEntryClass");
-    }
-    // A status bar's text lives in its own parts.  An application that parks an empty
-    // child window inside one -- a placeholder for text it will set later, or a
-    // progress bar it keeps hidden -- contributes nothing the projection can lose, so
-    // that child is absorbed.  One carrying text is not: that would be content.
-    if (FluentShell::EqualsIgnoreCase(parentClass, STATUSCLASSNAMEW)) {
-        return GetWindowTextLengthW(hwnd) == 0;
-    }
-    if (!FluentShell::EqualsIgnoreCase(parentClass, WC_LISTVIEWW)) return false;
-    return FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, childBuffer), WC_HEADERW) ||
-        hwnd == reinterpret_cast<HWND>(SendMessageW(parent, LVM_GETEDITCONTROL, 0, 0));
+    try {
+        struct Child final {
+            HWND parent = nullptr;
+            std::wstring className;
+            bool empty = false;
+            bool captionCandidate = false;
+        };
+        auto child = std::make_shared<Child>();
+        std::wstring reason;
+        if (!DispatchToWindowThread(hwnd, [hwnd, child] {
+                child->parent = GetParent(hwnd);
+                wchar_t name[kMaxClassNameChars]{};
+                child->className = ClassNameOf(hwnd, name);
+                child->empty = GetWindowTextLengthW(hwnd) == 0;
+                RECT client{};
+                child->captionCandidate = child->empty && !GetWindow(hwnd, GW_CHILD) &&
+                    GetClientRect(hwnd, &client) && client.right > 0 && client.bottom > 0 &&
+                    client.right <= 144 && client.bottom <= 48;
+            }, reason) || !child->parent) return false;
+        // The caption cluster's own facts belong to the child; MDI activation
+        // belongs to the client, which may live on a third GUI thread.
+        if (child->captionCandidate) {
+            struct Frame final { HWND parent = nullptr; HWND client = nullptr; bool mdi = false; };
+            for (HWND frame = child->parent, previous = nullptr; frame && frame != previous;) {
+                auto facts = std::make_shared<Frame>();
+                if (!DispatchToWindowThread(frame, [frame, facts] {
+                    wchar_t name[kMaxClassNameChars]{};
+                    facts->mdi = FluentShell::EqualsIgnoreCase(ClassNameOf(frame, name), L"MDIClient");
+                    facts->parent = GetParent(frame);
+                    facts->client = FindWindowExW(frame, nullptr, L"MDIClient", nullptr);
+                }, reason)) return false;
+                if (facts->mdi) break;
+                if (facts->client) {
+                    auto active = std::make_shared<HWND>(nullptr);
+                    if (!DispatchToWindowThread(facts->client, [client = facts->client, active] {
+                        *active = reinterpret_cast<HWND>(SendMessageW(client, WM_MDIGETACTIVE, 0, 0));
+                    }, reason)) return false;
+                    if (*active) {
+                        auto maximized = std::make_shared<bool>(false);
+                        if (!DispatchToWindowThread(*active, [active = *active, maximized] {
+                            *maximized = IsZoomed(active) != FALSE;
+                        }, reason)) return false;
+                        if (*maximized) return true;
+                    }
+                    break;
+                }
+                previous = frame;
+                frame = facts->parent;
+            }
+        }
+        auto absorbed = std::make_shared<bool>(false);
+        const HWND parent = child->parent;
+        return DispatchToWindowThread(parent, [parent, hwnd, child, absorbed] {
+            wchar_t name[kMaxClassNameChars]{};
+            const auto type = ClassNameOf(parent, name);
+            if (FluentShell::EqualsIgnoreCase(type, L"ComboBox")) {
+                COMBOBOXINFO info{sizeof(info)};
+                *absorbed = GetComboBoxInfo(parent, &info) &&
+                    (hwnd == info.hwndItem || hwnd == info.hwndList);
+            } else if (FluentShell::EqualsIgnoreCase(type, WC_TREEVIEWW)) {
+                *absorbed = hwnd == reinterpret_cast<HWND>(SendMessageW(parent, TVM_GETEDITCONTROL, 0, 0));
+            } else if (FluentShell::EqualsIgnoreCase(type, L"MonitorPaletteClass")) {
+                *absorbed = FluentShell::EqualsIgnoreCase(child->className, L"MonitorPaletteEntryClass");
+            } else if (FluentShell::EqualsIgnoreCase(type, STATUSCLASSNAMEW)) {
+                *absorbed = child->empty;
+            } else if (FluentShell::EqualsIgnoreCase(type, WC_LISTVIEWW)) {
+                *absorbed = FluentShell::EqualsIgnoreCase(child->className, WC_HEADERW) ||
+                    hwnd == reinterpret_cast<HWND>(SendMessageW(parent, LVM_GETEDITCONTROL, 0, 0));
+            } else if (FluentShell::EqualsIgnoreCase(type, L"DirectUIHWND")) {
+                // A DirectUI scroll viewer's hosted ScrollBar (in its CtrlNotifySink):
+                // the projected island scrolls its elements itself.
+                *absorbed = IsDirectUiScrollChrome(hwnd);
+            } else if (FluentShell::EqualsIgnoreCase(type, L"CtrlNotifySink")) {
+                *absorbed = IsDirectUiScrollChrome(parent);
+            }
+        }, reason) && *absorbed;
+    } catch (...) { return false; }
 }
 
 } // namespace FluentShell::Bridge::Translation

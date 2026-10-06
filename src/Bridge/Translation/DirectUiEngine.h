@@ -28,6 +28,7 @@ enum class DirectUiAction {
     SetEditText,     // EM_SETSEL + EM_REPLACESEL so EN_CHANGE still reaches the app
     SelectListItem,  // native list/combo/tab selection plus its own selection notify
     SetItemCheck,    // one ListView LVS_EX_CHECKBOXES item state in place
+    SetGroupExpanded, // one ListView group's LVGS_COLLAPSED state in place
     ToolbarCommand,  // post the toolbar's own WM_COMMAND to its owner
     HandoffLinkClick, // restore native visibility first, then route NM_CLICK
 };
@@ -63,7 +64,7 @@ enum DirectUiCapability : uint32_t {
 // UIA control types a composite owner slot absorbs as its own item descendants.
 bool IsDirectUiCompositeItemControlType(int controlType) noexcept;
 
-// One projected element of an admitted DirectUI page. A slot is either a
+// One capability-derived element of an admitted DirectUI page. A slot is either a
 // UIA virtual element with no backing HWND or a native backing HWND whose
 // canonical state the engine reads on the source GUI thread.
 struct DirectUiSlot final {
@@ -88,16 +89,11 @@ struct DirectUiSlot final {
     uint32_t nativeStyleValue = 0;
     uint32_t nativeStyleAlt = 0;
     int nativeControlId = -1;
-    // Action routing. A second route the same slot legitimately offers lives in
-    // secondaryAction at the end of this struct, where fields added after the
-    // profile table was written go so its positional rows stay valid.
+    // Action routing. secondaryAction carries a second route when the native
+    // control supports both selection and editing or item checking.
     DirectUiAction action = DirectUiAction::None;
     bool cancel = false;
     bool defaultButton = false;
-    // Trusted icon resource inside the admitted executable (0 = none).
-    int iconResourceId = 0;
-    int iconWidth = 0;
-    int iconHeight = 0;
     // Provider identity and geometry are profile data rather than engine
     // assumptions. Empty framework id accepts any provider framework.
     std::wstring_view uiaFrameworkId = L"DirectUI";
@@ -109,6 +105,14 @@ struct DirectUiSlot final {
     int propertySheetButton = -1;
     bool uiaOffscreen = false;
     bool captureBitmap = false;
+    // An inert virtual image is painted by its nearest native UIA ancestor.
+    // Its host identity and client-relative crop are sealed from A/U evidence;
+    // pixel capture never reads the desktop or substitutes an application icon.
+    HWND imageHostHwnd = nullptr;
+    uint64_t imageHostGeneration = 0;
+    RECT imageHostClientBounds{};
+    POINT imageHostClientOffset{};
+    RECT imageClientBounds{};
     // Reads this backing HWND through its own registered Win32 adapter so the
     // DirectUI lane inherits that adapter's proven typed contract instead of
     // re-deriving facets. Only set for slots whose native class is the class the
@@ -129,38 +133,19 @@ struct DirectUiSlot final {
     // primary route, and only advertised when the revision's own typed state
     // says the control currently accepts it.
     DirectUiAction secondaryAction = DirectUiAction::None;
+    DirectUiAction tertiaryAction = DirectUiAction::None;
 };
 
-// Exact census of implementation HWND classes below the DirectUI host. Every
-// count is an equality contract; any drift rejects the whole surface.
-struct DirectUiCensus final {
-    size_t visibleNotifyWrappers = 0;
-    size_t hiddenNotifyWrappers = 0;
-    size_t hiddenScrollBars = 0;
-    size_t hiddenSysLinks = 0;
-    size_t hiddenButtons = 0;
-    size_t hiddenPageHosts = 0;
-    size_t hiddenPageStaticTexts = 0;
-    size_t visiblePageHosts = 0;
-    size_t pageHostStaticTexts = 0;
-};
-
-// A declarative application contract. The engine contains no per-application
-// branches; every supported page is one row of profile data.
+// A sealed capability contract derived from native and UIA evidence for one
+// surface. No executable name, binary version, or page-specific rows are used.
 struct DirectUiWindowProfile final {
     std::wstring_view adapterId;
     std::wstring_view pageId;
-    std::wstring_view executableBasename;
-    uint16_t fileVersion[4] = {};
     std::wstring_view rootClass;
-    DirectUiCensus census;
     const DirectUiSlot* slots = nullptr;
     size_t slotCount = 0;
-    // The native dialog manager exposes the DirectUI host as its only tab
-    // stop; focus traversal within that host is pinned by slot tabIndex.
-    bool directUiOwnsTabOrder = false;
-    size_t minDescendants = 0;
-    size_t maxDescendants = 0;
+    // The observed HWND inventory is held to an equality across captures.
+    size_t descendantCount = 0;
     struct ImplementationClassContract final {
         std::wstring_view className;
         bool visible = false;
@@ -168,7 +153,6 @@ struct DirectUiWindowProfile final {
     };
     const ImplementationClassContract* implementationClasses = nullptr;
     size_t implementationClassCount = 0;
-    bool genericSemantic = false;
 };
 
 struct DirectUiOwnedProfile final {
@@ -178,16 +162,8 @@ struct DirectUiOwnedProfile final {
     DirectUiWindowProfile profile;
 };
 
-extern const DirectUiWindowProfile kDirectUiProfiles[];
-extern const size_t kDirectUiProfileCount;
-
-// Resolves the profile matching the current process image (canonical System32
-// path, exact fixed file version, Microsoft signature). Returns nullptr when
-// no profile applies; `error` is only set for a basename match that failed a
-// stricter identity check.
-const DirectUiWindowProfile* ResolveDirectUiWindowProfile(
-    std::wstring& imagePath,
-    std::wstring& error);
+// Requires the current process image to be the canonical System32 binary
+// with a verified Microsoft Windows embedded or catalog signature.
 bool ResolveGenericDirectUiImage(std::wstring& imagePath, std::wstring& error);
 
 struct DirectUiWindowEvidence final {
@@ -264,6 +240,8 @@ struct DirectUiNativeEvidence final {
 
 struct DirectUiBootstrapWindowEvidence final {
     DirectUiWindowEvidence window;
+    RECT clientBounds{};
+    POINT clientOriginScreen{};
     HWND parent = nullptr;
     std::wstring className;
     bool controlSupported = false;
@@ -274,6 +252,8 @@ struct DirectUiBootstrapWindowEvidence final {
     bool compositeImplementationChild = false;
     // Item count this control's own adapter reports (SIZE_MAX = not composite).
     size_t nativeItemCount = static_cast<size_t>(-1);
+    bool nativeGroupViewEnabled = false;
+    size_t nativeVisibleItemCount = static_cast<size_t>(-1);
 };
 
 struct DirectUiBootstrapEvidence final {
@@ -291,6 +271,9 @@ struct DirectUiSemanticEvidence final {
     std::wstring frameworkId;
     RECT bounds{};
     HWND backingHwnd = nullptr;
+    // Nearest HWND-bearing ancestor observed through the same UIA provider tree.
+    // Only HWND-less Image semantics use this field.
+    HWND imageHostHwnd = nullptr;
     int controlType = 0;
     bool focusable = false;
     bool enabled = false;
@@ -308,6 +291,22 @@ struct DirectUiUiaEvidence final {
     HWND directUiHwnd = nullptr;
     std::vector<DirectUiSemanticEvidence> semantics;
 };
+
+// Seals a virtual image's native paint source using only captured evidence.
+// Names and AutomationIds identify semantics; neither selects image content.
+bool ConfigureDirectUiVirtualImage(
+    const DirectUiBootstrapEvidence& native,
+    const DirectUiSemanticEvidence& semantic,
+    DirectUiSlot& slot,
+    std::wstring& error) noexcept;
+
+// Source-thread-only render of a bounded client region. PrintWindow is the sole
+// pixel source; failure never falls back to screen pixels or a resource guess.
+bool CaptureDirectUiVirtualImagePixels(
+    HWND host,
+    const RECT& clientRegion,
+    DirectUiWindowEvidence& image,
+    std::wstring& error) noexcept;
 
 enum class DirectUiAdmissionResult {
     NotApplicable,
@@ -327,6 +326,7 @@ struct DirectUiActionBinding final {
     DirectUiAction secondaryAction = DirectUiAction::None;
     bool cancel = false;
     int propertySheetButton = -1;
+    DirectUiAction tertiaryAction = DirectUiAction::None;
 };
 
 // Resolves the requested protocol action string against a binding's declared
@@ -403,16 +403,6 @@ bool RevalidateAndPostDirectUiPropertySheetAction(
     DWORD timeoutMs,
     HANDLE cancelEvent,
     std::wstring& error) noexcept;
-
-DirectUiAdmissionResult InspectDirectUiSurface(
-    SourceThreadAgent& agent,
-    const DirectUiWindowProfile& profile,
-    DWORD timeoutMs,
-    HANDLE cancelEvent,
-    std::wstring& diagnostic,
-    WindowSnapshot* snapshot = nullptr,
-    std::unordered_map<uint64_t, DirectUiActionBinding>* bindings = nullptr,
-    DirectUiNativeEvidence* nativeEvidence = nullptr) noexcept;
 
 DirectUiAdmissionResult InspectGenericDirectUiSurface(
     SourceThreadAgent& agent,

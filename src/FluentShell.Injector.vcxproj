@@ -41,7 +41,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>dwmapi.lib;shell32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>shell32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -60,9 +60,6 @@
     <ClCompile Include="Injector\main.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="FluentShell.Core.vcxproj">
-      <Project>{B1000001-0001-0001-0001-000000000001}</Project>
-    </ProjectReference>
     <ProjectReference Include="FluentShell.Bridge.vcxproj">
       <Project>{B1000003-0001-0001-0001-000000000003}</Project>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>

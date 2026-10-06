@@ -72,6 +72,7 @@ int ProportionalSplitTarget(
 // array, which is the same state the native header writes when the user drags a
 // column.  `order` must be a permutation of the column indexes.
 bool SetListViewColumnOrder(HWND listView, const std::vector<int>& order) noexcept;
+bool SetListViewGroupExpanded(HWND listView, int groupId, bool expanded) noexcept;
 
 // Reads an owned, bounded cell through the native control on its GUI thread.
 // Owner-data lists obtain their text through LVN_GETDISPINFO, not GETITEMTEXT.
@@ -81,6 +82,23 @@ bool ReadListViewItemText(HWND listView, int row, int column,
 // Moves only LVIS_FOCUSED. Selection is untouched. -1 clears focus; a nonnegative
 // index also asks the control to bring that item into its own viewport.
 bool SetListViewFocusedIndex(HWND listView, int index) noexcept;
+
+// Scrolls a container that moves its own child windows, through its WM_VSCROLL/
+// WM_HSCROLL line and page handling: a signed count of line steps, or toward a
+// target position (page steps while far, then line steps). True when it moved.
+bool ScrollPaneContainer(HWND container, bool vertical, bool byLines, int amount) noexcept;
+
+// BM_GETCHECK for a standard button; for an owner-draw WinForms CheckBox or
+// RadioButton (which keeps no native check state) the state its MSAA object
+// reports. -1 when an owner-draw button offers no such evidence. GUI thread only.
+int ReadButtonCheckState(HWND button) noexcept;
+
+// Opens the application's own context menu for one TreeView or ListView item: the
+// item (whose label must still be `expectedText`) is selected through the control's
+// selection messages, then WM_CONTEXTMENU is sent in its keyboard form. The caller
+// arms popup interception first; the application's TrackPopupMenu runs inside this.
+bool RequestItemContextMenu(HWND control, ControlKind kind, int index,
+    const std::wstring& expectedText, std::wstring& reason) noexcept;
 
 // Scrolls a non-report ListView by a pixel delta through LVM_SCROLL. Report views
 // are refused here because their projection scrolls inside the WinUI presenter.

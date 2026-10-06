@@ -682,18 +682,18 @@ Tranche J admits it.
 
 ### Tranche F: Application Adapters
 
-- Match canonical executable identity/version plus HWND and UIA signatures.
+- Match canonical executable identity and signer plus bounded HWND and UIA evidence.
 - Package capture, actions, invalidation, presentation, and rollback tests as
   one versioned adapter.
 - Never enable an application adapter globally by class name alone.
 
 This is the only supported lane for private/custom HWND contracts.
 
-The DirectUI translation engine is implemented in `DirectUiEngine.cpp` with
-both declarative exact profiles and fail-closed, capability-derived per-surface
-profiles; see `DIRECTUI-APPLICATION-ADAPTERS.md`. Exact profiles remain for
-MdSched `10.0.26100.7309` and RecoveryDrive `10.0.26100.33296`. Generated
-profiles are restricted to Microsoft-signed canonical System32 images, and every
+The DirectUI translation engine in `DirectUiEngine.cpp` derives every surface's
+contract from its current HWND and UIA evidence; see `DIRECTUI-APPLICATION-ADAPTERS.md`.
+Protocol minor 29 removes the exact MdSched and RecoveryDrive profiles and their
+adapter IDs. The remaining capability-derived contracts are restricted to
+Microsoft-signed canonical System32 images, and every
 projected slot takes its kind from the registered Win32 adapter that backs it, so
 the DirectUI lane's boundary is this roadmap's boundary rather than a second list
 maintained per application. Tranche A/B statics and buttons, Tranche C's one-row
@@ -791,9 +791,21 @@ no item rectangle at all. With these, `sigverif`, `cliconfg` and `iexpress`'s fi
 project. `eudcedit` stays native because its visible MDI frame (a ComboBox inside its
 status bar, MFC control bars) is unsupported, so its startup dialog stays native with it.
 
-The remaining recurring Win32 gaps are owner-draw ComboBox, grouped ListView and toolbar
-image-list variants; each needs its own adapter row under the contract above rather
-than a wider class allowlist.
+Follow-up on 2026-10-04 (protocol minor 29) adds owned hot, disabled, and pressed
+toolbar image-list variants. Each referenced image must match its button's normal
+icon dimensions, stay within the 96 px icon cap, and fit the existing aggregate
+toolbar pixel budget together with all other states. The renderer chooses the state
+image from the projected button's enabled, hover, pressed, and checked state;
+reconciliation refreshes or removes those images when the native lists change.
+Pressed buttons without a pressed image use the normal image; checked buttons use
+the hot image even without hover, and hover uses hot only for flat/list toolbars.
+Missing state images fall back to normal, while malformed or mismatched
+lists keep the whole surface native. This extends the toolbar adapter, not the
+owner-draw ComboBox or grouped ListView boundary, and does not establish projection
+for `mstsc` or WinForms views on a separate GUI thread.
+
+The remaining recurring Win32 gaps include owner-draw ComboBox and grouped ListView;
+each needs a bounded adapter contract rather than a wider class allowlist.
 
 ## Completion Rule
 

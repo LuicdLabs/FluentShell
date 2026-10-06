@@ -1,4 +1,6 @@
 #include "WindowCapture.h"
+#include "GuiThreadDispatch.h"
+#include "NativeDocument.h"
 
 #include "../../Common/FluentShell.h"
 #include "ControlAdapters.h"
@@ -184,13 +186,15 @@ bool CaptureNativeTabOrder(
     std::wstring& reason) {
     std::unordered_map<HWND, HWND> candidates;
     for (const HWND child : handles) {
-        if (IsCompositeImplementationChild(child) || IsMdiNavigationContainer(child)) continue;
-        const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
-        if (!IsDialogControlParent(child) && IsWindowVisible(child) &&
-            IsEffectivelyEnabled(root, child) &&
-            (style & WS_TABSTOP) != 0) {
-            candidates.emplace(child, NativeTabScope(root, child));
-        }
+        auto candidate = std::make_shared<HWND>(nullptr);
+        if (!DispatchToWindowThread(child, [root, child, candidate] {
+                if (IsCompositeImplementationChild(child) || IsMdiNavigationContainer(child)) return;
+                const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
+                if (!IsDialogControlParent(child) && IsWindowVisible(child) &&
+                    IsEffectivelyEnabled(root, child) && (style & WS_TABSTOP) != 0)
+                    *candidate = NativeTabScope(root, child);
+            }, reason)) return false;
+        if (*candidate) candidates.emplace(child, *candidate);
     }
     if (candidates.empty()) return true;
 
@@ -219,7 +223,11 @@ bool CaptureNativeTabOrder(
         std::unordered_set<HWND> visited;
         HWND current = *seed;
         for (size_t attempt = 0; attempt <= handles.size() + candidates.size(); ++attempt) {
-            const HWND next = GetNextDlgTabItem(container, current, FALSE);
+            auto nextValue = std::make_shared<HWND>(nullptr);
+            if (!DispatchToWindowThread(container, [container, current, nextValue] {
+                    *nextValue = GetNextDlgTabItem(container, current, FALSE);
+                }, reason)) return false;
+            const HWND next = *nextValue;
             if (!next) break;
             if (!IsChild(container, next)) {
                 reason = L"native dialog manager returned a tab stop outside its container";
@@ -602,9 +610,39 @@ bool CaptureChildNode(
     std::wstring& reason) {
     DWORD childProcess = 0;
     const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
-    if (childProcess != GetCurrentProcessId() || childThread != scope.rootThread) {
-        reason = L"foreign-process or foreign-thread child HWND";
+    if (childProcess != GetCurrentProcessId()) {
+        reason = L"foreign-process child HWND";
         return false;
+    }
+    if (childThread != GetCurrentThreadId()) {
+        struct RemoteCapture final {
+            CaptureContext context;
+            ChildCaptureScope scope;
+            std::unordered_map<HWND, int> tabs;
+            std::unordered_map<HWND, uint64_t> ids;
+            std::unordered_map<HWND, ControlKind> kinds;
+            ControlNode node;
+            std::wstring error;
+            bool success = false;
+        };
+        auto work = std::make_shared<RemoteCapture>();
+        work->context = context;
+        work->scope = scope;
+        work->tabs = *scope.tabIndexes;
+        work->ids = *scope.visibleNodeIds;
+        work->kinds = *scope.visibleNodeKinds;
+        work->scope.tabIndexes = &work->tabs;
+        work->scope.visibleNodeIds = &work->ids;
+        work->scope.visibleNodeKinds = &work->kinds;
+        if (!DispatchToWindowThread(child, [child, work] {
+                work->success = CaptureChildNode(child, work->context, work->scope, work->node, work->error);
+            }, reason)) return false;
+        if (!work->success) { reason = std::move(work->error); return false; }
+        context.nodeIds = std::move(work->context.nodeIds);
+        context.nextNodeId = work->context.nextNodeId;
+        context.nextNodeGeneration = work->context.nextNodeGeneration;
+        node = std::move(work->node);
+        return true;
     }
     return ClassifyControl(child, node.kind, reason) &&
         AssignNodeIdentity(child, context, node, reason) &&
@@ -672,6 +710,19 @@ bool CapturedChild(HWND root, HWND child) noexcept {
         DrawsInsideRoot(root, child) && !IsHiddenTabStrip(child);
 }
 
+bool ProbeChildOnOwner(HWND root, HWND child, bool& kept, ControlKind& kind, std::wstring& reason) {
+    struct Probe final { bool kept = false; bool valid = true; ControlKind kind{}; std::wstring error; };
+    auto probe = std::make_shared<Probe>();
+    if (!DispatchToWindowThread(child, [root, child, probe] {
+            probe->kept = CapturedChild(root, child);
+            if (probe->kept) probe->valid = ClassifyControl(child, probe->kind, probe->error);
+        }, reason)) return false;
+    kept = probe->kept;
+    kind = probe->kind;
+    reason = std::move(probe->error);
+    return probe->valid;
+}
+
 bool CaptureChildNodes(
     HWND root,
     CaptureContext& context,
@@ -691,18 +742,36 @@ bool CaptureChildNodes(
     const DWORD rootThread = GetWindowThreadProcessId(root, nullptr);
     std::wstring firstRejection;
     size_t rejections = 0;
+    std::unordered_set<HWND> keptChildren;
+    std::vector<HWND> nativeDocuments;
     for (const HWND child : enumeration.handles) {
-        if (!CapturedChild(root, child)) continue;
         DWORD childProcess = 0;
         const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
-        if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
-            reason = L"foreign-process or foreign-thread child HWND";
+        if (!childThread || childProcess != GetCurrentProcessId()) {
+            reason = L"destroyed or foreign-process child HWND";
             AppendWindowEvidence(child, reason);
             return false;
         }
         ControlKind kind{};
         std::wstring childReason;
-        if (ClassifyControl(child, kind, childReason)) continue;
+        bool kept = false;
+        bool documentChild = false;
+        for (const HWND document : nativeDocuments) {
+            if (!IsChild(document, child)) continue;
+            auto owned = std::make_shared<bool>(false);
+            if (!DispatchToWindowThread(document, [document, child, owned] {
+                    *owned = NativeDocumentOwnsDescendant(document, child);
+                }, childReason)) { reason = std::move(childReason); return false; }
+            if (*owned) { documentChild = true; break; }
+        }
+        if (documentChild) continue;
+        if (ProbeChildOnOwner(root, child, kept, kind, childReason)) {
+            if (kept) {
+                keptChildren.insert(child);
+                if (kind == ControlKind::NativeDocument) nativeDocuments.push_back(child);
+            }
+            continue;
+        }
         AppendWindowEvidence(child, childReason);
         if (rejections++ < 8) {
             try {
@@ -727,7 +796,7 @@ bool CaptureChildNodes(
     scope.visibleNodeIds = &visibleNodeIds;
     scope.visibleNodeKinds = &visibleNodeKinds;
     for (const HWND child : enumeration.handles) {
-        if (!CapturedChild(root, child)) continue;
+        if (!keptChildren.contains(child)) continue;
         // The menu-bar toolbar is projected as the surface's menu, so it must not also
         // appear as a control: one native menu bar becomes one projected menu bar.
         if (child == context.menuBarToolbar && !context.menuBarToolbarMenu.empty()) continue;
@@ -801,8 +870,31 @@ void ObserveMenuBarToolbar(HWND root, CaptureContext& context) noexcept {
         ControlNode identity;
         std::wstring reason;
         std::vector<MenuBarButton> buttons;
-        if (toolbar && (!AssignNodeIdentity(toolbar, context, identity, reason) ||
-                !ReadMenuBarButtons(toolbar, buttons))) toolbar = nullptr;
+        if (toolbar) {
+            struct Observation final {
+                CaptureContext context;
+                ControlNode identity;
+                std::vector<MenuBarButton> buttons;
+                bool success = false;
+            };
+            auto observed = std::make_shared<Observation>();
+            observed->context = context;
+            if (!DispatchToWindowThread(toolbar, [toolbar, observed] {
+                    std::wstring error;
+                    observed->success = AssignNodeIdentity(toolbar, observed->context,
+                        observed->identity, error) && ReadMenuBarButtons(toolbar, observed->buttons);
+                }, reason)) toolbar = nullptr;
+            else {
+                context.nodeIds = std::move(observed->context.nodeIds);
+                context.nextNodeId = observed->context.nextNodeId;
+                context.nextNodeGeneration = observed->context.nextNodeGeneration;
+                if (!observed->success) toolbar = nullptr;
+                else {
+                    identity = std::move(observed->identity);
+                    buttons = std::move(observed->buttons);
+                }
+            }
+        }
         if (!toolbar) {
             identity.generation = 0;
             buttons.clear();
@@ -815,6 +907,7 @@ void ObserveMenuBarToolbar(HWND root, CaptureContext& context) noexcept {
         context.menuBarButtons = std::move(buttons);
         context.menuBarToolbarMenu.clear();
         context.menuBarToolbarCommands.clear();
+        context.menuBarSilentButtons.clear();
         context.menuBarRefresh.Invalidate(GetTickCount64());
     } catch (...) {
         context.menuBarToolbar = nullptr;
@@ -869,8 +962,58 @@ bool CaptureWindow(
     }
 }
 
+std::wstring DescribeSnapshotDifference(const WindowSnapshot& before, const WindowSnapshot& after) {
+    if (before.nodes.size() != after.nodes.size())
+        return L"node count " + std::to_wstring(before.nodes.size()) + L" -> " +
+            std::to_wstring(after.nodes.size());
+    const auto rectText = [](const RECT& rect) {
+        return std::to_wstring(rect.left) + L"," + std::to_wstring(rect.top) + L"," +
+            std::to_wstring(rect.right) + L"," + std::to_wstring(rect.bottom);
+    };
+    for (size_t index = 0; index < before.nodes.size(); ++index) {
+        const auto& a = before.nodes[index];
+        const auto& b = after.nodes[index];
+        std::wstring field;
+        if (a.hwnd != b.hwnd || a.kind != b.kind) field = L"identity";
+        else if (!EqualRect(&a.rect, &b.rect)) field = L"rect " + rectText(a.rect) + L" -> " + rectText(b.rect);
+        else if (a.text != b.text) field = L"text";
+        else if (a.visible != b.visible || a.enabled != b.enabled) field = L"visibility/enabled";
+        else if (a.checked != b.checked || a.selectedIndex != b.selectedIndex ||
+                 a.focusedIndex != b.focusedIndex || a.position != b.position) field = L"state";
+        else if (a.items != b.items || a.itemRects.size() != b.itemRects.size()) field = L"items";
+        else if (a.chromeRegions.size() != b.chromeRegions.size()) field = L"chrome region count";
+        else {
+            for (size_t region = 0; region < a.chromeRegions.size() && field.empty(); ++region)
+                if (a.chromeRegions[region].imageData != b.chromeRegions[region].imageData)
+                    field = L"chrome pixels " + rectText(a.chromeRegions[region].rect);
+            for (size_t bar = 0; bar < a.scrollBars.size() && bar < b.scrollBars.size() && field.empty(); ++bar)
+                if (a.scrollBars[bar].position != b.scrollBars[bar].position ||
+                    a.scrollBars[bar].maximum != b.scrollBars[bar].maximum)
+                    field = L"scroll bar";
+            if (field.empty() && a.imageData != b.imageData) field = L"image pixels";
+        }
+        if (!field.empty()) {
+            wchar_t className[64]{};
+            GetClassNameW(a.hwnd, className, 64);
+            return L"node " + std::to_wstring(index) + L" (" + className + L") " + field;
+        }
+    }
+    return {};
+}
+
 uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
     uint64_t hash = 1469598103934665603ull;
+    const auto hashImage = [&](const ImageListEntry& image) {
+        HashBytes(hash, image.imageWidth);
+        HashBytes(hash, image.imageHeight);
+        HashString(hash, image.imageFormat);
+        HashBytes(hash, image.imageData.size());
+        if (!image.imageData.empty()) HashRange(hash, image.imageData.data(), image.imageData.size());
+    };
+    const auto hashOptionalImage = [&](const std::optional<ImageListEntry>& image) {
+        HashBytes(hash, image.has_value());
+        if (image) hashImage(*image);
+    };
     HashBytes(hash, snapshot.nativeHwnd);
     HashBytes(hash, snapshot.ownerHwnd);
     HashBytes(hash, snapshot.generation);
@@ -958,6 +1101,66 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.items.size());
         for (const auto& item : node.items) HashString(hash, item);
         HashString(hash, node.listViewMode);
+        HashBytes(hash, node.groupViewEnabled);
+        HashBytes(hash, node.listViewGroups.size());
+        for (const auto& group : node.listViewGroups) {
+            HashBytes(hash, group.groupId);
+            HashString(hash, group.header);
+            HashString(hash, group.footer);
+            HashString(hash, group.headerAlignment);
+            HashString(hash, group.footerAlignment);
+            HashBytes(hash, group.collapsible);
+            HashBytes(hash, group.collapsed);
+            HashBytes(hash, group.hidden);
+            HashBytes(hash, group.headerRect);
+            HashBytes(hash, group.footerRect);
+        }
+        HashBytes(hash, node.itemGroupIds.size());
+        for (const int groupId : node.itemGroupIds) HashBytes(hash, groupId);
+        HashBytes(hash, node.ownerDrawCombo.has_value());
+        if (node.ownerDrawCombo) {
+            HashString(hash, node.ownerDrawCombo->mode);
+            HashBytes(hash, node.ownerDrawCombo->items.size());
+            for (const auto& item : node.ownerDrawCombo->items) {
+                hashImage(item.normal);
+                hashImage(item.selected);
+            }
+            hashOptionalImage(node.ownerDrawCombo->selectionFace);
+        }
+        HashBytes(hash, node.document.has_value());
+        if (node.document) {
+            HashString(hash, node.document->documentId);
+            HashBytes(hash, node.document->regions.size());
+            for (const auto& region : node.document->regions) {
+                HashString(hash, region.key);
+                HashString(hash, region.kind);
+                HashBytes(hash, region.rect);
+                HashBytes(hash, region.contentWidth);
+                HashBytes(hash, region.contentHeight);
+                HashBytes(hash, region.maximumX);
+                HashBytes(hash, region.maximumY);
+                HashBytes(hash, region.offsetX);
+                HashBytes(hash, region.offsetY);
+            }
+            HashBytes(hash, node.document->items.size());
+            for (const auto& item : node.document->items) {
+                HashString(hash, item.key);
+                HashString(hash, item.kind);
+                HashBytes(hash, item.rect);
+                HashBytes(hash, item.regionIndex);
+                HashBytes(hash, item.reportRegionIndex);
+                HashString(hash, item.name);
+                HashString(hash, item.actionIdentity);
+                HashBytes(hash, item.enabled);
+                hashOptionalImage(item.image);
+                HashBytes(hash, item.reportRows.size());
+                for (const auto& row : item.reportRows) {
+                    HashString(hash, row.path);
+                    HashBytes(hash, row.value);
+                    HashBytes(hash, row.available);
+                }
+            }
+        }
         HashBytes(hash, node.itemRects.size());
         for (const auto& rect : node.itemRects) HashBytes(hash, rect);
         HashBytes(hash, node.itemNativeIds.size());
@@ -1027,6 +1230,10 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, item.checked);
             HashBytes(hash, item.dropDown);
             HashBytes(hash, item.wholeDropDown);
+            HashBytes(hash, item.paintedFace);
+            hashOptionalImage(item.hotImage);
+            hashOptionalImage(item.disabledImage);
+            hashOptionalImage(item.pressedImage);
             HashBytes(hash, item.imageWidth);
             HashBytes(hash, item.imageHeight);
             HashString(hash, item.imageFormat);
@@ -1042,6 +1249,17 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, split.minimum);
             HashBytes(hash, split.maximum);
         }
+        HashBytes(hash, node.scrollBars.size());
+        for (const auto& bar : node.scrollBars) {
+            HashBytes(hash, bar.vertical);
+            HashBytes(hash, bar.enabled);
+            HashBytes(hash, bar.minimum);
+            HashBytes(hash, bar.maximum);
+            HashBytes(hash, bar.page);
+            HashBytes(hash, bar.position);
+            HashBytes(hash, bar.rect);
+        }
+        if (!node.scrollBars.empty()) HashBytes(hash, node.clientRect);
         // The chrome pixels are part of the fingerprint, so a container that repaints
         // its own band reaches the renderer as a patch instead of going stale.
         HashBytes(hash, node.chromeRegions.size());

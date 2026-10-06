@@ -46,6 +46,13 @@ constexpr DWORD kMenuBarPopupWaitMs = 700;
 // moment later. Require a quiet owner graph before reprojecting the root so it
 // does not visibly bounce between native and WinUI during that transition.
 constexpr uint64_t kOwnerGraphQuietMs = 2000;
+// How long discovery waits for an unattempted window's GUI thread to answer
+// WM_NULL before deferring its single projection attempt to a later pass.
+constexpr UINT kBusyThreadProbeMs = 150;
+// A capture that failed on a timing condition is retried at most this many times,
+// each after a longer quiet period.
+constexpr unsigned kMaxTransientDiscoveryRetries = 4;
+constexpr uint64_t kTransientRetryBackoffMs = 1500;
 // A handoff-declared DirectUI navigation replaces the page inside the same
 // top-level window. The surface keeps its projection across that replacement, so
 // this bounds how long the proxy may hold the screen behind a re-armed input gate
@@ -1206,6 +1213,8 @@ void RendererSession::PruneDiscoveryState() {
         if (!IsWindow(iterator->first)) iterator = ownerGraphDeferrals_.erase(iterator);
         else ++iterator;
     }
+    std::erase_if(busyDiscoveryWindows_, [](HWND window) { return !IsWindow(window); });
+    std::erase_if(discoveryRetries_, [](const auto& entry) { return !IsWindow(entry.first); });
 }
 
 RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
@@ -1321,6 +1330,32 @@ void RendererSession::DiscoverTopLevelWindows() {
                 return EffectiveTopLevelOwner(candidate) == window &&
                     !IsModalOwnedTopLevel(candidate);
             });
+        // A window gets one projection attempt, and attaching needs its GUI thread
+        // to answer within 2 s. A thread busy with application work (RSoP's
+        // processing dialog, a snap-in loading) would spend that attempt on a
+        // timeout, so such a window waits until its thread answers.
+        bool attempted = false;
+        {
+            std::scoped_lock lock(surfacesMutex_);
+            // A window whose last attempt failed on a timing condition is offered
+            // its attempt again once the backoff has passed.
+            if (const auto retry = discoveryRetries_.find(window);
+                retry != discoveryRetries_.end() && GetTickCount64() >= retry->second.due &&
+                discoveryAttempts_.erase(window) != 0) {
+                retry->second.due = UINT64_MAX;
+                FluentShell::Log(L"Retrying projection after a transient capture failure (" +
+                    std::to_wstring(retry->second.attempts) + L"): " + DescribeTopLevel(window));
+            }
+            attempted = discoveryAttempts_.contains(window);
+        }
+        if (!attempted && SendMessageTimeoutW(window, WM_NULL, 0, 0,
+                SMTO_ABORTIFHUNG | SMTO_BLOCK, kBusyThreadProbeMs, nullptr) == 0) {
+            if (busyDiscoveryWindows_.insert(window).second)
+                FluentShell::Log(L"Native window deferred while its UI thread is busy: " +
+                    DescribeTopLevel(window));
+            continue;
+        }
+        busyDiscoveryWindows_.erase(window);
         auto decision = ClassifyTopLevel(window, ownsVisibleTopLevel);
         if (decision.skipReason) {
             std::wstring line = L"Native window remains untranslated: ";
@@ -1370,10 +1405,23 @@ void RendererSession::DiscoverTopLevelWindows() {
     }
 }
 
+void RendererSession::ScheduleDiscoveryRetry(HWND window) {
+    auto& retry = discoveryRetries_[window];
+    if (++retry.attempts > kMaxTransientDiscoveryRetries) {
+        FluentShell::Log(L"Native window stays untranslated after repeated transient capture failures: " +
+            DescribeTopLevel(window));
+        retry.due = UINT64_MAX;
+        return;
+    }
+    retry.due = GetTickCount64() + kTransientRetryBackoffMs * retry.attempts;
+}
+
 bool RendererSession::OpenNativeWindow(HWND root) {
-    auto agent = SourceThreadAgent::Attach(root, bridgeModule_);
+    bool transient = false;
+    auto agent = SourceThreadAgent::Attach(root, bridgeModule_, &transient);
     if (!agent) {
         FluentShell::Log(L"Native window source-thread attach failed");
+        if (transient) ScheduleDiscoveryRetry(root);
         return false;
     }
     auto surface = std::make_shared<Surface>();
@@ -1381,12 +1429,9 @@ bool RendererSession::OpenNativeWindow(HWND root) {
     surface->snapshot.surfaceId = Ipc::NewGuidString();
     surface->snapshot.revision = 1;
     std::wstring error;
-    const DirectUiWindowProfile* profile = agent->DirectUiProfile();
+    const DirectUiWindowProfile* profile = nullptr;
     DirectUiAdmissionResult admission = DirectUiAdmissionResult::NotApplicable;
-    if (profile) {
-        admission = InspectDirectUiSurface(*agent, *profile, 2000, shutdownEvent_, error,
-            &surface->snapshot, &surface->directUiBindings, &surface->directUiEvidence);
-    } else if (agent->GenericDirectUiCandidate()) {
+    if (agent->GenericDirectUiCandidate()) {
         admission = InspectGenericDirectUiSurface(*agent, 2000, shutdownEvent_, error,
             &surface->directUiOwnedProfile, &surface->snapshot,
             &surface->directUiBindings, &surface->directUiEvidence);
@@ -1395,6 +1440,9 @@ bool RendererSession::OpenNativeWindow(HWND root) {
     if (admission == DirectUiAdmissionResult::Rejected) {
         if (!agent->Shutdown()) RetainSourceThreadAgent(agent);
         FluentShell::Log(error);
+        // The DirectUI attempt only followed a failed HWND capture; when that failure
+        // was a timing condition, the HWND projection deserves another attempt.
+        if (transient) ScheduleDiscoveryRetry(root);
         return false;
     }
     surface->directUiAdapter = admission == DirectUiAdmissionResult::Admitted;
@@ -1571,8 +1619,10 @@ bool IsRecoverableActionFailure(std::wstring_view action) noexcept {
     return action == L"setText" || action == L"setCheck" || action == L"select" ||
         action == L"setSelection" || action == L"setFocusedIndex" ||
         action == L"setItemCheck" || action == L"setItemText" ||
-        action == L"setValue" || action == L"setExpand" || action == L"setSplit" ||
-        action == L"setColumnOrder" || action == L"scrollBy" ||
+        action == L"setValue" || action == L"setExpand" || action == L"setGroupExpanded" || action == L"setSplit" ||
+        action == L"setColumnOrder" || action == L"scrollBy" || action == L"htmlScroll" ||
+        // A context menu the application declines to open changes nothing.
+        action == L"contextMenu" || action == L"setScroll" ||
         action == L"move" || action == L"resize" ||
         action == L"minimize" || action == L"maximize" || action == L"restore";
 }
@@ -1618,7 +1668,7 @@ void RendererSession::HandleNativeAction(
     }
     // Index actions must keep the canonical native row identity across the hop
     // to the source thread, even if native changes have not yet been reconciled.
-    if (effectiveAction.action == L"activateItem" ||
+    if (effectiveAction.action == L"activateItem" || effectiveAction.action == L"setGroupExpanded" ||
         IsOwnerDataListViewIndexedAction(effectiveAction, surface->snapshot))
         effectiveAction.expectedNativeFingerprint = surface->fingerprint;
     if (effectiveAction.action == L"menuCommand")
@@ -2703,37 +2753,10 @@ const wchar_t* RendererSession::ReadmitDirectUiPage(ReconcilePass& pass) {
     std::shared_ptr<DirectUiOwnedProfile> owned;
     const DirectUiWindowProfile* profile = nullptr;
     std::wstring diagnostic;
-    auto admission = DirectUiAdmissionResult::NotApplicable;
-    if (!previousOwned && pass.directUiProfile) {
-        // This surface was admitted through a declarative row, so that row gets the
-        // first look at the page which replaced the one it describes.
-        admission = InspectDirectUiSurface(*agent, *pass.directUiProfile, 2000,
-            shutdownEvent_, diagnostic, &admitted, &bindings, &evidence);
-        if (admission == DirectUiAdmissionResult::Admitted)
-            profile = pass.directUiProfile;
-    }
-    if (admission != DirectUiAdmissionResult::Admitted) {
-        if (!diagnostic.empty()) {
-            try {
-                FluentShell::Log(
-                    L"DirectUI declared row does not describe the next page: " +
-                    diagnostic);
-            } catch (...) {}
-        }
-        admitted = seed;
-        bindings.clear();
-        // Declarative rows describe one page each, so a surface whose row stops
-        // matching degrades to the capability-derived lane every built-in DirectUI
-        // page is admitted through rather than being handed back to native.
-        if (agent->EnableGenericDirectUiCandidate()) {
-            admission = InspectGenericDirectUiSurface(*agent, 2000, shutdownEvent_,
-                diagnostic, &owned, &admitted, &bindings, &evidence);
-            if (admission == DirectUiAdmissionResult::Admitted && owned)
-                profile = &owned->profile;
-        } else {
-            admission = DirectUiAdmissionResult::Rejected;
-        }
-    }
+    const auto admission = InspectGenericDirectUiSurface(*agent, 2000, shutdownEvent_,
+        diagnostic, &owned, &admitted, &bindings, &evidence);
+    if (admission == DirectUiAdmissionResult::Admitted && owned)
+        profile = &owned->profile;
     const bool admittedPage =
         admission == DirectUiAdmissionResult::Admitted && profile != nullptr;
 

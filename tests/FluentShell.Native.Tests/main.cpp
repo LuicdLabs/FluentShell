@@ -3,6 +3,7 @@
 #include "../../src/Bridge/Translation/ControlAdapters.h"
 #include "../../src/Bridge/Translation/WindowCapture.h"
 #include "../../src/Bridge/Translation/SourceThreadAgent.h"
+#include "../../src/Bridge/Translation/GuiThreadDispatch.h"
 #include "../../src/Bridge/Translation/ListViewActivation.h"
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
@@ -17,12 +18,20 @@
 #include "OwnerDataListViewTests.h"
 #include "OwnerDataListViewActionTests.h"
 #include "ToolbarRadioGroupTests.h"
+#include "ToolbarImageVariantTests.h"
+#include "OwnerDrawComboBoxTests.h"
+#include "ListViewGroupTests.h"
+#include "DirectUiVirtualImageTests.h"
+#include "DirectUiDetailEvidenceTests.h"
+#include "NativeDocumentTests.h"
 #include "UiAutomationProjectionTests.h"
 
 #include <winrt/base.h>
 #include <objbase.h>
 #include <oleacc.h>
 #include <commctrl.h>
+#include <crtdbg.h>
+#include <dbghelp.h>
 #include <dwmapi.h>
 #include <prsht.h>
 #include <UIAutomation.h>
@@ -98,6 +107,46 @@ void Check(bool condition, const char* message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
+// A crashing test otherwise ends the process with no output at all, because no
+// test prints on success. Print the faulting stack so the failing test is named.
+LONG WINAPI ReportUnhandledException(EXCEPTION_POINTERS* exception) {
+    const HANDLE process = GetCurrentProcess();
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    SymInitialize(process, nullptr, TRUE);
+    std::cerr << "CRASH: exception 0x" << std::hex
+        << exception->ExceptionRecord->ExceptionCode << std::dec << '\n';
+    CONTEXT context = *exception->ContextRecord;
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME]{};
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+    for (int depth = 0; depth < 48 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, process,
+            GetCurrentThread(), &frame, &context, nullptr, SymFunctionTableAccess64,
+            SymGetModuleBase64, nullptr) && frame.AddrPC.Offset != 0; ++depth) {
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+        DWORD64 displacement = 0;
+        IMAGEHLP_LINE64 line{ sizeof(line) };
+        DWORD lineDisplacement = 0;
+        std::cerr << "  #" << depth << ' ';
+        if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol)) std::cerr << symbol->Name;
+        else std::cerr << "0x" << std::hex << frame.AddrPC.Offset << std::dec;
+        if (SymGetLineFromAddr64(process, frame.AddrPC.Offset, &lineDisplacement, &line))
+            std::cerr << " (" << line.FileName << ':' << line.LineNumber << ')';
+        std::cerr << '\n';
+    }
+    std::cerr.flush();
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+#include "GuiThreadDispatchTests.h"
+#include "CrossThreadSurfaceTests.h"
+#include "SnapshotDetailFingerprintTests.h"
 #include "MdiCaptureRegressionTests.h"
 #include "StaticDecorationRegressionTests.h"
 #include "SiblingZOrderCaptureTests.h"
@@ -200,14 +249,6 @@ Translation::DirectUiWindowEvidence DirectUiWindow(
     return value;
 }
 
-const Translation::DirectUiWindowProfile* TestProfileById(std::wstring_view adapterId) {
-    for (size_t index = 0; index < Translation::kDirectUiProfileCount; ++index) {
-        if (Translation::kDirectUiProfiles[index].adapterId == adapterId)
-            return &Translation::kDirectUiProfiles[index];
-    }
-    return nullptr;
-}
-
 // Builds profile-shaped native evidence. All slots get backing windows for
 // non-virtual slots; virtual slots keep null HWNDs.
 Translation::DirectUiNativeEvidence DirectUiNativeFixture(
@@ -245,11 +286,35 @@ void TestDirectUiEvidenceContracts() {
     Check(!Translation::NormalizeDirectUiEvidenceText(embeddedNull, normalized),
         "ambiguous embedded-NUL DirectUI evidence was accepted");
 
-    // The mutation bracket is profile-independent: it compares root, anchor,
-    // and every backing slot window between A and B.
-    const auto* profile = TestProfileById(L"microsoft.mdsched.directui");
-    Check(profile != nullptr, "MdSched profile is missing from the registry");
-    if (!profile) return;
+    // Capability-derived slots exercise the shared native/UIA contract without
+    // admitting any executable-specific page or trusting its resource IDs.
+    Translation::DirectUiSlot bracketSlots[3];
+    bracketSlots[0].semanticKey = L"semantic.instruction";
+    bracketSlots[0].uiaControlType = UIA_TextControlTypeId;
+    bracketSlots[0].uiaClassName = L"Element";
+    bracketSlots[0].pinUiaPatterns = true;
+    for (size_t index = 1; index < std::size(bracketSlots); ++index) {
+        auto& slot = bracketSlots[index];
+        slot.semanticKey = index == 1 ? L"semantic.next" : L"semantic.cancel";
+        slot.kind = Translation::ControlKind::Button;
+        slot.virtualSource = false;
+        slot.nativeClass = L"Button";
+        slot.uiaControlType = UIA_ButtonControlTypeId;
+        slot.uiaClassName = L"CCPushButton";
+        slot.uiaFocusable = true;
+        slot.uiaActionable = true;
+        slot.pinUiaPatterns = true;
+        slot.uiaPatternMask = Translation::DirectUiPatternInvoke;
+        slot.action = Translation::DirectUiAction::HandoffClick;
+        slot.cancel = index == 2;
+    }
+    Translation::DirectUiWindowProfile bracketProfile;
+    bracketProfile.adapterId = L"microsoft.windows.directui.semantic.v1";
+    bracketProfile.pageId = L"semantic-v1";
+    bracketProfile.rootClass = L"NativeHWNDHost";
+    bracketProfile.slots = bracketSlots;
+    bracketProfile.slotCount = std::size(bracketSlots);
+    const auto* profile = &bracketProfile;
     std::vector<HWND> backing;
     auto before = DirectUiNativeFixture(*profile, backing);
     auto after = before;
@@ -304,14 +369,14 @@ void TestDirectUiEvidenceContracts() {
     // Semantic identity is adapter-scoped, so the same key under two profiles is
     // two different nodes and a RuntimeId never leaks into identity.
     const uint64_t first = Translation::DirectUiSemanticNodeId(
-        profile->adapterId, L"MainInstruction");
+        profile->adapterId, L"semantic.instruction");
     const uint64_t second = Translation::DirectUiSemanticNodeId(
-        profile->adapterId, L"MainInstruction");
+        profile->adapterId, L"semantic.instruction");
     Check(first == second && first != Translation::DirectUiSemanticNodeId(
-        profile->adapterId, L"ContentText"),
+        profile->adapterId, L"semantic.content"),
         "DirectUI semantic identity is not stable and key-scoped");
     Check(first != Translation::DirectUiSemanticNodeId(
-        L"microsoft.recoverydrive.directui", L"MainInstruction"),
+        L"test.other-adapter", L"semantic.instruction"),
         "DirectUI semantic identity is not adapter-scoped");
 
     Check(Translation::IsMicrosoftWindowsSignerName(L"Microsoft Windows") &&
@@ -343,7 +408,6 @@ void TestDirectUiEvidenceContracts() {
     generatedProfile.rootClass = L"NativeHWNDHost";
     generatedProfile.slots = generatedSlots;
     generatedProfile.slotCount = std::size(generatedSlots);
-    generatedProfile.genericSemantic = true;
     Translation::DirectUiNativeEvidence generatedNative;
     generatedNative.root = DirectUiWindow(0x500, 50, 0, WS_VISIBLE | WS_POPUP);
     generatedNative.directUi = DirectUiWindow(0x501, 51, 0);
@@ -436,35 +500,54 @@ void TestDirectUiEvidenceContracts() {
               generatedNative, generatedSnapshot, generatedBindings, error),
         "generated DirectUI refresh accepted a changed semantic identity");
 
-    // The admitted profile set is exactly the two known application pages.
-    Check(Translation::kDirectUiProfileCount == 2 &&
-          TestProfileById(L"microsoft.mdsched.directui") != nullptr &&
-          TestProfileById(L"microsoft.recoverydrive.directui") != nullptr,
-        "DirectUI profile registry does not contain exactly the two admitted pages");
-    const auto* recovery = TestProfileById(L"microsoft.recoverydrive.directui");
-    Check(recovery && recovery->rootClass == L"NativeHWNDHost" &&
-          recovery->fileVersion[3] == 33296,
-        "RecoveryDrive profile identity is not the exact admitted contract");
-    bool foundToggle = false;
-    bool foundDisabledBack = false;
-    bool foundPageText = false;
-    for (size_t index = 0; recovery && index < recovery->slotCount; ++index) {
-        const auto& slot = recovery->slots[index];
-        if (slot.action == Translation::DirectUiAction::ToggleCheck) foundToggle = true;
-        if (slot.semanticKey == L"backbutton" && !slot.project) {}
-        if (slot.semanticKey == L"backbutton" && slot.action == Translation::DirectUiAction::None &&
-            !slot.uiaEnabled)
-            foundDisabledBack = true;
-        if (slot.semanticKey == L"pageText" && slot.project && !slot.virtualSource &&
-            slot.nativeClass == L"Static")
-            foundPageText = true;
+    Translation::DirectUiUiaEvidence uia;
+    uia.rootHwnd = before.root.hwnd;
+    uia.directUiHwnd = before.directUi.hwnd;
+    for (size_t index = 0; index < profile->slotCount; ++index) {
+        const auto& slot = profile->slots[index];
+        Translation::DirectUiSemanticEvidence semantic;
+        semantic.semanticKey = slot.semanticKey;
+        semantic.name = slot.virtualSource ? L"localized instruction" : before.slotWindows[index].text;
+        semantic.className = slot.uiaClassName;
+        semantic.frameworkId = slot.uiaFrameworkId;
+        semantic.controlType = slot.uiaControlType;
+        semantic.enabled = slot.uiaEnabled;
+        semantic.focusable = slot.uiaFocusable;
+        semantic.actionable = slot.uiaActionable;
+        semantic.patternMask = slot.uiaPatternMask;
+        semantic.bounds = slot.virtualSource ? RECT{ 10, 20, 310, 60 } : before.slotWindows[index].bounds;
+        semantic.backingHwnd = slot.virtualSource ? nullptr : before.slotWindows[index].hwnd;
+        uia.semantics.push_back(std::move(semantic));
     }
-    Check(foundToggle, "RecoveryDrive profile does not route the checkbox through native toggle");
-    Check(foundDisabledBack, "RecoveryDrive profile does not declare the back button inert");
-    Check(foundPageText && recovery->directUiOwnsTabOrder &&
-          recovery->census.visibleNotifyWrappers == 3 &&
-          recovery->census.hiddenNotifyWrappers == 2,
-        "RecoveryDrive profile does not pin its observed page text, tab owner, and census");
+    Check(Translation::MatchDirectUiEvidence(*profile, before, uia, error),
+        "capability-derived DirectUI UIA evidence was rejected");
+    auto changedUia = uia;
+    changedUia.semantics[0].controlType = UIA_PaneControlTypeId;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted changed virtual provider role");
+    changedUia = uia;
+    changedUia.semantics[0].patternMask = Translation::DirectUiPatternInvoke;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted new actions on a presentation-only virtual slot");
+    changedUia = uia;
+    changedUia.semantics.push_back(uia.semantics[0]);
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted duplicated virtual semantic identity");
+    changedUia = uia;
+    changedUia.semantics[1].bounds.right += 30;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted native/UIA backing geometry mismatch");
+    changedUia = uia;
+    changedUia.semantics[1].patternMask = Translation::DirectUiPatternNone;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted removal of a backing control's verified route");
+    changedUia = uia;
+    auto unexpected = uia.semantics[0];
+    unexpected.semanticKey = L"unexpected";
+    changedUia.semantics.push_back(std::move(unexpected));
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted a semantic outside the sealed capability contract");
+
 }
 
 // The in-place routes are the ones that keep a capability-derived page
@@ -589,7 +672,6 @@ void TestDirectUiInPlaceRoutes() {
     profile.rootClass = L"NativeHWNDHost";
     profile.slots = slots;
     profile.slotCount = std::size(slots);
-    profile.genericSemantic = true;
 
     Translation::DirectUiNativeEvidence before;
     before.root = DirectUiWindow(0x600, 60, 0, WS_VISIBLE | WS_POPUP);
@@ -2689,6 +2771,24 @@ void TestMenuBarToolbarLifecycle() {
         menu[0].items[0].commandId == 77 && menu[0].items[0].itemId == L"0.0" &&
         menu[1].itemId == L"1" && !menu[1].enabled && menu[1].items.empty(),
         "menu-bar capture lost copied commands, system-menu filtering or empty popup state");
+    {
+        // The Window button opens nothing. The read remembers that, and the next
+        // read waits only briefly for it instead of the full popup interval.
+        std::vector<bool> silent;
+        auto started = GetTickCount64();
+        const bool first = Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            600, 4000, cancelled, menu, error, nullptr, &silent);
+        const auto firstElapsed = GetTickCount64() - started;
+        Check(first && silent == std::vector<bool>{ false, false, true },
+            "menu-bar read did not remember the button that opened no popup");
+        started = GetTickCount64();
+        const bool second = Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            600, 4000, cancelled, menu, error, nullptr, &silent);
+        const auto secondElapsed = GetTickCount64() - started;
+        Check(second && menu.size() == 2 && !menu[1].enabled && firstElapsed >= 600 &&
+            secondElapsed + 300 < firstElapsed,
+            "a button that opened no popup still cost the full wait on the next read");
+    }
     context.menuBarToolbarMenu = menu;
     Translation::ObserveMenuBarToolbar(root, context);
     Check(!context.menuBarToolbarMenu.empty(), "unchanged toolbar discarded cached menu");
@@ -3104,11 +3204,20 @@ void TestSourceThreadPopupTracking() {
         action.action = L"islandInvoke";
         action.itemIndex = 0;
         Translation::ActionOutcome outcome;
-        if (!agent->Invoke(action, outcome) || !outcome.accepted) return false;
+        if (!agent->Invoke(action, outcome) || !outcome.accepted) {
+            std::wcerr << L"source popup invoke: " << outcome.error << L'\n';
+            return false;
+        }
         snapshot = std::move(outcome.snapshot);
         if (WaitForSingleObject(runtime.tracking, 2000) != WAIT_OBJECT_0 ||
-            WaitForSingleObject(runtime.returned, 0) != WAIT_TIMEOUT) return false;
-        return agent->Capture(snapshot, error) && snapshot.popupMenu.has_value();
+            WaitForSingleObject(runtime.returned, 0) != WAIT_TIMEOUT) {
+            std::wcerr << L"source popup tracking did not start or returned early\n";
+            return false;
+        }
+        const bool captured = agent->Capture(snapshot, error);
+        if (!captured || !snapshot.popupMenu)
+            std::wcerr << L"source popup snapshot: " << error << L'\n';
+        return captured && snapshot.popupMenu.has_value();
     };
     const auto answer = [&](std::optional<std::wstring> itemId) {
         Translation::ActionRequest action;
@@ -4297,10 +4406,21 @@ void TestMdiFrameCaptureAndCommands() {
 #include "ListViewActivationTests.h"
 #include "NativeListViewDoubleClickTests.h"
 #include "ListViewActivationFallbackTests.h"
+#include "ItemContextMenuTests.h"
+#include "WinFormsOwnerDrawTests.h"
+#include "ScrollingContainerTests.h"
 
 } // namespace
 
 int wmain() {
+#ifdef _DEBUG
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
+    SetUnhandledExceptionFilter(ReportUnhandledException);
+    // Snapshot serialization uses WinRT JSON, so the apartment must exist before
+    // the first test that serializes a frame.
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     // Capture always runs inside a per-monitor-aware scope, so every rectangle it
     // reads is in physical pixels.  A DPI-unaware test process would have its own
     // windows virtualized by DWM, leaving window rectangles and the geometry a
@@ -4309,9 +4429,20 @@ int wmain() {
     // declare the same awareness so their fixtures live in one space.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     TestVisibleUiaBoundsClipping();
+    TestGuiThreadDispatch();
+    TestCrossThreadSurface();
+    TestSnapshotDetailFingerprint();
+    FluentShell::Tests::TestDirectUiVirtualImages(Check);
+    FluentShell::Tests::TestDirectUiDetailEvidence(Check);
+    FluentShell::Tests::TestNativeDocumentAdmission(Check);
+    FluentShell::Tests::TestOwnerDrawComboBoxes(Check);
+    {
+        ListActivationCommonControls groups(ICC_LISTVIEW_CLASSES);
+        Check(static_cast<bool>(groups), "grouped ListView common-controls v6 context failed");
+        if (groups) FluentShell::Tests::TestListViewGroups(Check);
+    }
     TestDirectUiEvidenceContracts();
     TestDirectUiInPlaceRoutes();
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     INITCOMMONCONTROLSEX controls{ sizeof(controls),
         ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
     Check(InitCommonControlsEx(&controls) != FALSE,
@@ -4352,6 +4483,10 @@ int wmain() {
     TestPopupMenuState();
     TestSourceThreadPopupTracking();
     TestPopupActionProtocol();
+    TestItemContextMenuProtocol();
+    TestItemContextMenuTracking();
+    TestWinFormsOwnerDrawControls();
+    TestScrollingContainer();
     TestMenuActionValidationAndSerialization();
     TestToolbarCaptureBoundary();
     TestVirtualDialogSnapshots();
@@ -4373,6 +4508,13 @@ int wmain() {
     FluentShell::Tests::TestOwnerDataListViews(Check);
     FluentShell::Tests::TestOwnerDataListViewActions(Check);
     FluentShell::Tests::TestToolbarRadioGroups(Check);
+    {
+        // Pressed toolbar images are a v6 contract; keep other fixtures on the
+        // legacy common-controls path they are intended to exercise.
+        ListActivationCommonControls toolbarControls(ICC_BAR_CLASSES);
+        Check(static_cast<bool>(toolbarControls), "toolbar v6 activation failed");
+        if (toolbarControls) FluentShell::Tests::TestToolbarImageVariants(Check);
+    }
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";
         return 1;

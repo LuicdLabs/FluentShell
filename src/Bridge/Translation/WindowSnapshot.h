@@ -44,6 +44,8 @@ enum class ControlKind {
     StaticDecoration,
     StaticBitmap,
     UpDown,
+    NativeDocument,
+    DiskView,
     Count,
 };
 
@@ -67,6 +69,20 @@ struct PaneSplitSnapshot final {
     int thickness = 0;
     int minimum = 0;
     int maximum = 0;
+};
+
+// A standard window scroll bar of a container whose application scrolls its child
+// windows (a WinForms AutoScroll panel). The rect is in the node's own window-
+// relative coordinates; position is the application's, moved only through its own
+// WM_VSCROLL/WM_HSCROLL handling.
+struct ScrollBarSnapshot final {
+    bool vertical = true;
+    bool enabled = true;
+    int minimum = 0;
+    int maximum = 0;
+    int page = 0;
+    int position = 0;
+    RECT rect{};
 };
 
 // One rectangle of a container's client area that no child covers and that is too
@@ -100,6 +116,92 @@ struct AccessibleIslandItemSnapshot final {
     std::vector<uint8_t> imageData;
 };
 
+// An owned icon from a native image list. Item-bearing controls address shared
+// entries by projection index; toolbar state variants carry one optional entry.
+struct ImageListEntry final {
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
+};
+
+// A DOM scrollport or the standard native scrollbar of an embedded report.
+// Coordinates remain physical pixels; native report ranges remain native units.
+struct NativeDocumentRegion final {
+    std::wstring key;
+    std::wstring kind;
+    RECT rect{};
+    int contentWidth = 0;
+    int contentHeight = 0;
+    int maximumX = 0;
+    int maximumY = 0;
+    int offsetX = 0;
+    int offsetY = 0;
+};
+
+struct NativeReportRow final {
+    std::wstring path;
+    double value = 0;
+    bool available = false;
+};
+
+struct NativeDocumentItem final {
+    std::wstring key;
+    std::wstring kind;
+    RECT rect{};
+    int regionIndex = -1;
+    int reportRegionIndex = -1;
+    std::wstring name;
+    std::wstring actionIdentity;
+    bool enabled = true;
+    std::optional<ImageListEntry> image;
+    std::vector<NativeReportRow> reportRows;
+};
+
+struct NativeDocumentSnapshot final {
+    std::wstring documentId;
+    std::vector<NativeDocumentRegion> regions;
+    std::vector<NativeDocumentItem> items;
+};
+
+struct OwnerDrawComboItemSnapshot final {
+    ImageListEntry normal;
+    ImageListEntry selected;
+};
+
+// The Windows Disk Management graphical view's own MSAA table. IDs are native
+// positive child IDs, never disk numbers or indexes into an independent query.
+struct DiskViewItemSnapshot final {
+    uint32_t itemId = 0;
+    uint32_t diskId = 0;
+    std::wstring kind;
+    RECT rect{};
+    std::wstring name;
+    std::wstring value;
+    bool enabled = true;
+    bool selected = false;
+    bool focused = false;
+};
+
+struct DiskViewSnapshot final {
+    std::wstring name;
+    RECT clientRect{};
+    RECT scrollRect{};
+    int scrollMinimum = 0;
+    int scrollMaximum = 0;
+    int scrollPosition = 0;
+    int scrollPage = 0;
+    std::vector<DiskViewItemSnapshot> items;
+};
+
+struct OwnerDrawComboSnapshot final {
+    std::wstring mode;
+    std::vector<OwnerDrawComboItemSnapshot> items;
+    // A dropdown-list selection field gets ODS_COMBOBOXEDIT, including itemID
+    // UINT(-1) when empty. Editable combos keep the native text editor instead.
+    std::optional<ImageListEntry> selectionFace;
+};
+
 struct ToolbarItemSnapshot final {
     ToolbarItemKind kind = ToolbarItemKind::PushButton;
     uint32_t commandId = 0;
@@ -123,16 +225,22 @@ struct ToolbarItemSnapshot final {
     uint32_t imageHeight = 0;
     std::wstring imageFormat;
     std::vector<uint8_t> imageData;
+    std::optional<ImageListEntry> hotImage;
+    std::optional<ImageListEntry> disabledImage;
+    std::optional<ImageListEntry> pressedImage;
 };
 
-// One referenced icon from a control's own image list. Item-bearing controls
-// share a bounded compact list and address it by projection index; unused native
-// entries do not travel, and repeated references share the same owned pixels.
-struct ImageListEntry final {
-    uint32_t imageWidth = 0;
-    uint32_t imageHeight = 0;
-    std::wstring imageFormat;
-    std::vector<uint8_t> imageData;
+struct ListViewGroupSnapshot final {
+    int groupId = 0;
+    std::wstring header;
+    std::wstring footer;
+    std::wstring headerAlignment = L"left";
+    std::wstring footerAlignment = L"left";
+    bool collapsible = false;
+    bool collapsed = false;
+    bool hidden = false;
+    RECT headerRect{};
+    RECT footerRect{};
 };
 
 struct ControlNode final {
@@ -187,9 +295,14 @@ struct ControlNode final {
     bool vertical = false;
     bool reversed = false;
     std::vector<std::wstring> items;
+    std::optional<OwnerDrawComboSnapshot> ownerDrawCombo;
     // ListView presentation mode. Report remains the default for old snapshots;
     // icon/list modes carry item labels and geometry without synthetic columns.
     std::wstring listViewMode = L"report";
+    bool groupViewEnabled = false;
+    // Native display order; row membership keeps the canonical item sequence.
+    std::vector<ListViewGroupSnapshot> listViewGroups;
+    std::vector<int> itemGroupIds;
     // TCM_GETITEMRECT / non-report LVM_GETITEMRECT results in client-local physical
     // pixels. List items may lie outside the current viewport after scrolling.
     std::vector<RECT> itemRects;
@@ -242,8 +355,12 @@ struct ControlNode final {
     // container paints itself.
     std::vector<PaneSplitSnapshot> splits;
     std::vector<ChromeRegionSnapshot> chromeRegions;
+    // Scrolling containers only, with clientRect set to the scrolled viewport.
+    std::vector<ScrollBarSnapshot> scrollBars;
     // Accessible islands only: the HWND-less elements the host window exposes.
     std::vector<AccessibleIslandItemSnapshot> islandItems;
+    std::optional<NativeDocumentSnapshot> document;
+    std::optional<DiskViewSnapshot> diskView;
     std::wstring adapterId;
     std::wstring pageId;
     std::wstring semanticKey;
@@ -331,11 +448,19 @@ struct ActionRequest final {
     // generation across the source-thread hop, including a failed recapture.
     uint64_t expectedMenuBindingGeneration = 0;
     std::wstring action;
+    std::wstring nativeDocumentId;
+    std::wstring nativeDocumentItemKey;
+    std::wstring nativeDocumentActionIdentity;
+    uint32_t diskItemId = 0;
     std::wstring text;
     int integerValue = 0;
     std::vector<int> integerValues;
     int itemIndex = -1;
     bool booleanValue = false;
+    // setScroll: booleanValue names the vertical bar, and integerValue is either a
+    // target position or (when this is set) a signed count of line steps.
+    bool scrollByLines = false;
+    int groupId = 0;
     int selectionStart = 0;
     int selectionLength = 0;
     uint32_t menuCommandId = 0;

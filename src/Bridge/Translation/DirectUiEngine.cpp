@@ -2,6 +2,7 @@
 
 #include "SourceThreadAgent.h"
 #include "ControlAdapters.h"
+#include "PaintedPixel.h"
 #include "../../Common/FluentShell.h"
 #include "../Ipc/Protocol.h"
 
@@ -9,7 +10,6 @@
 #include <dwmapi.h>
 #include <wincrypt.h>
 #include <mscat.h>
-#include <winver.h>
 #include <wintrust.h>
 #include <softpub.h>
 #include <commctrl.h>
@@ -20,13 +20,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <future>
 #include <memory>
 #include <thread>
 #include <unordered_set>
 
-#pragma comment(lib, "version.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
 
@@ -45,6 +45,10 @@ constexpr int kMaxUiaDescendants = 512;
 // Items a single projected composite may own. Larger native lists stay native
 // rather than being truncated into a partially represented control.
 constexpr size_t kMaxCompositeItems = 256;
+// The host is rendered offscreen once per image. Bound the transient allocation
+// independently of the small image payload; no host pixels leave the Bridge.
+constexpr LONG kMaxImageHostDimension = 4096;
+constexpr size_t kMaxImageHostBytes = 32u * 1024u * 1024u;
 
 bool Fail(std::wstring& error, std::wstring_view value) {
     error.assign(value);
@@ -59,6 +63,13 @@ std::wstring ClassName(HWND window) {
 
 bool SameRect(const RECT& left, const RECT& right) noexcept {
     return EqualRect(&left, &right) != FALSE;
+}
+
+bool SameImage(const DirectUiWindowEvidence& left,
+    const DirectUiWindowEvidence& right) noexcept {
+    return left.imageWidth == right.imageWidth &&
+        left.imageHeight == right.imageHeight &&
+        left.imageFormat == right.imageFormat && left.imageData == right.imageData;
 }
 
 bool SameImplementationIdentity(
@@ -197,6 +208,55 @@ bool CaptureSlotDetail(
     return true;
 }
 
+bool SameImageEntry(const ImageListEntry& left, const ImageListEntry& right) noexcept {
+    return left.imageWidth == right.imageWidth && left.imageHeight == right.imageHeight &&
+        left.imageFormat == right.imageFormat && left.imageData == right.imageData;
+}
+
+bool SameOptionalImage(const std::optional<ImageListEntry>& left,
+    const std::optional<ImageListEntry>& right) noexcept {
+    return left.has_value() == right.has_value() && (!left || SameImageEntry(*left, *right));
+}
+
+bool SameOwnerDrawCombo(const std::optional<OwnerDrawComboSnapshot>& left,
+    const std::optional<OwnerDrawComboSnapshot>& right) noexcept {
+    if (left.has_value() != right.has_value()) return false;
+    if (!left) return true;
+    if (left->mode != right->mode || left->items.size() != right->items.size() ||
+        !SameOptionalImage(left->selectionFace, right->selectionFace)) return false;
+    for (size_t index = 0; index < left->items.size(); ++index) {
+        if (!SameImageEntry(left->items[index].normal, right->items[index].normal) ||
+            !SameImageEntry(left->items[index].selected, right->items[index].selected)) return false;
+    }
+    return true;
+}
+
+bool SameGroupShape(const ControlNode& left, const ControlNode& right) noexcept {
+    if (left.groupViewEnabled != right.groupViewEnabled ||
+        left.listViewGroups.size() != right.listViewGroups.size() ||
+        left.itemGroupIds != right.itemGroupIds) return false;
+    for (size_t index = 0; index < left.listViewGroups.size(); ++index) {
+        const auto& a = left.listViewGroups[index];
+        const auto& b = right.listViewGroups[index];
+        if (a.groupId != b.groupId || a.collapsible != b.collapsible) return false;
+    }
+    return true;
+}
+
+bool SameGroupContent(const std::vector<ListViewGroupSnapshot>& left,
+    const std::vector<ListViewGroupSnapshot>& right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t index = 0; index < left.size(); ++index) {
+        const auto& a = left[index];
+        const auto& b = right[index];
+        if (a.header != b.header || a.footer != b.footer ||
+            a.headerAlignment != b.headerAlignment || a.footerAlignment != b.footerAlignment ||
+            a.collapsed != b.collapsed || a.hidden != b.hidden ||
+            !SameRect(a.headerRect, b.headerRect) || !SameRect(a.footerRect, b.footerRect)) return false;
+    }
+    return true;
+}
+
 bool SameToolbarItems(
     const std::vector<ToolbarItemSnapshot>& left,
     const std::vector<ToolbarItemSnapshot>& right) noexcept {
@@ -209,7 +269,11 @@ bool SameToolbarItems(
             a.checked != b.checked || a.radioGroup != b.radioGroup ||
             a.dropDown != b.dropDown || a.wholeDropDown != b.wholeDropDown ||
             a.imageWidth != b.imageWidth || a.imageHeight != b.imageHeight ||
-            a.imageFormat != b.imageFormat || a.imageData != b.imageData) return false;
+            a.imageFormat != b.imageFormat || a.imageData != b.imageData ||
+            a.paintedFace != b.paintedFace ||
+            !SameOptionalImage(a.hotImage, b.hotImage) ||
+            !SameOptionalImage(a.disabledImage, b.disabledImage) ||
+            !SameOptionalImage(a.pressedImage, b.pressedImage)) return false;
     }
     return true;
 }
@@ -246,8 +310,7 @@ bool SameItemImageList(
     for (size_t index = 0; index < left.size(); ++index) {
         const auto& a = left[index];
         const auto& b = right[index];
-        if (a.imageWidth != b.imageWidth || a.imageHeight != b.imageHeight ||
-            a.imageFormat != b.imageFormat || a.imageData != b.imageData) return false;
+        if (!SameImageEntry(a, b)) return false;
     }
     return true;
 }
@@ -476,6 +539,9 @@ bool CaptureDirectUiBootstrapCore(
         value.className = ClassName(child);
         if (value.className.empty() ||
             !ReadBasicWindowEvidence(agent, child, value.window, error)) return false;
+        if (!GetClientRect(child, &value.clientBounds) ||
+            !ClientToScreen(child, &value.clientOriginScreen))
+            return Fail(error, L"bootstrap: descendant client geometry is unavailable");
         // A composite control's own implementation child is absorbed by its owner
         // slot rather than projected. The probe interrogates the parent with
         // messages, so it can only run here, on the control's own GUI thread. It
@@ -494,8 +560,14 @@ bool CaptureDirectUiBootstrapCore(
                 IsDirectUiCompositeKind(value.controlKind)) {
                 ControlNode probe;
                 std::wstring ignoredDetail;
-                if (CaptureDirectUiSlotNode(child, value.controlKind, probe, ignoredDetail))
+                if (CaptureDirectUiSlotNode(child, value.controlKind, probe, ignoredDetail)) {
                     value.nativeItemCount = DirectUiNativeItemCount(probe);
+                    value.nativeGroupViewEnabled = probe.kind == ControlKind::ListView && probe.groupViewEnabled;
+                    value.nativeVisibleItemCount = value.nativeGroupViewEnabled
+                        ? static_cast<size_t>(std::count_if(probe.itemRects.begin(), probe.itemRects.end(),
+                            [](const RECT& rect) { return rect.right > rect.left && rect.bottom > rect.top; }))
+                        : value.nativeItemCount;
+                }
             }
         }
         evidence.native.implementationWindows.push_back({
@@ -540,24 +612,6 @@ std::wstring CanonicalPath(std::wstring_view path) {
     if (result.starts_with(L"\\\\?\\")) result.erase(0, 4);
     return result;
 }
-
-bool ExactFileVersion(std::wstring_view path, const DirectUiWindowProfile& profile) {
-    const std::wstring owned(path);
-    DWORD ignored = 0;
-    const DWORD size = GetFileVersionInfoSizeW(owned.c_str(), &ignored);
-    if (!size || size > 1024 * 1024) return false;
-    std::vector<uint8_t> data(size);
-    if (!GetFileVersionInfoW(owned.c_str(), 0, size, data.data())) return false;
-    VS_FIXEDFILEINFO* info = nullptr;
-    UINT infoSize = 0;
-    if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &infoSize) ||
-        !info || infoSize < sizeof(*info) || info->dwSignature != VS_FFI_SIGNATURE) return false;
-    return HIWORD(info->dwFileVersionMS) == profile.fileVersion[0] &&
-        LOWORD(info->dwFileVersionMS) == profile.fileVersion[1] &&
-        HIWORD(info->dwFileVersionLS) == profile.fileVersion[2] &&
-        LOWORD(info->dwFileVersionLS) == profile.fileVersion[3];
-}
-
 
 std::wstring BstrValue(BSTR raw) {
     std::wstring value = raw ? std::wstring(raw, SysStringLen(raw)) : L"";
@@ -942,6 +996,9 @@ bool CaptureUia(
         return Fail(error, L"DirectUI anchor UIA identity mismatch");
     evidence.directUiHwnd = directUiHwnd;
     ComPtr<IUIAutomationCondition> condition;
+    ComPtr<IUIAutomationTreeWalker> rawWalker;
+    if (FAILED(automation->get_RawViewWalker(&rawWalker)) || !rawWalker)
+        return Fail(error, L"UIA ancestry walker is unavailable");
     if (FAILED(automation->CreateTrueCondition(&condition)) || !condition)
         return Fail(error, L"UIA descendant condition failed");
     ComPtr<IUIAutomationElementArray> descendants;
@@ -966,6 +1023,27 @@ bool CaptureUia(
             return Fail(error, L"visible UIA semantic evidence read failed");
         if (!ReadPatterns(element.Get(), semantic))
             return Fail(error, L"visible UIA action-pattern evidence read failed");
+        if (semantic.controlType == UIA_ImageControlTypeId && !semantic.backingHwnd &&
+            !semantic.offscreen) {
+            ComPtr<IUIAutomationElement> current = element;
+            for (int depth = 0; depth < 64; ++depth) {
+                ComPtr<IUIAutomationElement> parent;
+                UIA_HWND host = nullptr;
+                int parentPid = 0;
+                if (FAILED(rawWalker->GetParentElement(current.Get(), &parent)) || !parent ||
+                    FAILED(parent->get_CurrentNativeWindowHandle(&host)) ||
+                    FAILED(parent->get_CurrentProcessId(&parentPid)) ||
+                    parentPid != static_cast<int>(processId))
+                    return Fail(error, L"UIA image native ancestry is unavailable");
+                if (host) {
+                    semantic.imageHostHwnd = reinterpret_cast<HWND>(host);
+                    break;
+                }
+                current = std::move(parent);
+            }
+            if (!semantic.imageHostHwnd)
+                return Fail(error, L"UIA image native ancestry exceeds the bound");
+        }
         const bool actionable = semantic.actionable || semantic.focusable ||
             semantic.controlType == UIA_ButtonControlTypeId ||
             semantic.controlType == UIA_HyperlinkControlTypeId ||
@@ -1043,6 +1121,8 @@ std::wstring_view DirectUiActionName(DirectUiAction action, ControlKind kind) no
         return kind == ControlKind::ListView ? L"setSelection" : L"select";
     case DirectUiAction::SetItemCheck:
         return L"setItemCheck";
+    case DirectUiAction::SetGroupExpanded:
+        return L"setGroupExpanded";
     case DirectUiAction::ToolbarCommand:
         return L"toolbarCommand";
     default:
@@ -1062,6 +1142,10 @@ bool DirectUiSecondaryActionApplies(
             (node.kind == ControlKind::ComboBox && node.editable)) && !node.readOnly;
     case DirectUiAction::SetItemCheck:
         return node.kind == ControlKind::ListView && node.checkBoxes;
+    case DirectUiAction::SetGroupExpanded:
+        return node.kind == ControlKind::ListView && node.groupViewEnabled &&
+            std::any_of(node.listViewGroups.begin(), node.listViewGroups.end(),
+                [](const auto& group) { return group.collapsible && !group.hidden; });
     default:
         return false;
     }
@@ -1077,38 +1161,15 @@ void SetDirectUiSupportedActions(const DirectUiSlot& slot, ControlNode& node) {
     if (!secondary.empty() && secondary != primary &&
         DirectUiSecondaryActionApplies(slot.secondaryAction, node))
         node.supportedActions.emplace_back(secondary);
+    const std::wstring_view tertiary = DirectUiActionName(slot.tertiaryAction, slot.kind);
+    if (!tertiary.empty() && tertiary != primary && tertiary != secondary &&
+        DirectUiSecondaryActionApplies(slot.tertiaryAction, node))
+        node.supportedActions.emplace_back(tertiary);
 }
 
 RECT ClientRectFor(const RECT& screen, const POINT& origin) noexcept {
     return { screen.left - origin.x, screen.top - origin.y,
         screen.right - origin.x, screen.bottom - origin.y };
-}
-
-bool LoadTrustedIconResource(
-    std::wstring_view imagePath,
-    int resourceId,
-    int width,
-    int height,
-    ControlNode& node,
-    std::wstring& error) {
-    const std::wstring owned(imagePath);
-    HMODULE resources = LoadLibraryExW(owned.c_str(), nullptr,
-        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
-    if (!resources) return Fail(error, L"resource: application image resource module unavailable");
-    HICON icon = reinterpret_cast<HICON>(LoadImageW(resources, MAKEINTRESOURCEW(resourceId),
-        IMAGE_ICON, width, height, LR_DEFAULTCOLOR));
-    bool captured = false;
-    if (icon) {
-        captured = CaptureOwnedIconPixels(icon, node.imageWidth, node.imageHeight,
-            node.imageFormat, node.imageData, error);
-        DestroyIcon(icon);
-    } else {
-        error = L"resource: application icon resource is unavailable";
-    }
-    FreeLibrary(resources);
-    return captured && node.imageWidth == static_cast<uint32_t>(width) &&
-        node.imageHeight == static_cast<uint32_t>(height) ||
-        Fail(error, L"resource: application icon did not resolve to owned pixels");
 }
 
 // Publishes a backing control's adapter-read typed state onto the projected
@@ -1163,6 +1224,7 @@ bool ApplyDirectUiDetailToNode(
         node.text = detail.text;
         node.items = detail.items;
         node.selectedIndex = detail.selectedIndex;
+        node.ownerDrawCombo = detail.ownerDrawCombo;
         node.editable = detail.editable;
         node.readOnly = detail.readOnly;
         break;
@@ -1175,6 +1237,9 @@ bool ApplyDirectUiDetailToNode(
     case ControlKind::ListView:
         node.items = detail.items;
         node.listViewMode = detail.listViewMode;
+        node.groupViewEnabled = detail.groupViewEnabled;
+        node.listViewGroups = detail.listViewGroups;
+        node.itemGroupIds = detail.itemGroupIds;
         node.itemRects = detail.itemRects;
         node.itemNativeIds = detail.itemNativeIds;
         node.itemActivationSupported = detail.itemActivationSupported;
@@ -1219,11 +1284,10 @@ bool ApplyDirectUiDetailToNode(
 }
 
 // Builds the composite renderer snapshot from verified evidence. Every node is
-// emitted by profile slot order, so no two profiles can drift apart.
+// emitted in the verified semantic order.
 bool BuildCompositeSnapshot(
     SourceThreadAgent& agent,
     const DirectUiWindowProfile& profile,
-    std::wstring_view imagePath,
     const DirectUiNativeEvidence& native,
     const DirectUiUiaEvidence& uia,
     WindowSnapshot& snapshot,
@@ -1286,12 +1350,19 @@ bool BuildCompositeSnapshot(
             node.automationName = semantic->name;
             node.helpText = semantic->helpText;
             node.accessKey = semantic->accessKey;
+            if (slot.captureBitmap) {
+                const auto& image = native.slotWindows[index];
+                if (image.imageFormat != L"bgra8-premultiplied" ||
+                    !image.imageWidth || !image.imageHeight || image.imageData.size() !=
+                        static_cast<size_t>(image.imageWidth) * image.imageHeight * 4)
+                    return Fail(error, L"snapshot: virtual image pixels are missing");
+                node.imageWidth = image.imageWidth;
+                node.imageHeight = image.imageHeight;
+                node.imageFormat = image.imageFormat;
+                node.imageData = image.imageData;
+            }
             if (slot.kind == ControlKind::CheckBox && semantic->toggleState >= 0)
                 node.checked = semantic->toggleState == ToggleState_On ? 1 : 0;
-            if (slot.iconResourceId) {
-                if (!LoadTrustedIconResource(imagePath, slot.iconResourceId,
-                        slot.iconWidth, slot.iconHeight, node, error)) return false;
-            }
         } else {
             const DirectUiWindowEvidence& backing = native.slotWindows[index];
             const auto* semantic = FindSemanticByBacking(uia, backing.hwnd);
@@ -1343,7 +1414,7 @@ bool BuildCompositeSnapshot(
                 slot.virtualSource ? native.root.hwnd : native.slotWindows[index].hwnd,
                 slot.virtualSource ? native.root.generation : native.slotWindows[index].generation,
                 index, slot.kind, slot.action, slot.secondaryAction, slot.cancel,
-                slot.propertySheetButton });
+                slot.propertySheetButton, slot.tertiaryAction });
         }
         snapshot.nodes.push_back(std::move(node));
     }
@@ -1353,7 +1424,6 @@ bool BuildCompositeSnapshot(
 bool BuildGenericSemanticProfile(
     const DirectUiBootstrapEvidence& native,
     DirectUiUiaEvidence& uia,
-    std::wstring_view imagePath,
     std::shared_ptr<DirectUiOwnedProfile>& owned,
     std::wstring& error) {
     if (uia.semantics.empty() ||
@@ -1410,8 +1480,9 @@ bool BuildGenericSemanticProfile(
             if (!owner || !owner->controlSupported ||
                 !IsDirectUiCompositeKind(owner->controlKind)) continue;
         } else if (!backing->controlSupported ||
-                   !IsAbsorbedChildControlType(
-                       backing->controlKind, semantic.controlType)) {
+                   (!IsAbsorbedChildControlType(backing->controlKind, semantic.controlType) &&
+                    !(backing->controlKind == ControlKind::ListView && backing->nativeGroupViewEnabled &&
+                        semantic.controlType == UIA_GroupControlTypeId))) {
             continue;
         }
         const uint32_t childPatterns = semantic.patternMask &
@@ -1788,7 +1859,10 @@ bool BuildGenericSemanticProfile(
             slot.presentationVariant = L"standard";
             slot.captureDetail = true;
             slot.action = DirectUiAction::SelectListItem;
-            if (nativeListView) slot.secondaryAction = DirectUiAction::SetItemCheck;
+            if (nativeListView) {
+                slot.secondaryAction = DirectUiAction::SetItemCheck;
+                slot.tertiaryAction = DirectUiAction::SetGroupExpanded;
+            }
             break;
         case UIA_DataGridControlTypeId:
         case UIA_TableControlTypeId:
@@ -1804,6 +1878,7 @@ bool BuildGenericSemanticProfile(
             slot.captureDetail = true;
             slot.action = DirectUiAction::SelectListItem;
             slot.secondaryAction = DirectUiAction::SetItemCheck;
+            slot.tertiaryAction = DirectUiAction::SetGroupExpanded;
             break;
         case UIA_TabControlTypeId:
             if (!nativeTabControl || semantic.actionable ||
@@ -1855,6 +1930,9 @@ bool BuildGenericSemanticProfile(
             slot.action = DirectUiAction::ToolbarCommand;
             break;
         case UIA_ImageControlTypeId:
+            if (!ConfigureDirectUiVirtualImage(native, semantic, slot, error))
+                return Fail(error, L"generic U: " + error + describeSemantic());
+            break;
         case UIA_PaneControlTypeId:
         case UIA_GroupControlTypeId:
         case UIA_WindowControlTypeId: {
@@ -1968,7 +2046,9 @@ bool BuildGenericSemanticProfile(
                     return Fail(error,
                         L"generic U: composite has no readable native item census" +
                         describeSemantic());
-                if (absorbedChildren < backing->nativeItemCount)
+                const size_t visibleItems = backing->nativeGroupViewEnabled
+                    ? backing->nativeVisibleItemCount : backing->nativeItemCount;
+                if (absorbedChildren < visibleItems)
                     return Fail(error,
                         L"generic U: composite provider published fewer elements than items" +
                         describeSemantic());
@@ -1987,20 +2067,27 @@ bool BuildGenericSemanticProfile(
     }
     if (result->slots.empty())
         return Fail(error, L"generic U: no projectable or accountable semantics remain");
+    for (size_t imageIndex = 0; imageIndex < result->slots.size(); ++imageIndex) {
+        const auto& image = result->slots[imageIndex];
+        if (!image.virtualSource || !image.captureBitmap) continue;
+        for (size_t other = 0; other < result->slots.size(); ++other) {
+            RECT overlap{};
+            if (other != imageIndex && result->slots[other].project &&
+                IntersectRect(&overlap, &admittedSemantics[imageIndex].bounds,
+                    &admittedSemantics[other].bounds))
+                return Fail(error, L"generic U: virtual image overlaps another projected semantic");
+        }
+    }
 
     auto& profile = result->profile;
     profile.adapterId = L"microsoft.windows.directui.semantic.v1";
     profile.pageId = L"semantic-v1";
-    profile.executableBasename = own(std::wstring(FluentShell::FileNameOf(imagePath)));
     profile.rootClass = own(native.rootClass);
     profile.slots = result->slots.data();
     profile.slotCount = result->slots.size();
-    profile.directUiOwnsTabOrder = true;
-    profile.minDescendants = native.descendants.size();
-    profile.maxDescendants = native.descendants.size();
+    profile.descendantCount = native.descendants.size();
     profile.implementationClasses = result->implementationClasses.data();
     profile.implementationClassCount = result->implementationClasses.size();
-    profile.genericSemantic = true;
     uia.semantics = std::move(admittedSemantics);
 
     std::unordered_map<HWND, std::vector<const DirectUiBootstrapWindowEvidence*>> radioGroups;
@@ -2033,12 +2120,11 @@ bool CaptureGeneratedProfileEvidence(
     DirectUiBootstrapEvidence bootstrap;
     if (!CaptureDirectUiBootstrapCore(agent, bootstrap, error)) return false;
     if (!FluentShell::EqualsIgnoreCase(ClassName(agent.Root()), profile.rootClass) ||
-        bootstrap.descendants.size() < profile.minDescendants ||
-        bootstrap.descendants.size() > profile.maxDescendants) {
+        bootstrap.descendants.size() != profile.descendantCount) {
         return Fail(error, L"generic A/B: root class or descendant count changed"
             L" (expectedRoot=" + std::wstring(profile.rootClass) + L", actualRoot=" +
             ClassName(agent.Root()) + L", expectedCount=" +
-            std::to_wstring(profile.minDescendants) + L", actualCount=" +
+            std::to_wstring(profile.descendantCount) + L", actualCount=" +
             std::to_wstring(bootstrap.descendants.size()) + L")");
     }
 
@@ -2128,17 +2214,44 @@ bool CaptureGeneratedProfileEvidence(
             return Fail(error, L"generic A/B: semantic backing slot is unavailable");
     }
 
-    if (profile.directUiOwnsTabOrder) {
-        const HWND first = GetNextDlgTabItem(agent.Root(), nullptr, FALSE);
-        if (first != evidence.directUi.hwnd || GetNextDlgTabItem(agent.Root(), first, FALSE) != first)
-            return Fail(error, L"generic A/B: DirectUI anchor is not the native tab cycle");
-    }
+    // DirectUI owns traversal inside its host; native traversal must still
+    // expose exactly that host, as corroborated by the generated slot order.
+    const HWND first = GetNextDlgTabItem(agent.Root(), nullptr, FALSE);
+    if (first != evidence.directUi.hwnd || GetNextDlgTabItem(agent.Root(), first, FALSE) != first)
+        return Fail(error, L"generic A/B: DirectUI anchor is not the native tab cycle");
     evidence.mutationEpoch = agent.MutationEpoch();
     evidence.lastMutationHwnd = agent.LastMutationHwnd();
     evidence.lastMutationMessage = agent.LastMutationMessage();
     for (size_t index = 0; index < profile.slotCount; ++index) {
         const DirectUiSlot& slot = profile.slots[index];
-        if (slot.virtualSource) continue;
+        if (slot.virtualSource) {
+            if (!slot.captureBitmap) continue;
+            const auto host = std::find_if(bootstrap.descendants.begin(),
+                bootstrap.descendants.end(), [&](const auto& candidate) {
+                    return candidate.window.hwnd == slot.imageHostHwnd;
+                });
+            if (host == bootstrap.descendants.end() || !host->window.visible ||
+                host->window.generation != slot.imageHostGeneration ||
+                !SameRect(host->clientBounds, slot.imageHostClientBounds) ||
+                host->clientOriginScreen.x - evidence.clientOriginScreen.x !=
+                    slot.imageHostClientOffset.x ||
+                host->clientOriginScreen.y - evidence.clientOriginScreen.y !=
+                    slot.imageHostClientOffset.y)
+                return Fail(error, L"generic A/B: virtual image host identity or geometry changed");
+            auto& image = evidence.slotWindows[index];
+            image.hwnd = host->window.hwnd;
+            image.generation = host->window.generation;
+            image.bounds = slot.imageClientBounds;
+            OffsetRect(&image.bounds, host->clientOriginScreen.x, host->clientOriginScreen.y);
+            if (!CaptureDirectUiVirtualImagePixels(
+                    image.hwnd, slot.imageClientBounds, image, error)) return false;
+            RECT afterBounds{};
+            if (agent.DirectUiWindowGeneration(image.hwnd) != slot.imageHostGeneration ||
+                !GetWindowRect(image.hwnd, &afterBounds) ||
+                !SameRect(afterBounds, host->window.bounds))
+                return Fail(error, L"generic A/B: virtual image host changed during painting");
+            continue;
+        }
         DirectUiWindowEvidence& value = evidence.slotWindows[index];
         if (slot.captureBitmap && !CaptureWindowClientPixels(value.hwnd, value, error))
             return false;
@@ -2148,6 +2261,8 @@ bool CaptureGeneratedProfileEvidence(
         if (slot.captureDetail && !CaptureSlotDetail(value.hwnd, slot.kind, value, error))
             return false;
     }
+    if (evidence.mutationEpoch != agent.MutationEpoch())
+        return Fail(error, L"generic A/B: native state changed during image/detail capture");
     return true;
 }
 
@@ -2185,6 +2300,165 @@ bool MatchBootstrapToGenerated(
 
 } // namespace
 
+bool ConfigureDirectUiVirtualImage(
+    const DirectUiBootstrapEvidence& native,
+    const DirectUiSemanticEvidence& semantic,
+    DirectUiSlot& slot,
+    std::wstring& error) noexcept {
+    try {
+        const uint32_t behavior = semantic.patternMask &
+            ~(semantic.valueReadOnly ? DirectUiPatternValue : DirectUiPatternNone);
+        if (semantic.controlType != UIA_ImageControlTypeId || semantic.backingHwnd ||
+            !semantic.imageHostHwnd || semantic.offscreen || semantic.focusable ||
+            semantic.actionable || behavior != DirectUiPatternNone ||
+            semantic.capabilityMask != DirectUiCapabilityNone ||
+            semantic.frameworkId != L"DirectUI")
+            return Fail(error, L"virtual image lacks an inert DirectUI image contract");
+        const auto host = std::find_if(native.descendants.begin(), native.descendants.end(),
+            [&](const auto& candidate) {
+                return candidate.window.hwnd == semantic.imageHostHwnd;
+            });
+        if (host == native.descendants.end() || !host->window.visible ||
+            !host->window.generation ||
+            !Inside(host->window.bounds, native.native.directUi.bounds))
+            return Fail(error, L"virtual image native host is outside the admitted anchor");
+        RECT crop = semantic.bounds;
+        OffsetRect(&crop, -host->clientOriginScreen.x, -host->clientOriginScreen.y);
+        const int64_t width = static_cast<int64_t>(crop.right) - crop.left;
+        const int64_t height = static_cast<int64_t>(crop.bottom) - crop.top;
+        if (width <= 0 || height <= 0 || width > Ipc::kMaxImageDimension ||
+            height > Ipc::kMaxImageDimension || !Inside(crop, host->clientBounds))
+            return Fail(error, L"virtual image crop exceeds its host or owned icon bounds");
+        // A virtual image cannot absorb any HWND control that the renderer also
+        // projects. The image's own native ancestors are the only overlap allowed.
+        for (const auto& candidate : native.descendants) {
+            if (!candidate.window.visible || candidate.window.hwnd == host->window.hwnd)
+                continue;
+            bool ancestor = false;
+            HWND parent = host->parent;
+            for (size_t depth = 0; parent && depth < native.descendants.size(); ++depth) {
+                if (parent == candidate.window.hwnd) { ancestor = true; break; }
+                const auto found = std::find_if(native.descendants.begin(),
+                    native.descendants.end(), [&](const auto& value) {
+                        return value.window.hwnd == parent;
+                    });
+                if (found == native.descendants.end()) break;
+                parent = found->parent;
+            }
+            RECT overlap{};
+            if (!ancestor && IntersectRect(&overlap, &semantic.bounds, &candidate.window.bounds))
+                return Fail(error, L"virtual image crop overlaps a native control");
+        }
+        slot.kind = ControlKind::StaticIcon;
+        slot.presentationVariant = L"standard";
+        slot.virtualSource = true;
+        slot.captureBitmap = true;
+        slot.imageHostHwnd = host->window.hwnd;
+        slot.imageHostGeneration = host->window.generation;
+        slot.imageHostClientBounds = host->clientBounds;
+        slot.imageHostClientOffset = {
+            host->clientOriginScreen.x - native.native.clientOriginScreen.x,
+            host->clientOriginScreen.y - native.native.clientOriginScreen.y };
+        slot.imageClientBounds = crop;
+        return true;
+    } catch (...) {
+        return Fail(error, L"virtual image contract exception");
+    }
+}
+
+bool CaptureDirectUiVirtualImagePixels(
+    HWND host,
+    const RECT& clientRegion,
+    DirectUiWindowEvidence& image,
+    std::wstring& error) noexcept {
+    image.imageWidth = image.imageHeight = 0;
+    image.imageFormat.clear();
+    image.imageData.clear();
+    try {
+        DWORD process = 0;
+        RECT client{};
+        if (!host || GetWindowThreadProcessId(host, &process) != GetCurrentThreadId() ||
+            process != GetCurrentProcessId() || !GetClientRect(host, &client))
+            return Fail(error, L"virtual image capture requires its native owning thread");
+        const int64_t width = static_cast<int64_t>(clientRegion.right) - clientRegion.left;
+        const int64_t height = static_cast<int64_t>(clientRegion.bottom) - clientRegion.top;
+        if (width <= 0 || height <= 0 || width > Ipc::kMaxImageDimension ||
+            height > Ipc::kMaxImageDimension || !Inside(clientRegion, client))
+            return Fail(error, L"virtual image crop is outside its bounded native client");
+        if (client.left != 0 || client.top != 0 || client.right <= 0 || client.bottom <= 0 ||
+            client.right > kMaxImageHostDimension || client.bottom > kMaxImageHostDimension ||
+            static_cast<size_t>(client.right) * client.bottom * 4 > kMaxImageHostBytes)
+            return Fail(error, L"virtual image paint host exceeds its allocation bound");
+        struct PaintBuffer final {
+            HDC dc = CreateCompatibleDC(nullptr);
+            HBITMAP bitmap = nullptr;
+            HGDIOBJ previous = nullptr;
+            void* bits = nullptr;
+            ~PaintBuffer() {
+                if (previous) SelectObject(dc, previous);
+                if (bitmap) DeleteObject(bitmap);
+                if (dc) DeleteDC(dc);
+            }
+        } paint;
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = client.right;
+        info.bmiHeader.biHeight = -client.bottom;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        paint.bitmap = paint.dc ? CreateDIBSection(paint.dc, &info, DIB_RGB_COLORS,
+            &paint.bits, nullptr, 0) : nullptr;
+        paint.previous = paint.bitmap ? SelectObject(paint.dc, paint.bitmap) : nullptr;
+        if (!paint.dc || !paint.bitmap || !paint.bits || !paint.previous)
+            return Fail(error, L"virtual image offscreen paint buffer is unavailable");
+        const size_t hostBytes = static_cast<size_t>(client.right) * client.bottom * 4;
+        std::vector<uint8_t> black(hostBytes);
+        const auto render = [&](uint8_t background) {
+            std::memset(paint.bits, background, hostBytes);
+            // PrintWindow may copy a compositor surface via WM_PAINT and replace
+            // both initialized backgrounds, making unpainted pixels look opaque.
+            // Ask the host to paint only its own client into this DC instead. No
+            // visibility check, background erase, or child-window paint is requested;
+            // a host that does not support client printing leaves a transparent crop.
+            const int saved = SaveDC(paint.dc);
+            if (!saved) return false;
+            SendMessageW(host, WM_PRINT, reinterpret_cast<WPARAM>(paint.dc), PRF_CLIENT);
+            const bool restored = RestoreDC(paint.dc, saved) != FALSE;
+            GdiFlush();
+            RECT current{};
+            return restored && IsWindow(host) && GetClientRect(host, &current) &&
+                SameRect(client, current);
+        };
+        if (!render(0)) return Fail(error, L"virtual image host print rendering failed");
+        std::memcpy(black.data(), paint.bits, hostBytes);
+        if (!render(255)) return Fail(error, L"virtual image host print rendering failed");
+        const auto* white = static_cast<const uint8_t*>(paint.bits);
+        std::vector<uint8_t> pixels(static_cast<size_t>(width * height) * 4);
+        bool painted = false;
+        for (int64_t y = 0; y < height; ++y) {
+            for (int64_t x = 0; x < width; ++x) {
+                const size_t source = (static_cast<size_t>(clientRegion.top + y) *
+                    client.right + static_cast<size_t>(clientRegion.left + x)) * 4;
+                const size_t target = static_cast<size_t>(y * width + x) * 4;
+                const uint8_t alpha = RecoverPaintAlpha(black.data() + source, white + source);
+                for (size_t channel = 0; channel < 3; ++channel)
+                    pixels[target + channel] = (std::min)(black[source + channel], alpha);
+                pixels[target + 3] = alpha;
+                painted = painted || alpha != 0;
+            }
+        }
+        if (!painted) return Fail(error, L"virtual image host painted no image pixels");
+        image.imageWidth = static_cast<uint32_t>(width);
+        image.imageHeight = static_cast<uint32_t>(height);
+        image.imageFormat = L"bgra8-premultiplied";
+        image.imageData = std::move(pixels);
+        return true;
+    } catch (...) {
+        return Fail(error, L"virtual image paint capture exception");
+    }
+}
+
 // Shape facets describe which control this is. A projected composite may change
 // its selection or content between revisions, but a shape change means the
 // native surface is no longer the control the profile admitted.
@@ -2203,7 +2477,10 @@ bool SameDirectUiDetailShape(
         a.itemActivationSupported == b.itemActivationSupported &&
         a.vertical == b.vertical && a.reversed == b.reversed &&
         a.smallChange == b.smallChange && a.largeChange == b.largeChange &&
-        a.columns == b.columns && a.columnWidths == b.columnWidths;
+        a.columns == b.columns && a.columnWidths == b.columnWidths &&
+        a.ownerDrawCombo.has_value() == b.ownerDrawCombo.has_value() &&
+        (!a.ownerDrawCombo || a.ownerDrawCombo->mode == b.ownerDrawCombo->mode) &&
+        SameGroupShape(a, b);
 }
 
 // Content facets are the ones a still-admitted control may legitimately change:
@@ -2232,6 +2509,10 @@ bool SameDirectUiDetailContent(
         a.checked == b.checked && a.minimum == b.minimum &&
         a.maximum == b.maximum && a.position == b.position &&
         a.indeterminate == b.indeterminate &&
+        a.imageWidth == b.imageWidth && a.imageHeight == b.imageHeight &&
+        a.imageFormat == b.imageFormat && a.imageData == b.imageData &&
+        SameOwnerDrawCombo(a.ownerDrawCombo, b.ownerDrawCombo) &&
+        SameGroupContent(a.listViewGroups, b.listViewGroups) &&
         SameToolbarItems(a.toolbarItems, b.toolbarItems);
 }
 
@@ -2266,6 +2547,9 @@ DirectUiAction DirectUiActionForRequest(
     if (binding.secondaryAction != DirectUiAction::None &&
         DirectUiActionName(binding.secondaryAction, binding.kind) == action)
         return binding.secondaryAction;
+    if (binding.tertiaryAction != DirectUiAction::None &&
+        DirectUiActionName(binding.tertiaryAction, binding.kind) == action)
+        return binding.tertiaryAction;
     return DirectUiAction::None;
 }
 
@@ -2280,6 +2564,7 @@ bool IsDirectUiInPlaceAction(DirectUiAction action) noexcept {
     case DirectUiAction::SetEditText:
     case DirectUiAction::SelectListItem:
     case DirectUiAction::SetItemCheck:
+    case DirectUiAction::SetGroupExpanded:
     case DirectUiAction::ToolbarCommand:
         return true;
     default:
@@ -2320,47 +2605,6 @@ bool CaptureDirectUiSlotNode(
     if (!CaptureControlDetail(window, node, reason))
         return Fail(error, L"backing control typed state was rejected: " + reason);
     return true;
-}
-
-const DirectUiWindowProfile* ResolveDirectUiWindowProfile(
-    std::wstring& imagePath,
-    std::wstring& error) {
-    imagePath.clear();
-    error.clear();
-    wchar_t image[32768]{};
-    const DWORD length = GetModuleFileNameW(nullptr, image, static_cast<DWORD>(std::size(image)));
-    if (!length || length >= std::size(image)) return nullptr;
-    const std::wstring_view base = FluentShell::FileNameOf(
-        std::wstring_view(image, length));
-    const DirectUiWindowProfile* candidate = nullptr;
-    for (size_t index = 0; index < kDirectUiProfileCount; ++index) {
-        if (FluentShell::EqualsIgnoreCase(base, kDirectUiProfiles[index].executableBasename)) {
-            candidate = &kDirectUiProfiles[index];
-            break;
-        }
-    }
-    if (!candidate) return nullptr;
-    wchar_t systemDirectory[32768]{};
-    const UINT systemLength =
-        GetSystemDirectoryW(systemDirectory, static_cast<UINT>(std::size(systemDirectory)));
-    if (!systemLength || systemLength >= std::size(systemDirectory))
-        return Fail(error, L"process: System32 path unavailable") ? nullptr : nullptr;
-    std::wstring expected(systemDirectory, systemLength);
-    expected += L"\\";
-    expected += candidate->executableBasename;
-    imagePath = CanonicalPath(std::wstring_view(image, length));
-    const auto expectedCanonical = CanonicalPath(expected);
-    if (imagePath.empty() || expectedCanonical.empty() ||
-        !FluentShell::EqualsIgnoreCase(imagePath, expectedCanonical)) {
-        Fail(error, L"process: image is not the canonical System32 executable");
-        return nullptr;
-    }
-    if (!ExactFileVersion(imagePath, *candidate)) {
-        Fail(error, L"process: file version does not match the admitted profile");
-        return nullptr;
-    }
-    if (!VerifyMicrosoftSignature(imagePath, error)) return nullptr;
-    return candidate;
 }
 
 bool ResolveGenericDirectUiImage(std::wstring& imagePath, std::wstring& error) {
@@ -2407,253 +2651,7 @@ bool CaptureDirectUiNativeEvidenceOnSourceThread(
     DirectUiNativeEvidence& evidence,
     std::wstring& error) noexcept {
     try {
-        if (profile.genericSemantic)
-            return CaptureGeneratedProfileEvidence(agent, profile, evidence, error);
-        const HWND root = agent.Root();
-        if (!FluentShell::EqualsIgnoreCase(ClassName(root), profile.rootClass))
-            return Fail(error, L"A/B: root class does not match the profile");
-        DWORD rootProcess = 0;
-        const DWORD rootThread = GetWindowThreadProcessId(root, &rootProcess);
-        if (!rootThread || rootThread != agent.ThreadId() || rootProcess != GetCurrentProcessId())
-            return Fail(error, L"A/B: root thread or process identity mismatch");
-        evidence = {};
-        evidence.mutationEpoch = agent.MutationEpoch();
-        DWORD cloakReasons = 0;
-        if (FAILED(DwmGetWindowAttribute(root, DWMWA_CLOAKED,
-                &cloakReasons, sizeof(cloakReasons))))
-            return Fail(error, L"A/B: native cloak state is unavailable");
-        evidence.cloaked = (cloakReasons & DWM_CLOAKED_APP) != 0;
-        evidence.dpi = GetDpiForWindow(root);
-        if (!evidence.dpi || !ReadWindowEvidence(agent, root, false, evidence.root, error))
-            return false;
-        evidence.ownerHwnd = GetWindow(root, GW_OWNER);
-        evidence.effectiveOwnerHwnd = EffectiveTopLevelOwner(root);
-        evidence.title = evidence.root.text;
-        if (!GetClientRect(root, &evidence.clientBounds))
-            return Fail(error, L"A/B: root client geometry unavailable");
-        evidence.clientOriginScreen = { 0, 0 };
-        if (!ClientToScreen(root, &evidence.clientOriginScreen))
-            return Fail(error, L"A/B: root client origin unavailable");
-
-        std::vector<HWND> descendants;
-        EnumChildWindows(root, [](HWND window, LPARAM raw) -> BOOL {
-            auto& values = *reinterpret_cast<std::vector<HWND>*>(raw);
-            values.push_back(window);
-            return values.size() <= 64;
-        }, reinterpret_cast<LPARAM>(&descendants));
-        if (descendants.empty() || descendants.size() < profile.minDescendants ||
-            descendants.size() > profile.maxDescendants)
-            return Fail(error, L"A/B: descendant count is outside the profile bound");
-
-        // Census of implementation HWNDs. Every class is either part of the
-        // declared census or rejects the surface; nothing is skipped silently.
-        size_t visibleWrappers = 0;
-        size_t hiddenWrappers = 0;
-        size_t hiddenScrollBars = 0;
-        size_t hiddenLinks = 0;
-        size_t hiddenButtons = 0;
-        size_t hiddenPageHosts = 0;
-        size_t hiddenPageStaticTexts = 0;
-        size_t visiblePageHosts = 0;
-        size_t pageHostStaticTexts = 0;
-        std::vector<HWND> backingWindows;
-        evidence.slotWindows.assign(profile.slotCount, DirectUiWindowEvidence{});
-        std::vector<bool> slotFilled(profile.slotCount, false);
-        for (HWND child : descendants) {
-            DWORD process = 0;
-            if (GetWindowThreadProcessId(child, &process) != rootThread ||
-                process != rootProcess)
-                return Fail(error, L"A/B: descendant escaped the source thread/process");
-            const auto name = ClassName(child);
-            const bool visible = IsWindowVisible(child) != FALSE;
-            const uint64_t generation = agent.DirectUiWindowGeneration(child);
-            if (!generation)
-                return Fail(error, L"A/B: descendant generation is unavailable");
-            evidence.implementationWindows.push_back(
-                { child, generation, GetParent(child), name, visible });
-            if (FluentShell::EqualsIgnoreCase(name, L"DirectUIHWND")) {
-                if (!visible || GetParent(child) != root || evidence.directUi.hwnd ||
-                    !ReadWindowEvidence(agent, child, false, evidence.directUi, error))
-                    return Fail(error, L"A/B: DirectUI anchor shape mismatch");
-            } else if (FluentShell::EqualsIgnoreCase(name, L"CtrlNotifySink")) {
-                visible ? ++visibleWrappers : ++hiddenWrappers;
-            } else if (FluentShell::EqualsIgnoreCase(name, L"ScrollBar")) {
-                if (visible) return Fail(error, L"A/B: visible ScrollBar outside the census");
-                ++hiddenScrollBars;
-            } else if (FluentShell::EqualsIgnoreCase(name, L"SysLink")) {
-                if (visible) return Fail(error, L"A/B: visible SysLink outside the census");
-                ++hiddenLinks;
-            } else if (FluentShell::EqualsIgnoreCase(name, L"Button")) {
-                if (!visible) {
-                    ++hiddenButtons;
-                    continue;
-                }
-                backingWindows.push_back(child);
-            } else if (FluentShell::EqualsIgnoreCase(name, L"#32770")) {
-                if (visible) ++visiblePageHosts; else ++hiddenPageHosts;
-                if (visible) {
-                    evidence.pageHosts.push_back(child);
-                    backingWindows.push_back(child);
-                }
-            } else if (FluentShell::EqualsIgnoreCase(name, L"Static")) {
-                const HWND parent = GetParent(child);
-                const auto parentClass = parent ? ClassName(parent) : std::wstring();
-                if (visible && FluentShell::EqualsIgnoreCase(parentClass, L"#32770")) {
-                    ++pageHostStaticTexts;
-                    evidence.pageStatics.push_back(child);
-                    backingWindows.push_back(child);
-                } else if (visible) {
-                    // A visible Static must belong to an admitted page host.
-                    bool inPageHost = false;
-                    for (HWND host : evidence.pageHosts) {
-                        if (GetParent(child) == host) { inPageHost = true; break; }
-                    }
-                    if (!inPageHost)
-                        return Fail(error, L"A/B: visible Static outside a page host");
-                    ++pageHostStaticTexts;
-                    evidence.pageStatics.push_back(child);
-                    backingWindows.push_back(child);
-                } else {
-                    ++hiddenPageStaticTexts;
-                }
-            } else {
-                return Fail(error, L"A/B: unexpected visible or implementation HWND class");
-            }
-        }
-        if (FluentShell::EqualsIgnoreCase(profile.rootClass, L"NativeHWNDHost")) {
-            evidence.propertySheetPageHwnd =
-                CurrentPropertySheetPage(root, evidence.pageHosts);
-        }
-        const DirectUiCensus& census = profile.census;
-        if (!evidence.directUi.hwnd ||
-            visibleWrappers != census.visibleNotifyWrappers ||
-            hiddenWrappers != census.hiddenNotifyWrappers ||
-            hiddenScrollBars != census.hiddenScrollBars ||
-            hiddenLinks != census.hiddenSysLinks ||
-            hiddenButtons != census.hiddenButtons ||
-            hiddenPageHosts != census.hiddenPageHosts ||
-            hiddenPageStaticTexts != census.hiddenPageStaticTexts ||
-            visiblePageHosts != census.visiblePageHosts ||
-            pageHostStaticTexts != census.pageHostStaticTexts) {
-            error = L"A/B: implementation HWND census mismatch (visibleWrappers=" +
-                std::to_wstring(visibleWrappers) + L", hiddenWrappers=" +
-                std::to_wstring(hiddenWrappers) + L", hiddenScrollBars=" +
-                std::to_wstring(hiddenScrollBars) + L", hiddenLinks=" +
-                std::to_wstring(hiddenLinks) + L", hiddenButtons=" +
-                std::to_wstring(hiddenButtons) + L", hiddenPageHosts=" +
-                std::to_wstring(hiddenPageHosts) + L", hiddenPageStaticTexts=" +
-                std::to_wstring(hiddenPageStaticTexts) + L", visiblePageHosts=" +
-                std::to_wstring(visiblePageHosts) + L", pageHostStaticTexts=" +
-                std::to_wstring(pageHostStaticTexts) + L")";
-            return false;
-        }
-
-        // Bind every visible native backing HWND to a profile slot by class,
-        // masked style, and control id. Geometry order makes otherwise
-        // identical controls deterministic without application branches.
-        std::sort(backingWindows.begin(), backingWindows.end(), [](HWND left, HWND right) {
-            RECT leftRect{};
-            RECT rightRect{};
-            if (GetWindowRect(left, &leftRect) && GetWindowRect(right, &rightRect)) {
-                if (leftRect.top != rightRect.top) return leftRect.top < rightRect.top;
-                if (leftRect.left != rightRect.left) return leftRect.left < rightRect.left;
-            }
-            return reinterpret_cast<uintptr_t>(left) < reinterpret_cast<uintptr_t>(right);
-        });
-        size_t backingSlots = 0;
-        for (size_t index = 0; index < profile.slotCount; ++index) {
-            if (!profile.slots[index].virtualSource) ++backingSlots;
-        }
-        if (backingWindows.size() != backingSlots)
-            return Fail(error, L"A/B: visible native backing count does not match profile slots");
-        for (HWND backingWindow : backingWindows) {
-            if (!IsChild(evidence.directUi.hwnd, backingWindow))
-                return Fail(error, L"A/B: native backing is not below the DirectUI anchor");
-            const std::wstring backingClass = ClassName(backingWindow);
-            const bool isButton = FluentShell::EqualsIgnoreCase(backingClass, L"Button");
-            DirectUiWindowEvidence value;
-            if (!ReadWindowEvidence(agent, backingWindow, isButton, value, error)) return false;
-            bool matched = false;
-            for (size_t index = 0; index < profile.slotCount; ++index) {
-                const DirectUiSlot& slot = profile.slots[index];
-                if (slot.virtualSource || slotFilled[index]) continue;
-                if (!FluentShell::EqualsIgnoreCase(backingClass, slot.nativeClass)) continue;
-                const uint64_t maskedStyle = value.style & slot.nativeStyleMask;
-                const bool styleOk = slot.nativeStyleMask == 0 ||
-                    maskedStyle == slot.nativeStyleValue ||
-                    maskedStyle == slot.nativeStyleAlt;
-                const bool idOk = slot.nativeControlId < 0 ||
-                    value.controlId == slot.nativeControlId;
-                if (styleOk && idOk) {
-                    value.tabIndex = -1;
-                    evidence.slotWindows[index] = std::move(value);
-                    slotFilled[index] = true;
-                    matched = true;
-                    break;
-                }
-            }
-            if (!matched) {
-                error = L"A/B: native backing class/style/control id is outside the profile (class=" +
-                    backingClass + L", id=" + std::to_wstring(value.controlId) +
-                    L", style=" + std::to_wstring(value.style) + L")";
-                return false;
-            }
-        }
-        for (size_t index = 0; index < profile.slotCount; ++index) {
-            if (!profile.slots[index].virtualSource && !slotFilled[index])
-                return Fail(error, L"A/B: profile backing slot has no native window");
-        }
-
-        // DirectUI dialogs expose their host as the native dialog-manager tab
-        // stop; the provider owns focus traversal inside it. Profiles pin that
-        // internal order and UIA corroborates focusability at U.
-        if (profile.directUiOwnsTabOrder) {
-            const HWND first = GetNextDlgTabItem(root, nullptr, FALSE);
-            if (first != evidence.directUi.hwnd ||
-                GetNextDlgTabItem(root, first, FALSE) != first)
-                return Fail(error, L"A/B: DirectUI host is not the exact native dialog tab cycle");
-        } else {
-            HWND current = nullptr;
-            int index = 0;
-            std::unordered_set<HWND> seen;
-            for (;;) {
-                current = GetNextDlgTabItem(root, current, FALSE);
-                if (!current || !seen.insert(current).second) break;
-                for (size_t slot = 0; slot < profile.slotCount; ++slot) {
-                    if (evidence.slotWindows[slot].hwnd == current)
-                        evidence.slotWindows[slot].tabIndex = index++;
-                }
-            }
-        }
-        // Declared traversal indexes must be complete and unique for enabled,
-        // focusable slots owned by the DirectUI provider.
-        std::unordered_set<int> declaredTabIndexes;
-        for (size_t index = 0; index < profile.slotCount; ++index) {
-            const DirectUiSlot& slot = profile.slots[index];
-            if (profile.directUiOwnsTabOrder && slot.project && slot.uiaEnabled &&
-                slot.uiaFocusable && slot.tabIndex < 0)
-                return Fail(error, L"A/B: focusable DirectUI slot has no declared tab index");
-            if (slot.project && slot.tabIndex >= 0) {
-                if (slot.virtualSource && !slot.uiaFocusable)
-                    return Fail(error, L"A/B: profile declares a tab order for a non-focusable slot");
-                if (!declaredTabIndexes.insert(slot.tabIndex).second)
-                    return Fail(error, L"A/B: profile declares duplicate tab indexes");
-                if (profile.directUiOwnsTabOrder && !slot.virtualSource)
-                    evidence.slotWindows[index].tabIndex = slot.tabIndex;
-            }
-        }
-        // Typed state through each backing control's own registered adapter. The
-        // flag is lane-independent, so an exact profile row can pin a composite
-        // control exactly the way a generated one does.
-        for (size_t index = 0; index < profile.slotCount; ++index) {
-            const DirectUiSlot& slot = profile.slots[index];
-            if (slot.virtualSource || !slot.captureDetail) continue;
-            if (!CaptureSlotDetail(evidence.slotWindows[index].hwnd, slot.kind,
-                    evidence.slotWindows[index], error))
-                return false;
-        }
-        evidence.mutationEpoch = agent.MutationEpoch();
-        return true;
+        return CaptureGeneratedProfileEvidence(agent, profile, evidence, error);
     } catch (...) {
         return Fail(error, L"A/B: native evidence exception");
     }
@@ -2683,7 +2681,13 @@ bool MatchDirectUiMutationBracket(
             before.implementationWindows, after.implementationWindows))
         return Fail(error, L"B: root/anchor identity or native facets changed");
     for (size_t index = 0; index < profile.slotCount; ++index) {
-        if (profile.slots[index].virtualSource) continue;
+        if (profile.slots[index].virtualSource) {
+            if (profile.slots[index].captureBitmap &&
+                (!SameWindow(before.slotWindows[index], after.slotWindows[index]) ||
+                 !SameImage(before.slotWindows[index], after.slotWindows[index])))
+                return Fail(error, L"B: virtual image host, bounds, or pixels changed");
+            continue;
+        }
         if (!SameProfileWindow(profile.slots[index],
                 before.slotWindows[index], after.slotWindows[index])) {
             const auto& oldValue = before.slotWindows[index];
@@ -2775,11 +2779,14 @@ bool MatchDirectUiMoveTransition(
         return Fail(error, L"move: DirectUI root or anchor changed beyond translation");
     }
     for (size_t index = 0; index < profile.slotCount; ++index) {
-        if (profile.slots[index].virtualSource) continue;
+        if (profile.slots[index].virtualSource && !profile.slots[index].captureBitmap) continue;
         if (!SameMovedWindow(
                 before.slotWindows[index], after.slotWindows[index], deltaX, deltaY)) {
             return Fail(error, L"move: DirectUI backing slot changed beyond translation");
         }
+        if (profile.slots[index].virtualSource &&
+            !SameImage(before.slotWindows[index], after.slotWindows[index]))
+            return Fail(error, L"move: DirectUI virtual image pixels changed");
     }
     return true;
 }
@@ -2822,7 +2829,12 @@ bool MatchDirectUiRefreshTransition(
 
     for (size_t index = 0; index < profile.slotCount; ++index) {
         const DirectUiSlot& slot = profile.slots[index];
-        if (slot.virtualSource) continue;
+        if (slot.virtualSource) {
+            if (slot.captureBitmap &&
+                !SameMovedWindow(before.slotWindows[index], after.slotWindows[index], deltaX, deltaY))
+                return Fail(error, L"refresh: virtual image host or geometry changed");
+            continue;
+        }
         const auto& oldValue = before.slotWindows[index];
         const auto& newValue = after.slotWindows[index];
         auto stable = newValue;
@@ -2877,13 +2889,6 @@ bool DirectUiCaptureFailureIsTopologyChange(std::wstring_view error) noexcept {
         L"generic A/B: visible backing HWND count changed",
         L"generic A/B: backing HWND no longer matches",
         L"generic A/B: semantic backing slot is unavailable",
-        L"A/B: descendant count is outside the profile bound",
-        L"A/B: DirectUI anchor shape mismatch",
-        L"A/B: unexpected visible or implementation HWND class",
-        L"A/B: implementation HWND census mismatch",
-        L"A/B: visible native backing count does not match",
-        L"A/B: native backing class/style/control id is outside",
-        L"A/B: profile backing slot has no native window",
         L"U: composite item census changed",
     };
     return std::any_of(std::begin(prefixes), std::end(prefixes),
@@ -2897,6 +2902,8 @@ bool MatchDirectUiEvidence(
     std::wstring& error) noexcept {
     if (uia.rootHwnd != native.root.hwnd || uia.directUiHwnd != native.directUi.hwnd)
         return Fail(error, L"U: root or DirectUI anchor backing HWND mismatch");
+    if (native.slotWindows.size() != profile.slotCount)
+        return Fail(error, L"U: DirectUI slot evidence is incomplete");
 
     // Virtual and backing slots each require exactly one UIA semantic with the
     // declared role. Backing slots additionally require geometry/label parity.
@@ -2929,6 +2936,7 @@ bool MatchDirectUiEvidence(
                 semantic->offscreen != slot.uiaOffscreen ||
                 (slot.pinUiaPatterns &&
                     (semantic->patternMask != slot.uiaPatternMask ||
+                     semantic->capabilityMask != slot.uiaCapabilityMask ||
                      semantic->toggleState != slot.uiaToggleState)) ||
                 (!slot.uiaOffscreen &&
                     (semantic->bounds.right <= semantic->bounds.left ||
@@ -2942,6 +2950,21 @@ bool MatchDirectUiEvidence(
                     std::to_wstring(semantic->enabled) + L", actionable=" +
                     std::to_wstring(semantic->actionable) + L")";
                 return false;
+            }
+            if (slot.captureBitmap) {
+                const auto& image = native.slotWindows[index];
+                if (semantic->imageHostHwnd != slot.imageHostHwnd ||
+                    image.hwnd != slot.imageHostHwnd ||
+                    image.generation != slot.imageHostGeneration ||
+                    !SameRect(semantic->bounds, image.bounds) ||
+                    image.imageWidth != static_cast<uint32_t>(
+                        slot.imageClientBounds.right - slot.imageClientBounds.left) ||
+                    image.imageHeight != static_cast<uint32_t>(
+                        slot.imageClientBounds.bottom - slot.imageClientBounds.top) ||
+                    image.imageFormat != L"bgra8-premultiplied" ||
+                    image.imageData.size() !=
+                        static_cast<size_t>(image.imageWidth) * image.imageHeight * 4)
+                    return Fail(error, L"U: virtual image paint evidence does not match its semantic");
             }
             continue;
         }
@@ -3142,12 +3165,26 @@ bool RefreshDirectUiSnapshotFromNative(
                 node.enabled = native.root.enabled && native.directUi.enabled && slot.uiaEnabled;
                 node.tabStop = node.enabled && slot.uiaFocusable && slot.tabIndex >= 0;
                 node.tabIndex = node.tabStop ? slot.tabIndex : -1;
+                if (slot.captureBitmap) {
+                    const auto& image = native.slotWindows[slotIndex];
+                    if (image.hwnd != slot.imageHostHwnd ||
+                        image.generation != slot.imageHostGeneration ||
+                        image.imageFormat != L"bgra8-premultiplied" ||
+                        !image.imageWidth || !image.imageHeight || image.imageData.size() !=
+                            static_cast<size_t>(image.imageWidth) * image.imageHeight * 4)
+                        return Fail(error, L"refresh: virtual image paint evidence is unavailable");
+                    node.rect = ClientRectFor(image.bounds, native.clientOriginScreen);
+                    node.imageWidth = image.imageWidth;
+                    node.imageHeight = image.imageHeight;
+                    node.imageFormat = image.imageFormat;
+                    node.imageData = image.imageData;
+                }
                 SetDirectUiSupportedActions(slot, node);
                 if (slot.action != DirectUiAction::None) {
                     bindings.emplace(node.nodeId, DirectUiActionBinding{
                         native.root.hwnd, native.root.generation, slotIndex,
                         slot.kind, slot.action, slot.secondaryAction, slot.cancel,
-                        slot.propertySheetButton });
+                        slot.propertySheetButton, slot.tertiaryAction });
                 }
                 continue;
             }
@@ -3215,7 +3252,7 @@ bool RefreshDirectUiSnapshotFromNative(
                 bindings.emplace(node.nodeId, DirectUiActionBinding{
                     backing.hwnd, backing.generation, slotIndex,
                     slot.kind, slot.action, slot.secondaryAction, slot.cancel,
-                    slot.propertySheetButton });
+                    slot.propertySheetButton, slot.tertiaryAction });
             }
         }
         return true;
@@ -3372,129 +3409,6 @@ bool RevalidateAndPostDirectUiPropertySheetAction(
     }
 }
 
-DirectUiAdmissionResult InspectDirectUiSurface(
-    SourceThreadAgent& agent,
-    const DirectUiWindowProfile& profile,
-    DWORD timeoutMs,
-    HANDLE cancelEvent,
-    std::wstring& diagnostic,
-    WindowSnapshot* snapshot,
-    std::unordered_map<uint64_t, DirectUiActionBinding>* bindings,
-    DirectUiNativeEvidence* nativeEvidence) noexcept {
-    diagnostic.clear();
-    const auto absoluteDeadline = std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(timeoutMs);
-    std::wstring imagePath;
-    std::wstring processError;
-    if (!ResolveDirectUiWindowProfile(imagePath, processError) ||
-        std::chrono::steady_clock::now() >= absoluteDeadline) {
-        diagnostic = L"DirectUI adapter rejected at process: " +
-            (processError.empty() ? L"profile resolution failed" : processError);
-        return DirectUiAdmissionResult::Rejected;
-    }
-    if (agent.DirectUiUiaPoisoned()) {
-        diagnostic = L"DirectUI adapter rejected at U: UIA worker was previously abandoned";
-        return DirectUiAdmissionResult::Rejected;
-    }
-    struct Result final { bool ok = false; DirectUiUiaEvidence value; std::wstring error; };
-    try {
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            const auto remainingMs = [&]() -> DWORD {
-                const auto now = std::chrono::steady_clock::now();
-                if (now >= absoluteDeadline) return 0;
-                return static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    absoluteDeadline - now).count());
-            };
-            DirectUiNativeEvidence before;
-            DWORD remaining = remainingMs();
-            if (!remaining || !agent.CaptureDirectUiNativeEvidence(
-                    profile, before, diagnostic, remaining, cancelEvent)) {
-                diagnostic = L"DirectUI adapter rejected at A: " + diagnostic;
-                return DirectUiAdmissionResult::Rejected;
-            }
-            auto promise = std::make_shared<std::promise<Result>>();
-            auto future = promise->get_future();
-            const HWND root = before.root.hwnd;
-            const HWND directUi = before.directUi.hwnd;
-            const DWORD processId = GetCurrentProcessId();
-            const bool allowDeclaredOffscreen = before.cloaked;
-            std::vector<std::wstring> virtualAutomationIds;
-            std::vector<HWND> backingWindows;
-            for (size_t index = 0; index < profile.slotCount; ++index) {
-                const DirectUiSlot& slot = profile.slots[index];
-                if (slot.virtualSource) {
-                    virtualAutomationIds.emplace_back(slot.uiaAutomationId.empty()
-                        ? slot.semanticKey : slot.uiaAutomationId);
-                } else if (before.slotWindows[index].hwnd) {
-                    backingWindows.push_back(before.slotWindows[index].hwnd);
-                }
-            }
-            std::thread worker([promise, root, directUi, processId, allowDeclaredOffscreen,
-                    virtualAutomationIds = std::move(virtualAutomationIds),
-                    backingWindows = std::move(backingWindows)] {
-                Result result;
-                try {
-                    result.ok = CaptureUia(root, directUi, processId,
-                        allowDeclaredOffscreen, virtualAutomationIds, backingWindows, false,
-                        result.value, result.error);
-                }
-                catch (...) { result.error = L"UIA evidence worker exception"; }
-                try { promise->set_value(std::move(result)); } catch (...) {}
-            });
-            remaining = (std::min)(remainingMs(), kUiaDeadlineMs);
-            auto status = remaining
-                ? future.wait_for(std::chrono::milliseconds(remaining))
-                : std::future_status::timeout;
-            if (cancelEvent && WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0)
-                status = std::future_status::timeout;
-            if (status != std::future_status::ready) {
-                agent.PoisonDirectUiUia();
-                worker.detach();
-                diagnostic = L"DirectUI adapter rejected at U: bounded UIA deadline expired; worker abandoned and agent poisoned";
-                return DirectUiAdmissionResult::Rejected;
-            }
-            worker.join();
-            auto uia = future.get();
-            if (!uia.ok || !MatchDirectUiEvidence(profile, before, uia.value, diagnostic)) {
-                diagnostic = L"DirectUI adapter rejected at U: " +
-                    (diagnostic.empty() ? uia.error : diagnostic);
-                return DirectUiAdmissionResult::Rejected;
-            }
-            DirectUiNativeEvidence after;
-            remaining = remainingMs();
-            const bool capturedAfter = remaining && agent.CaptureDirectUiNativeEvidence(
-                profile, after, diagnostic, remaining, cancelEvent);
-            if (capturedAfter &&
-                MatchDirectUiMutationBracket(profile, before, after, diagnostic)) {
-                if (snapshot && bindings) {
-                    WindowSnapshot composite = *snapshot;
-                    std::unordered_map<uint64_t, DirectUiActionBinding> capturedBindings;
-                    if (!BuildCompositeSnapshot(agent, profile, imagePath, after, uia.value,
-                            composite, capturedBindings, diagnostic)) {
-                        diagnostic = L"DirectUI adapter rejected at composite: " + diagnostic;
-                        return DirectUiAdmissionResult::Rejected;
-                    }
-                    *snapshot = std::move(composite);
-                    *bindings = std::move(capturedBindings);
-                }
-                if (nativeEvidence) *nativeEvidence = std::move(after);
-                diagnostic = L"DirectUI adapter admitted exact signed page";
-                return DirectUiAdmissionResult::Admitted;
-            }
-            if (attempt == 0 &&
-                diagnostic == L"B: mutation epoch changed during UIA capture")
-                continue;
-            diagnostic = L"DirectUI adapter rejected at B: " + diagnostic;
-            return DirectUiAdmissionResult::Rejected;
-        }
-        diagnostic = L"DirectUI adapter rejected at B: mutation bracket retry exhausted";
-        return DirectUiAdmissionResult::Rejected;
-    } catch (...) {
-        diagnostic = L"DirectUI adapter rejected at U: worker setup exception";
-        return DirectUiAdmissionResult::Rejected;
-    }
-}
-
 DirectUiAdmissionResult InspectGenericDirectUiSurface(
     SourceThreadAgent& agent,
     DWORD timeoutMs,
@@ -3570,7 +3484,7 @@ DirectUiAdmissionResult InspectGenericDirectUiSurface(
 
             std::shared_ptr<DirectUiOwnedProfile> discovered;
             if (!BuildGenericSemanticProfile(
-                    before, uia.value, imagePath, discovered, diagnostic)) {
+                    before, uia.value, discovered, diagnostic)) {
                 diagnostic = L"Generic DirectUI adapter rejected at contract: " + diagnostic;
                 return DirectUiAdmissionResult::Rejected;
             }
@@ -3584,7 +3498,7 @@ DirectUiAdmissionResult InspectGenericDirectUiSurface(
                 if (snapshot && bindings) {
                     WindowSnapshot composite = *snapshot;
                     std::unordered_map<uint64_t, DirectUiActionBinding> capturedBindings;
-                    if (!BuildCompositeSnapshot(agent, discovered->profile, imagePath, after,
+                    if (!BuildCompositeSnapshot(agent, discovered->profile, after,
                             uia.value, composite, capturedBindings, diagnostic)) {
                         diagnostic = L"Generic DirectUI adapter rejected at composite: " + diagnostic;
                         return DirectUiAdmissionResult::Rejected;

@@ -71,6 +71,8 @@ public sealed class TranslatedWindow : Window
         Grid.SetRow(_canvas, 1);
         _root.Children.Add(_canvas);
         Content = _root;
+        Activated += (_, args) => RendererDiagnostics.Log(
+            $"window activation={args.WindowActivationState} popup={_popupFlyout is not null}");
         _canvas.KeyDown += OnCanvasKeyDown;
         _root.AddHandler(UIElement.PointerPressedEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, args) =>
         {
@@ -527,17 +529,39 @@ public sealed class TranslatedWindow : Window
         _popupItems.Clear();
         _popupItems.AddRange(popup.Items.Select(MenuItemViewModel.FromSnapshot));
         var popupId = popup.PopupId;
+        RendererDiagnostics.Log($"popup show id={popupId} node={popup.NodeId} item={popup.ItemIndex} at={position.X:F0},{position.Y:F0} items={popup.Items.Count}");
         var lifetime = _popupLifetime = new PresentationLifetime();
         var flyout = new MenuProjectionFactory(
             item => RespondToPopup(popupId, item.ItemId), lifetime, popupId).CreateFlyout(_popupItems);
         _popupFlyout = flyout;
         _popupPosition = position;
+        var openedAt = Environment.TickCount64;
         flyout.Closed += (_, _) =>
         {
             // Programmatic hiding clears this reference first. Click also records
             // its terminal response in this input turn. Defer dismissal so a
             // Closed notification delivered before Click cannot win that race.
             if (!ReferenceEquals(_popupFlyout, flyout)) return;
+            var focused = _root.XamlRoot is { } xamlRoot
+                ? Microsoft.UI.Xaml.Input.FocusManager.GetFocusedElement(xamlRoot) as DependencyObject
+                : null;
+            RendererDiagnostics.Log($"popup closed id={popupId} focus={focused?.GetType().Name ?? "none"}");
+            // The selection the native context menu made arrives in the same patch,
+            // and a WinUI tree/list then moves focus to its newly selected item a
+            // frame later, which light-dismisses the flyout. No user gesture lands
+            // within that window, so reopen once instead of answering a dismissal.
+            if (Environment.TickCount64 - openedAt < SpuriousPopupCloseMilliseconds &&
+                _reopenedPopupId != popupId && IsWithinNode(focused, popup.NodeId))
+            {
+                _reopenedPopupId = popupId;
+                RendererDiagnostics.Log($"popup reopened id={popupId} after its anchor took focus");
+                _popupLifetime?.Dispose();
+                _popupLifetime = null;
+                _popupFlyout = null;
+                _popupPosition = null;
+                QueuePopupSynchronization();
+                return;
+            }
             DispatcherQueue.TryEnqueue(() =>
             {
                 if (ReferenceEquals(_popupFlyout, flyout)) RespondToPopup(popupId, null);
@@ -558,20 +582,43 @@ public sealed class TranslatedWindow : Window
         }
     }
 
+    private const long SpuriousPopupCloseMilliseconds = 400;
+    private string? _reopenedPopupId;
+
+    private bool IsWithinNode(DependencyObject? element, string nodeId)
+    {
+        if (element is null || !_controls.TryGetValue(nodeId, out var owner)) return false;
+        for (var current = element; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (ReferenceEquals(current, owner)) return true;
+        return false;
+    }
+
     private bool TryGetPopupPosition(
         PopupMenuSnapshot popup, out global::Windows.Foundation.Point position)
     {
         position = default;
         var node = ViewModel.Nodes.FirstOrDefault(candidate => candidate.NodeId == popup.NodeId);
+        // An item context menu opens where the projected request was made.
+        if (node is { Kind: "treeView" or "listView", Visible: true, ContextMenuAnchor: { } anchor } &&
+            _controls.TryGetValue(popup.NodeId, out var owner) && owner.XamlRoot is not null)
+        {
+            position = owner.TransformToVisual(_canvas).TransformPoint(
+                new global::Windows.Foundation.Point(anchor.X, anchor.Y));
+            return double.IsFinite(position.X) && double.IsFinite(position.Y);
+        }
         if (PopupMenuAnchor.ItemRect(node, popup) is not { } rect ||
             !_controls.TryGetValue(popup.NodeId, out var control) || control.XamlRoot is null)
             return false;
         // MMC disables More Actions while its native tracking call is pending.
         // That is still the live anchor; enabled state does not retire the popup.
         var scale = 96.0 / RenderDpi;
-        position = control.TransformToVisual(_canvas).TransformPoint(new global::Windows.Foundation.Point(
-            (rect.X + (ViewModel.Rtl ? rect.Width : 0)) * scale,
-            (rect.Y + rect.Height) * scale));
+        var local = control is SemanticAccessibleIsland island &&
+            island.ItemAnchor(popup.ItemIndex, ViewModel.Rtl) is { } scrolled
+            ? scrolled
+            : new global::Windows.Foundation.Point(
+                (rect.X + (ViewModel.Rtl ? rect.Width : 0)) * scale,
+                (rect.Y + rect.Height) * scale);
+        position = control.TransformToVisual(_canvas).TransformPoint(local);
         return double.IsFinite(position.X) && double.IsFinite(position.Y);
     }
 
@@ -769,9 +816,13 @@ public sealed class TranslatedWindow : Window
             "setItemText" => "items",
             "setValue" => "position",
             "setExpand" => "itemExpanded",
+            "setGroupExpanded" => "listViewGroups",
             "setSplit" => "splits",
+            "setScroll" => "scrollBars",
             "setColumnOrder" => "columnOrder",
             "islandInvoke" => "islandItems",
+            "htmlInvoke" or "htmlScroll" => "document",
+            "diskSelect" or "diskContext" or "diskScroll" => "diskView",
             _ => action,
         };
 
@@ -793,7 +844,7 @@ public sealed class TranslatedWindow : Window
         var terminalPopup = action == "popupCommand" && !_applyingCanonical &&
             _committed && _interactive && !_retired;
         if (!CanEmitActions && !terminalPopup) return null;
-        if ((property == "invoke" || property == "close" ||
+        if ((property == "invoke" || property == "close" || property == "contextMenu" ||
              property.StartsWith("menu:", StringComparison.Ordinal) ||
              property.StartsWith("popup:", StringComparison.Ordinal)) &&
             _pending.Values.Any(pending =>
@@ -802,6 +853,7 @@ public sealed class TranslatedWindow : Window
             return null;
         }
         var eventId = _nextEventId();
+        RendererDiagnostics.Log($"action.emit event={eventId} action={action} node={node?.NodeId ?? "-"} rev={ViewModel.Revision}");
         node?.RegisterPending(property, eventId);
         _pending[eventId] = new PendingNodeAction(node, property, action, value, retryCount);
         if (property is "state" or "bounds") _placementEventIds.Add(eventId);

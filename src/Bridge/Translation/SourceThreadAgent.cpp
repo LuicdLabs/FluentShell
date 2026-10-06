@@ -1,4 +1,7 @@
 #include "SourceThreadAgent.h"
+#include "GuiThreadDispatch.h"
+#include "NativeDocument.h"
+#include "DiskView.h"
 #include "AccessibleIsland.h"
 #include "DirectUiEngine.h"
 #include "MenuBarCapture.h"
@@ -76,6 +79,12 @@ constexpr WPARAM kDeferredListViewActivation = 3;
 constexpr WPARAM kDeferredNativeAction = 4;
 
 struct Command final {
+    explicit Command(std::shared_ptr<std::atomic<bool>> token = {})
+        : cancellation(token ? std::move(token) : std::make_shared<std::atomic<bool>>(false)),
+          cancelled(*cancellation) {}
+    std::shared_ptr<std::atomic<bool>> cancellation;
+    std::atomic<bool>& cancelled;
+    ULONGLONG deadline = 0;
     std::atomic<long> references{ 1 };
     // Distinguish a failed PostThreadMessageW from a queued command whose
     // callback may still be waiting in the source thread's message pump.
@@ -106,12 +115,13 @@ struct Command final {
     // working, not the projection failing, so the surface keeps its projection and
     // the renderer is told the action was rejected.
     bool refused = false;
-    std::atomic<bool> cancelled{ false };
     std::wstring error;
 };
 
-Command* CreateCommand(UINT kind, SourceThreadAgent* agent) noexcept {
-    auto* command = new (std::nothrow) Command();
+Command* CreateCommand(UINT kind, SourceThreadAgent* agent,
+    std::shared_ptr<std::atomic<bool>> cancellation = {}) noexcept {
+    Command* command = nullptr;
+    try { command = new Command(std::move(cancellation)); } catch (...) { return nullptr; }
     if (!command) return nullptr;
     command->started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     command->completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -134,6 +144,53 @@ std::vector<std::shared_ptr<SourceThreadAgent>> g_retainedAgents;
 std::atomic<UINT> g_nextMessage{ WM_APP + 0x4A1 };
 std::atomic<uint64_t> g_nextGeneration{ 1 };
 thread_local unsigned g_boundedSourceCommandDepth = 0;
+// Capture reads send messages that answer with notifications (TVN_GETDISPINFO for
+// callback text, custom draw, toolbar reads). Those are the capture observing the
+// application, not the application changing, so hooks on a thread running a
+// capture read do not advance the mutation epoch. A remote GUI thread running
+// dispatched capture work is recognized by its dispatch scope.
+thread_local unsigned g_captureReadDepth = 0;
+
+bool CaptureReadInProgress() noexcept {
+    return g_captureReadDepth != 0 || IsGuiThreadDispatchActive();
+}
+
+struct CaptureReadScope final {
+    CaptureReadScope() noexcept { ++g_captureReadDepth; }
+    ~CaptureReadScope() { --g_captureReadDepth; }
+    CaptureReadScope(const CaptureReadScope&) = delete;
+    CaptureReadScope& operator=(const CaptureReadScope&) = delete;
+};
+thread_local std::function<bool(HMENU, UINT, HWND, BOOL&)> g_remotePopupHandler;
+
+// Identity only: a provider commonly disables its opener (HWND or item) while its
+// native tracking call runs, and that is still the live anchor of the popup.
+bool PopupAnchorMatches(const ControlNode& node, const IslandActionRequest& request) noexcept {
+    if (node.nodeId != request.nodeId || node.hwnd != request.island || node.generation != request.generation ||
+        node.kind != request.kind || !node.visible || request.index < 0) return false;
+    const auto index = static_cast<size_t>(request.index);
+    if (request.kind == ControlKind::DiskView) {
+        if (!node.diskView || !request.diskView || index >= node.diskView->items.size() ||
+            index >= request.diskView->items.size()) return false;
+        const auto& live = node.diskView->items[index];
+        const auto& expected = request.diskView->items[index];
+        return live.itemId == expected.itemId && live.diskId == expected.diskId && live.name == expected.name &&
+            live.value == expected.value;
+    }
+    if (request.kind == ControlKind::TreeView || request.kind == ControlKind::ListView)
+        return index < node.items.size() && node.items[index] == request.name;
+    return index < node.islandItems.size() && node.islandItems[index].dropDown &&
+        node.islandItems[index].name == request.name && node.islandItems[index].actionName == request.action;
+}
+
+bool InvokePopupOwner(const IslandActionRequest& request, std::wstring& reason) {
+    if (GuiThreadOperationCancelled()) return false;
+    if (request.kind == ControlKind::DiskView)
+        return request.diskView && RequestDiskViewContextMenu(request.island, *request.diskView, request.index, reason);
+    if (request.kind == ControlKind::TreeView || request.kind == ControlKind::ListView)
+        return RequestItemContextMenu(request.island, request.kind, request.index, request.name, reason);
+    return InvokeAccessibleIslandItem(request.island, request.index, request.name, request.action, reason);
+}
 
 struct BoundedSourceCommandScope final {
     BoundedSourceCommandScope() noexcept { ++g_boundedSourceCommandDepth; }
@@ -175,7 +232,9 @@ void Complete(Command* command) noexcept {
 }
 
 bool AbortIfCancelled(Command* command) noexcept {
-    if (!command || !command->cancelled.load(std::memory_order_acquire)) return false;
+    if (!command) return false;
+    if (command->deadline && GetTickCount64() >= command->deadline) command->cancelled = true;
+    if (!command->cancelled.load(std::memory_order_acquire)) return false;
     try {
         command->success = false;
         command->captured = false;
@@ -305,12 +364,8 @@ void MarkWindowCloseCompleted(HWND window) noexcept {
     } catch (...) {}
 }
 
-bool RelevantMessage(UINT message) noexcept {
-    // Common-control message values overlap heavily inside WM_USER. Keep the
-    // Toolbar and Trackbar mutators out of the switch so aliases cannot create
-    // duplicate cases: TBM_SETRANGEMIN and PBM_GETRANGE, TBM_SETSELSTART and
-    // SB_SETTEXTW, and several others are the same number.
-    if (message == TB_ENABLEBUTTON || message == TB_HIDEBUTTON ||
+bool ToolbarMutator(UINT message) noexcept {
+    return message == TB_ENABLEBUTTON || message == TB_HIDEBUTTON ||
         message == TB_INDETERMINATE || message == TB_MARKBUTTON ||
         message == TB_PRESSBUTTON || message == TB_CHECKBUTTON ||
         message == TB_SETSTATE || message == TB_ADDBUTTONSA ||
@@ -321,20 +376,44 @@ bool RelevantMessage(UINT message) noexcept {
         message == TB_SETDISABLEDIMAGELIST || message == TB_SETPRESSEDIMAGELIST ||
         message == TB_SETEXTENDEDSTYLE || message == TB_SETBUTTONSIZE ||
         message == TB_SETBITMAPSIZE || message == TB_SETROWS ||
-        message == TB_MOVEBUTTON || message == TB_AUTOSIZE) return true;
-    // Trackbar range, position, and step mutators. Without them a dirty-gated
-    // reconcile would never notice a native slider update.
-    if (message == TBM_SETPOS || message == TBM_SETPOSNOTIFY ||
+        message == TB_MOVEBUTTON || message == TB_AUTOSIZE;
+}
+
+// Trackbar range, position, and step mutators. Without them a dirty-gated
+// reconcile would never notice a native slider update.
+bool TrackbarMutator(UINT message) noexcept {
+    return message == TBM_SETPOS || message == TBM_SETPOSNOTIFY ||
         message == TBM_SETRANGE || message == TBM_SETRANGEMIN ||
         message == TBM_SETRANGEMAX || message == TBM_SETLINESIZE ||
         message == TBM_SETPAGESIZE || message == TBM_SETTICFREQ ||
         message == TBM_SETSEL || message == TBM_SETSELSTART ||
         message == TBM_SETSELEND || message == TBM_CLEARSEL ||
-        message == TBM_SETBUDDY || message == TBM_SETTOOLTIPS) return true;
-    // UpDown range, position, step and buddy mutators.
-    if (message == UDM_SETPOS || message == UDM_SETPOS32 || message == UDM_SETRANGE ||
+        message == TBM_SETBUDDY || message == TBM_SETTOOLTIPS;
+}
+
+// UpDown range, position, step and buddy mutators.
+bool UpDownMutator(UINT message) noexcept {
+    return message == UDM_SETPOS || message == UDM_SETPOS32 || message == UDM_SETRANGE ||
         message == UDM_SETRANGE32 || message == UDM_SETACCEL || message == UDM_SETBASE ||
-        message == UDM_SETBUDDY) return true;
+        message == UDM_SETBUDDY;
+}
+
+// ProgressBar state is driven entirely by these messages.  Without them a
+// dirty-gated reconcile would never notice a native progress update.
+bool ProgressMutator(UINT message) noexcept {
+    return message == PBM_SETPOS || message == PBM_DELTAPOS || message == PBM_STEPIT ||
+        message == PBM_SETRANGE || message == PBM_SETRANGE32 || message == PBM_SETSTEP ||
+        message == PBM_SETSTATE || message == PBM_SETMARQUEE;
+}
+
+bool StatusBarMutator(UINT message) noexcept {
+    return message == SB_SIMPLE || message == SB_SETTEXTW;
+}
+
+// Class-independent mutators. The WM_USER-range control families above share
+// numbers (TBM_SETLINESIZE is TB_GETBUTTON, PBM_SETSTATE is TB_SETSTATE), so they are
+// decided per class in RelevantMessageFor instead.
+bool RelevantMessage(UINT message) noexcept {
     switch (message) {
     case WM_SETTEXT:
     case WM_ENABLE:
@@ -354,6 +433,10 @@ bool RelevantMessage(UINT message) noexcept {
     case STM_SETICON:
     case STM_SETIMAGE:
     case CB_ADDSTRING:
+    case CB_INSERTSTRING:
+    case CB_SETITEMDATA:
+    case CB_SETITEMHEIGHT:
+    case CB_SETDROPPEDWIDTH:
     case CB_DELETESTRING:
     case CB_RESETCONTENT:
     case CB_SETCURSEL:
@@ -383,6 +466,15 @@ bool RelevantMessage(UINT message) noexcept {
     case LVM_SORTITEMSEX:
     case LVM_SETEXTENDEDLISTVIEWSTYLE:
     case LVM_ENABLEGROUPVIEW:
+    case LVM_INSERTGROUP:
+    case LVM_INSERTGROUPSORTED:
+    case LVM_SETGROUPINFO:
+    case LVM_REMOVEGROUP:
+    case LVM_REMOVEALLGROUPS:
+    case LVM_MOVEGROUP:
+    case LVM_MOVEITEMTOGROUP:
+    case LVM_SORTGROUPS:
+    case LVM_SETGROUPMETRICS:
     case LVM_SETVIEW:
     case TCM_SETCURSEL:
     case TCM_INSERTITEMA:
@@ -415,22 +507,49 @@ bool RelevantMessage(UINT message) noexcept {
     case TVM_SETEXTENDEDSTYLE:
     case TVM_SETTOOLTIPS:
     case TVM_ENDEDITLABELNOW:
-    case SB_SIMPLE:
-    case SB_SETTEXTW:
-    // ProgressBar state is driven entirely by these messages.  Without them a
-    // dirty-gated reconcile would never notice a native progress update.
-    case PBM_SETPOS:
-    case PBM_DELTAPOS:
-    case PBM_STEPIT:
-    case PBM_SETRANGE:
-    case PBM_SETRANGE32:
-    case PBM_SETSTEP:
-    case PBM_SETSTATE:
-    case PBM_SETMARQUEE:
         return true;
     default:
         return false;
     }
+}
+
+// A WM_USER-range control code means something only to the class that defines it:
+// the capture's own TB_GETBUTTON read of a toolbar is not a trackbar line-size
+// change. Every other message is class-independent.
+// Notifications that ask the parent for display data or report painting, hovering
+// and hit-testing. They accompany every repaint and every capture read of a
+// callback control, and none of them changes control state.
+bool QueryOrPaintNotification(UINT code) noexcept {
+    switch (code) {
+    case NM_CUSTOMDRAW: case NM_TOOLTIPSCREATED: case NM_SETCURSOR: case NM_HOVER:
+    case NM_NCHITTEST:
+    case LVN_GETDISPINFOA: case LVN_GETDISPINFOW: case LVN_ODCACHEHINT:
+    case LVN_ODFINDITEMA: case LVN_ODFINDITEMW: case LVN_GETINFOTIPA: case LVN_GETINFOTIPW:
+    case LVN_HOTTRACK:
+    case TVN_GETDISPINFOA: case TVN_GETDISPINFOW: case TVN_GETINFOTIPA: case TVN_GETINFOTIPW:
+    case TBN_GETDISPINFOA: case TBN_GETDISPINFOW: case TBN_GETBUTTONINFOA: case TBN_GETBUTTONINFOW:
+    case TBN_GETINFOTIPA: case TBN_GETINFOTIPW: case TBN_HOTITEMCHANGE:
+    case TTN_GETDISPINFOA: case TTN_GETDISPINFOW:
+    case HDN_GETDISPINFOA: case HDN_GETDISPINFOW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool RelevantMessageFor(HWND window, UINT message, LPARAM lParam = 0) noexcept {
+    if (message == WM_NOTIFY && lParam &&
+        QueryOrPaintNotification(reinterpret_cast<const NMHDR*>(lParam)->code)) return false;
+    if (message < WM_USER || message >= WM_USER + 0x100) return RelevantMessage(message);
+    if (!window) return false;
+    wchar_t buffer[kMaxClassNameChars]{};
+    const auto type = ClassNameOf(window, buffer);
+    if (FluentShell::EqualsIgnoreCase(type, TOOLBARCLASSNAMEW)) return ToolbarMutator(message);
+    if (FluentShell::EqualsIgnoreCase(type, TRACKBAR_CLASSW)) return TrackbarMutator(message);
+    if (FluentShell::EqualsIgnoreCase(type, UPDOWN_CLASSW)) return UpDownMutator(message);
+    if (FluentShell::EqualsIgnoreCase(type, PROGRESS_CLASSW)) return ProgressMutator(message);
+    if (FluentShell::EqualsIgnoreCase(type, STATUSCLASSNAMEW)) return StatusBarMutator(message);
+    return false;
 }
 
 bool MenuMutationMessage(UINT message, LPARAM lParam) noexcept {
@@ -473,9 +592,11 @@ LRESULT CALLBACK ControlSubclassProc(
     const auto owner = AgentForSubclass(
         reinterpret_cast<SourceThreadAgent*>(refData & ~DWORD_PTR{ 1 }));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
-    if (owner && (RelevantMessage(message) || (statusBar && message == SB_SETMINHEIGHT)))
+    if (owner && !CaptureReadInProgress() &&
+        (RelevantMessageFor(window, message, lParam) || (statusBar && message == SB_SETMINHEIGHT)))
         owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY) {
+        ForgetNativeDocument(window);
         RemoveWindowSubclass(window, ControlSubclassProc, subclassId);
     }
     return result;
@@ -487,7 +608,8 @@ LRESULT CALLBACK RootSubclassProc(
     const auto owner = AgentForSubclass(reinterpret_cast<SourceThreadAgent*>(refData));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
     if (message == WM_CLOSE) MarkWindowCloseCompleted(window);
-    if (owner && RelevantMessage(message)) owner->MarkDirty(window, message);
+    if (owner && !CaptureReadInProgress() && RelevantMessageFor(window, message, lParam))
+        owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY && owner) {
         owner->MarkDestroyed();
         RemoveWindowSubclass(window, RootSubclassProc, subclassId);
@@ -495,7 +617,15 @@ LRESULT CALLBACK RootSubclassProc(
     return result;
 }
 
-void InstallChildSubclass(SourceThreadAgent* agent, HWND hwnd) {
+bool InstallChildSubclass(SourceThreadAgent* agent, HWND hwnd) {
+    if (hwnd && GetWindowThreadProcessId(hwnd, nullptr) != GetCurrentThreadId()) {
+        const auto owner = agent->weak_from_this().lock();
+        std::wstring error;
+        auto installed = std::make_shared<bool>(false);
+        return owner && DispatchToWindowThread(hwnd, [owner, hwnd, installed] {
+            *installed = InstallChildSubclass(owner.get(), hwnd);
+        }, error) && *installed;
+    }
     if (hwnd && IsWindow(hwnd)) {
         wchar_t className[64]{};
         const bool statusBar = GetClassNameW(hwnd, className,
@@ -503,9 +633,10 @@ void InstallChildSubclass(SourceThreadAgent* agent, HWND hwnd) {
             FluentShell::EqualsIgnoreCase(className, STATUSCLASSNAMEW);
         const DWORD_PTR refData = reinterpret_cast<DWORD_PTR>(agent) |
             static_cast<DWORD_PTR>(statusBar);
-        SetWindowSubclass(hwnd, ControlSubclassProc, kControlSubclassId,
-            refData);
+        return SetWindowSubclass(hwnd, ControlSubclassProc, kControlSubclassId,
+            refData) != FALSE;
     }
+    return false;
 }
 
 void InstallRootSubclass(SourceThreadAgent* agent) {
@@ -537,11 +668,20 @@ bool ExecuteCapture(Command* command) {
     InstallRootSubclass(agent);
     for (const auto& node : command->snapshot.nodes) {
         if (command->cancelled.load(std::memory_order_acquire)) break;
-        InstallChildSubclass(agent, node.hwnd);
+        if (node.hwnd && !InstallChildSubclass(agent, node.hwnd)) {
+            command->success = false;
+            command->error = L"could not observe control on its owning GUI thread";
+            break;
+        }
     }
     if (command->cancelled.load(std::memory_order_acquire)) {
         for (const auto& node : command->snapshot.nodes) {
-            RemoveWindowSubclass(node.hwnd, ControlSubclassProc, kControlSubclassId);
+            if (!node.hwnd) continue;
+            std::wstring ignored;
+            GuiThreadOperationScope cleanup({}, GetTickCount64() + 250);
+            DispatchToWindowThread(node.hwnd, [hwnd = node.hwnd] {
+                RemoveWindowSubclass(hwnd, ControlSubclassProc, kControlSubclassId);
+            }, ignored, 250);
         }
         RemoveWindowSubclass(agent->Root(), RootSubclassProc, kRootSubclassId);
         AbortIfCancelled(command);
@@ -727,16 +867,17 @@ bool ApplySetCheck(
     // BM_SETCHECK would bypass the application handler, so the native control is
     // clicked through its own state machine until it reports the requested
     // value.  A click that does not move the state ends the walk.
-    int current = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
-    for (int attempt = 0; current != requested && attempt <= maximum; ++attempt) {
+    // An owner-draw WinForms toggle keeps no BM_GETCHECK state; its state is read
+    // from the control's MSAA object, and BM_CLICK reaches its own click handler.
+    int current = ReadButtonCheckState(target);
+    for (int attempt = 0; current >= 0 && current != requested && attempt <= maximum; ++attempt) {
         if (AbortIfCancelled(command)) return false;
         SendMessageW(target, BM_CLICK, 0, 0);
-        const int next = static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0));
+        const int next = ReadButtonCheckState(target);
         if (next == current) break;
         current = next;
     }
-    command->success =
-        static_cast<int>(SendMessageW(target, BM_GETCHECK, 0, 0)) == requested;
+    command->success = ReadButtonCheckState(target) == requested;
     return true;
 }
 
@@ -928,6 +1069,84 @@ bool ApplySetExpand(
     return true;
 }
 
+bool ApplySetGroupExpanded(Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView || !node.groupViewEnabled) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = SetListViewGroupExpanded(target, command->action.groupId, command->action.booleanValue);
+    if (AbortIfCancelled(command)) return false;
+    command->refused = !command->success;
+    if (command->refused) command->error = L"the list did not keep the requested group expansion";
+    return true;
+}
+
+bool ApplyHtmlInvoke(Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if (node.kind != ControlKind::NativeDocument || !node.document) return true;
+    return QueueNativeAction(command, agent, &node);
+}
+
+bool ApplyHtmlScroll(Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::NativeDocument || !node.document || command->action.integerValues.size() != 2)
+        return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = ScrollNativeDocument(target, *node.document, command->action.itemIndex,
+        command->action.integerValues[0], command->action.integerValues[1], command->error);
+    if (AbortIfCancelled(command)) return false;
+    command->refused = !command->success;
+    return true;
+}
+
+bool ApplyDiskSelect(Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::DiskView || !node.diskView) return true;
+    const auto& items = node.diskView->items;
+    const auto item = std::find_if(items.begin(), items.end(), [&](const auto& value) {
+        return value.itemId == command->action.diskItemId;
+    });
+    if (item == items.end()) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = SelectDiskViewItem(target, *node.diskView,
+        static_cast<int>(item - items.begin()), command->error);
+    if (AbortIfCancelled(command)) return false;
+    command->refused = !command->success;
+    return true;
+}
+
+bool ApplyDiskContext(Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if (node.kind != ControlKind::DiskView || !node.diskView) return true;
+    const auto& items = node.diskView->items;
+    const auto item = std::find_if(items.begin(), items.end(), [&](const auto& value) {
+        return value.itemId == command->action.diskItemId;
+    });
+    if (item == items.end()) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->deferredActionKind = kDeferredIslandAction;
+    command->success = agent->PostIslandAction(node, static_cast<int>(item - items.begin()),
+        command->refused, &command->deferredActionToken);
+    return true;
+}
+
+// The application's context menu may track its own popup, so the request is queued
+// to run after this command returns, with popup interception armed for its anchor.
+bool ApplyContextMenu(Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if ((node.kind != ControlKind::TreeView && node.kind != ControlKind::ListView) || !agent) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->deferredActionKind = kDeferredIslandAction;
+    command->success = agent->PostIslandAction(node, command->action.itemIndex,
+        command->refused, &command->deferredActionToken);
+    if (!command->success && command->error.empty()) command->error = command->refused
+        ? L"another native popup action is already pending"
+        : L"the context-menu request could not be queued";
+    return true;
+}
+
+bool ApplyDiskScroll(Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::DiskView || !node.diskView) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = ScrollDiskView(target, *node.diskView, command->action.integerValue, command->error);
+    if (AbortIfCancelled(command)) return false;
+    command->refused = !command->success;
+    return true;
+}
+
 bool ApplySetItemText(
     Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
     const bool renamable = (node.kind == ControlKind::TreeView ||
@@ -1017,6 +1236,21 @@ bool ApplySetSplit(
     return true;
 }
 
+bool ApplySetScroll(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::PaneContainer || node.scrollBars.empty()) return true;
+    if (AbortIfCancelled(command)) return false;
+    const auto& action = command->action;
+    const bool moved = ScrollPaneContainer(target, action.booleanValue, action.scrollByLines,
+        action.integerValue);
+    if (AbortIfCancelled(command)) return false;
+    command->success = moved;
+    // A container already at its end does not move; canonical state is unchanged.
+    command->refused = !moved;
+    if (!moved) command->error = L"the container did not scroll";
+    return true;
+}
+
 bool ApplyMdiCommand(
     Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
     if (node.kind != ControlKind::MdiChild) return true;
@@ -1042,9 +1276,17 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"setItemText", &ApplySetItemText },
     NodeActionEntry{ L"setValue", &ApplySetValue },
     NodeActionEntry{ L"setExpand", &ApplySetExpand },
+    NodeActionEntry{ L"setGroupExpanded", &ApplySetGroupExpanded },
+    NodeActionEntry{ L"htmlInvoke", &ApplyHtmlInvoke },
+    NodeActionEntry{ L"htmlScroll", &ApplyHtmlScroll },
+    NodeActionEntry{ L"diskSelect", &ApplyDiskSelect },
+    NodeActionEntry{ L"diskContext", &ApplyDiskContext },
+    NodeActionEntry{ L"diskScroll", &ApplyDiskScroll },
+    NodeActionEntry{ L"contextMenu", &ApplyContextMenu },
     NodeActionEntry{ L"toolbarCommand", &ApplyToolbarCommand },
     NodeActionEntry{ L"mdiCommand", &ApplyMdiCommand },
     NodeActionEntry{ L"setSplit", &ApplySetSplit },
+    NodeActionEntry{ L"setScroll", &ApplySetScroll },
     NodeActionEntry{ L"setColumnOrder", &ApplySetColumnOrder },
     NodeActionEntry{ L"islandInvoke", &ApplyIslandInvoke },
     NodeActionEntry{ L"activateItem", &ApplyActivateItem },
@@ -1069,6 +1311,29 @@ bool InvokeOnNode(
     if (AbortIfCancelled(command)) return false;
     if (!node->visible || !node->enabled) return true;
     const NodeAction apply = FindNodeAction(action.action);
+    const bool queued = action.action == L"invoke" || action.action == L"toolbarCommand" ||
+        action.action == L"mdiCommand" || action.action == L"activateItem" || action.action == L"islandInvoke" ||
+        action.action == L"htmlInvoke" || action.action == L"diskContext" || action.action == L"contextMenu";
+    if (apply && !queued && GetWindowThreadProcessId(node->hwnd, nullptr) != GetCurrentThreadId()) {
+        auto remote = std::shared_ptr<Command>(CreateCommand(command->kind, agent, command->cancellation), Release);
+        if (!remote) { command->error = L"remote source command allocation failed"; return true; }
+        remote->action = command->action;
+        remote->deadline = command->deadline;
+        const auto owner = agent->shared_from_this();
+        const ControlNode expected = *node;
+        if (!DispatchToWindowThread(node->hwnd, [remote, owner, expected, apply] {
+                if (GetPropW(expected.hwnd, kNodeGenerationProperty) !=
+                    reinterpret_cast<HANDLE>(static_cast<uintptr_t>(expected.generation))) return;
+                apply(remote.get(), owner.get(), expected.hwnd, expected);
+            }, command->error)) {
+            if (AbortIfCancelled(command)) return false;
+            return true;
+        }
+        command->success = remote->success;
+        command->refused = remote->refused;
+        command->error = std::move(remote->error);
+        return true;
+    }
     return apply == nullptr || apply(command, agent, node->hwnd, *node);
 }
 
@@ -1456,7 +1721,8 @@ bool ExecuteDirectUiNodeAction(Command* command) {
         !command->profile->slots[slot].virtualSource &&
         command->profile->slots[slot].kind == binding.kind &&
         (command->profile->slots[slot].action == route ||
-            command->profile->slots[slot].secondaryAction == route) &&
+            command->profile->slots[slot].secondaryAction == route ||
+            command->profile->slots[slot].tertiaryAction == route) &&
         slot < current.slotWindows.size() &&
         current.slotWindows[slot].hwnd == binding.hwnd &&
         current.slotWindows[slot].generation == binding.generation &&
@@ -1696,12 +1962,23 @@ bool ExecuteRestore(Command* command) {
 bool ExecuteShutdown(Command* command) {
     if (AbortIfCancelled(command)) return false;
     command->agent->CancelPopupOnSourceThread();
-    EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM) -> BOOL {
-        RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
-        RemovePropW(child, kNodeGenerationProperty);
-        RemovePropW(child, kDirectUiGenerationProperty);
+    std::vector<HWND> children;
+    EnumChildWindows(command->agent->Root(), [](HWND child, LPARAM raw) -> BOOL {
+        reinterpret_cast<std::vector<HWND>*>(raw)->push_back(child);
         return TRUE;
-    }, 0);
+    }, reinterpret_cast<LPARAM>(&children));
+    for (const HWND child : children) {
+        if (!IsWindow(child)) continue;
+        if (!DispatchToWindowThread(child, [child] {
+            RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
+            RemovePropW(child, kNodeGenerationProperty);
+            RemovePropW(child, kDirectUiGenerationProperty);
+            ForgetNativeDocument(child);
+        }, command->error)) {
+            if (AbortIfCancelled(command)) return false;
+            return true;
+        }
+    }
     RemovePropW(command->agent->Root(), kDirectUiGenerationProperty);
     RemoveWindowSubclass(command->agent->Root(), RootSubclassProc, kRootSubclassId);
     command->success = true;
@@ -1737,6 +2014,7 @@ CommandHandler HandlerFor(UINT kind) noexcept {
 }
 
 void ExecuteCommandImpl(Command* command) {
+    GuiThreadOperationScope operation(command->cancellation, command->deadline);
     auto* agent = command->agent;
     if (!agent || !IsWindow(agent->Root())) {
         command->error = L"source window no longer exists";
@@ -1865,15 +2143,20 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code >= 0 && lParam) {
         const auto* message = reinterpret_cast<CWPRETSTRUCT*>(lParam);
         const bool menuChanged = MenuMutationMessage(message->message, message->lParam);
-        if (RelevantMessage(message->message) || message->message == WM_NCDESTROY ||
-            message->message == WM_CANCELMODE || menuChanged) {
-            MarkCurrentThreadAgentsDirty(message->hwnd, message->message, menuChanged);
+        const bool observed = !CaptureReadInProgress() &&
+            (RelevantMessageFor(message->hwnd, message->message, message->lParam) || menuChanged);
+        if (observed || message->message == WM_NCDESTROY || message->message == WM_CANCELMODE) {
+            MarkCurrentThreadAgentsDirty(message->hwnd, message->message, observed && menuChanged);
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 } // namespace
+
+bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam) noexcept {
+    return RelevantMessageFor(window, message, lParam);
+}
 
 bool IsOwnerDataListViewIndexedAction(
     const ActionRequest& action, const WindowSnapshot& snapshot) noexcept {
@@ -1933,18 +2216,70 @@ bool SourceThreadAgent::CaptureOnSourceThread(
         captureContext_.surfaceId = surfaceId;
         captureContext_.generation = generation_;
         captureContext_.revision = revision;
+        CaptureReadScope reading;
         if (!CaptureWindow(root_, captureContext_, snapshot, error)) return false;
+        const bool multipleThreads = std::any_of(snapshot.nodes.begin(), snapshot.nodes.end(), [this](const auto& node) {
+            return node.hwnd && GetWindowThreadProcessId(node.hwnd, nullptr) != threadId_;
+        });
+        if (multipleThreads) {
+            // A root-thread barrier alone cannot freeze a child GUI thread. Two
+            // complete, matching collections plus observed mutation evidence
+            // bracket the publication; all passes share the command deadline.
+            bool stable = false;
+            std::wstring instability;
+            for (int attempt = 0; attempt != 2 && !GuiThreadOperationCancelled(); ++attempt) {
+                const auto epoch = MutationEpoch();
+                WindowSnapshot confirmation;
+                if (!CaptureWindow(root_, captureContext_, confirmation, error)) return false;
+                const bool quiet = epoch == MutationEpoch();
+                const bool same = SnapshotFingerprint(snapshot) == SnapshotFingerprint(confirmation);
+                stable = quiet && same;
+                if (!stable) {
+                    // Name what moved, so a persistently unstable host can be diagnosed.
+                    wchar_t mutation[128]{};
+                    wchar_t className[64]{};
+                    if (const HWND moved = LastMutationHwnd()) GetClassNameW(moved, className, 64);
+                    swprintf_s(mutation, L"mutation message 0x%04X on %s", LastMutationMessage(), className);
+                    instability = !same ? DescribeSnapshotDifference(snapshot, confirmation) : mutation;
+                }
+                snapshot = std::move(confirmation);
+                if (stable) break;
+            }
+            if (!stable) {
+                error = std::wstring(kCaptureBarrierUnstable) + L": " + instability;
+                return false;
+            }
+        }
         snapshot.popupMenu = popupMenu_.Current();
+        if (remotePopup_) {
+            std::scoped_lock lock(remotePopup_->mutex);
+            if (!remotePopup_->error.empty()) { error = remotePopup_->error; return false; }
+            if (const auto& popup = remotePopup_->menu.Current()) {
+                const auto& request = remotePopup_->request;
+                const auto anchor = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(), [&](const auto& node) {
+                    return node.nodeId == request.nodeId && node.hwnd == request.island &&
+                        node.generation == request.generation;
+                });
+                if (anchor == snapshot.nodes.end() || !PopupAnchorMatches(*anchor, request)) {
+                    error = L"remote island popup anchor changed";
+                    return false;
+                }
+                snapshot.popupMenu = popup;
+                return true;
+            }
+        }
         if (snapshot.popupMenu) {
             const auto& popup = *snapshot.popupMenu;
             const auto anchor = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
                 [&](const ControlNode& node) { return node.nodeId == popup.nodeId; });
-            if (anchor == snapshot.nodes.end() || anchor->kind != ControlKind::AccessibleIsland ||
-                popup.itemIndex < 0 || static_cast<size_t>(popup.itemIndex) >= anchor->islandItems.size() ||
-                !anchor->visible || !anchor->islandItems[popup.itemIndex].dropDown ||
-                !trackedIslandMenu_ || anchor->generation != trackedIslandMenu_->generation ||
-                anchor->islandItems[popup.itemIndex].name != trackedIslandMenu_->name ||
-                anchor->islandItems[popup.itemIndex].actionName != trackedIslandMenu_->action) {
+            if (anchor == snapshot.nodes.end() || !trackedIslandMenu_ ||
+                popup.itemIndex != trackedIslandMenu_->index || !PopupAnchorMatches(*anchor, *trackedIslandMenu_)) {
+                FluentShell::Log(L"Tracked popup anchor changed; dismissing popup id=" +
+                    std::to_wstring(popup.popupId) + L" node=" + std::to_wstring(popup.nodeId) +
+                    (anchor == snapshot.nodes.end() ? L" (anchor node is gone)" :
+                        L" visible=" + std::to_wstring(anchor->visible) +
+                        L" enabled=" + std::to_wstring(anchor->enabled) +
+                        L" generation=" + std::to_wstring(anchor->generation)));
                 CancelPopupOnSourceThread();
                 snapshot.popupMenu.reset();
             }
@@ -1956,7 +2291,9 @@ bool SourceThreadAgent::CaptureOnSourceThread(
     }
 }
 
-std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(HWND root, HMODULE module) {
+std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(
+    HWND root, HMODULE module, bool* transientFailure) {
+    if (transientFailure) *transientFailure = false;
     if (!root || !IsWindow(root)) return {};
     DWORD threadId = GetWindowThreadProcessId(root, nullptr);
     if (!threadId) return {};
@@ -2002,6 +2339,10 @@ std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(HWND root, HMODULE 
         FluentShell::Log(L"Initial source capture failed within the 2 s deadline: " +
             initialCaptureError);
     }
+    if (!success && transientFailure)
+        *transientFailure = !posted || initialCaptureError.starts_with(kCaptureBarrierUnstable) ||
+            // The capture ran past its deadline: a host still loading its views.
+            initialCaptureError == L"source-thread command cancelled";
     if (!posted) {
         // The hook may already be inside ExecuteCommand. Keep every pointer used
         // by that callback valid even though Attach must honor its 2 s deadline;
@@ -2010,47 +2351,19 @@ std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(HWND root, HMODULE 
     }
     Release(command);
     if (!success && posted) {
-        // A generic-capture failure on a profile-matched process falls back to
-        // DirectUI admission; the resolved profile travels with the agent so
-        // every later evidence/handoff command validates the same contract.
+        // Unsupported HWND capture gets one capability-derived DirectUI attempt
+        // only after the current image passes the canonical System32 trust gate.
         std::wstring imagePath;
         std::wstring processError;
-        const DirectUiWindowProfile* profile =
-            ResolveDirectUiWindowProfile(imagePath, processError);
-        if (profile) {
-            FluentShell::Log(L"Generic capture deferred to DirectUI adapter " +
-                std::wstring(profile->adapterId) + L" page=" +
-                std::wstring(profile->pageId) + L": " + initialCaptureError);
-            agent->directUiProfile_ = profile;
-            command = CreateCommand(kCommandCaptureDirectUiEvidence, agent.get());
-            if (command) {
-                command->profile = profile;
-                posted = agent->Post(command, 2000, nullptr);
-                success = posted && command->success;
-                if (!success) FluentShell::Log(L"Exact DirectUI profile page '" +
-                    std::wstring(profile->pageId) +
-                    L"' did not match at attach A: " + command->error);
-                Release(command);
-            }
-        } else {
-            FluentShell::Log(L"Initial source capture failed within the 2 s deadline: " +
+        if (ResolveGenericDirectUiImage(imagePath, processError)) {
+            agent->genericDirectUiCandidate_ = true;
+            success = true;
+            FluentShell::Log(
+                L"DirectUI surface deferred to capability-derived generic admission: " +
                 initialCaptureError);
-            if (!processError.empty()) {
-                FluentShell::Log(L"DirectUI application adapter not applicable: " + processError);
-            }
-        }
-        if (!success && posted) {
-            std::wstring genericImagePath;
-            std::wstring genericError;
-            if (ResolveGenericDirectUiImage(genericImagePath, genericError)) {
-                agent->directUiProfile_ = nullptr;
-                agent->genericDirectUiCandidate_ = true;
-                success = true;
-                FluentShell::Log(
-                    L"DirectUI surface deferred to capability-derived generic admission");
-            } else {
-                FluentShell::Log(L"Generic DirectUI admission not applicable: " + genericError);
-            }
+        } else {
+            FluentShell::Log(L"Initial source capture failed: " + initialCaptureError);
+            FluentShell::Log(L"Generic DirectUI admission not applicable: " + processError);
         }
     }
     if (!success) {
@@ -2085,6 +2398,7 @@ void SourceThreadAgent::UnhookAll() noexcept {
 
 bool SourceThreadAgent::Post(void* rawCommand, DWORD timeoutMs, HANDLE cancelEvent) noexcept {
     auto* command = static_cast<Command*>(rawCommand);
+    command->deadline = GetTickCount64() + timeoutMs;
     bool dispatchReference = false;
     try {
         AddRef(command);
@@ -2205,7 +2519,7 @@ std::optional<Request> SourceThreadAgent::TakeDeferred(
     DeferredSlot<Request>& slot, WPARAM kind, uint64_t token, Dropped dropped) noexcept {
     if (GetCurrentThreadId() != threadId_ || token == 0 || token != slot.token || !slot)
         return std::nullopt;
-    if (g_boundedSourceCommandDepth != 0) {
+    if (g_boundedSourceCommandDepth != 0 || IsGuiThreadDispatchActive()) {
         slot.rearm = true;
         return std::nullopt;
     }
@@ -2229,23 +2543,39 @@ bool SourceThreadAgent::PostIslandAction(
     refused = false;
     if (queuedToken) *queuedToken = 0;
     try {
+        const bool itemContext = node.kind == ControlKind::TreeView || node.kind == ControlKind::ListView;
+        const size_t count = node.kind == ControlKind::DiskView && node.diskView
+            ? node.diskView->items.size()
+            : itemContext ? node.items.size() : node.islandItems.size();
         if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
-            index < 0 || static_cast<size_t>(index) >= node.islandItems.size() ||
+            index < 0 || static_cast<size_t>(index) >= count ||
             islandAction_.nextToken == 0) return false;
-        if (islandAction_ || nativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+        if (islandAction_ || nativeAction_ || nativeActionRunning_ || remoteActions_.load() || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
             refused = true;
             return false;
         }
-        const auto& item = node.islandItems[index];
         IslandActionRequest deferred;
         deferred.island = node.hwnd;
         deferred.nodeId = node.nodeId;
         deferred.generation = node.generation;
         deferred.index = index;
-        deferred.name = item.name;
-        deferred.action = item.actionName;
-        deferred.dropDown = item.dropDown;
+        deferred.kind = node.kind;
+        if (node.kind == ControlKind::DiskView && node.diskView) {
+            deferred.name = node.diskView->items[index].name;
+            deferred.action = L"diskContext";
+            deferred.dropDown = true;
+            deferred.diskView = node.diskView;
+        } else if (itemContext) {
+            deferred.name = node.items[index];
+            deferred.action = L"contextMenu";
+            deferred.dropDown = true;
+        } else {
+            const auto& item = node.islandItems[index];
+            deferred.name = item.name;
+            deferred.action = item.actionName;
+            deferred.dropDown = item.dropDown;
+        }
         const uint64_t token = QueueDeferred(islandAction_, kDeferredIslandAction, std::move(deferred));
         if (queuedToken) *queuedToken = token;
         return token != 0;
@@ -2449,6 +2779,35 @@ HWND NativeActionOwner(HWND root, const ActionRequest& action, HWND source) noex
 }
 }
 
+bool SourceThreadAgent::PostRemoteAction(HWND target,
+    std::function<void(const std::shared_ptr<std::atomic<bool>>&)> work, std::wstring& error) {
+    std::scoped_lock submission(remoteSubmissionMutex_);
+    if (restoring_.load() || shuttingDown_.load()) {
+        error = L"native surface is restoring";
+        return false;
+    }
+    if (!remoteCancellation_ || remoteCancellation_->load())
+        remoteCancellation_ = std::make_shared<std::atomic<bool>>(false);
+    const auto cancellation = remoteCancellation_;
+    const auto agent = shared_from_this();
+    // The ticket keeps both the agent and its pending-action guard alive, even
+    // when cancellation removes a callback before its target ever pumps it.
+    const auto armed = std::make_shared<bool>(false);
+    auto ticket = std::shared_ptr<SourceThreadAgent>(this, [agent, armed](SourceThreadAgent*) {
+        if (*armed) {
+            agent->remoteActions_.fetch_sub(1);
+            agent->RequestMenuBarRefresh();
+            agent->MarkDirty();
+        }
+    });
+    remoteActions_.fetch_add(1);
+    *armed = true;
+    return PostToWindowThread(target, [ticket, cancellation, work = std::move(work)] {
+        if (!cancellation->load() && !ticket->shuttingDown_.load() && !ticket->IsDestroyed())
+            work(cancellation);
+    }, cancellation, error);
+}
+
 bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const ControlNode* node,
     bool& refused, std::wstring& error, uint64_t* queuedToken, uint64_t* closeSequence) noexcept {
     refused = true;
@@ -2459,16 +2818,17 @@ bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const Cont
             ((action.action == L"invoke" &&
                 (node->kind == ControlKind::Button || node->kind == ControlKind::SysLink)) ||
              (action.action == L"toolbarCommand" && node->kind == ControlKind::Toolbar) ||
+             (action.action == L"htmlInvoke" && node->kind == ControlKind::NativeDocument && node->document) ||
              (action.action == L"mdiCommand" && node->kind == ControlKind::MdiChild));
         const bool rootAction = !node && !action.nodeId &&
             (action.action == L"close" || action.action == L"menuCommand");
-        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || IsDestroyed() ||
+        if (GetCurrentThreadId() != threadId_ || restoring_.load() || shuttingDown_.load() || IsDestroyed() ||
             (!nodeAction && !rootAction) || nativeAction_.nextToken == 0 ||
             !IsApplicationCloaked(root_)) {
             error = L"native action has no current projected source identity";
             return false;
         }
-        if (nativeAction_ || nativeActionRunning_ || islandAction_ || menuAction_ ||
+        if (nativeAction_ || nativeActionRunning_ || remoteActions_.load() || islandAction_ || menuAction_ ||
             listViewActivation_ || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
             error = L"a native action is already pending";
@@ -2480,14 +2840,26 @@ bool SourceThreadAgent::PostNativeAction(const ActionRequest& action, const Cont
             request.source = node->hwnd;
             request.nodeGeneration = node->generation;
             request.kind = node->kind;
-            if (!IsChild(root_, request.source) ||
-                reinterpret_cast<uintptr_t>(GetPropW(request.source, kNodeGenerationProperty)) != node->generation) {
+            request.document = node->document;
+            auto valid = std::make_shared<bool>(false);
+            if (!DispatchToWindowThread(request.source, [root = root_, source = request.source,
+                    generation = node->generation, valid] {
+                    *valid = IsChild(root, source) &&
+                        reinterpret_cast<uintptr_t>(GetPropW(source, kNodeGenerationProperty)) == generation;
+                }, error) || !*valid) {
                 error = L"native action source control was replaced";
                 return false;
             }
         }
-        request.owner = NativeActionOwner(root_, action, request.source);
-        if (!request.owner || GetWindowThreadProcessId(request.owner, nullptr) != threadId_) return false;
+        auto owner = std::make_shared<HWND>(nullptr);
+        if (!DispatchToWindowThread(request.source ? request.source : root_,
+                [root = root_, action, source = request.source, owner] {
+                    *owner = NativeActionOwner(root, action, source);
+                }, error)) return false;
+        request.owner = *owner;
+        DWORD ownerProcess = 0;
+        if (!request.owner || !GetWindowThreadProcessId(request.owner, &ownerProcess) ||
+            ownerProcess != GetCurrentProcessId()) return false;
         if (action.action == L"menuCommand") {
             std::vector<MenuItemSnapshot> menu;
             request.menu = GetMenu(root_);
@@ -2549,12 +2921,15 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
         const auto sourceCurrent = [&] {
             if (!request.source) return true;
             const auto identity = captureContext_.nodeIds.find(request.source);
-            return IsChild(root_, request.source) &&
-                GetWindowThreadProcessId(request.source, nullptr) == threadId_ &&
-                reinterpret_cast<uintptr_t>(GetPropW(request.source, kNodeGenerationProperty)) == request.nodeGeneration &&
-                identity != captureContext_.nodeIds.end() &&
-                identity->second.nodeId == request.action.nodeId && identity->second.generation == request.nodeGeneration &&
-                NativeActionOwner(root_, request.action, request.source) == request.owner;
+            if (identity == captureContext_.nodeIds.end() || identity->second.nodeId != request.action.nodeId ||
+                identity->second.generation != request.nodeGeneration) return false;
+            auto valid = std::make_shared<bool>(false);
+            std::wstring ignored;
+            return DispatchToWindowThread(request.source, [root = root_, request, valid] {
+                *valid = IsChild(root, request.source) &&
+                    reinterpret_cast<uintptr_t>(GetPropW(request.source, kNodeGenerationProperty)) == request.nodeGeneration &&
+                    NativeActionOwner(root, request.action, request.source) == request.owner;
+            }, ignored) && *valid;
         };
         const auto ready = [&] {
             if (GetCurrentThreadId() != threadId_ || g_boundedSourceCommandDepth != 0 ||
@@ -2576,6 +2951,13 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
         });
         if (request.source && (node == current.nodes.end() || node->hwnd != request.source ||
                 node->generation != request.nodeGeneration || node->kind != request.kind)) return;
+        if (request.source && GetWindowThreadProcessId(request.source, nullptr) != threadId_) {
+            const ControlNode expected = *node;
+            PostRemoteAction(request.source, [this, request, expected](const auto& cancelled) {
+                RunNativeActionOnOwner(request, expected, cancelled);
+            }, error);
+            return;
+        }
         const auto& action = request.action;
         if (action.action == L"close") {
             SendMessageW(root_, WM_CLOSE, 0, 0);
@@ -2584,6 +2966,8 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
                 GetMenu(root_) != request.menu || !IsMenu(request.menu) ||
                 NativeMenuFingerprint(current.menu) != request.menuFingerprint) return;
             SendMessageW(root_, WM_COMMAND, MAKEWPARAM(action.menuCommandId, 0), 0);
+        } else if (action.action == L"htmlInvoke" && request.document) {
+            InvokeNativeDocumentItem(request.source, *request.document, action.itemIndex, error);
         } else if (action.action == L"toolbarCommand") {
             if (!ApplyToolbarCheckState(request.source, *node, action.menuCommandId, error) || !ready()) return;
             SendMessageW(request.owner, WM_COMMAND, MAKEWPARAM(action.menuCommandId, 0),
@@ -2616,6 +3000,55 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
     } catch (...) {
         // The request has already been consumed. Reconcile owns any fallback.
     }
+}
+
+void SourceThreadAgent::RunNativeActionOnOwner(const NativeActionRequest& request, const ControlNode& node,
+    const std::shared_ptr<std::atomic<bool>>& cancelled) noexcept {
+    try {
+        const auto ready = [&] {
+            if (cancelled->load() || shuttingDown_.load() || IsDestroyed() ||
+                GetWindowThreadProcessId(request.source, nullptr) != GetCurrentThreadId() ||
+                !IsApplicationCloaked(root_) || !IsChild(root_, request.source) ||
+                reinterpret_cast<uintptr_t>(GetPropW(request.source, kNodeGenerationProperty)) != request.nodeGeneration ||
+                NativeActionOwner(root_, request.action, request.source) != request.owner) return false;
+            for (HWND current = request.source; current; current = GetParent(current)) {
+                if (!IsWindowVisible(current) || !IsWindowEnabled(current)) return false;
+                if (current == root_) return true;
+            }
+            return false;
+        };
+        if (!ready()) return;
+        const auto& action = request.action;
+        std::wstring error;
+        if (action.action == L"htmlInvoke" && request.document) {
+            if (ready()) InvokeNativeDocumentItem(request.source, *request.document, action.itemIndex, error);
+        } else if (action.action == L"toolbarCommand") {
+            if (!ApplyToolbarCheckState(request.source, node, action.menuCommandId, error) || !ready()) return;
+            SendMessageW(request.owner, WM_COMMAND, MAKEWPARAM(action.menuCommandId, 0),
+                reinterpret_cast<LPARAM>(request.source));
+        } else if (action.action == L"mdiCommand") {
+            if (action.text == L"activate")
+                SendMessageW(request.owner, WM_MDIACTIVATE, reinterpret_cast<WPARAM>(request.source), 0);
+            else {
+                const WPARAM code = action.text == L"close" ? SC_CLOSE : action.text == L"minimize" ? SC_MINIMIZE :
+                    action.text == L"maximize" ? SC_MAXIMIZE : SC_RESTORE;
+                SendMessageW(request.source, WM_SYSCOMMAND, code, 0);
+            }
+        } else if (request.kind == ControlKind::Button) {
+            SendMessageW(request.source, BM_CLICK, 0, 0);
+        } else if (request.kind == ControlKind::SysLink) {
+            LITEM item{};
+            item.mask = LIF_ITEMINDEX | LIF_STATE;
+            item.iLink = 0;
+            item.stateMask = LIS_FOCUSED;
+            item.state = LIS_FOCUSED;
+            if (!SendMessageW(request.source, LM_SETITEM, 0, reinterpret_cast<LPARAM>(&item)) || !ready()) return;
+            SendMessageW(request.source, WM_SETFOCUS, 0, 0);
+            if (ready()) SendMessageW(request.source, WM_KEYDOWN, VK_RETURN, 1);
+            if (ready()) SendMessageW(request.source, WM_KEYUP, VK_RETURN, 1 | (1ll << 30) | (1ll << 31));
+            if (ready()) SendMessageW(request.source, WM_KILLFOCUS, 0, 0);
+        }
+    } catch (...) { MarkDirty(); }
 }
 
 bool ListViewItemsHaveNativeDefaultActions(HWND listView, const ControlNode& node) noexcept {
@@ -2663,7 +3096,7 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             return false;
         }
         if (listViewActivation_ || islandAction_ || menuAction_ ||
-            nativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+            nativeAction_ || nativeActionRunning_ || remoteActions_.load() || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
             error = L"a native item action is already pending";
             return false;
@@ -2676,7 +3109,7 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             ~PreparingScope() { agent->nativeActionRunning_ = false; }
         } preparing{this};
         nativeActionRunning_ = true;
-        const auto cancellation = listViewActivationCancellation_;
+        const auto cancellation = listViewActivationCancellation_.load();
         ListViewActivationRequest request;
         request.listView = node.hwnd;
         request.nodeId = node.nodeId;
@@ -2686,12 +3119,19 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
         request.itemCount = ListViewItemCount(node);
         request.viewStyle = static_cast<DWORD>(node.style) & kListViewActivationStyle;
         request.text = node.items[index];
+        struct Prepared { ListViewActivationRequest request; std::wstring error; bool valid = false; };
+        auto prepared = std::make_shared<Prepared>();
+        prepared->request = request;
+        const auto agent = shared_from_this();
+        if (!DispatchToWindowThread(node.hwnd, [agent, prepared, node, index, cancellation] {
+            auto& request = prepared->request;
+            auto& error = prepared->error;
         const auto current = [&] {
-            return !shuttingDown_.load() && cancellation == listViewActivationCancellation_ &&
-                ListViewActivationReady(root_, request);
+            return !agent->shuttingDown_.load() && cancellation == agent->listViewActivationCancellation_ &&
+                ListViewActivationReady(agent->root_, request);
         };
         if (!current() || !ReadListViewActivationIdentity(request, request.nativeState, error) ||
-            !current()) return false;
+            !current()) return;
         const bool selected = std::find(node.selectedIndices.begin(), node.selectedIndices.end(), index) !=
             node.selectedIndices.end();
         const bool checked = std::find(node.checkedIndices.begin(), node.checkedIndices.end(), index) !=
@@ -2701,12 +3141,12 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
             (node.checkBoxes && (request.nativeState & LVIS_STATEIMAGEMASK) !=
                 INDEXTOSTATEIMAGEMASK(checked ? 2 : 1))) {
             error = L"ListView activation selection, focus or check state changed";
-            return false;
+            return;
         }
         {
             AccessibleListViewItem live;
             if (!ReadListViewAccessibleAction(request, live, request.accessibleName,
-                    request.defaultAction, request.accessibleState, error)) return false;
+                    request.defaultAction, request.accessibleState, error)) return;
             // A provider's Release can pump too. Finish its lifetime before
             // final validation and publication of the deferred message.
         }
@@ -2714,8 +3154,12 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
         if (!current() || !ReadListViewActivationIdentity(request, state, error) ||
             state != request.nativeState || !current()) {
             error = L"ListView item or activation lifetime changed while its default action was read";
-            return false;
+            return;
         }
+            prepared->valid = true;
+        }, error)) return false;
+        if (!prepared->valid) { error = std::move(prepared->error); return false; }
+        request = std::move(prepared->request);
         const uint64_t token = QueueDeferred(
             listViewActivation_, kDeferredListViewActivation, std::move(request));
         if (token == 0) {
@@ -2779,14 +3223,28 @@ void SourceThreadAgent::RunListViewActivationOnSourceThread(const ListViewActiva
         }
     } running{this};
     nativeActionRunning_ = true;
-    const auto cancellation = listViewActivationCancellation_;
+    const auto identity = captureContext_.nodeIds.find(request.listView);
+    if (identity == captureContext_.nodeIds.end() || identity->second.nodeId != request.nodeId ||
+        identity->second.generation != request.generation || trackedPopup_) return;
+    const auto cancellation = listViewActivationCancellation_.load();
+    if (GetWindowThreadProcessId(request.listView, nullptr) != threadId_) {
+        std::wstring error;
+        try {
+            PostRemoteAction(request.listView, [this, request, cancellation](const auto& cancelled) {
+                RunListViewActivationOnOwner(request, cancellation, cancelled);
+            }, error);
+        } catch (...) { MarkDirty(); }
+        return;
+    }
+    RunListViewActivationOnOwner(request, cancellation, {});
+}
+
+void SourceThreadAgent::RunListViewActivationOnOwner(const ListViewActivationRequest& request,
+    uint64_t cancellation, const std::shared_ptr<std::atomic<bool>>& cancelled) noexcept {
     try {
         const auto ready = [&] {
-            const auto identity = captureContext_.nodeIds.find(request.listView);
-            return !shuttingDown_.load() && !trackedPopup_ &&
-                cancellation == listViewActivationCancellation_ &&
-                identity != captureContext_.nodeIds.end() && identity->second.nodeId == request.nodeId &&
-                identity->second.generation == request.generation && ListViewActivationReady(root_, request);
+            return !shuttingDown_.load() && !(cancelled && cancelled->load()) &&
+                cancellation == listViewActivationCancellation_.load() && ListViewActivationReady(root_, request);
         };
         if (!ready()) return;
         UINT nativeState = 0;
@@ -2891,23 +3349,60 @@ void SourceThreadAgent::RunListViewActivationOnSourceThread(const ListViewActiva
 
 void SourceThreadAgent::RunIslandActionOnSourceThread(const IslandActionRequest& request) noexcept {
     try {
-        if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
-            !IsApplicationCloaked(root_) || trackedPopup_ ||
-            !IsChild(root_, request.island) || !IsWindowVisible(request.island) ||
-            reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) !=
-                request.generation) return;
-        for (HWND current = request.island; current; current = GetParent(current)) {
-            if (!IsWindowEnabled(current)) return;
+        if (GetCurrentThreadId() == threadId_ &&
+            GetWindowThreadProcessId(request.island, nullptr) != threadId_) {
+            const auto identity = captureContext_.nodeIds.find(request.island);
+            if (shuttingDown_.load() || trackedPopup_ || identity == captureContext_.nodeIds.end() ||
+                identity->second.nodeId != request.nodeId || identity->second.generation != request.generation ||
+                !IsApplicationCloaked(root_)) return;
+            remotePopup_ = std::make_shared<RemotePopupState>();
+            remotePopup_->request = request;
+            const auto popup = remotePopup_;
+            std::wstring error;
+            PostRemoteAction(request.island, [this, request, popup](const auto& cancelled) {
+                if (cancelled->load() || !IsChild(root_, request.island) || !IsWindowVisible(request.island) ||
+                    !IsWindowEnabled(request.island) ||
+                    reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) != request.generation)
+                    return;
+                auto previous = std::move(g_remotePopupHandler);
+                struct RestoreHandler {
+                    std::function<bool(HMENU, UINT, HWND, BOOL&)> previous;
+                    ~RestoreHandler() { g_remotePopupHandler = std::move(previous); }
+                } restore{std::move(previous)};
+                g_remotePopupHandler = [this, request, popup, cancelled](HMENU menu, UINT flags, HWND owner, BOOL& result) {
+                    return TrackRemoteIslandPopup(request, popup, cancelled, menu, flags, owner, result);
+                };
+                std::wstring reason;
+                if (!cancelled->load() && !InvokePopupOwner(request, reason)) {
+                    FluentShell::Log(L"Remote island action did not run: " + reason);
+                }
+            }, error);
+            return;
+        }
+        const wchar_t* refusal =
+            GetCurrentThreadId() != threadId_ || shuttingDown_.load() ? L"agent is not live on this thread" :
+            !IsApplicationCloaked(root_) ? L"native root is no longer cloaked" :
+            trackedPopup_ ? L"another native popup is tracking" :
+            !IsChild(root_, request.island) || !IsWindowVisible(request.island) ? L"its window is gone or hidden" :
+            reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) != request.generation
+                ? L"its window was recreated" : nullptr;
+        for (HWND current = request.island; !refusal && current; current = GetParent(current)) {
+            if (!IsWindowEnabled(current)) refusal = L"its window or an ancestor is disabled";
             if (current == root_) break;
         }
+        if (refusal) {
+            FluentShell::Log(std::wstring(L"Deferred popup action refused: ") + refusal);
+            return;
+        }
+        FluentShell::Log(L"Deferred popup action running: " + request.action + L" node=" +
+            std::to_wstring(request.nodeId) + L" index=" + std::to_wstring(request.index));
         pendingIslandMenu_.reset();
         if (request.dropDown) {
             pendingIslandMenu_ = request;
             pendingIslandDeadline_ = GetTickCount64() + 2000;
         }
         std::wstring reason;
-        if (!InvokeAccessibleIslandItem(request.island, request.index,
-                request.name, request.action, reason)) {
+        if (!InvokePopupOwner(request, reason)) {
             pendingIslandMenu_.reset();
             FluentShell::Log(L"Island action did not run: " + reason);
         }
@@ -2922,6 +3417,8 @@ void SourceThreadAgent::CancelPopupOnSourceThread(bool activeOnly) noexcept {
     // before entering TrackPopupMenu; that does not cancel the pending open request.
     if (activeOnly && !trackedPopup_) return;
     ++listViewActivationCancellation_;
+    if (remoteCancellation_) CancelPostedGuiThreadWork(remoteCancellation_);
+    remotePopup_.reset();
     CancelNativeActionOnSourceThread();
     listViewActivation_.Reset();
     menuAction_.Reset();
@@ -2935,6 +3432,20 @@ void SourceThreadAgent::CancelPopupOnSourceThread(bool activeOnly) noexcept {
 
 bool SourceThreadAgent::CompletePopupOnSourceThread(
     const ActionRequest& action, std::wstring& error) {
+    if (remotePopup_) {
+        std::scoped_lock lock(remotePopup_->mutex);
+        if (remotePopup_->menu.Current()) {
+            PopupMenuDecision decision;
+            if (!remoteCancellation_ || remoteCancellation_->load() ||
+                !remotePopup_->menu.Resolve(action.popupId, action.popupItemId, decision)) {
+                error = L"remote popup is no longer active or its item is disabled";
+                return false;
+            }
+            remotePopup_->decision = decision;
+            MarkDirty();
+            return true;
+        }
+    }
     PopupMenuDecision decision;
     if (!trackedPopup_ || !IsApplicationCloaked(root_) ||
         !popupMenu_.Resolve(action.popupId, action.popupItemId, decision)) {
@@ -2953,6 +3464,80 @@ bool SourceThreadAgent::CompletePopupOnSourceThread(
     }
     popupDecision_ = std::move(decision);
     return true;
+}
+
+bool SourceThreadAgent::TrackRemoteIslandPopup(const IslandActionRequest& request,
+    const std::shared_ptr<RemotePopupState>& state,
+    const std::shared_ptr<std::atomic<bool>>& cancelled,
+    HMENU menu, UINT flags, HWND owner, BOOL& result) {
+    result = FALSE;
+    const auto current = [&] {
+        return !cancelled->load() && !shuttingDown_.load() && !IsDestroyed() &&
+            IsWindow(owner) && IsMenu(menu) && IsApplicationCloaked(root_) &&
+            IsChild(root_, request.island) &&
+            reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) == request.generation;
+    };
+    if (!current()) return true;
+    if ((flags & TPM_NONOTIFY) == 0) SendMessageW(owner, WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu), 0);
+    std::vector<MenuItemSnapshot> items;
+    std::wstring error;
+    const bool captured = request.dropDown && current() && CaptureMenuHandle(menu, L"", items, error) && !items.empty();
+    {
+        std::scoped_lock lock(state->mutex);
+        if (!captured || state->menu.BeginWithId(request.nodeId, request.index, std::move(items), AllocatePopupId()) == 0)
+            state->error = L"remote island popup cannot be projected: " + error;
+    }
+    MarkDirty();
+    bool quit = false;
+    int quitCode = 0;
+    std::optional<PopupMenuDecision> decision;
+    while (current()) {
+        {
+            std::scoped_lock lock(state->mutex);
+            decision = state->decision;
+            if (decision) break;
+        }
+        MSG message{};
+        if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) { quit = true; quitCode = static_cast<int>(message.wParam); break; }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        } else {
+            MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    }
+    // The HMENU remains owned by the native tracking call. Revalidate its
+    // command identity on this GUI thread before answering the application.
+    if (decision && !decision->IsDismissal()) {
+        std::vector<MenuItemSnapshot> live;
+        if (!current() || !CaptureMenuHandle(menu, L"", live, error) ||
+            !PopupMenuState::MatchLiveChoice(live, *decision)) decision.reset();
+    }
+    if ((flags & TPM_NONOTIFY) == 0 && IsWindow(owner))
+        SendMessageW(owner, WM_UNINITMENUPOPUP, reinterpret_cast<WPARAM>(menu), 0);
+    if (quit) PostQuitMessage(quitCode);
+    if (!quit && current() && decision && !decision->IsDismissal()) {
+        if ((flags & TPM_RETURNCMD) != 0) result = static_cast<BOOL>(decision->commandId);
+        else if ((flags & TPM_NONOTIFY) == 0)
+            result = PostMessageW(owner, WM_COMMAND, MAKEWPARAM(decision->commandId, 0), 0);
+        else result = TRUE;
+    }
+    {
+        std::scoped_lock lock(state->mutex);
+        state->menu.Cancel();
+        state->decision.reset();
+    }
+    MarkDirty();
+    return true;
+}
+
+uint64_t SourceThreadAgent::AllocatePopupId() noexcept {
+    uint64_t next = nextPopupId_.load();
+    while (next != 0) {
+        const uint64_t successor = next == UINT64_MAX ? 0 : next + 1;
+        if (nextPopupId_.compare_exchange_weak(next, successor)) return next;
+    }
+    return 0;
 }
 
 bool SourceThreadAgent::TrackIslandPopupOnSourceThread(
@@ -2992,7 +3577,7 @@ bool SourceThreadAgent::TrackIslandPopupOnSourceThread(
     std::vector<MenuItemSnapshot> items;
     std::wstring reason;
     if (!CaptureMenuHandle(menu, L"", items, reason) || items.empty() ||
-        popupMenu_.Begin(request.nodeId, request.index, std::move(items)) == 0) {
+        popupMenu_.BeginWithId(request.nodeId, request.index, std::move(items), AllocatePopupId()) == 0) {
         popupCaptureError_ = L"island popup cannot be projected: " + reason;
         FluentShell::Log(popupCaptureError_);
     } else {
@@ -3042,18 +3627,32 @@ bool SourceThreadAgent::TrackIslandPopupOnSourceThread(
 
 bool TryTrackIslandPopup(HMENU menu, UINT flags, HWND owner, BOOL& result) noexcept {
     try {
+        if (g_remotePopupHandler) return g_remotePopupHandler(menu, flags, owner, result);
+        // MMC tracks context menus with an owner outside its frame's hierarchy, so
+        // the owner's root names the agent only when the application uses its own
+        // frame. Otherwise the agent on this thread that armed a popup request is
+        // the one waiting for it; TrackIslandPopupOnSourceThread refuses unarmed agents.
         const HWND root = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
-        std::shared_ptr<SourceThreadAgent> selected;
+        std::vector<std::shared_ptr<SourceThreadAgent>> candidates;
         {
             std::scoped_lock lock(g_agentsMutex);
             for (const auto& [_, agent] : g_agents) {
-                if (agent && agent->Root() == root && agent->ThreadId() == GetCurrentThreadId()) {
-                    selected = agent->shared_from_this();
-                    break;
-                }
+                if (!agent || agent->ThreadId() != GetCurrentThreadId()) continue;
+                auto shared = agent->shared_from_this();
+                if (agent->Root() == root) candidates.insert(candidates.begin(), std::move(shared));
+                else candidates.push_back(std::move(shared));
             }
         }
-        return selected && selected->TrackIslandPopupOnSourceThread(menu, flags, owner, result);
+        for (const auto& candidate : candidates) {
+            if (candidate->TrackIslandPopupOnSourceThread(menu, flags, owner, result)) return true;
+        }
+        if (!candidates.empty()) {
+            wchar_t ownerClass[64]{};
+            if (owner) GetClassNameW(owner, ownerClass, 64);
+            FluentShell::Log(L"Native popup not claimed by a pending request; owner class=" +
+                std::wstring(ownerClass) + L" agents=" + std::to_wstring(candidates.size()));
+        }
+        return false;
     } catch (...) {
         result = FALSE;
         return true;
@@ -3083,12 +3682,27 @@ bool SourceThreadAgent::Restore(
     std::wstring& error,
     DWORD timeoutMs,
     HANDLE cancelEvent) {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    {
+        std::scoped_lock submission(remoteSubmissionMutex_);
+        restoring_.store(true);
+        if (remoteCancellation_) CancelPostedGuiThreadWork(remoteCancellation_);
+    }
+    // Cancel from the caller as well: a GUI thread stuck in a native callback
+    // cannot consume its restore command until that callback unwinds.
+    std::wstring drainError;
+    if (!CancelAndDrainGuiThreadWork(root_, drainError, timeoutMs)) {
+        error = drainError;
+        return false;
+    }
     Command* command = CreateCommand(kCommandRestore, this);
     if (!command) {
         error = L"source command allocation failed";
         return false;
     }
-    const bool posted = Post(command, timeoutMs, cancelEvent);
+    const auto now = GetTickCount64();
+    const DWORD remaining = now >= deadline ? 0 : static_cast<DWORD>(deadline - now);
+    const bool posted = remaining && Post(command, remaining, cancelEvent);
     if (!posted) error = L"source UI thread did not acknowledge restore";
     else if (!command->success) error = command->error;
     const bool success = posted && command->success;
@@ -3306,7 +3920,7 @@ bool SourceThreadAgent::RefreshMenuBarOnSourceThread(
     bool& changed,
     std::wstring& error) {
     changed = false;
-    if (menuAction_ || nativeAction_ || nativeActionRunning_ || trackedPopup_ ||
+    if (menuAction_ || nativeAction_ || nativeActionRunning_ || remoteActions_.load() || trackedPopup_ ||
         (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_))
         return true;
     if (GetCurrentThreadId() != threadId_) {
@@ -3330,9 +3944,12 @@ bool SourceThreadAgent::RefreshMenuBarOnSourceThread(
     const auto buttons = state.menuBarButtons;
     std::vector<MenuItemSnapshot> menu;
     std::vector<MenuBarCommandBinding> commands;
+    auto silent = state.menuBarSilentButtons;
     const bool read = CaptureMenuBarToolbar(root_, toolbar, buttons, popupWaitMs,
-        6500, cancelled, menu, error, &commands);
+        6500, cancelled, menu, error, &commands, &silent);
     if (cancelled.load(std::memory_order_acquire)) return false;
+    // Pumping can replace the bar; the observation below clears stale memory then.
+    if (state.menuBarButtons == buttons) state.menuBarSilentButtons = std::move(silent);
     // The application's message pump may replace the bar while it is being read.
     // Revalidate on the same source thread before publishing any cached commands.
     ObserveMenuBarToolbar(root_, state);
@@ -3546,21 +4163,6 @@ bool SourceThreadAgent::CaptureAndCloak(
     return success;
 }
 
-bool SourceThreadAgent::EnableGenericDirectUiCandidate() noexcept {
-    if (genericDirectUiCandidate_) return true;
-    std::wstring imagePath;
-    std::wstring error;
-    if (!ResolveGenericDirectUiImage(imagePath, error)) {
-        FluentShell::Log(
-            L"DirectUI generic lane refused for this process: " + error);
-        return false;
-    }
-    genericDirectUiCandidate_ = true;
-    FluentShell::Log(
-        L"DirectUI surface degraded to the capability-derived generic lane");
-    return true;
-}
-
 void SourceThreadAgent::AdoptDirectUiProfile(
     std::shared_ptr<DirectUiOwnedProfile> profile) noexcept {
     ownedDirectUiProfile_ = std::move(profile);
@@ -3569,9 +4171,14 @@ void SourceThreadAgent::AdoptDirectUiProfile(
 
 bool SourceThreadAgent::Shutdown() noexcept {
     try {
-    if (shuttingDown_.exchange(true)) {
-        return hook_ == nullptr && cbtHook_ == nullptr && callWndRetHook_ == nullptr;
+    shuttingDown_.store(true);
+    {
+        std::scoped_lock submission(remoteSubmissionMutex_);
+        restoring_.store(true);
+        if (remoteCancellation_) CancelPostedGuiThreadWork(remoteCancellation_);
     }
+    std::wstring drainError;
+    if (!CancelAndDrainGuiThreadWork(root_, drainError, 500)) return false;
     if (hook_) {
         if (!IsWindow(root_)) {
             UnhookAll();

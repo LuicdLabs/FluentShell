@@ -46,6 +46,12 @@ internal static class PopupMenuAnchor
 {
     public static PixelRect? ItemRect(ControlNodeViewModel? node, PopupMenuSnapshot popup)
     {
+        if (node is { Kind: "diskView", Visible: true, DiskView: { } view } &&
+            node.NodeId == popup.NodeId && popup.ItemIndex >= 0 && popup.ItemIndex < view.Items.Count)
+        {
+            var native = view.Items[popup.ItemIndex].Rect;
+            return native with { X = native.X + view.ClientRect.X, Y = native.Y + view.ClientRect.Y };
+        }
         if (node is null || node.NodeId != popup.NodeId || node.Kind != "accessibleIsland" ||
             !node.Visible || popup.ItemIndex < 0 || popup.ItemIndex >= node.IslandItems.Count)
             return null;

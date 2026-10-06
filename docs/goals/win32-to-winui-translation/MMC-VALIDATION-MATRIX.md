@@ -277,6 +277,78 @@ the extended HTML pane. Logs:
 Both processes exited after cleanup. The remaining barrier failure is therefore
 not confined to the extended view's HTML capture.
 
+## 2026-10-06/07: context menus, splitters, menus, WinForms consoles
+
+Protocol minor 32. All 545 Renderer tests, the full native suite and the production
+gates pass (`build/session-20261007-test2.log`).
+
+Interaction fixes, each verified live in a disposable console with
+`tools/Drive-ProjectedMmc.ps1` (real pointer input against the projection):
+
+- **TreeView/ListView right-click.** A new `contextMenu` action carries the item
+  index and its label as a witness (request-semantic, refused if the index names a
+  different item). The Bridge focuses the control, selects the item through the
+  control's own messages, and sends the keyboard form of `WM_CONTEXTMENU`. MMC
+  hit-tests the *cursor*, not the message's point, and routes the keyboard form to
+  the focused pane (Task Scheduler's focus otherwise rests in its WinForms view);
+  `tools/Probe-NativeContextMenu.ps1` records that behavior. The application's
+  `TrackPopupMenu` is answered by a WinUI flyout at the click point. MMC tracks its
+  menus with an owner outside the frame, so an armed agent on the tracking thread
+  now claims the popup even when the owner's root differs. Verified in compmgmt
+  (tree and list) and taskschd.
+- **Popup dismissal.** The selection a context menu makes arrives in the same patch,
+  and the WinUI tree/list then moves focus to the selected item a frame later, which
+  light-dismissed the flyout. A close within 400 ms that leaves focus in the anchor
+  reopens the flyout once instead of answering a dismissal.
+- **Menu-bar reads no longer steal activation.** Every navigation re-reads MMC's
+  toolbar menu bar; the read used to `SetForegroundWindow` the cloaked frame for
+  about 2 s, closing any open flyout and sending keystrokes to the hidden window.
+  Passive reads no longer activate it (command execution still does). Buttons that
+  opened no popup last time (Favorites, SnapinMenu) wait 150 ms instead of 700 ms.
+- **Splitter drags** track locally and make one native `setSplit` on release, as
+  MMC's own tracking bar does: a 24-move drag produced exactly one request, accepted
+  about 100 ms after release. Escape and lost capture abandon the drag.
+- **Native test crash fixed.** `LVM_GETGROUPINFOBYINDEX` with `LVGF_SUBTITLE` or
+  `LVGF_TASK` dereferences null in comctl32 10.0.26100 for a group that has neither;
+  those fields are no longer requested (it would have crashed the target).
+
+Console coverage additions:
+
+- **Windows Forms controls** (taskschd, eventvwr, tpm): owner-draw Labels and
+  Buttons are classified by their MSAA role and state; `TCS_RAGGEDRIGHT` and a
+  single-line strip that overflows into its own up-down are admitted; a tab control
+  is a container for the TabPage windows WinForms parents to it; leaf panels and
+  picture boxes with no tab stop and no accessible action project as their own
+  pixels; callback ListView icons are resolved as the control resolves them.
+- **Scrolling containers** (`scrollBars` on `paneContainer`, action `setScroll`):
+  children are clipped to the native viewport, WinUI scroll bars sit where the
+  native ones are, and scrolling goes through the application's own line/page
+  handling (WinForms ignores a synthetic `SB_THUMBPOSITION`).
+- **DirectUI scroll chrome**: an overflowing Actions pane hosts a real ScrollBar in
+  a `CtrlNotifySink`; it is absorbed as chrome and the elements scroll locally.
+- **Multi-thread capture barrier**: our own capture reads (toolbar `TB_GETBUTTON`,
+  which aliases `TBM_SETLINESIZE`, and `WM_NOTIFY` display-info/custom-draw) no
+  longer count as mutations; WM_USER-range codes are judged by the receiving
+  window's class. Barrier failures now name the first difference.
+- **Timing failures are retried**: a window whose GUI thread is busy (RSoP
+  processing) is deferred instead of spending its one attempt; an attach timeout,
+  an unstable barrier or a capture past its deadline is retried up to four times.
+
+All-console startup (`build/mmc-startup-20261007-032922/`, elevated, 12 s observation):
+**19 of 22 stable startups with Renderer cleanup**, up from 17 on 2026-10-03, with
+taskschd, rsop and tpm newly stable. eventvwr projected in its dedicated run
+(`build/mmc-startup-20261007-032646/`, after one transient retry while loading) but
+in the all-console run its later surface open timed out waiting for the source UI
+thread ("source UI thread did not acknowledge capture"), so it is intermittent, like
+the earlier Services barrier. WF and perfmon stay native (below).
+
+Known gaps from this pass: Event Viewer's overview section headers project as
+captured pixels that do not match the native gradient, and their collapse icons
+(clickable natively, but publishing no MSAA action) are inert in the projection.
+WF still stays native: its collapsible section headers are tab stops and its links
+are owner-draw WinForms LinkLabels, neither of which has an adapter. perfmon is
+unchanged (HTML host plus the `SysmonReport` control).
+
 ## Installed console coverage
 
 Inventory: 21 top-level `C:\Windows\System32\*.msc` files, reconfirmed on 2026-10-02.

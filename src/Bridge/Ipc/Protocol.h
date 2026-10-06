@@ -60,7 +60,12 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // Minor 28 adds the staticBitmap kind (SS_BITMAP pictures under the large-bitmap cap)
 // and the upDown kind (msctls_updown32 stepped through setValue); a BS_ICON/BS_BITMAP
 // push button may carry its picture in the image fields.
-inline constexpr uint16_t kProtocolMinor = 28;
+// Minor 29 retires exact application pages in favor of capability-derived DirectUI
+// semantics and adds owned toolbar hot, disabled, and pressed image variants.
+// Minor 30 adds native documents, owner-draw ComboBox faces, and ListView groups.
+// Minor 31 adds the native Disk Management MSAA table and its semantic actions.
+// Minor 32 adds the contextMenu action for TreeView and ListView items.
+inline constexpr uint16_t kProtocolMinor = 32;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
@@ -91,6 +96,10 @@ inline constexpr size_t kMaxMenuItemPathChars = 64;
 // window with more than a handful of independently sized panes is not a frame the
 // projection can describe, so the cap is deliberately small.
 inline constexpr size_t kMaxPaneSplits = 8;
+// A scrolling container has at most its two standard window scroll bars, and one
+// setScroll request moves at most this many application line steps.
+inline constexpr size_t kMaxScrollBars = 2;
+inline constexpr int kMaxScrollLines = 100;
 // Split positions are client coordinates, bounded by the same limit the protocol
 // already applies to window and control geometry.
 inline constexpr int kMaxCoordinate = 65535;

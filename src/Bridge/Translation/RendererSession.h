@@ -267,6 +267,15 @@ private:
     std::unordered_set<std::wstring> retiredSurfaceIds_;
     std::deque<std::wstring> retiredSurfaceOrder_;
     std::unordered_set<HWND> discoveryAttempts_;
+    // Windows whose busy GUI thread deferred their attempt (logged once each).
+    // Touched only by the supervisor thread.
+    std::unordered_set<HWND> busyDiscoveryWindows_;
+    // Windows whose attempt failed on a timing condition (a snap-in still loading):
+    // retry count and the tick at which discovery may attempt them again.
+    // Touched only by the supervisor thread.
+    struct DiscoveryRetry final { unsigned attempts = 0; uint64_t due = 0; };
+    std::unordered_map<HWND, DiscoveryRetry> discoveryRetries_;
+    void ScheduleDiscoveryRetry(HWND window);
     // Identifies the last enumeration reported to the log, so the census is
     // written when the window set changes instead of once per second.  Touched
     // only by the supervisor thread, which is the only caller of discovery.

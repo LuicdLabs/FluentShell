@@ -149,7 +149,10 @@ bool CaptureMenuBarToolbar(
     const std::atomic<bool>& cancelled,
     std::vector<MenuItemSnapshot>& menu,
     std::wstring& reason,
-    std::vector<MenuBarCommandBinding>* commands = nullptr) noexcept;
+    std::vector<MenuBarCommandBinding>* commands = nullptr,
+    // Per button: opened no popup on the previous read. Such buttons get a short
+    // wait; the read updates the vector (resized to the button count).
+    std::vector<bool>* silentButtons = nullptr) noexcept;
 
 // Reopens just the bound native slot and resolves the selection while its HMENU
 // is alive. The hook returns TPM_RETURNCMD or notifies the actual tracking owner.

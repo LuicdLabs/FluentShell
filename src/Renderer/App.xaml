@@ -14,6 +14,10 @@
       <DataTemplate x:Key="ProjectedItemTemplate">
         <ContentPresenter Content="{Binding Content}" />
       </DataTemplate>
+      <DataTemplate x:Key="OwnerDrawComboItemTemplate">
+        <Image Source="{Binding Source}" Width="{Binding Width}" Height="{Binding Height}"
+               Stretch="Fill" AutomationProperties.Name="{Binding Label}" />
+      </DataTemplate>
     </ResourceDictionary>
   </Application.Resources>
 </Application>

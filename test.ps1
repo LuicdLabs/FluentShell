@@ -122,16 +122,19 @@ foreach ($forbidden in @(
 
 $solutionText = Get-Content -Raw (Join-Path $Root "FluentShell.sln")
 $injectorProjectText = Get-Content -Raw (Join-Path $Root "src\FluentShell.Injector.vcxproj")
-if ($solutionText -match "FluentShell\.Bootstrap" -or $injectorProjectText -match "FluentShell\.Bootstrap") {
-    throw "Bootstrap remains in the production solution/dependency graph"
+$bridgeProjectText = Get-Content -Raw (Join-Path $Root "src\FluentShell.Bridge.vcxproj")
+foreach ($projectText in @($solutionText, $injectorProjectText, $bridgeProjectText)) {
+    if ($projectText -match "FluentShell\.(Bootstrap|Core)|Renderer\.Dwm") {
+        throw "A removed legacy component remains in the production solution/dependency graph"
+    }
 }
 
 $usage = (& $injector 2>&1 | Out-String)
 if ($usage -match "inject <pid\|exe>" -or
     $usage -match "system \[" -or
-    $usage -match "l0 \[--watch\]" -or
+    $usage -match "\bl0\b" -or
     $usage -match "island-(demo|smoke)") {
-    throw "Injector still advertises a removed broad/name-only entry point"
+    throw "Injector still advertises a removed diagnostic/broad/name-only entry point"
 }
 Write-Host "Injector CLI cutover gate passed."
 Write-Host "All available tests and production gates passed."
