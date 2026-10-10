@@ -47,6 +47,7 @@ public:
         if (!dc_ || !bitmap_ || !bits_ || !previous_ || previous_ == HGDI_ERROR) return false;
         const size_t bytes = static_cast<size_t>(width_) * height_ * 4;
         std::vector<uint8_t> black(bytes);
+        bool drawn = false;
         for (int pass = 0; pass < 2; ++pass) {
             std::memset(bits_, pass == 0 ? 0 : 255, bytes);
             const int saved = SaveDC(dc_);
@@ -67,9 +68,15 @@ public:
                 reinterpret_cast<LPARAM>(&draw));
             GdiFlush();
             RestoreDC(dc_, saved);
-            if (!handled || !IsWindow(combo) || !IsWindow(owner)) return false;
+            if (!IsWindow(combo) || !IsWindow(owner)) return false;
+            // A dialog procedure answers WM_DRAWITEM through DWL_MSGRESULT, which the sender reads as 0
+            // even when the procedure painted the item (Performance Monitor's property pages), so
+            // painting is evidence of handling too. Either pass may leave its own fill alone (a black
+            // swatch over the black pass), so the two are judged together.
+            drawn = drawn || handled != 0 || Painted(pass == 0 ? 0 : 255, bytes);
             if (pass == 0) std::memcpy(black.data(), bits_, bytes);
         }
+        if (!drawn) return false;
         face.imageWidth = static_cast<uint32_t>(width_);
         face.imageHeight = static_cast<uint32_t>(height_);
         face.imageFormat = L"bgra8-premultiplied";
@@ -80,6 +87,14 @@ public:
         return true;
     }
 private:
+    // Whether any colour channel of the canvas differs from the fill the pass started with.
+    bool Painted(uint8_t fill, size_t bytes) const noexcept {
+        const auto* pixels = static_cast<const uint8_t*>(bits_);
+        for (size_t offset = 0; offset + 2 < bytes; offset += 4)
+            if (pixels[offset] != fill || pixels[offset + 1] != fill || pixels[offset + 2] != fill) return true;
+        return false;
+    }
+
     int width_;
     int height_;
     HDC dc_ = nullptr;

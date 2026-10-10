@@ -46,6 +46,144 @@
         }
       }
     },
+    "richText": {
+      "$comment": "Minor 35: a read-only rich edit control as paragraphs of runs, each run one character format. Sizes and indents are points; color is 0xRRGGBB or -1 for the control's automatic colour.",
+      "type": "object",
+      "required": ["paragraphs"],
+      "properties": {
+        "paragraphs": {
+          "type": "array", "maxItems": 512,
+          "items": {
+            "type": "object",
+            "required": ["alignment", "bullet", "leftIndent", "firstLineIndent", "spaceBefore", "spaceAfter", "runs"],
+            "properties": {
+              "alignment": { "enum": ["left", "center", "right", "justify"] },
+              "bullet": { "type": "boolean" },
+              "leftIndent": { "type": "number", "minimum": -2000, "maximum": 2000 },
+              "firstLineIndent": { "type": "number", "minimum": -2000, "maximum": 2000 },
+              "spaceBefore": { "type": "number", "minimum": 0, "maximum": 2000 },
+              "spaceAfter": { "type": "number", "minimum": 0, "maximum": 2000 },
+              "runs": {
+                "type": "array", "maxItems": 128,
+                "items": {
+                  "type": "object",
+                  "required": ["text", "bold", "italic", "underline", "strike", "size", "color"],
+                  "properties": {
+                    "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+                    "bold": { "type": "boolean" },
+                    "italic": { "type": "boolean" },
+                    "underline": { "type": "boolean" },
+                    "strike": { "type": "boolean" },
+                    "size": { "type": "number", "minimum": 1, "maximum": 400 },
+                    "color": { "type": "integer", "minimum": -1, "maximum": 16777215 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "performanceGraph": {
+      "$comment": "Minor 36: Performance Monitor's graph as read from the System Monitor control. series[].values holds one entry per graph slot in drawing order (null where the counter had no sample); barSlot is the slot of the newest sample of a wrapping chart (-1 for a scrolling one). Times are milliseconds since the Unix epoch and colours are 0xRRGGBB.",
+      "type": "object",
+      "required": ["displayType", "minimum", "maximum", "sampleCount", "intervalMs", "scroll", "barSlot", "wrapped", "startTimeMs", "endTimeMs", "showVerticalGrid", "showHorizontalGrid", "showScaleLabels", "showTimeLabels", "title", "yAxisLabel", "backColor", "controlColor", "gridColor", "textColor", "barColor", "series"],
+      "properties": {
+        "displayType": { "enum": ["line", "histogram"] },
+        "minimum": { "type": "number", "minimum": -1e15, "maximum": 1e15 },
+        "maximum": { "type": "number", "minimum": -1e15, "maximum": 1e15 },
+        "sampleCount": { "type": "integer", "minimum": 2, "maximum": 2000 },
+        "intervalMs": { "type": "integer", "minimum": 100, "maximum": 3600000 },
+        "scroll": { "type": "boolean" },
+        "barSlot": { "type": "integer", "minimum": -1, "maximum": 1999 },
+        "wrapped": { "type": "boolean" },
+        "startTimeMs": { "type": "integer", "minimum": 0, "maximum": 253402300799999 },
+        "endTimeMs": { "type": "integer", "minimum": 0, "maximum": 253402300799999 },
+        "showVerticalGrid": { "type": "boolean" },
+        "showHorizontalGrid": { "type": "boolean" },
+        "showScaleLabels": { "type": "boolean" },
+        "showTimeLabels": { "type": "boolean" },
+        "title": { "type": "string", "maxLength": 1024 },
+        "yAxisLabel": { "type": "string", "maxLength": 1024 },
+        "backColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "controlColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "gridColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "textColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "barColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "series": {
+          "type": "array", "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["name", "color", "width", "style", "scale", "visible", "highlighted", "values"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 1024 },
+              "color": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+              "width": { "type": "integer", "minimum": 1, "maximum": 8 },
+              "style": { "enum": ["solid", "dash", "dot", "dashdot", "dashdotdot"] },
+              "scale": { "type": "number", "minimum": -1e9, "maximum": 1e9 },
+              "visible": { "type": "boolean" },
+              "highlighted": { "type": "boolean" },
+              "values": {
+                "type": "array", "maxItems": 2000,
+                "items": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": -1e300, "maximum": 1e300 }] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "performanceLegend": {
+      "$comment": "Minor 36: the legend under the graph. Each row's cells follow the Show and Color columns, one per remaining column.",
+      "type": "object",
+      "required": ["displayType", "columns", "rows"],
+      "properties": {
+        "displayType": { "enum": ["line", "histogram"] },
+        "columns": {
+          "type": "array", "minItems": 1, "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["title", "width"],
+            "properties": {
+              "title": { "type": "string", "maxLength": 1024 },
+              "width": { "type": "integer", "minimum": 0, "maximum": 16384 }
+            }
+          }
+        },
+        "rows": {
+          "type": "array", "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["visible", "color", "width", "style", "selected", "cells"],
+            "properties": {
+              "visible": { "type": "boolean" },
+              "color": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+              "width": { "type": "integer", "minimum": 1, "maximum": 8 },
+              "style": { "enum": ["solid", "dash", "dot", "dashdot", "dashdotdot"] },
+              "selected": { "type": "boolean" },
+              "cells": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 1024 } }
+            }
+          }
+        }
+      }
+    },
+    "performanceValueBar": {
+      "$comment": "Minor 36: the value strip under the graph (Last, Average, Minimum, Maximum, Duration), labelled by the control's own strings.",
+      "type": "object",
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "array", "minItems": 1, "maxItems": 8,
+          "items": {
+            "type": "object",
+            "required": ["label", "value"],
+            "properties": {
+              "label": { "type": "string", "maxLength": 1024 },
+              "value": { "type": "string", "maxLength": 1024 }
+            }
+          }
+        }
+      }
+    },
     "nativeDocument": {
       "type": "object", "required": ["documentId", "regions", "items"],
       "properties": {
@@ -222,10 +360,25 @@
       "dependentRequired": {
         "groupViewEnabled": ["listViewGroups", "itemGroupIds"],
         "listViewGroups": ["groupViewEnabled", "itemGroupIds"],
-        "itemGroupIds": ["groupViewEnabled", "listViewGroups"]
+        "itemGroupIds": ["groupViewEnabled", "listViewGroups"],
+        "itemCount": ["itemWindowStart"],
+        "itemWindowStart": ["itemCount"]
       },
       "required": ["nodeId", "generation", "nativeHwnd", "kind", "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "editable", "items"],
       "allOf": [
+        {
+          "$comment": "Minor 33: a large virtual report ListView carries a window of its rows. items and rows hold the rows from itemWindowStart on; itemCount is the list's length, and every index (selection, focus, actions) stays absolute.",
+          "if": { "required": ["itemCount"] },
+          "then": {
+            "properties": {
+              "kind": { "const": "listView" },
+              "listViewMode": { "const": "report" },
+              "checkBoxes": { "const": false },
+              "groupViewEnabled": { "const": false },
+              "itemNativeIds": { "maxItems": 0 }
+            }
+          }
+        },
         {
           "if": { "properties": { "groupViewEnabled": { "const": true } }, "required": ["groupViewEnabled"] },
           "then": { "required": ["itemRects"] },
@@ -247,7 +400,7 @@
           "else": { "not": { "required": ["indeterminate"] } }
         },
         {
-          "if": { "properties": { "kind": { "enum": ["slider", "upDown"] } }, "required": ["kind"] },
+          "if": { "properties": { "kind": { "enum": ["slider", "upDown", "datePicker", "timePicker"] } }, "required": ["kind"] },
           "then": { "required": ["minimum", "maximum", "position", "smallChange", "largeChange"] }
         },
         {
@@ -279,7 +432,8 @@
                 { "required": ["imageList"] },
                 { "required": ["itemImages"] },
                 { "required": ["editableLabels"] },
-                { "required": ["editingIndex"] }
+                { "required": ["editingIndex"] },
+                { "required": ["itemDefaultActivation"] }
               ]
             }
           }
@@ -357,7 +511,9 @@
                 { "required": ["itemNativeIds"] },
                 { "required": ["groupViewEnabled"] },
                 { "required": ["listViewGroups"] },
-                { "required": ["itemGroupIds"] }
+                { "required": ["itemGroupIds"] },
+                { "required": ["itemCount"] },
+                { "required": ["itemWindowStart"] }
               ]
             }
           }
@@ -415,6 +571,26 @@
           "else": { "not": { "required": ["diskView"] } }
         },
         {
+          "if": { "properties": { "kind": { "const": "richText" } }, "required": ["kind"] },
+          "then": { "required": ["richText"] },
+          "else": { "not": { "required": ["richText"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "performanceGraph" } }, "required": ["kind"] },
+          "then": { "required": ["performanceGraph"] },
+          "else": { "not": { "required": ["performanceGraph"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "performanceLegend" } }, "required": ["kind"] },
+          "then": { "required": ["performanceLegend"] },
+          "else": { "not": { "required": ["performanceLegend"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "performanceValueBar" } }, "required": ["kind"] },
+          "then": { "required": ["performanceValueBar"] },
+          "else": { "not": { "required": ["performanceValueBar"] } }
+        },
+        {
           "$comment": "An accessible island's elements own no HWND, so they travel as typed items on the island's own node rather than as virtual nodes.",
           "if": { "properties": { "kind": { "const": "accessibleIsland" } }, "required": ["kind"] },
           "then": { "required": ["islandItems"] },
@@ -426,9 +602,13 @@
         "generation": { "$ref": "#/$defs/u64String" },
         "nativeHwnd": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hwndString" }] },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "staticIcon", "staticBitmap", "staticDecoration", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "upDown", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland", "nativeDocument", "diskView"] },
+        "kind": { "enum": ["static", "staticIcon", "staticBitmap", "staticDecoration", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "upDown", "datePicker", "timePicker", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland", "nativeDocument", "diskView", "richText", "performanceGraph", "performanceLegend", "performanceValueBar"] },
         "document": { "$ref": "#/$defs/nativeDocument" },
         "diskView": { "$ref": "#/$defs/diskView" },
+        "richText": { "$ref": "#/$defs/richText" },
+        "performanceGraph": { "$ref": "#/$defs/performanceGraph" },
+        "performanceLegend": { "$ref": "#/$defs/performanceLegend" },
+        "performanceValueBar": { "$ref": "#/$defs/performanceValueBar" },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -442,9 +622,11 @@
         "text": { "$ref": "#/$defs/text" },
         "automationName": { "$ref": "#/$defs/text" },
         "checked": { "type": "integer", "minimum": 0, "maximum": 2 },
-        "selectedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
-        "selectedIndices": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 4095 } },
-        "focusedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
+        "selectedIndex": { "type": "integer", "minimum": -1, "maximum": 16777215 },
+        "selectedIndices": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 16777215 } },
+        "focusedIndex": { "type": "integer", "minimum": -1, "maximum": 16777215 },
+        "itemCount": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "itemWindowStart": { "type": "integer", "minimum": 0, "maximum": 16777215 },
         "multiSelect": { "type": "boolean" },
         "selectionStart": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "selectionLength": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
@@ -489,6 +671,10 @@
         },
         "itemGroupIds": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/nativeListGroupId", "not": { "const": "-1" } } },
         "itemActivationSupported": { "type": "boolean" },
+        "itemDefaultActivation": {
+          "type": "boolean",
+          "description": "A ListView or TreeView item may be opened (double-click, Enter) by the openItem action: the item is selected and its control is sent the Enter key."
+        },
         "itemNativeIds": {
           "type": "array", "maxItems": 4096, "uniqueItems": true,
           "description": "Canonical LVM_MAPINDEXTOID identities. Empty means no stable identity contract. Runtime validation requires one per item when activation is supported.",
@@ -899,7 +1085,8 @@
           }
         },
         {
-          "if": { "properties": { "action": { "const": "contextMenu" } }, "required": ["action"] },
+          "$comment": "contextMenu asks for an item's own menu. Minor 34's openItem selects the item and sends its control Enter (a double-click), where the node offers itemDefaultActivation; both witness the item by label.",
+          "if": { "properties": { "action": { "enum": ["contextMenu", "openItem"] } }, "required": ["action"] },
           "then": {
             "required": ["nodeId"],
             "properties": {
@@ -908,12 +1095,17 @@
                 "additionalProperties": false,
                 "required": ["index", "text"],
                 "properties": {
-                  "index": { "type": "integer", "minimum": 0, "maximum": 4095 },
+                  "index": { "type": "integer", "minimum": 0, "maximum": 16777215 },
                   "text": { "$ref": "#/$defs/text" }
                 }
               }
             }
           }
+        },
+        {
+          "$comment": "Minor 33: move a windowed virtual ListView's window by scrolling the native list so the row is its top row.",
+          "if": { "properties": { "action": { "const": "setTopIndex" } }, "required": ["action"] },
+          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 16777215 } } }
         },
         {
           "if": { "properties": { "action": { "const": "setGroupExpanded" } }, "required": ["action"] },
@@ -942,7 +1134,7 @@
         },
         {
           "if": { "properties": { "action": { "const": "setFocusedIndex" } }, "required": ["action"] },
-          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": -1, "maximum": 4095 } } }
+          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": -1, "maximum": 16777215 } } }
         },
         {
           "if": { "properties": { "action": { "const": "scrollBy" } }, "required": ["action"] },
@@ -1041,7 +1233,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "setItemCheck", "setItemText", "setValue", "setExpand", "setGroupExpanded", "setSplit", "setColumnOrder", "islandInvoke", "htmlInvoke", "htmlScroll", "diskSelect", "diskContext", "diskScroll", "contextMenu", "setScroll", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "setItemCheck", "setItemText", "setValue", "setExpand", "setGroupExpanded", "setSplit", "setColumnOrder", "islandInvoke", "htmlInvoke", "htmlScroll", "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

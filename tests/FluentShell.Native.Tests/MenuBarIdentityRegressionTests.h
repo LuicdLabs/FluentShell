@@ -12,6 +12,9 @@ struct MenuIdentityRuntime final {
     bool disabledAncestor = false;
     bool changedOwner = false;
     bool firstSystem = false;
+    // Slot whose popup is an MDI Window menu: its child-window items count up from the
+    // frame's idFirstChild (0xFF00), above the SC_* range of a system menu.
+    WPARAM mdiWindowSlot = 0;
     bool excessive = false;
     unsigned ownerCommands = 0;
     unsigned rootCommands = 0;
@@ -28,6 +31,9 @@ LRESULT CALLBACK MenuIdentitySubclass(HWND window, UINT message, WPARAM wParam,
         const HMENU popup = CreatePopupMenu();
         if (state.firstSystem && wParam == 1) {
             AppendMenuW(popup, MF_STRING, SC_CLOSE, L"Close");
+        } else if (state.mdiWindowSlot && wParam == state.mdiWindowSlot) {
+            AppendMenuW(popup, MF_STRING, 0xE130, L"New Window");
+            AppendMenuW(popup, MF_STRING, 0xFF00, L"1 Console");
         } else {
             AppendMenuW(popup, MF_STRING, state.nativeId,
                 state.changedLabel ? L"Changed" : L"Shared");
@@ -168,6 +174,31 @@ void TestMenuBarCommandIdentityAndNativeRouting() {
         Check(capture() && commands.size() == 2 && commands[0].toolbarIndex == 2 &&
                 commands[0].itemId == L"0.0", "skipped system slot shifted the native toolbar binding");
         runtime.firstSystem = false;
+        // MMC keeps Favorites and snap-in placeholder buttons in its bar but hides them
+        // (STATE_SYSTEM_INVISIBLE), and lists its MDI children in the Window menu.
+        accessible->names = {L"System", L"&File", L"Favorites", L"&Window", L"SnapinMenu"};
+        accessible->hiddenChildren = {1, 3, 5};
+        accessible->popupChildLimit = 5;
+        runtime.mdiWindowSlot = 4;
+        accessible->drives = 0;
+        const bool hiddenCaptured = capture();
+        if (!hiddenCaptured) std::wcerr << L"Hidden menu button capture: " << error << L'\n';
+        Check(hiddenCaptured && menu.size() == 2 && menu[0].text == L"&File" &&
+                menu[1].text == L"&Window" && menu[1].items.size() == 2,
+            "hidden menu-bar buttons were projected, or an MDI Window menu was taken for the system menu");
+        Check(accessible->drives == 2 && buttons.size() == 5 && !buttons[0].visible &&
+                buttons[1].visible && !buttons[2].visible && buttons[3].visible && !buttons[4].visible,
+            "hidden menu-bar buttons were driven or their visibility was not read");
+        Check(hiddenCaptured && commands.size() == 4 && commands[2].toolbarIndex == 4 &&
+                commands[3].nativeCommandId == 0xFF00,
+            "a visible menu button lost its native toolbar slot behind hidden ones, or the MDI window list was refused");
+        Check(Translation::IsSystemCommandId(SC_CLOSE) && Translation::IsSystemCommandId(SC_CONTEXTHELP) &&
+                !Translation::IsSystemCommandId(0xFF00) && !Translation::IsSystemCommandId(0xE130),
+            "the system command range swallowed MDI window-list or framework command identifiers");
+        accessible->names = {L"System", L"&File", L"&Window"};
+        accessible->hiddenChildren.clear();
+        accessible->popupChildLimit = 2;
+        runtime.mdiWindowSlot = 0;
         runtime.excessive = true;
         Check(!capture(), "independently bounded popups exceeded the complete bar's protocol cap");
     }

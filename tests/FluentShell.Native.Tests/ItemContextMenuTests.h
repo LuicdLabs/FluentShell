@@ -23,10 +23,15 @@ struct Runtime final {
     std::atomic<bool> handled{ false };
     std::atomic<bool> keyboardForm{ false };
     std::wstring subject;
+    // The control's Enter (NM_RETURN to its parent): what an opened item reports.
+    HANDLE activated = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<unsigned> activations{ 0 };
+    std::wstring activatedLabel;
     ~Runtime() {
         if (ready) CloseHandle(ready);
         if (tracking) CloseHandle(tracking);
         if (returned) CloseHandle(returned);
+        if (activated) CloseHandle(activated);
     }
 };
 
@@ -57,6 +62,14 @@ inline std::wstring SelectedLabel(HWND control) {
 inline LRESULT CALLBACK OwnerSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR, DWORD_PTR data) {
     auto& runtime = *reinterpret_cast<Runtime*>(data);
+    if (message == WM_NOTIFY) {
+        const auto* header = reinterpret_cast<const NMHDR*>(lParam);
+        if (header && header->code == NM_RETURN) {
+            runtime.activatedLabel = SelectedLabel(header->hwndFrom);
+            ++runtime.activations;
+            SetEvent(runtime.activated);
+        }
+    }
     if (message == WM_CONTEXTMENU) {
         const HWND source = reinterpret_cast<HWND>(wParam);
         runtime.keyboardForm.store(LOWORD(lParam) == 0xFFFF && HIWORD(lParam) == 0xFFFF);
@@ -124,6 +137,35 @@ void TestItemContextMenuProtocol() {
     snapshot.popupMenu = Translation::PopupMenuSnapshot{ 9, 3, 1, {} };
     Check(!Translation::ValidateActionForSnapshot(action, snapshot, error),
         "a second context menu was accepted while a native popup awaits selection");
+
+    // openItem: the same item witness, and only where the node offers default activation.
+    Translation::ActionRequest open;
+    Check(Translation::ParseActionInvoke(ReadFixture(L"action.invoke.open-item.json"), nonce, open, error) &&
+        open.action == L"openItem" && open.nodeId == std::optional<uint64_t>(3) && open.itemIndex == 2 &&
+        open.text == L"Leaf" && Translation::IsRequestSemanticAction(L"openItem"),
+        "openItem fixture lost its node, item witness, or revision policy");
+    Translation::WindowSnapshot opened;
+    Translation::ControlNode node;
+    node.nodeId = 3;
+    node.kind = Translation::ControlKind::TreeView;
+    node.items = { L"Root", L"Child", L"Leaf" };
+    opened.nodes.push_back(node);
+    Check(!Translation::ValidateActionForSnapshot(open, opened, error),
+        "openItem was accepted on a node that does not offer default activation");
+    opened.nodes[0].itemDefaultActivation = true;
+    Check(Translation::ValidateActionForSnapshot(open, opened, error),
+        "openItem was refused for an item of a node that offers default activation");
+    open.text = L"Child";
+    Check(!Translation::ValidateActionForSnapshot(open, opened, error),
+        "openItem accepted an index whose item no longer carries the requested label");
+    open.text = L"Leaf";
+    open.itemIndex = 3;
+    Check(!Translation::ValidateActionForSnapshot(open, opened, error),
+        "openItem accepted an index past the TreeView items");
+    open.itemIndex = 2;
+    opened.nodes[0].kind = Translation::ControlKind::ListBox;
+    Check(!Translation::ValidateActionForSnapshot(open, opened, error),
+        "openItem accepted a control without an item contract");
 }
 
 void TestItemContextMenuTracking() {
@@ -132,9 +174,15 @@ void TestItemContextMenuTracking() {
         Check(false, "item context-menu events were not created");
         return;
     }
+    // The frame is an MMC frame by class, which is what offers its trees default activation.
+    WNDCLASSW frameClass{};
+    frameClass.hInstance = GetModuleHandleW(nullptr);
+    frameClass.lpfnWndProc = DefWindowProcW;
+    frameClass.lpszClassName = L"MMCMainFrame";
+    const ATOM frameRegistered = RegisterClassW(&frameClass);
     std::thread gui([&] {
         runtime.thread.store(GetCurrentThreadId());
-        HWND root = CreateWindowExW(0, L"Static", L"item-context-menu",
+        HWND root = CreateWindowExW(0, L"MMCMainFrame", L"item-context-menu",
             WS_OVERLAPPEDWINDOW, 60, 60, 520, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
         HWND tree = root ? CreateWindowExW(0, WC_TREEVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
             TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS,
@@ -191,6 +239,7 @@ void TestItemContextMenuTracking() {
         if (runtime.thread.load()) PostThreadMessageW(runtime.thread.load(), WM_QUIT, 0, 0);
         gui.join();
         agent.reset();
+        if (frameRegistered) UnregisterClassW(L"MMCMainFrame", GetModuleHandleW(nullptr));
     };
     Check(WaitForSingleObject(runtime.ready, 5000) == WAIT_OBJECT_0 && runtime.root.load(),
         "item context-menu GUI thread did not create its controls");
@@ -273,5 +322,36 @@ void TestItemContextMenuTracking() {
         ListView_GetSelectedCount(runtime.list.load()) == 1 &&
         (ListView_GetItemState(runtime.list.load(), 2, LVIS_SELECTED) & LVIS_SELECTED) != 0,
         "ListView context menu did not select only its row or a dismissal returned a command");
+
+    // openItem: a double-click selects the item and its control receives Enter.
+    const auto treeNode = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [](const Translation::ControlNode& candidate) { return candidate.kind == Translation::ControlKind::TreeView; });
+    Check(treeNode != snapshot.nodes.end() && treeNode->itemDefaultActivation,
+        "an MMC frame's result tree was not offered default activation");
+    if (treeNode != snapshot.nodes.end() && treeNode->itemDefaultActivation) {
+        ResetEvent(runtime.activated);
+        Translation::ActionRequest open;
+        open.surfaceId = snapshot.surfaceId;
+        open.expectedRevision = snapshot.revision;
+        open.eventId = 90;
+        open.nodeId = treeNode->nodeId;
+        open.action = L"openItem";
+        open.itemIndex = 1;
+        open.text = treeNode->items[1];
+        Translation::ActionOutcome outcome;
+        Check(agent->Invoke(open, outcome) && outcome.accepted, "openItem was not accepted for a tree item");
+        Check(WaitForSingleObject(runtime.activated, 2000) == WAIT_OBJECT_0 &&
+            runtime.activatedLabel == L"Services" && runtime.activations.load() == 1 &&
+            ItemContextMenu::SelectedLabel(runtime.tree.load()) == L"Services",
+            "openItem did not select the item and deliver Enter to its control");
+        snapshot = std::move(outcome.snapshot);
+        // A stale witness is refused before anything reaches the control.
+        open.eventId = 91;
+        open.expectedRevision = snapshot.revision;
+        open.text = L"No such item";
+        Translation::ActionOutcome refused;
+        Check(!(agent->Invoke(open, refused) && refused.accepted) && runtime.activations.load() == 1,
+            "openItem acted on an item whose label no longer matched");
+    }
     cleanup();
 }

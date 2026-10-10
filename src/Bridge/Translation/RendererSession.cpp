@@ -49,10 +49,30 @@ constexpr uint64_t kOwnerGraphQuietMs = 2000;
 // How long discovery waits for an unattempted window's GUI thread to answer
 // WM_NULL before deferring its single projection attempt to a later pass.
 constexpr UINT kBusyThreadProbeMs = 150;
-// A capture that failed on a timing condition is retried at most this many times,
-// each after a longer quiet period.
-constexpr unsigned kMaxTransientDiscoveryRetries = 4;
+// An internal work item on the action queue: roll back a surface the renderer
+// faulted. No wire action can carry this name (the parser admits a fixed set).
+constexpr wchar_t kRendererFaultRollback[] = L"\x1F" L"rendererFaultRollback";
+// A capture that failed on a timing condition is retried, each time after a longer
+// quiet period (capped), for this long after the first failure of the run.  A snap-in
+// that loads a view on its own thread can hold the console's GUI thread in a
+// cross-thread call for tens of seconds at startup (Event Viewer's overview).
+constexpr uint64_t kTransientRetryWindowMs = 90000;
 constexpr uint64_t kTransientRetryBackoffMs = 1500;
+constexpr uint64_t kTransientRetryMaxBackoffMs = 6000;
+// Re-projection after a rollback: 2 s, doubling to 30 s, at most 12 times before a
+// projection holds for kStableProjectionMs again.
+constexpr unsigned kMaxReprojections = 12;
+constexpr uint64_t kReprojectionBaseMs = 2000;
+constexpr uint64_t kReprojectionMaxMs = 30000;
+constexpr uint64_t kStableProjectionMs = 60000;
+// A native navigation of a rolled-back window is answered at most this often.
+constexpr uint64_t kTopologyRetryIntervalMs = 1500;
+// A capture-stage refusal that showed nothing is re-attempted on a slowing timer: 5 s,
+// doubling to a minute.
+constexpr uint64_t kTimedWatchBaseMs = 5000;
+constexpr uint64_t kTimedWatchMaxMs = 60000;
+// How long reconcile holds a projection whose capture is refused while a view loads.
+constexpr uint64_t kRejectionGraceMs = 3000;
 // A handoff-declared DirectUI navigation replaces the page inside the same
 // top-level window. The surface keeps its projection across that replacement, so
 // this bounds how long the proxy may hold the screen behind a re-armed input gate
@@ -201,6 +221,8 @@ struct RendererSession::Surface final {
     // Reconcile bookkeeping.  Written only by the supervisor thread.
     unsigned captureTimeouts = 0;
     unsigned reconcileSkips = 0;
+    // Tick of the first of consecutive reconcile capture rejections, or zero.
+    uint64_t rejectionSince = 0;
     // Splits the user moved through the projection, remembered so an application
     // re-layout does not silently discard the request.  See PaneSplitIntent.
     std::vector<PaneSplitIntent> splitIntents;
@@ -599,7 +621,17 @@ void RendererSession::HandleFrame(const Ipc::Frame& frame) {
             }
             if (surface) {
                 try { FluentShell::Log(L"Renderer surface fault: " + error); } catch (...) {}
-                RestoreSurface(surface, L"rendererSurfaceFault");
+                // Rolled back on the action worker: the reader must not wait for the
+                // native-operation barrier (see HandleAction).
+                ActionRequest rollback;
+                rollback.surfaceId = surface->snapshot.surfaceId;
+                rollback.action = kRendererFaultRollback;
+                {
+                    std::scoped_lock actionLock(actionMutex_);
+                    if (stopping_.load() || failed_.load()) return;
+                    actionQueue_.emplace_back(std::move(rollback), surface);
+                }
+                actionCondition_.notify_one();
                 return;
             }
             if (IsRetiredSurface(faultedSurfaceId)) return;
@@ -968,6 +1000,12 @@ bool RendererSession::RepublishResyncRevision(
 // renderer input gated until the whole contract has passed.
 bool RendererSession::CommitProvisional(ProjectionAttempt& attempt) {
     const auto& snapshot = attempt.surface->snapshot;
+    // The renderer activates the proxy on commit.  While the native window holds the
+    // foreground, this process is the one entitled to hand it over; without that grant
+    // the proxy can come up behind it and the focus gate rejects an otherwise good
+    // projection ("proxy did not take the native foreground slot").
+    if ((attempt.nativeWasForeground || snapshot.modal) && rendererProcessId_)
+        AllowSetForegroundWindow(rendererProcessId_);
     if (Send(Ipc::MessageType::SurfaceCommit, snapshot.revision,
             SerializeSurfaceCommit(
                 nonce_, snapshot.surfaceId, snapshot.revision, true, false))) {
@@ -988,6 +1026,21 @@ bool RendererSession::AwaitProxyVisible(ProjectionAttempt& attempt) {
     }
     if (!IsWindowVisible(proxy) || (cloakReasons & DWM_CLOAKED_APP) != 0) {
         return RejectAfterCommit(attempt, L"proxy did not become visible and uncloaked");
+    }
+    // The proxy replaces the window the user was working in, so it takes the foreground
+    // the native window held.  The renderer's own activation can lose that race to the
+    // native frame (a view that re-activates its frame as it loads); this process is the
+    // foreground process and is entitled to hand the slot over itself.
+    if ((attempt.nativeWasForeground || attempt.surface->snapshot.modal) &&
+        GetForegroundWindow() != proxy && !SetForegroundWindow(proxy)) {
+        wchar_t holder[64]{};
+        DWORD holderProcess = 0;
+        if (const HWND foreground = GetForegroundWindow()) {
+            GetClassNameW(foreground, holder, 64);
+            GetWindowThreadProcessId(foreground, &holderProcess);
+        }
+        FluentShell::Log(L"Proxy foreground handoff was refused; foreground stays with '" +
+            std::wstring(holder) + L"' of process " + std::to_wstring(holderProcess));
     }
     return true;
 }
@@ -1198,7 +1251,53 @@ void LogDiscoveryCensus(const TopLevelCensus& census, std::wstring& lastSignatur
     }
 }
 
+// How many owners stand between a window and the desktop.  A dialog is decided only
+// once its owners have been, and a nested dialog sits above the dialog that owns it
+// in the z-order discovery enumerates in.
+size_t OwnerDepth(HWND window) noexcept {
+    size_t depth = 0;
+    for (HWND owner = EffectiveTopLevelOwner(window); owner && depth < 32;
+         owner = EffectiveTopLevelOwner(owner)) {
+        ++depth;
+    }
+    return depth;
+}
+
+// Whether `root` is anywhere in the owner chain of `window`.
+bool IsOwnedBy(HWND window, HWND root) noexcept {
+    size_t depth = 0;
+    for (HWND owner = EffectiveTopLevelOwner(window); owner && depth < 32;
+         owner = EffectiveTopLevelOwner(owner), ++depth) {
+        if (owner == root) return true;
+    }
+    return false;
+}
+
 } // namespace
+
+// A cheap fingerprint of a native window's descendant HWNDs, their class atoms and
+// visibility. Reads window-manager state only (no messages), so the supervisor can
+// take it every discovery pass for a window it is not projecting.
+static uint64_t NativeTopologyFingerprint(HWND root) noexcept {
+    struct State final {
+        uint64_t hash = 1469598103934665603ull;
+        void Mix(uint64_t value) noexcept {
+            for (int shift = 0; shift < 64; shift += 8) {
+                hash ^= (value >> shift) & 0xff;
+                hash *= 1099511628211ull;
+            }
+        }
+    } state;
+    state.Mix(reinterpret_cast<uintptr_t>(root));
+    EnumChildWindows(root, [](HWND child, LPARAM raw) -> BOOL {
+        auto& combined = *reinterpret_cast<State*>(raw);
+        combined.Mix(reinterpret_cast<uintptr_t>(child));
+        combined.Mix(static_cast<uint64_t>(GetClassLongPtrW(child, GCW_ATOM)));
+        combined.Mix(IsWindowVisible(child) ? 1u : 0u);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&state));
+    return state.hash;
+}
 
 // Discovery bookkeeping is keyed by HWND, so entries for destroyed windows must
 // go before an address is reused by a new window.
@@ -1214,7 +1313,10 @@ void RendererSession::PruneDiscoveryState() {
         else ++iterator;
     }
     std::erase_if(busyDiscoveryWindows_, [](HWND window) { return !IsWindow(window); });
+    std::erase_if(ownedWaiting_, [](HWND window) { return !IsWindow(window); });
+    std::erase_if(refusedDialogs_, [](HWND window) { return !IsWindow(window); });
     std::erase_if(discoveryRetries_, [](const auto& entry) { return !IsWindow(entry.first); });
+    std::erase_if(projectedSince_, [](const auto& entry) { return !IsWindow(entry.first); });
 }
 
 RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
@@ -1247,13 +1349,6 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
             retryDeferredOwner = true;
         }
     }
-    // One attempt per window until it is destroyed or explicitly retried, so a
-    // rejected window does not reappear in the log every second.
-    if (!discoveryAttempts_.insert(window).second) return decision;
-
-    for (const auto& [_, surface] : surfaces_) {
-        if (surface->agent && surface->agent->Root() == window) return decision;
-    }
     // Every projected ancestor in this window's owner chain, nearest first.  A window
     // the projection cannot take has to hand the whole chain back at once: a graph
     // with some native and some projected windows is the hybrid surface the
@@ -1270,32 +1365,42 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
             if (surface->state == SurfaceState::Projected) projectedOwners.push_back(surface);
         }
     }
-
+    // An owned surface is never projected independently from its owner: it is either
+    // covered by the fallback below or already fully native.  While its direct owner is
+    // not a projection it waits without using its one attempt: a graph handed back to
+    // native is projected again from its root, and the dialogs on it are offered after.
     if (directOwner) {
-        // An owned surface is never projected independently from its owner: it is
-        // either covered by the fallback below or already fully native.
-        if (projectedOwners.empty()) {
-            decision.skipReason = L"an owned window stays native while a visible owner "
-                L"the Bridge does not project holds the screen";
-            decision.skipEvidence = directOwner;
+        const bool ownerProjected = !projectedOwners.empty() &&
+            projectedOwners.front()->agent->Root() == directOwner;
+        if (!ownerProjected) {
+            if (ownedWaiting_.insert(window).second) {
+                decision.skipReason = L"an owned window stays native while a visible owner "
+                    L"the Bridge does not project holds the screen";
+                decision.skipEvidence = directOwner;
+            }
             return decision;
         }
+        ownedWaiting_.erase(window);
+    }
+
+    // One attempt per window until it is destroyed or explicitly retried, so a
+    // rejected window does not reappear in the log every second.
+    if (!discoveryAttempts_.insert(window).second) return decision;
+
+    for (const auto& [_, surface] : surfaces_) {
+        if (surface->agent && surface->agent->Root() == window) return decision;
+    }
+
+    if (directOwner) {
         decision.projectedOwners = std::move(projectedOwners);
         // A dialog the application runs modally against a projected owner is a
         // surface in its own right: the proxy inherits the real owner and blocks it.
         // Anything else in the owner graph resolves the ancestors back to native,
         // because keeping them cloaked can strand the child behind an unrelated
         // renderer HWND.
-        if (IsModalOwnedTopLevel(window)) {
-            decision.action = DiscoveryAction::ProjectOwnedDialog;
-            return decision;
-        }
-        decision.action = DiscoveryAction::RestoreOwnerGraph;
-        for (const auto& owner : decision.projectedOwners) {
-            if (const HWND ownerRoot = owner->agent ? owner->agent->Root() : nullptr) {
-                ownerGraphDeferrals_.insert_or_assign(ownerRoot, 0);
-            }
-        }
+        decision.action = IsModalOwnedTopLevel(window)
+            ? DiscoveryAction::ProjectOwnedDialog
+            : DiscoveryAction::RestoreOwnerGraph;
         return decision;
     }
     if (ownsVisibleTopLevel) {
@@ -1318,17 +1423,35 @@ void RendererSession::DiscoverTopLevelWindows() {
     PruneDiscoveryState();
     // Desktop z-order puts an owned dialog above its owner, but an owned window can only
     // be decided once its owner has been: classify every root before the windows it owns.
+    // Roots first, then each depth of owner in turn: a nested dialog is above the dialog
+    // that owns it, so it is enumerated first, and it can only be decided after that one.
     std::vector<HWND> candidates = census.candidates;
-    std::stable_partition(candidates.begin(), candidates.end(),
-        [](HWND candidate) { return EffectiveTopLevelOwner(candidate) == nullptr; });
+    {
+        std::vector<std::pair<size_t, HWND>> keyed;
+        keyed.reserve(candidates.size());
+        for (const HWND candidate : candidates) keyed.emplace_back(OwnerDepth(candidate), candidate);
+        std::stable_sort(keyed.begin(), keyed.end(),
+            [](const auto& left, const auto& right) { return left.first < right.first; });
+        for (size_t index = 0; index < keyed.size(); ++index) candidates[index] = keyed[index].second;
+    }
+    // What keeps a root native while it owns a window: one that is not a modal dialog
+    // (it has no projection contract), or a modal dialog the Bridge already tried and
+    // could not take (projecting the root again would only hand the graph back).
+    const auto holdsOwnerNative = [this](HWND candidate) {
+        if (!IsModalOwnedTopLevel(candidate)) return true;
+        std::scoped_lock lock(surfacesMutex_);
+        return refusedDialogs_.contains(candidate);
+    };
     for (const HWND window : candidates) {
         // A modal dialog does not hold its owner native: the owner projects first and
         // the dialog follows it in this same pass as a modal surface of its own.  That
-        // is how a console that opens a dialog during startup ever projects.
+        // is how a console that opens a dialog during startup ever projects.  Anything
+        // owned below the root, at any depth, counts: a Color chooser opened from a
+        // property sheet holds the console as long as the sheet does.
         const bool ownsVisibleTopLevel = !EffectiveTopLevelOwner(window) &&
-            std::any_of(candidates.begin(), candidates.end(), [window](HWND candidate) {
-                return EffectiveTopLevelOwner(candidate) == window &&
-                    !IsModalOwnedTopLevel(candidate);
+            std::any_of(candidates.begin(), candidates.end(), [&](HWND candidate) {
+                return candidate != window && IsOwnedBy(candidate, window) &&
+                    holdsOwnerNative(candidate);
             });
         // A window gets one projection attempt, and attaching needs its GUI thread
         // to answer within 2 s. A thread busy with application work (RSoP's
@@ -1339,14 +1462,46 @@ void RendererSession::DiscoverTopLevelWindows() {
             std::scoped_lock lock(surfacesMutex_);
             // A window whose last attempt failed on a timing condition is offered
             // its attempt again once the backoff has passed.
-            if (const auto retry = discoveryRetries_.find(window);
-                retry != discoveryRetries_.end() && GetTickCount64() >= retry->second.due &&
+            const auto retry = discoveryRetries_.find(window);
+            const uint64_t now = GetTickCount64();
+            // A rolled-back window the user navigated natively is offered its next
+            // attempt promptly, whatever the backoff had reached.
+            if (retry != discoveryRetries_.end() && retry->second.reprojecting &&
+                retry->second.due != UINT64_MAX && now < retry->second.due &&
+                now - retry->second.lastAttempt >= kTopologyRetryIntervalMs &&
+                NativeTopologyFingerprint(window) != retry->second.topology) {
+                retry->second.due = now;
+                retry->second.reprojections = 0;
+            }
+            // A never-projected window whose view was refused is offered an attempt
+            // once the user has navigated it to another view, or -- when the refusal
+            // showed nothing, so repeating it cannot flash -- on a slowing timer, because
+            // a view that is still populating (System Monitor's counters) never changes
+            // the window's topology while it finishes.
+            if (retry != discoveryRetries_.end() && retry->second.watching &&
+                retry->second.due == UINT64_MAX) {
+                const unsigned failures = retry->second.watchFailures > 0 ? retry->second.watchFailures - 1 : 0u;
+                const uint64_t elapsed = now - retry->second.lastAttempt;
+                const bool navigated = elapsed >= std::min<uint64_t>(
+                        kTopologyRetryIntervalMs << std::min(failures, 5u), kReprojectionMaxMs) &&
+                    NativeTopologyFingerprint(window) != retry->second.topology;
+                const bool timerDue = retry->second.timedRetry &&
+                    elapsed >= std::min<uint64_t>(kTimedWatchBaseMs << std::min(failures, 4u), kTimedWatchMaxMs);
+                if (navigated || timerDue) retry->second.due = now;
+            }
+            if (retry != discoveryRetries_.end() && now >= retry->second.due &&
                 discoveryAttempts_.erase(window) != 0) {
                 retry->second.due = UINT64_MAX;
-                FluentShell::Log(L"Retrying projection after a transient capture failure (" +
-                    std::to_wstring(retry->second.attempts) + L"): " + DescribeTopLevel(window));
+                retry->second.lastAttempt = now;
+                FluentShell::Log(L"Retrying projection (transient " +
+                    std::to_wstring(retry->second.attempts) + L", after rollback " +
+                    std::to_wstring(retry->second.reprojections) + L", after view change " +
+                    std::to_wstring(retry->second.watching ? retry->second.watchFailures : 0) + L"): " +
+                    DescribeTopLevel(window));
             }
-            attempted = discoveryAttempts_.contains(window);
+            // A window waiting for its owner has not been attempted either, but it is not
+            // probed again every pass: nothing is asked of its thread until the owner is there.
+            attempted = discoveryAttempts_.contains(window) || ownedWaiting_.contains(window);
         }
         if (!attempted && SendMessageTimeoutW(window, WM_NULL, 0, 0,
                 SMTO_ABORTIFHUNG | SMTO_BLOCK, kBusyThreadProbeMs, nullptr) == 0) {
@@ -1372,9 +1527,7 @@ void RendererSession::DiscoverTopLevelWindows() {
         case DiscoveryAction::RestoreOwnerGraph:
             FluentShell::Log(
                 L"Visible owned top-level requires native owner-graph fallback");
-            for (const auto& owner : decision.projectedOwners) {
-                RestoreSurface(owner, L"ownedTopLevel");
-            }
+            HandOwnerGraphToNative(decision.projectedOwners);
             break;
         case DiscoveryAction::ProjectOwnedDialog:
             // The owner stays projected only while its dialog projects too.  A refused
@@ -1383,9 +1536,14 @@ void RendererSession::DiscoverTopLevelWindows() {
             if (!OpenNativeWindow(window)) {
                 FluentShell::Log(L"Owned modal dialog could not be projected; "
                     L"restoring the owner graph to native");
-                for (const auto& owner : decision.projectedOwners) {
-                    RestoreSurface(owner, L"ownedTopLevel");
+                {
+                    std::scoped_lock lock(surfacesMutex_);
+                    refusedDialogs_.insert(window);
                 }
+                HandOwnerGraphToNative(decision.projectedOwners);
+            } else {
+                std::scoped_lock lock(surfacesMutex_);
+                refusedDialogs_.erase(window);
             }
             break;
         case DiscoveryAction::DeferOwnerGraph:
@@ -1396,24 +1554,158 @@ void RendererSession::DiscoverTopLevelWindows() {
             break;
         case DiscoveryAction::ProjectAfterDeferral:
             FluentShell::Log(L"Owned top-level closed; retrying native owner projection");
-            OpenNativeWindow(window);
+            if (OpenNativeWindow(window)) ReleaseOwnedWindows(window, candidates);
             break;
         case DiscoveryAction::Project:
-            OpenNativeWindow(window);
+            if (OpenNativeWindow(window)) ReleaseOwnedWindows(window, candidates);
             break;
+        }
+        ContinueReprojection(window);
+    }
+}
+
+void RendererSession::HandOwnerGraphToNative(
+    const std::vector<std::shared_ptr<Surface>>& owners) {
+    // The roots are read before the restore shuts their agents down.
+    std::vector<HWND> roots;
+    for (const auto& owner : owners) {
+        if (owner && owner->agent) roots.push_back(owner->agent->Root());
+    }
+    for (const auto& owner : owners) RestoreSurface(owner, L"ownedTopLevel");
+    // Handing the graph back is not the end of it: the owners are offered again once the
+    // window that forced it is gone.  The root waits for a quiet owner graph; a dialog on
+    // the way gets its attempt back for after its own owner has projected (a root it is
+    // owned by is projected first in the pass, the dialogs below it after).
+    std::scoped_lock lock(surfacesMutex_);
+    for (const HWND root : roots) {
+        if (!root) continue;
+        if (EffectiveTopLevelOwner(root)) {
+            discoveryAttempts_.erase(root);
+            ownedWaiting_.erase(root);
+        } else {
+            ownerGraphDeferrals_.insert_or_assign(root, 0);
         }
     }
 }
 
-void RendererSession::ScheduleDiscoveryRetry(HWND window) {
-    auto& retry = discoveryRetries_[window];
-    if (++retry.attempts > kMaxTransientDiscoveryRetries) {
-        FluentShell::Log(L"Native window stays untranslated after repeated transient capture failures: " +
-            DescribeTopLevel(window));
-        retry.due = UINT64_MAX;
-        return;
+void RendererSession::ReleaseOwnedWindows(HWND root, const std::vector<HWND>& candidates) {
+    std::scoped_lock lock(surfacesMutex_);
+    for (const HWND candidate : candidates) {
+        if (candidate == root || !IsOwnedBy(candidate, root)) continue;
+        bool projected = false;
+        for (const auto& [_, surface] : surfaces_) {
+            if (surface->agent && surface->agent->Root() == candidate) projected = true;
+        }
+        if (projected) continue;
+        discoveryAttempts_.erase(candidate);
+        ownedWaiting_.erase(candidate);
     }
-    retry.due = GetTickCount64() + kTransientRetryBackoffMs * retry.attempts;
+}
+
+// A timing failure (the GUI thread did not pick up the capture within its deadline,
+// typically while it waits on a snap-in's own thread to finish loading a view) is
+// retried with a growing backoff for a bounded time.  Past that the window is not
+// given up on: like a refused view, it is offered again when its topology changes,
+// which is what a finished load or a native navigation looks like.
+void RendererSession::ScheduleDiscoveryRetry(HWND window) {
+    bool watch = false;
+    {
+        std::scoped_lock lock(surfacesMutex_);
+        auto& retry = discoveryRetries_[window];
+        const uint64_t now = GetTickCount64();
+        if (retry.attempts++ == 0) retry.firstTransient = now;
+        if (now - retry.firstTransient > kTransientRetryWindowMs) {
+            FluentShell::Log(L"Native window stays untranslated after repeated transient capture failures; "
+                L"waiting for its view to change: " + DescribeTopLevel(window));
+            retry.attempts = 0;
+            retry.due = UINT64_MAX;
+            watch = true;
+        } else {
+            retry.due = now + std::min<uint64_t>(kTransientRetryBackoffMs * retry.attempts,
+                kTransientRetryMaxBackoffMs);
+        }
+    }
+    if (watch) WatchTopology(window, true);
+}
+
+// A projected window handed back to native because of what it showed (the user
+// navigated to a view without an adapter) is not unsupportable: the next view may
+// project again. The root is offered new attempts with exponential backoff, and a
+// projection that then holds for a minute restores the full retry budget. A window
+// that never projected keeps its own transient policy, so a deterministic gate
+// failure cannot make the proxy flash repeatedly.
+void RendererSession::ScheduleReprojection(HWND root, std::wstring_view reason) noexcept {
+    try {
+        std::scoped_lock lock(surfacesMutex_);
+        const auto since = projectedSince_.find(root);
+        if (since == projectedSince_.end()) return;
+        const uint64_t projectedAt = since->second;
+        projectedSince_.erase(since);
+        if (!root || !IsWindow(root) || reason == L"nativeDestroyed" || reason == L"shutdown" ||
+            reason == L"ownedTopLevel") return;
+        const uint64_t now = GetTickCount64();
+        auto& retry = discoveryRetries_[root];
+        if (now - projectedAt >= kStableProjectionMs) retry.reprojections = 0;
+        if (++retry.reprojections > kMaxReprojections) {
+            retry.due = UINT64_MAX;
+            FluentShell::Log(L"Native window stays untranslated after repeated rollbacks: " +
+                DescribeTopLevel(root));
+            return;
+        }
+        const uint64_t delay = std::min<uint64_t>(
+            kReprojectionBaseMs << (retry.reprojections - 1), kReprojectionMaxMs);
+        retry.due = now + delay;
+        retry.reprojecting = true;
+        retry.topology = NativeTopologyFingerprint(root);
+        FluentShell::Log(L"Native window will be re-attempted " + std::to_wstring(delay) +
+            L" ms after its rollback (" + std::wstring(reason) + L")");
+    } catch (...) {}
+}
+
+// A window that never projected because its capture refused the current view (an
+// unsupported control, a view still loading) is not unsupportable: the user can move
+// the native window to a view that projects.  A refused capture showed nothing, so a
+// later attempt costs no flash.  It is offered when the window's child-window topology
+// changes -- the native navigation -- and the wait grows while consecutive views keep
+// being refused.  A rollback chain, when one exists, keeps ownership of the window.
+void RendererSession::WatchTopology(HWND root, bool timed) noexcept {
+    try {
+        std::scoped_lock lock(surfacesMutex_);
+        if (!root || !IsWindow(root) || projectedSince_.contains(root)) return;
+        auto& retry = discoveryRetries_[root];
+        if (retry.reprojecting || (retry.due != UINT64_MAX && retry.due != 0)) return;
+        retry.watching = true;
+        retry.timedRetry = timed;
+        ++retry.watchFailures;
+        retry.due = UINT64_MAX;
+        retry.topology = NativeTopologyFingerprint(root);
+        retry.lastAttempt = GetTickCount64();
+    } catch (...) {}
+}
+
+// After a post-rollback attempt: a window that did not project again (its view is
+// still unsupported) keeps the chain going with a longer backoff until the cap.
+void RendererSession::ContinueReprojection(HWND root) noexcept {
+    try {
+        std::scoped_lock lock(surfacesMutex_);
+        const auto retry = discoveryRetries_.find(root);
+        if (retry == discoveryRetries_.end() || !retry->second.reprojecting) return;
+        if (projectedSince_.contains(root)) {
+            retry->second.reprojecting = false;
+            return;
+        }
+        // A transient failure in this attempt already scheduled its own retry.
+        if (retry->second.due != UINT64_MAX) return;
+        if (++retry->second.reprojections > kMaxReprojections) {
+            retry->second.reprojecting = false;
+            FluentShell::Log(L"Native window stays untranslated after repeated rollbacks: " +
+                DescribeTopLevel(root));
+            return;
+        }
+        retry->second.due = GetTickCount64() + std::min<uint64_t>(
+            kReprojectionBaseMs << (retry->second.reprojections - 1), kReprojectionMaxMs);
+        retry->second.topology = NativeTopologyFingerprint(root);
+    } catch (...) {}
 }
 
 bool RendererSession::OpenNativeWindow(HWND root) {
@@ -1443,15 +1735,22 @@ bool RendererSession::OpenNativeWindow(HWND root) {
         // The DirectUI attempt only followed a failed HWND capture; when that failure
         // was a timing condition, the HWND projection deserves another attempt.
         if (transient) ScheduleDiscoveryRetry(root);
+        else WatchTopology(root, true);
         return false;
     }
     surface->directUiAdapter = admission == DirectUiAdmissionResult::Admitted;
     surface->directUiProfile = profile;
+    bool captureTimedOut = false;
     if (surface->snapshot.surfaceId.empty() ||
         (!surface->directUiAdapter &&
-         !agent->Capture(surface->snapshot, error, 2000, shutdownEvent_))) {
+         !agent->Capture(surface->snapshot, error, 2000, shutdownEvent_, &captureTimedOut))) {
         if (!agent->Shutdown()) RetainSourceThreadAgent(agent);
         FluentShell::Log(L"Native window remains untranslated: " + error);
+        // A capture that ran past its deadline, or whose GUI threads kept changing
+        // while a view loaded, is a timing condition rather than a verdict on the view.
+        if (captureTimedOut || error == L"source-thread command cancelled" ||
+            error.starts_with(kCaptureBarrierUnstable)) ScheduleDiscoveryRetry(root);
+        else WatchTopology(root, true);
         return false;
     }
     surface->fingerprint = SnapshotFingerprint(surface->snapshot);
@@ -1461,7 +1760,21 @@ bool RendererSession::OpenNativeWindow(HWND root) {
     }
     if (!OpenSurface(surface, true)) {
         RestoreSurface(surface, L"unsupported");
+        // A gate refusal can show the proxy for a moment, so a window that never
+        // projected waits for the user to navigate before its next attempt, and the
+        // wait grows with each refusal.
+        WatchTopology(root);
         return false;
+    }
+    {
+        std::scoped_lock lock(surfacesMutex_);
+        projectedSince_.insert_or_assign(root, GetTickCount64());
+        if (const auto retry = discoveryRetries_.find(root); retry != discoveryRetries_.end()) {
+            retry->second.attempts = 0;
+            retry->second.firstTransient = 0;
+            retry->second.watching = false;
+            retry->second.watchFailures = 0;
+        }
     }
     FluentShell::Log(L"Projected native window: " + surface->snapshot.title);
     return true;
@@ -1563,7 +1876,24 @@ void RendererSession::HandleAction(const ActionRequest& action) {
         Fail(L"action references an unknown surface");
         return;
     }
+    // The pipe reader never waits for the native-operation barrier: reconcile and
+    // menu-bar refresh hold it while a slow source thread answers (seconds), and a
+    // reader parked behind them stops consuming renderer heartbeats, which tears
+    // the whole session down. Admission against the canonical snapshot happens on
+    // the action worker, in arrival order.
+    {
+        std::scoped_lock actionLock(actionMutex_);
+        if (stopping_.load() || failed_.load()) return;
+        actionQueue_.emplace_back(action, surface);
+    }
+    actionCondition_.notify_one();
+}
 
+void RendererSession::AdmitAction(const ActionRequest& action, const std::shared_ptr<Surface>& surface) {
+    if (action.action == kRendererFaultRollback) {
+        RestoreSurface(surface, L"rendererSurfaceFault");
+        return;
+    }
     std::unique_lock canonicalLock(surface->canonicalMutex);
     std::unique_lock lock(surface->mutex);
     if (surface->state != SurfaceState::Projected) {
@@ -1599,17 +1929,21 @@ void RendererSession::HandleAction(const ActionRequest& action) {
         ApplyVirtualDialogAction(surface, lock, action);
         return;
     }
+    // MMC's busy shield takes the frame's mouse input while a snap-in holds the
+    // console (a prompt on the snap-in's own thread, a long load) but leaves the frame
+    // enabled, focusable, and movable.  The proxy stays the same, so the refusal is
+    // made here: anything but the window frame's own commands is declined while the
+    // shield is up, and reconcile republishes the unchanged state.
+    if (surface->agent && HasVisibleMmcBusyShield(surface->agent->Root()) &&
+        action.action != L"move" && action.action != L"resize" && action.action != L"minimize" &&
+        action.action != L"maximize" && action.action != L"restore" && action.action != L"close") {
+        RejectAction(surface, lock, action, L"rejected", L"the console is busy (MMC busy shield is up)");
+        return;
+    }
 
-    // Native work needs the source UI thread, so it is queued for the action
-    // worker rather than run on the pipe reader.
     lock.unlock();
     canonicalLock.unlock();
-    {
-        std::scoped_lock actionLock(actionMutex_);
-        if (stopping_.load() || failed_.load()) return;
-        actionQueue_.emplace_back(action, surface);
-    }
-    actionCondition_.notify_one();
+    HandleNativeAction(action, surface);
 }
 
 // A property action that does not land leaves canonical state where it was.
@@ -1621,8 +1955,10 @@ bool IsRecoverableActionFailure(std::wstring_view action) noexcept {
         action == L"setItemCheck" || action == L"setItemText" ||
         action == L"setValue" || action == L"setExpand" || action == L"setGroupExpanded" || action == L"setSplit" ||
         action == L"setColumnOrder" || action == L"scrollBy" || action == L"htmlScroll" ||
-        // A context menu the application declines to open changes nothing.
-        action == L"contextMenu" || action == L"setScroll" ||
+        // A context menu the application declines to open, or an item it declines to
+        // activate, changes nothing.
+        action == L"contextMenu" || action == L"openItem" || action == L"setScroll" || action == L"setTopIndex" ||
+        action == L"toolbarDropDown" ||
         action == L"move" || action == L"resize" ||
         action == L"minimize" || action == L"maximize" || action == L"restore";
 }
@@ -2239,7 +2575,7 @@ void RendererSession::ActionMain() noexcept {
                 work = std::move(actionQueue_.front());
                 actionQueue_.pop_front();
             }
-            HandleNativeAction(work.first, work.second);
+            AdmitAction(work.first, work.second);
         }
     } catch (...) {
         Fail(L"native action worker exception");
@@ -2359,6 +2695,10 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
         return PublishReconciledSnapshot(pass);
     }
     if (!pass.agent->Capture(pass.next, error, 2000, shutdownEvent_, &timedOut)) {
+        // A capture that ran past its deadline, or whose GUI threads kept changing,
+        // is a timing condition, not evidence about the view.
+        timedOut = timedOut || error == L"source-thread command cancelled" ||
+            error.starts_with(kCaptureBarrierUnstable);
         // A source thread inside a modal loop can miss a bounded deadline without
         // being broken, so a few misses keep the projection.
         if (timedOut && !stopping_.load() && !failed_.load() &&
@@ -2370,6 +2710,7 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
             } catch (...) {}
             return nullptr;
         }
+        if (!timedOut && HoldThroughTransientRejection(surface, error)) return nullptr;
         // The reason a live surface stopped capturing is the whole diagnosis for a
         // rollback, so it is logged where it is known rather than reduced to the
         // wire reason the renderer sees.
@@ -2380,22 +2721,43 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
         return timedOut ? L"timeout" : L"unsupported";
     }
     ReassertRememberedSplits(pass);
-    if (const wchar_t* reason = RefreshMenuBarToolbar(pass)) {
+    std::wstring refreshError;
+    if (const wchar_t* reason = RefreshMenuBarToolbar(pass, refreshError)) {
         if (std::wstring_view(reason) == L"timeout" && !stopping_.load() && !failed_.load() &&
             ++surface->captureTimeouts < kMaxCaptureTimeouts) {
             // Keep the published revision intact until its replacement captures
             // successfully. The source binding witness rejects old menu clicks.
             return nullptr;
         }
+        if (std::wstring_view(reason) == L"unsupported" &&
+            HoldThroughTransientRejection(surface, refreshError)) return nullptr;
         return reason;
     }
     surface->captureTimeouts = 0;
+    surface->rejectionSince = 0;
     return PublishReconciledSnapshot(pass);
+}
+
+// A snap-in that is loading a view passes through shapes the projection refuses (an
+// empty host panel, a report list before its columns exist). The projection keeps
+// its last canonical state while the view settles, and rolls back only when the
+// refusal persists. Stale actions meanwhile fail their revision and capture checks.
+bool RendererSession::HoldThroughTransientRejection(
+    const std::shared_ptr<Surface>& surface, const std::wstring& error) noexcept {
+    if (stopping_.load() || failed_.load()) return false;
+    const uint64_t now = GetTickCount64();
+    if (surface->rejectionSince == 0) surface->rejectionSince = now;
+    if (now - surface->rejectionSince >= kRejectionGraceMs) return false;
+    try {
+        FluentShell::Log(L"Reconcile capture rejected; holding the projection while the view settles: " +
+            error);
+    } catch (...) {}
+    return true;
 }
 
 // The source thread owns discovery, refresh policy and cached menu state. Reconcile
 // only requests the post-commit stage and publishes the resulting canonical capture.
-const wchar_t* RendererSession::RefreshMenuBarToolbar(ReconcilePass& pass) {
+const wchar_t* RendererSession::RefreshMenuBarToolbar(ReconcilePass& pass, std::wstring& failure) {
     std::wstring error;
     bool changed = false;
     const bool refreshed = pass.agent->RefreshMenuBarToolbar(
@@ -2415,6 +2777,9 @@ const wchar_t* RendererSession::RefreshMenuBarToolbar(ReconcilePass& pass) {
         try {
             FluentShell::Log(L"Recapture after menu-bar refresh failed: " + captureError);
         } catch (...) {}
+        failure = captureError;
+        timedOut = timedOut || captureError == L"source-thread command cancelled" ||
+            captureError.starts_with(kCaptureBarrierUnstable);
         return timedOut ? L"timeout" : L"unsupported";
     }
     return nullptr;
@@ -3131,6 +3496,7 @@ void RendererSession::RestoreSurface(
         NotifyRendererOfRollback(attempt, protocolReason);
         if (nativeRestored) RetireSurfaceIfClosed(surface);
         if (scheduleRetry) ScheduleEmergencyUncloakRetry(attempt);
+        if (nativeRestored) ScheduleReprojection(attempt.nativeRoot, reason);
     } catch (...) {
         // Allocation and IPC failures must not escape a noexcept rollback
         // boundary.  Only bounded, non-allocating emergency operations here.
@@ -3160,6 +3526,32 @@ void RendererSession::RestoreAll(std::wstring_view reason) noexcept {
         }
     } catch (...) {
         return;
+    }
+    // A dialog goes before the window that owns it, the deepest of a chain first: the
+    // renderer closes a proxy as its surface is restored, and an owner proxy destroyed
+    // first takes the proxies it owns with it from underneath their XAML windows.
+    std::array<size_t, 512> depths{};
+    for (size_t index = 0; index < count; ++index) {
+        try {
+            HWND root = nullptr;
+            {
+                std::scoped_lock lock(surfaces[index]->mutex);
+                if (surfaces[index]->agent) root = surfaces[index]->agent->Root();
+            }
+            depths[index] = root && IsWindow(root) ? OwnerDepth(root) : 0;
+        } catch (...) { depths[index] = 0; }
+    }
+    for (size_t index = 1; index < count; ++index) {
+        std::shared_ptr<Surface> surface = std::move(surfaces[index]);
+        const size_t depth = depths[index];
+        size_t slot = index;
+        while (slot > 0 && depths[slot - 1] < depth) {
+            surfaces[slot] = std::move(surfaces[slot - 1]);
+            depths[slot] = depths[slot - 1];
+            --slot;
+        }
+        surfaces[slot] = std::move(surface);
+        depths[slot] = depth;
     }
     for (size_t index = 0; index < count; ++index) {
         try { RestoreSurface(surfaces[index], reason); }

@@ -25,6 +25,9 @@ public sealed class TranslatedWindow : Window
     private PresentationLifetime? _controlLifetime;
     private PresentationLifetime? _popupLifetime;
     private readonly PopupMenuCoordinator _popupCommands = new();
+    // Counts item presses across presenter rebuilds, so a double-click survives the first
+    // press's own patch.
+    private readonly ItemPressTracker _itemPresses = new();
     private readonly List<MenuItemViewModel> _popupItems = [];
     private global::Windows.Foundation.Point? _popupPosition;
     private bool _popupSyncQueued;
@@ -54,6 +57,11 @@ public sealed class TranslatedWindow : Window
     private bool _retired;
     private bool _interactionBlocked;
     private uint _renderDpi;
+    // Whether this window is the active one, and the focus a rebuild would have restored while it was
+    // not: moving XAML focus into an inactive window activates it, which lifted a console above the
+    // dialog the user had just opened over it.
+    private bool _windowActive;
+    private (string NodeId, int SelectionStart, int SelectionLength)? _deferredFocus;
 
     public WindowViewModel ViewModel { get; }
     public nint Hwnd { get; }
@@ -71,9 +79,22 @@ public sealed class TranslatedWindow : Window
         Grid.SetRow(_canvas, 1);
         _root.Children.Add(_canvas);
         Content = _root;
-        Activated += (_, args) => RendererDiagnostics.Log(
-            $"window activation={args.WindowActivationState} popup={_popupFlyout is not null}");
-        _canvas.KeyDown += OnCanvasKeyDown;
+        Activated += (_, args) =>
+        {
+            RendererDiagnostics.Log(
+                $"window activation={args.WindowActivationState} popup={_popupFlyout is not null} " +
+                $"surface={ViewModel.SurfaceId} title='{ViewModel.Title}'");
+            _windowActive = args.WindowActivationState != WindowActivationState.Deactivated;
+            if (_windowActive && _deferredFocus is { } pending)
+            {
+                _deferredFocus = null;
+                RestoreFocus(pending);
+            }
+        };
+        // On the root, not the canvas: a click that disables the focused control (or a native
+        // response that hides it) leaves keyboard focus on the island's input site, with no element
+        // to route a key to; the root still sees it, and Escape must still cancel the dialog.
+        _root.KeyDown += OnRootKeyDown;
         _root.AddHandler(UIElement.PointerPressedEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, args) =>
         {
             if (Environment.GetEnvironmentVariable("FLUENTSHELL_DIAG_ACCESSIBILITY") != "1") return;
@@ -245,7 +266,7 @@ public sealed class TranslatedWindow : Window
         {
             _applyingCanonical = false;
         }
-        RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"}");
+        RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"} surface={ViewModel.SurfaceId}");
         if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
         if (boundsReplay is { } boundsIntent) QueueOrEmitBoundsAction(boundsIntent);
         if (nodeReplay is { } nodeIntent) EmitStaleReplay(nodeIntent);
@@ -430,8 +451,56 @@ public sealed class TranslatedWindow : Window
         }
     }
 
+    // The control the user is working in, by node and with its text selection: a rebuild replaces
+    // every control, and without this the new ones start with no focus (the user's next
+    // keystroke goes nowhere).
+    private (string NodeId, int SelectionStart, int SelectionLength)? CaptureFocus()
+    {
+        if (Content?.XamlRoot is not { } root ||
+            Microsoft.UI.Xaml.Input.FocusManager.GetFocusedElement(root) is not DependencyObject focused) return null;
+        for (DependencyObject? current = focused; current is not null; current = VisualTreeHelper.GetParent(current))
+        {
+            if (current is FrameworkElement { DataContext: ControlNodeViewModel node })
+            {
+                var text = focused as TextBox;
+                return (node.NodeId, text?.SelectionStart ?? 0, text?.SelectionLength ?? 0);
+            }
+        }
+        return null;
+    }
+
+    private void RestoreFocus((string NodeId, int SelectionStart, int SelectionLength)? focus)
+    {
+        if (focus is not { } target || !_controls.TryGetValue(target.NodeId, out var control)) return;
+        // A window the user is not in keeps the focus for its next activation instead of taking it now.
+        if (!_windowActive)
+        {
+            _deferredFocus = target;
+            return;
+        }
+        void Apply()
+        {
+            if (!control.IsLoaded || _retired) return;
+            if (control.Focus(FocusState.Programmatic) && control is TextBox text)
+                text.Select(Math.Clamp(target.SelectionStart, 0, text.Text.Length),
+                    Math.Clamp(target.SelectionLength, 0, Math.Max(0, text.Text.Length - target.SelectionStart)));
+        }
+        if (control.IsLoaded) Apply();
+        else
+        {
+            RoutedEventHandler? loaded = null;
+            loaded = (_, _) =>
+            {
+                control.Loaded -= loaded;
+                Apply();
+            };
+            control.Loaded += loaded;
+        }
+    }
+
     private void RebuildControls()
     {
+        var focus = CaptureFocus();
         _controlLifetime?.Dispose();
         var lifetime = _controlLifetime = new PresentationLifetime();
         _canvas.Children.Clear();
@@ -450,7 +519,7 @@ public sealed class TranslatedWindow : Window
         var factory = new ControlFactory(
             Math.Max(1, (int)Math.Round(dpi)), ViewModel.Nodes, EmitNodeAction,
             () => !CanEmitActions,
-            IsImeComposing, lifetime);
+            IsImeComposing, lifetime, _itemPresses);
         var icon = CreateDialogIcon();
         if (icon is not null) _canvas.Children.Add(icon);
         foreach (var node in ViewModel.Nodes)
@@ -473,6 +542,7 @@ public sealed class TranslatedWindow : Window
                     "Validated control parent is not a projected container.");
             }
         }
+        RestoreFocus(focus);
         QueuePopupSynchronization();
     }
 
@@ -529,7 +599,7 @@ public sealed class TranslatedWindow : Window
         _popupItems.Clear();
         _popupItems.AddRange(popup.Items.Select(MenuItemViewModel.FromSnapshot));
         var popupId = popup.PopupId;
-        RendererDiagnostics.Log($"popup show id={popupId} node={popup.NodeId} item={popup.ItemIndex} at={position.X:F0},{position.Y:F0} items={popup.Items.Count}");
+        RendererDiagnostics.Log($"popup show id={popupId} node={popup.NodeId} item={popup.ItemIndex} at={position.X:F0},{position.Y:F0} items={popup.Items.Count} default={popup.Items.FindIndex(entry => entry.IsDefault)}");
         var lifetime = _popupLifetime = new PresentationLifetime();
         var flyout = new MenuProjectionFactory(
             item => RespondToPopup(popupId, item.ItemId), lifetime, popupId).CreateFlyout(_popupItems);
@@ -739,7 +809,10 @@ public sealed class TranslatedWindow : Window
             if (ViewModel.Visible)
             {
                 if (!SetCloaked(false)) throw new InvalidOperationException("Unable to uncloak renderer proxy.");
-                _appWindow.Show(false);
+                // Show brings the window to the top of the z-order, so a window that is already
+                // up is left alone: every later patch would otherwise lift it above a dialog
+                // opened over it in the meantime.
+                if (!_appWindow.IsVisible) _appWindow.Show(false);
                 if (applyCanonicalPlacement) ApplyPresenterState();
             }
             else
@@ -792,11 +865,19 @@ public sealed class TranslatedWindow : Window
     private void ApplyPresenterState()
     {
         if (_appWindow.Presenter is not OverlappedPresenter presenter) return;
+        // Only a real change is asked of the presenter: ShowWindow(SW_RESTORE) on a window that
+        // is already restored still activates it and lifts it in the z-order.
         switch (ViewModel.State)
         {
-            case "minimized": presenter.Minimize(); break;
-            case "maximized": presenter.Maximize(); break;
-            default: presenter.Restore(); break;
+            case "minimized":
+                if (presenter.State != OverlappedPresenterState.Minimized) presenter.Minimize();
+                break;
+            case "maximized":
+                if (presenter.State != OverlappedPresenterState.Maximized) presenter.Maximize();
+                break;
+            default:
+                if (presenter.State != OverlappedPresenterState.Restored) presenter.Restore();
+                break;
         }
     }
 
@@ -844,7 +925,8 @@ public sealed class TranslatedWindow : Window
         var terminalPopup = action == "popupCommand" && !_applyingCanonical &&
             _committed && _interactive && !_retired;
         if (!CanEmitActions && !terminalPopup) return null;
-        if ((property == "invoke" || property == "close" || property == "contextMenu" ||
+        if ((property == "invoke" || property == "close" || property == "contextMenu" || property == "openItem" ||
+             property == "toolbarDropDown" ||
              property.StartsWith("menu:", StringComparison.Ordinal) ||
              property.StartsWith("popup:", StringComparison.Ordinal)) &&
             _pending.Values.Any(pending =>
@@ -905,8 +987,14 @@ public sealed class TranslatedWindow : Window
         EmitAction(null, "close", "close", null);
     }
 
-    private void OnCanvasKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
+    private void OnRootKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
     {
+        // The menu bar answers its own Enter and Escape (it opens and closes its menus).
+        if (_menuBar is not null && args.OriginalSource is DependencyObject source)
+        {
+            for (DependencyObject? current = source; current is not null; current = VisualTreeHelper.GetParent(current))
+                if (ReferenceEquals(current, _menuBar)) return;
+        }
         if (_popupFlyout is not null && args.Key == global::Windows.System.VirtualKey.Escape &&
             _popupCommands.PopupId is { } popupId)
         {

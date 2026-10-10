@@ -12,6 +12,8 @@
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
 #include "../../src/Bridge/Translation/PopupMenuState.h"
 #include "../../src/Bridge/Translation/PaintedPixel.h"
+#include "../../src/Bridge/Translation/RichText.h"
+#include "../../src/Bridge/Translation/PerformanceChart.h"
 #include "ItemImageCaptureTests.h"
 #include "MmcHtmlDocumentTests.h"
 #include "ListViewModeRegressionTests.h"
@@ -34,6 +36,7 @@
 #include <dbghelp.h>
 #include <dwmapi.h>
 #include <prsht.h>
+#include <richedit.h>
 #include <UIAutomation.h>
 
 #include <algorithm>
@@ -153,6 +156,9 @@ LONG WINAPI ReportUnhandledException(EXCEPTION_POINTERS* exception) {
 #include "MmcMessageViewTests.h"
 #include "CaptureVisibilityTests.h"
 #include "UpDownAdapterTests.h"
+#include "DateTimePickerAdapterTests.h"
+#include "ListBoxMultiSelectTests.h"
+#include "PerformanceChartTests.h"
 
 std::string ReadFixture(const wchar_t* name) {
     const auto path = std::filesystem::current_path() / L"tests" / L"ProtocolFixtures" / name;
@@ -1532,9 +1538,11 @@ void TestControlAdapterRegistry() {
         { L"Button", BS_AUTO3STATE, true, ControlKind::ThreeState, "3-state Button" },
         { L"Button", BS_AUTORADIOBUTTON, true, ControlKind::RadioButton, "radio Button" },
         { L"Button", BS_GROUPBOX, true, ControlKind::GroupBox, "GroupBox" },
-        { L"Button", BS_GROUPBOX | WS_TABSTOP, false, ControlKind::GroupBox,
+        // A group box never takes the focus: a template's WS_TABSTOP on one (MMC's Customize View)
+        // is dropped from the traversal at capture, not a reason to keep the dialog native.
+        { L"Button", BS_GROUPBOX | WS_TABSTOP, true, ControlKind::GroupBox,
           "tab-stop GroupBox" },
-        { L"Button", BS_OWNERDRAW, false, ControlKind::Button, "owner-draw Button" },
+        { L"Button", BS_OWNERDRAW, true, ControlKind::Button, "owner-draw Button" },
         { L"Button", BS_PUSHBUTTON | BS_ICON, true, ControlKind::Button, "icon Button" },
         { L"Button", BS_PUSHBUTTON | BS_BITMAP, true, ControlKind::Button, "bitmap Button" },
         { L"Button", BS_AUTOCHECKBOX | BS_ICON, false, ControlKind::CheckBox, "icon check Button" },
@@ -1544,7 +1552,11 @@ void TestControlAdapterRegistry() {
         { L"ComboBox", CBS_SIMPLE | CBS_HASSTRINGS, false, ControlKind::ComboBox,
           "simple ComboBox" },
         { L"ListBox", 0, true, ControlKind::ListBox, "ListBox" },
-        { L"ListBox", LBS_EXTENDEDSEL, false, ControlKind::ListBox, "multi-select ListBox" },
+        { L"ListBox", LBS_EXTENDEDSEL, true, ControlKind::ListBox, "extended-selection ListBox" },
+        { L"ListBox", LBS_MULTIPLESEL, true, ControlKind::ListBox, "multiple-selection ListBox" },
+        { L"ListBox", LBS_MULTICOLUMN, false, ControlKind::ListBox, "multi-column ListBox" },
+        { L"ListBox", LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "owner-draw ListBox" },
+        { L"ListBox", LBS_NODATA | LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "virtual ListBox" },
         { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
         { PROGRESS_CLASSW, PBS_MARQUEE, true, ControlKind::ProgressBar, "marquee ProgressBar" },
         { PROGRESS_CLASSW, PBS_VERTICAL, false, ControlKind::ProgressBar, "vertical ProgressBar" },
@@ -1585,6 +1597,32 @@ void TestControlAdapterRegistry() {
             Check(!reason.empty(), adapter.label);
         }
         DestroyWindow(child);
+    }
+
+    // A Static that takes the focus and says nothing is a control its dialog subclassed and paints
+    // (the palettes of the Color chooser): a text label could not carry its pixels or its clicks.
+    {
+        struct StaticFocusCase { DWORD style; const wchar_t* text; bool supported; const char* label; };
+        const StaticFocusCase focusCases[] = {
+            { SS_SIMPLE | WS_TABSTOP, L"", false, "tab-stop Static without text" },
+            { SS_LEFT | WS_TABSTOP, L"", false, "tab-stop left Static without text" },
+            { SS_SIMPLE | WS_TABSTOP, L"Label", true, "tab-stop Static with text" },
+            { SS_SIMPLE, L"", true, "empty Static that is not a tab stop" },
+        };
+        for (const auto& focusCase : focusCases) {
+            HWND child = CreateWindowExW(0, L"Static", focusCase.text, WS_CHILD | focusCase.style,
+                0, 0, 80, 24, root, reinterpret_cast<HMENU>(303), GetModuleHandleW(nullptr), nullptr);
+            Check(child != nullptr, focusCase.label);
+            if (!child) continue;
+            ControlKind kind = ControlKind::Count;
+            std::wstring reason;
+            Check(Translation::ClassifyControl(child, kind, reason) == focusCase.supported,
+                focusCase.label);
+            if (!focusCase.supported) {
+                Check(reason.find(L"custom-drawn") != std::wstring::npos, focusCase.label);
+            }
+            DestroyWindow(child);
+        }
     }
 
     HWND styledList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT,
@@ -1872,10 +1910,17 @@ void TestStructuredCommonControlCapture() {
     virtualContext.surfaceId = L"22222222-2222-3333-4444-555555555555";
     virtualContext.generation = 1;
     virtualContext.revision = 1;
+    // Without rows a column-less list paints nothing and is carried as an empty list;
+    // a virtual list that claims rows it has no columns to show stays refused.
+    Check(virtualList && Translation::CaptureWindow(
+            virtualWindow, virtualContext, rejected, error),
+        "an empty virtual report ListView without columns was refused");
+    if (virtualList) SendMessageW(virtualList, LVM_SETITEMCOUNT, 3, 0);
+    virtualContext.revision = 2;
     Check(virtualList && !Translation::CaptureWindow(
             virtualWindow, virtualContext, rejected, error) &&
             error.find(L"no native report columns") != std::wstring::npos,
-        "virtual report ListView without columns was accepted by the bounded adapter");
+        "virtual report ListView with rows but no columns was accepted by the bounded adapter");
     DestroyWindow(virtualWindow);
 }
 
@@ -2228,6 +2273,152 @@ void TestAncestorEnabledTabOrderCapture() {
     DestroyWindow(window);
 }
 
+// An owner-draw button of any framework but Windows Forms (Performance Monitor's colour swatch) is a push
+// button whose whole face its owner paints: the face is captured as painted, all background included.
+LRESULT CALLBACK OwnerDrawSwatchParent(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (message == WM_DRAWITEM && lParam) {
+        const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        HBRUSH brush = CreateSolidBrush(RGB(200, 30, 30));
+        FillRect(draw->hDC, &draw->rcItem, brush);
+        DeleteObject(brush);
+        return TRUE;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void TestOwnerDrawButtonFace() {
+    HWND root = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"owner-draw-face",
+        WS_OVERLAPPEDWINDOW, 20, 20, 300, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND swatch = root ? CreateWindowExW(0, L"Button", L"Colour", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        10, 10, 90, 24, root, reinterpret_cast<HMENU>(700), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && swatch, "owner-draw swatch controls were not created");
+    if (!root || !swatch) {
+        if (root) DestroyWindow(root);
+        return;
+    }
+    // A face wider than a button picture may be is the inert picture it shows when no key reaches the
+    // button, and has no contract when one does.
+    HWND wide = CreateWindowExW(0, L"Button", L"Wide", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        10, 44, 150, 24, root, reinterpret_cast<HMENU>(701), GetModuleHandleW(nullptr), nullptr);
+    HWND wideFocusable = CreateWindowExW(0, L"Button", L"Wide focusable", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        10, 78, 150, 24, root, reinterpret_cast<HMENU>(702), GetModuleHandleW(nullptr), nullptr);
+    Check(wide && wideFocusable, "wide owner-draw buttons were not created");
+    if (wide && wideFocusable) {
+        Translation::ControlKind wideKind{};
+        std::wstring wideReason;
+        Check(Translation::ClassifyControl(wide, wideKind, wideReason) &&
+              wideKind == Translation::ControlKind::StaticBitmap,
+            "a wide owner-draw button that no key reaches was not carried as an inert picture");
+        wideReason.clear();
+        Check(!Translation::ClassifyControl(wideFocusable, wideKind, wideReason) && !wideReason.empty(),
+            "a wide owner-draw button that takes focus was admitted");
+        DestroyWindow(wideFocusable);
+    }
+    SetWindowSubclass(root, OwnerDrawSwatchParent, 1, 0);
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    UpdateWindow(root);
+    Translation::CaptureContext context;
+    context.surfaceId = L"77777777-7777-7777-7777-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(root, context, snapshot, error);
+    if (!captured) std::wcerr << L"owner-draw button capture: " << error << L'\n';
+    Check(captured, "an owner-draw button of a non-WinForms owner was rejected");
+    if (captured) {
+        RECT client{};
+        GetClientRect(swatch, &client);
+        const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [swatch](const Translation::ControlNode& candidate) { return candidate.hwnd == swatch; });
+        Check(node != snapshot.nodes.end() && node->kind == Translation::ControlKind::Button &&
+              node->text == L"Colour" &&
+              node->imageWidth == static_cast<uint32_t>(client.right) &&
+              node->imageHeight == static_cast<uint32_t>(client.bottom) &&
+              node->imageData.size() == static_cast<size_t>(client.right) * client.bottom * 4,
+            "an owner-draw button face was not captured at the control's size");
+        if (node != snapshot.nodes.end() && node->imageData.size() >= 4) {
+            const size_t centre = (static_cast<size_t>(client.bottom / 2) * client.right + client.right / 2) * 4;
+            Check(node->imageData[centre] == 30 && node->imageData[centre + 1] == 30 &&
+                  node->imageData[centre + 2] == 200 && node->imageData[centre + 3] == 255,
+                "an owner-draw button face was keyed out instead of captured as painted");
+        }
+    }
+    DestroyWindow(root);
+}
+
+// The native dialog manager numbers a container's tab stops from its first one -- even when the
+// container's first child is itself a tab stop -- and a child dialog that is no control parent (the pages of
+// an OLE property frame, such as Performance Monitor's chart Properties) is a navigation scope of its own.
+void TestTabOrderScopes() {
+    const auto find = [](const Translation::WindowSnapshot& snapshot, HWND window) {
+        return std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [window](const Translation::ControlNode& node) { return node.hwnd == window; });
+    };
+    HWND startRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"tab-order-start",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND first = startRoot ? CreateWindowExW(0, L"Edit", L"first", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 10, 120, 24, startRoot, reinterpret_cast<HMENU>(501), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND second = startRoot ? CreateWindowExW(0, L"Edit", L"second", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 44, 120, 24, startRoot, reinterpret_cast<HMENU>(502), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND third = startRoot ? CreateWindowExW(0, L"Button", L"third", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        10, 78, 120, 24, startRoot, reinterpret_cast<HMENU>(503), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(startRoot && first && second && third, "tab-order start controls were not created");
+    if (startRoot && first && second && third) {
+        ShowWindow(startRoot, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"66666666-6666-6666-6666-555555555555";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        Check(Translation::CaptureWindow(startRoot, context, snapshot, error), "tab-order start window was rejected");
+        const auto a = find(snapshot, first), b = find(snapshot, second), c = find(snapshot, third);
+        Check(a != snapshot.nodes.end() && b != snapshot.nodes.end() && c != snapshot.nodes.end() &&
+              a->tabIndex == 0 && b->tabIndex == 1 && c->tabIndex == 2,
+            "a first child that is a tab stop was not numbered first");
+    }
+    if (startRoot) DestroyWindow(startRoot);
+
+    HWND frame = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"property-frame",
+        WS_OVERLAPPEDWINDOW, 20, 20, 400, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND frameButton = frame ? CreateWindowExW(0, L"Button", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        10, 250, 80, 24, frame, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    // No DS_CONTROL and no WS_EX_CONTROLPARENT: the frame's dialog manager never reaches the page's controls.
+    HWND page = frame ? CreateWindowExW(0, L"#32770", L"Page", WS_CHILD | WS_VISIBLE,
+        10, 10, 360, 200, frame, reinterpret_cast<HMENU>(600), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND pageFirst = page ? CreateWindowExW(0, L"Edit", L"one", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 10, 150, 24, page, reinterpret_cast<HMENU>(601), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND pageSecond = page ? CreateWindowExW(0, L"Edit", L"two", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 44, 150, 24, page, reinterpret_cast<HMENU>(602), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(frame && frameButton && page && pageFirst && pageSecond, "property-page tab-order controls were not created");
+    if (frame && frameButton && page && pageFirst && pageSecond) {
+        ShowWindow(frame, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"66666666-6666-6666-6666-666666666666";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        const bool captured = Translation::CaptureWindow(frame, context, snapshot, error);
+        if (!captured) std::wcerr << L"property page capture: " << error << L'\n';
+        Check(captured, "a child dialog that is no control parent was rejected");
+        if (captured) {
+            const auto container = find(snapshot, page);
+            const auto one = find(snapshot, pageFirst), two = find(snapshot, pageSecond), ok = find(snapshot, frameButton);
+            Check(container != snapshot.nodes.end() && one != snapshot.nodes.end() && two != snapshot.nodes.end() &&
+                  ok != snapshot.nodes.end() &&
+                  container->kind == Translation::ControlKind::DialogContainer && container->tabIndex == -1,
+                "a child dialog that is no control parent was not captured as a structural container");
+            Check(one != snapshot.nodes.end() && two != snapshot.nodes.end() && ok != snapshot.nodes.end() &&
+                  one->tabIndex >= 0 && two->tabIndex >= 0 && ok->tabIndex >= 0 &&
+                  one->tabIndex + 1 == two->tabIndex && one->tabIndex != ok->tabIndex && two->tabIndex != ok->tabIndex,
+                "the controls of an independent dialog page lost their own tab order");
+        }
+    }
+    if (frame) DestroyWindow(frame);
+}
+
 void TestTabOrderRejectionSpecificity() {
     HWND dialogRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"dialog-container",
         WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
@@ -2446,6 +2637,10 @@ public:
     bool duplicateTabSelection = false;
     int selectedTab = 1;
     unsigned drives = 0;
+    // Menu-bar buttons (one-based) that report STATE_SYSTEM_INVISIBLE, as MMC's hidden
+    // Favorites and snap-in placeholders do, and the last one whose default action opens a popup.
+    std::vector<long> hiddenChildren;
+    long popupChildLimit = 2;
     DWORD thread = GetCurrentThreadId();
     TestIslandPopupRuntime* islandRuntime = nullptr;
 
@@ -2517,6 +2712,9 @@ public:
             if (child.lVal == selectedTab || duplicateTabSelection) state->lVal |= STATE_SYSTEM_SELECTED;
             if (!itemEnabled) state->lVal |= STATE_SYSTEM_UNAVAILABLE;
         }
+        if (child.vt == VT_I4 && std::find(hiddenChildren.begin(), hiddenChildren.end(), child.lVal) !=
+                hiddenChildren.end())
+            state->lVal |= STATE_SYSTEM_INVISIBLE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR*) override { return S_FALSE; }
@@ -2565,7 +2763,7 @@ public:
             PostMessageW(toolbar, kTestMenuFlood, 0, 0);
             return S_OK;
         }
-        if (child.vt == VT_I4 && child.lVal < 3)
+        if (child.vt == VT_I4 && child.lVal <= popupChildLimit)
             PostMessageW(toolbar, kTestMenuPopup, child.lVal, 0);
         return S_OK;
     }
@@ -3680,6 +3878,208 @@ void TestPaneContainerCaptureAndSplit() {
     DestroyWindow(root);
 }
 
+// A Windows Forms dialog shown without an owner is parented to the desktop and disables the
+// thread's other top-level windows instead (Event Viewer's Filter dialog). The desktop is no
+// owner; the disabled window is the one the dialog is modal to.
+void TestUnownedModalDialogOwnerResolution() {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND frame = CreateWindowExW(0, L"Static", L"modal-peer-frame", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40, 40, 320, 220, nullptr, nullptr, instance, nullptr);
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"Static", L"modal-peer-dialog",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 70, 70, 200, 120, GetDesktopWindow(), nullptr, instance, nullptr);
+    HWND plain = CreateWindowExW(0, L"Static", L"modal-peer-plain",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 90, 90, 200, 120, GetDesktopWindow(), nullptr, instance, nullptr);
+    Check(frame && dialog && plain, "unowned modal dialog fixtures were not created");
+    if (!frame || !dialog || !plain) {
+        for (HWND window : { frame, dialog, plain }) if (window) DestroyWindow(window);
+        return;
+    }
+    Check(Translation::EffectiveTopLevelOwner(dialog) == nullptr && !Translation::IsModalOwnedTopLevel(dialog),
+        "a dialog beside an enabled window was given an owner");
+    EnableWindow(frame, FALSE);
+    Check(Translation::EffectiveTopLevelOwner(dialog) == frame && Translation::IsModalOwnedTopLevel(dialog),
+        "an unowned dialog was not modal to the window disabled for it");
+    Check(Translation::EffectiveTopLevelOwner(frame) == nullptr && !Translation::IsModalOwnedTopLevel(frame),
+        "the disabled window was given an owner");
+    Check(Translation::EffectiveTopLevelOwner(plain) == nullptr,
+        "a window with no dialog frame was taken for the dialog of a disabled peer");
+    EnableWindow(frame, TRUE);
+    Check(Translation::EffectiveTopLevelOwner(dialog) == nullptr,
+        "a dialog stayed owned by a window that is enabled again");
+    DestroyWindow(plain);
+    DestroyWindow(dialog);
+    DestroyWindow(frame);
+}
+
+// A group box a dialog template gave WS_TABSTOP is no stop of the traversal: the box is captured, takes
+// neither a tab stop nor a tab index, and the controls around it keep theirs.
+void TestTabStopGroupBoxIsNotATabStop() {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    struct WindowOwner final {
+        HWND window;
+        ~WindowOwner() { if (window) DestroyWindow(window); }
+    } owner{ CreateWindowExW(WS_EX_CONTROLPARENT, L"#32770", L"group-tab",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, 40, 40, 300, 200, nullptr, nullptr, instance, nullptr) };
+    const HWND root = owner.window;
+    const HWND first = root ? CreateWindowExW(0, L"Edit", L"a", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 10, 100, 22, root, reinterpret_cast<HMENU>(61), instance, nullptr) : nullptr;
+    const HWND group = root ? CreateWindowExW(0, L"Button", L"frame", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        WS_GROUP | BS_GROUPBOX, 10, 40, 200, 100, root, reinterpret_cast<HMENU>(62), instance, nullptr) : nullptr;
+    const HWND second = root ? CreateWindowExW(0, L"Edit", L"b", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        20, 60, 100, 22, root, reinterpret_cast<HMENU>(63), instance, nullptr) : nullptr;
+    Check(root && first && group && second, "tab-stop group box fixture could not create its windows");
+    if (!root || !first || !group || !second) return;
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    Translation::CaptureContext context;
+    context.surfaceId = L"a1a1a1a1-b2b2-c3c3-d4d4-e5e5e5e5e5e5";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring reason;
+    const bool captured = Translation::CaptureWindow(root, context, snapshot, reason);
+    if (!captured) std::wcerr << L"tab-stop group box capture: " << reason << L"\n";
+    const auto find = [&snapshot](HWND window) {
+        return std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [window](const auto& candidate) { return candidate.hwnd == window; });
+    };
+    const auto groupNode = find(group);
+    const auto firstNode = find(first);
+    const auto secondNode = find(second);
+    Check(captured && groupNode != snapshot.nodes.end() && groupNode->kind == Translation::ControlKind::GroupBox &&
+        !groupNode->tabStop && groupNode->tabIndex == -1,
+        "a tab-stop group box was captured as a tab stop or refused");
+    Check(captured && firstNode != snapshot.nodes.end() && secondNode != snapshot.nodes.end() &&
+        firstNode->tabStop && secondNode->tabStop && firstNode->tabIndex >= 0 && secondNode->tabIndex >= 0,
+        "the controls around a tab-stop group box lost their tab stops");
+}
+
+// An animation control (the flashlight of Find Certificates) takes no input: it travels as the picture it
+// shows, and one that is a tab stop is refused.
+void TestAnimationControlIsAnInertPicture() {
+    INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_ANIMATE_CLASS };
+    InitCommonControlsEx(&controls);
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    struct WindowOwner final {
+        HWND window;
+        ~WindowOwner() { if (window) DestroyWindow(window); }
+    } owner{ CreateWindowExW(WS_EX_CONTROLPARENT, L"#32770", L"animation",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, 40, 40, 300, 200, nullptr, nullptr, instance, nullptr) };
+    const HWND root = owner.window;
+    const HWND animation = root ? CreateWindowExW(0, ANIMATE_CLASSW, L"", WS_CHILD | WS_VISIBLE | ACS_TRANSPARENT,
+        10, 10, 48, 48, root, reinterpret_cast<HMENU>(71), instance, nullptr) : nullptr;
+    const HWND focusable = root ? CreateWindowExW(0, ANIMATE_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        80, 10, 48, 48, root, reinterpret_cast<HMENU>(72), instance, nullptr) : nullptr;
+    Check(root && animation && focusable, "animation fixture could not create its windows");
+    if (!root || !animation || !focusable) return;
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(animation, kind, reason) && kind == Translation::ControlKind::StaticBitmap,
+        "an animation control was not classified as an inert picture");
+    reason.clear();
+    Check(!Translation::ClassifyControl(focusable, kind, reason) && !reason.empty(),
+        "an animation control that is a tab stop was accepted");
+    DestroyWindow(focusable);
+    Translation::CaptureContext context;
+    context.surfaceId = L"b1b1b1b1-c2c2-d3d3-e4e4-f5f5f5f5f5f5";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    const bool captured = Translation::CaptureWindow(root, context, snapshot, reason);
+    if (!captured) std::wcerr << L"animation capture: " << reason << L"\n";
+    const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [animation](const auto& candidate) { return candidate.hwnd == animation; });
+    Check(captured && node != snapshot.nodes.end() && node->kind == Translation::ControlKind::StaticBitmap &&
+        node->imageWidth > 0 && node->imageHeight > 0 && !node->imageData.empty(),
+        "an animation control's frame was not captured as a picture");
+}
+
+// A dialog opened from a dialog (a Color chooser from a property sheet from a console) is a
+// chain: each window is modal to the one that owns it exactly while that one is disabled.
+// The chain is projected one dialog at a time, so every level has to answer for itself.
+void TestNestedModalDialogChain() {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND frame = CreateWindowExW(0, L"Static", L"chain-frame", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40, 40, 360, 240, nullptr, nullptr, instance, nullptr);
+    HWND sheet = frame ? CreateWindowExW(WS_EX_DLGMODALFRAME, L"Static", L"chain-sheet",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 70, 70, 260, 160, frame, nullptr, instance, nullptr) : nullptr;
+    HWND chooser = sheet ? CreateWindowExW(WS_EX_DLGMODALFRAME, L"Static", L"chain-chooser",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 100, 100, 180, 110, sheet, nullptr, instance, nullptr) : nullptr;
+    Check(frame && sheet && chooser, "nested dialog chain fixtures were not created");
+    if (!frame || !sheet || !chooser) {
+        for (HWND window : { chooser, sheet, frame }) if (window) DestroyWindow(window);
+        return;
+    }
+    Check(Translation::EffectiveTopLevelOwner(chooser) == sheet &&
+          Translation::EffectiveTopLevelOwner(sheet) == frame &&
+          Translation::EffectiveTopLevelOwner(frame) == nullptr,
+        "the dialog chain did not resolve each window to its own owner");
+    // Everything enabled: nothing is modal, whatever the depth.
+    Check(!Translation::IsModalOwnedTopLevel(sheet) && !Translation::IsModalOwnedTopLevel(chooser),
+        "a dialog of an enabled owner was taken for a modal one");
+    // The sheet is open modally over the console.
+    EnableWindow(frame, FALSE);
+    Check(Translation::IsModalOwnedTopLevel(sheet) && !Translation::IsModalOwnedTopLevel(chooser),
+        "the sheet was not modal to the disabled console, or the chooser was modal to the enabled sheet");
+    // The chooser is open modally over the sheet: it is modal although its owner is itself owned.
+    EnableWindow(sheet, FALSE);
+    Check(Translation::IsModalOwnedTopLevel(sheet) && Translation::IsModalOwnedTopLevel(chooser),
+        "a dialog modal to an owned dialog was not taken for a modal one");
+    Check(!Translation::IsModalOwnedTopLevel(frame), "the console of the chain was taken for a dialog");
+    EnableWindow(sheet, TRUE);
+    EnableWindow(frame, TRUE);
+    DestroyWindow(chooser);
+    DestroyWindow(sheet);
+    DestroyWindow(frame);
+}
+
+// A form page of label/field rows has a strip between each label and its field, and every
+// strip has a neighbour on both sides. None of them is a splitter: each is one row tall and
+// stops at the next row (Task Scheduler's task Properties page offered a draggable bar).
+void TestFormRowStripsAreNotSplits() {
+    WNDCLASSEXW containerClass{};
+    containerClass.cbSize = sizeof(containerClass);
+    containerClass.lpfnWndProc = PaneContainerProc;
+    containerClass.hInstance = GetModuleHandleW(nullptr);
+    containerClass.lpszClassName = L"FluentShellTestPaneHost";
+    RegisterClassExW(&containerClass);
+
+    HWND root = CreateWindowExW(0, L"Static", L"form-rows", WS_OVERLAPPEDWINDOW,
+        30, 30, 360, 280, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND container = root ? CreateWindowExW(0, L"FluentShellTestPaneHost", L"",
+        WS_CHILD | WS_VISIBLE, 0, 0, 300, 94, root, reinterpret_cast<HMENU>(700),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && container, "form-row test container was not created");
+    if (!root || !container) {
+        if (root) DestroyWindow(root);
+        return;
+    }
+    // Three rows, 26 px tall (a pane's minimum extent is 24), 8 px between a label and its
+    // field and between rows: every uncovered piece is a thin strip, so the rows tile.
+    for (int row = 0; row < 3; ++row) {
+        const int top = row * 34;
+        CreateWindowExW(0, L"Static", L"label", WS_CHILD | WS_VISIBLE,
+            0, top, 90, 26, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"Static", L"field", WS_CHILD | WS_VISIBLE,
+            98, top, 202, 26, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    UpdateWindow(root);
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(container, kind, reason) &&
+          kind == Translation::ControlKind::PaneContainer,
+        "a container of label/field rows was not admitted");
+    Translation::ControlNode node;
+    node.kind = Translation::ControlKind::PaneContainer;
+    reason.clear();
+    Check(Translation::CaptureControlDetail(container, node, reason) && node.splits.empty(),
+        "a strip between a label and its field was offered as a draggable split");
+    if (!node.splits.empty()) std::wcerr << L"form-row splits=" << node.splits.size() << L'\n';
+    DestroyWindow(root);
+}
+
 void TestVirtualDialogSnapshots() {
     std::unordered_map<uint64_t, int> results;
     const auto messageBox = Translation::BuildMessageBoxSnapshot(
@@ -4409,6 +4809,7 @@ void TestMdiFrameCaptureAndCommands() {
 #include "ItemContextMenuTests.h"
 #include "WinFormsOwnerDrawTests.h"
 #include "ScrollingContainerTests.h"
+#include "EventViewerSurfaceTests.h"
 
 } // namespace
 
@@ -4439,7 +4840,10 @@ int wmain() {
     {
         ListActivationCommonControls groups(ICC_LISTVIEW_CLASSES);
         Check(static_cast<bool>(groups), "grouped ListView common-controls v6 context failed");
-        if (groups) FluentShell::Tests::TestListViewGroups(Check);
+        if (groups) {
+            FluentShell::Tests::TestListViewGroups(Check);
+            FluentShell::Tests::TestListViewGroupsWithoutText(Check);
+        }
     }
     TestDirectUiEvidenceContracts();
     TestDirectUiInPlaceRoutes();
@@ -4464,6 +4868,8 @@ int wmain() {
     TestStaticIconCaptureBoundary();
     TestStaticDecorationCaptureAndRejection();
     TestAncestorEnabledTabOrderCapture();
+    TestOwnerDrawButtonFace();
+    TestTabOrderScopes();
     TestTabOrderRejectionSpecificity();
     TestStructuredCommonControlCapture();
     TestListViewCheckNotificationSemantics();
@@ -4486,11 +4892,24 @@ int wmain() {
     TestItemContextMenuProtocol();
     TestItemContextMenuTracking();
     TestWinFormsOwnerDrawControls();
+    TestWindowsFormsSpinButtons();
     TestScrollingContainer();
+    TestSurfaceFilledContainers();
+    TestReadOnlyRichEditAdapter();
+    TestObscuredHostIsNotCaptured();
+    TestListViewHeaderPlacementFlag();
+    TestVirtualListWindow();
+    TestEmptyReportListWithoutColumns();
+    TestMmcBusyShieldIdentity();
     TestMenuActionValidationAndSerialization();
     TestToolbarCaptureBoundary();
     TestVirtualDialogSnapshots();
     TestPaneContainerCaptureAndSplit();
+    TestFormRowStripsAreNotSplits();
+    TestUnownedModalDialogOwnerResolution();
+    TestNestedModalDialogChain();
+    TestTabStopGroupBoxIsNotATabStop();
+    TestAnimationControlIsAnInertPicture();
     TestOverlappingSiblingZOrderCapture();
     TestAccessibleIslandBoundary();
     TestAccessiblePageTabs();
@@ -4500,8 +4919,15 @@ int wmain() {
     TestFullyClippedChildIsNotCaptured();
     TestStaticBitmapCapture();
     TestUpDownAdapter();
+    TestDateTimePickerDayNumbers();
+    TestDateTimePickerAdapter();
     TestWizardSheetTabStripIsNotCaptured();
     TestIconButtonCapture();
+    TestMultiSelectListBox();
+    TestPerformanceChartLayout();
+    TestPerformanceChartText();
+    TestPerformanceChartSerialization();
+    TestPerformanceChartActions();
     FluentShell::Tests::TestUiAutomationProjectionScope(Check);
     FluentShell::Tests::TestMmcHtmlDocumentAdmission(Check);
     FluentShell::Tests::TestListViewModes(Check);

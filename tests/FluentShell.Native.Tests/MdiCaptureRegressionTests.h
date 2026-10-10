@@ -130,8 +130,8 @@ void TestMdiCapturePreservesNavigationAcrossModalDisable() {
         Check(rootNode && rootNode->tabIndex == 0,
             "MDI descendant received its order from the root traversal");
         for (const HWND child : children) {
-            const HWND seed = GetWindow(child, GW_CHILD);
-            const HWND first = GetNextDlgTabItem(child, seed, FALSE);
+            // The native order starts at the container's first tab stop, which a null start answers.
+            const HWND first = GetNextDlgTabItem(child, nullptr, FALSE);
             const HWND second = first ? GetNextDlgTabItem(child, first, FALSE) : nullptr;
             const auto* firstNode = nodeFor(first);
             const auto* secondNode = nodeFor(second);

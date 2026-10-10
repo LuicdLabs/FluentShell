@@ -127,6 +127,15 @@ void TestMutationMessageClasses() {
         !Translation::IsNativeMutationMessage(root, WM_NOTIFY, reinterpret_cast<LPARAM>(&query)) &&
         Translation::IsNativeMutationMessage(root, WM_NOTIFY, reinterpret_cast<LPARAM>(&change)),
         "WM_NOTIFY was not judged by its notification code");
+    // An edit's redraw, focus and scroll notifications travel as WM_COMMAND too; only
+    // a real change (or a non-edit command such as a click) counts.
+    const auto source = reinterpret_cast<LPARAM>(label);
+    Check(!Translation::IsNativeMutationMessage(root, WM_COMMAND, source, MAKEWPARAM(7, EN_UPDATE)) &&
+        !Translation::IsNativeMutationMessage(root, WM_COMMAND, source, MAKEWPARAM(7, EN_KILLFOCUS)) &&
+        Translation::IsNativeMutationMessage(root, WM_COMMAND, source, MAKEWPARAM(7, EN_CHANGE)) &&
+        Translation::IsNativeMutationMessage(root, WM_COMMAND, source, MAKEWPARAM(7, BN_CLICKED)) &&
+        Translation::IsNativeMutationMessage(root, WM_COMMAND, 0, MAKEWPARAM(40001, 0)),
+        "WM_COMMAND was not judged by its edit notification code");
     DestroyWindow(root);
 }
 

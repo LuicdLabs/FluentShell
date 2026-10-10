@@ -4,7 +4,11 @@
 # documented action route where UIA exposes none.
 param(
     [Parameter(Mandatory = $true)][string] $ProcessName,
-    [Parameter(Mandatory = $true)][string] $ClassName,
+    # Optional with -Hwnd, which names the window itself (hex, as Dump-WindowTree prints it).
+    [string] $ClassName = '',
+    # Inspect exactly this window instead of searching the main window's children by class:
+    # a dialog is its own top-level window, which the class search never reaches.
+    [string] $Hwnd = '',
     [int] $MaxNodes = 40,
     [int] $ProcessId = 0,
     [switch] $AllMatches,
@@ -58,7 +62,12 @@ $find = [MsaaProbe.Win32+EnumProc] {
     }
     return $true
 }
-[void][MsaaProbe.Win32]::EnumChildWindows($process.MainWindowHandle, $find, [IntPtr]::Zero)
+if ($Hwnd) {
+    $script:targets.Add([IntPtr][Convert]::ToInt64($Hwnd.Replace('0x', ''), 16))
+} else {
+    if (-not $ClassName) { throw 'Pass -ClassName or -Hwnd.' }
+    [void][MsaaProbe.Win32]::EnumChildWindows($process.MainWindowHandle, $find, [IntPtr]::Zero)
+}
 if ($script:targets.Count -eq 0) { "no visible '$ClassName'"; exit 1 }
 
 function Role-Text([object] $value) {

@@ -104,4 +104,43 @@ inline void TestListViewGroups(void (*check)(bool, const char*)) {
     check(fixture.Capture(node, error) && !node.groupViewEnabled && node.listViewGroups.empty() && node.itemGroupIds.empty() && node.itemRects.empty(),
         "disabling native groups retained grouped projection state");
 }
+
+// comctl32 6.10.26100 copies a group's header and footer into the caller's buffer without checking that
+// the group has them, so a group inserted without a footer -- every group of Performance Monitor's Add
+// Counters list -- is a null read that ends the whole application. Such groups capture with empty texts.
+inline void TestListViewGroupsWithoutText(void (*check)(bool, const char*)) {
+    using namespace Bridge::Translation;
+    ListViewModes::Fixture fixture(LVS_REPORT);
+    check(fixture.ready, "text-less grouped ListView fixture failed");
+    if (!fixture.ready) return;
+    const auto addGroup = [&](int id, const wchar_t* header) {
+        LVGROUP group{ sizeof(group) };
+        group.mask = LVGF_GROUPID | LVGF_STATE | (header ? LVGF_HEADER : 0);
+        group.iGroupId = id;
+        group.pszHeader = const_cast<LPWSTR>(header);
+        group.stateMask = LVGS_COLLAPSIBLE;
+        group.state = LVGS_COLLAPSIBLE;
+        return SendMessageW(fixture.list, LVM_INSERTGROUP, static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>(&group)) != -1;
+    };
+    const bool inserted = addGroup(3, L"Header only") && addGroup(4, nullptr);
+    check(inserted, "groups without footer text could not be inserted");
+    if (!inserted) return;
+    for (int row = 0; row < 2; ++row) {
+        LVITEMW item{}; item.mask = LVIF_GROUPID; item.iItem = row; item.iGroupId = row == 0 ? 3 : 4;
+        check(SendMessageW(fixture.list, LVM_SETITEMW, 0, reinterpret_cast<LPARAM>(&item)) != FALSE,
+            "text-less group row assignment failed");
+    }
+    SendMessageW(fixture.list, LVM_ENABLEGROUPVIEW, TRUE, 0);
+    ControlNode node;
+    std::wstring error;
+    const bool captured = fixture.Capture(node, error);
+    if (!captured) std::wcerr << L"text-less group capture: " << error << L'\n';
+    check(captured, "groups without footer or header text were refused");
+    if (!captured) return;
+    check(node.listViewGroups.size() == 2 && node.listViewGroups[0].groupId == 3 &&
+        node.listViewGroups[0].header == L"Header only" && node.listViewGroups[0].footer.empty() &&
+        node.listViewGroups[1].groupId == 4 && node.listViewGroups[1].header.empty() &&
+        node.listViewGroups[1].footer.empty(),
+        "an absent group header or footer was not captured as empty text");
+}
 } // namespace FluentShell::Tests

@@ -46,6 +46,15 @@ enum class ControlKind {
     UpDown,
     NativeDocument,
     DiskView,
+    RichText,
+    PerformanceGraph,
+    PerformanceLegend,
+    PerformanceValueBar,
+    // SysDateTimePick32.  The value travels in the range fields every node already
+    // carries: a date picker's position is its day number (days since 0001-01-01), a time
+    // picker's the second of the day, both stepped through setValue.
+    DatePicker,
+    TimePicker,
     Count,
 };
 
@@ -194,6 +203,111 @@ struct DiskViewSnapshot final {
     std::vector<DiskViewItemSnapshot> items;
 };
 
+// One run of a read-only rich edit control's text: a constant character format. Sizes are in
+// points; the colour is 0xRRGGBB, or -1 for the control's automatic text colour.
+struct RichRunSnapshot final {
+    std::wstring text;
+    bool bold = false;
+    bool italic = false;
+    bool underline = false;
+    bool strike = false;
+    float size = 0;
+    int64_t color = -1;
+};
+
+// A paragraph of runs. Indents and spacing are in points; the alignment names its edge.
+struct RichParagraphSnapshot final {
+    std::wstring alignment = L"left";
+    bool bullet = false;
+    float leftIndent = 0;
+    float firstLineIndent = 0;
+    float spaceBefore = 0;
+    float spaceAfter = 0;
+    std::vector<RichRunSnapshot> runs;
+};
+
+// One counter's line on Performance Monitor's graph. `values` has one entry per graph slot, in
+// drawing order, and none where the counter had no sample for that slot.
+struct PerformanceSeriesSnapshot final {
+    std::wstring name;
+    // 0xRRGGBB.
+    uint32_t color = 0;
+    int width = 1;
+    std::wstring style = L"solid";
+    // The factor the control multiplies a value by before it plots it.
+    double scale = 1;
+    bool visible = true;
+    bool highlighted = false;
+    std::vector<std::optional<double>> values;
+};
+
+// The System Monitor control's chart as data: its scale, grid and counters, and the samples the
+// Bridge was told about. The slots lay the samples out as the control does: wrapping (a time bar
+// sweeps across and old samples remain to its right until overwritten) or scrolling.
+struct PerformanceGraphSnapshot final {
+    std::wstring displayType = L"line";
+    double minimum = 0;
+    double maximum = 100;
+    int sampleCount = 100;
+    int intervalMs = 1000;
+    bool scroll = false;
+    // Wrapping charts only: the slot of the newest sample, where the time bar stands; -1 otherwise.
+    int barSlot = -1;
+    // A wrapping chart that has written past its last slot: the slots after the bar hold the
+    // previous pass's samples, so they are older by one pass than the slots before it.
+    bool wrapped = false;
+    // The time of slot 0's sample (in the pass in progress) and of the last slot's, in
+    // milliseconds since the Unix epoch. The axis labels the time of the sample each slot holds.
+    int64_t startTimeMs = 0;
+    int64_t endTimeMs = 0;
+    bool showVerticalGrid = false;
+    bool showHorizontalGrid = false;
+    bool showScaleLabels = true;
+    bool showTimeLabels = true;
+    std::wstring title;
+    std::wstring yAxisLabel;
+    // The plot's own background, and the control's behind the labels around it.
+    uint32_t backColor = 0xFFFFFF;
+    uint32_t controlColor = 0xF0F0F0;
+    uint32_t gridColor = 0x808080;
+    uint32_t textColor = 0;
+    uint32_t barColor = 0xFF0000;
+    std::vector<PerformanceSeriesSnapshot> series;
+};
+
+struct PerformanceLegendColumnSnapshot final {
+    std::wstring title;
+    int width = 0;
+};
+
+struct PerformanceLegendRowSnapshot final {
+    bool visible = true;
+    uint32_t color = 0;
+    int width = 1;
+    std::wstring style = L"solid";
+    bool selected = false;
+    // The cells after Show and Color: one per remaining column.
+    std::vector<std::wstring> cells;
+};
+
+// The legend under the graph: one row per counter, in the columns the native legend has. Its
+// swatches follow the chart's type: a line for a line graph, a solid bar for a histogram.
+struct PerformanceLegendSnapshot final {
+    std::wstring displayType = L"line";
+    std::vector<PerformanceLegendColumnSnapshot> columns;
+    std::vector<PerformanceLegendRowSnapshot> rows;
+};
+
+struct PerformanceValueFieldSnapshot final {
+    std::wstring label;
+    std::wstring value;
+};
+
+// The strip under the graph: Last, Average, Minimum, Maximum and Duration of the selected counter.
+struct PerformanceValueBarSnapshot final {
+    std::vector<PerformanceValueFieldSnapshot> fields;
+};
+
 struct OwnerDrawComboSnapshot final {
     std::wstring mode;
     std::vector<OwnerDrawComboItemSnapshot> items;
@@ -313,6 +427,11 @@ struct ControlNode final {
     // True only when stable item IDs and the native accessible default action
     // both exist. Older peers and controls without that capability expose false.
     bool itemActivationSupported = false;
+    // The projection may open an item (double-click, Enter) with the openItem action: the
+    // item is selected and its control is sent Enter. Offered for MMC result lists that have
+    // no stable-identity activation contract (virtual lists) and for MMC result trees
+    // (Device Manager's devices); never for the MMC scope tree, where a double-click only expands.
+    bool itemDefaultActivation = false;
     std::vector<std::wstring> columns;
     std::vector<int> columnWidths;
     // Report ListView only: the display order of the columns as a permutation of
@@ -320,6 +439,12 @@ struct ControlNode final {
     // order, so nothing on the wire changes meaning when the user reorders them.
     std::vector<int> columnOrder;
     std::vector<std::vector<std::wstring>> rows;
+    // A large virtual report list carries a window of its rows: `items` and `rows`
+    // hold the rows from itemWindowStart on, and itemCount is the list's full length.
+    // Zero means the node carries every row.  Every index on the wire (selection,
+    // focus, actions) stays absolute.
+    size_t itemCount = 0;
+    size_t itemWindowStart = 0;
     bool columnHeadersVisible = false;
     bool checkBoxes = false;
     std::vector<int> checkedIndices;
@@ -361,6 +486,12 @@ struct ControlNode final {
     std::vector<AccessibleIslandItemSnapshot> islandItems;
     std::optional<NativeDocumentSnapshot> document;
     std::optional<DiskViewSnapshot> diskView;
+    // Rich text only: the paragraphs a read-only rich edit control shows, in their formats.
+    std::vector<RichParagraphSnapshot> richParagraphs;
+    // Performance Monitor's chart, legend and value strip (each on its own kind).
+    std::optional<PerformanceGraphSnapshot> performanceGraph;
+    std::optional<PerformanceLegendSnapshot> performanceLegend;
+    std::optional<PerformanceValueBarSnapshot> performanceValueBar;
     std::wstring adapterId;
     std::wstring pageId;
     std::wstring semanticKey;
@@ -373,8 +504,16 @@ struct ControlNode final {
 
 // Report capture mirrors each first cell into items; every ListView view uses
 // this one canonical item sequence for selection, checks, editing and actions.
+// A windowed virtual list counts every row, carried or not.
 inline size_t ListViewItemCount(const ControlNode& node) noexcept {
-    return node.items.size();
+    return node.itemCount != 0 ? node.itemCount : node.items.size();
+}
+
+// The label of the item at an absolute index, when the node carries that row.
+inline const std::wstring* ListViewItemLabel(const ControlNode& node, int index) noexcept {
+    if (index < 0 || static_cast<size_t>(index) < node.itemWindowStart) return nullptr;
+    const size_t local = static_cast<size_t>(index) - node.itemWindowStart;
+    return local < node.items.size() ? &node.items[local] : nullptr;
 }
 
 enum class MenuItemKind {

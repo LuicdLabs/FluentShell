@@ -6,11 +6,14 @@
 
 #include <mshtml.h>
 #include <oleacc.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cwctype>
 #include <unordered_map>
 #include <unordered_set>
@@ -143,6 +146,162 @@ bool Inside(const RECT& child, const RECT& parent) {
     return child.left >= parent.left && child.top >= parent.top &&
         child.right <= parent.right && child.bottom <= parent.bottom;
 }
+
+// WIC's factory and its premultiplied BGRA format, spelled out so the Bridge needs no
+// import of the codec library's GUID definitions.
+constexpr CLSID kWicImagingFactory = {0xcacaf262, 0x9370, 0x4615, {0xa1,0x3b,0x9f,0x55,0x39,0xda,0x4c,0x0a}};
+constexpr GUID kWicPixelFormat32bppPBGRA = {0x6fddc324, 0x4e03, 0x4bfe, {0xb1,0x85,0x3d,0x77,0x76,0x8d,0xc9,0x10}};
+constexpr size_t kMaxResourceImageBytes = 1024 * 1024;
+
+// The bytes of a resource of a System32 module, named by a res:// source the way MSHTML
+// resolves one: res://<module>/[<type>/]<name>, the type defaulting to RT_HTML and either
+// part written "#<number>" for an integer identifier.  Anything else -- another
+// directory, an escape, a query -- is not read.
+bool ReadSystemResource(std::wstring_view source, std::vector<uint8_t>& bytes) {
+    bytes.clear();
+    if (source.size() < 8 || !FluentShell::EqualsIgnoreCase(source.substr(0, 6), L"res://") ||
+        source.find_first_of(L"%?") != std::wstring_view::npos) return false;
+    const std::wstring_view rest = source.substr(6);
+    const size_t moduleEnd = rest.find(L'/');
+    if (moduleEnd == std::wstring_view::npos || moduleEnd == 0) return false;
+    const std::wstring module(rest.substr(0, moduleEnd));
+    std::vector<std::wstring> parts;
+    for (size_t start = moduleEnd + 1; start <= rest.size();) {
+        const size_t end = (std::min)(rest.find(L'/', start), rest.size());
+        parts.emplace_back(rest.substr(start, end - start));
+        if (parts.back().empty() || parts.size() > 2) return false;
+        start = end + 1;
+    }
+    wchar_t system[MAX_PATH]{};
+    const UINT systemLength = GetSystemDirectoryW(system, MAX_PATH);
+    if (parts.empty() || systemLength == 0 || systemLength >= MAX_PATH) return false;
+    std::wstring path;
+    if (module.find_first_of(L"\\/:") != std::wstring::npos) {
+        const size_t slash = module.find_last_of(L"\\/");
+        if (slash == std::wstring::npos || !FluentShell::EqualsIgnoreCase(module.substr(0, slash), system))
+            return false;
+        path = module;
+    } else {
+        path = std::wstring(system) + L"\\" + module;
+    }
+    const auto identifier = [](const std::wstring& part, bool decimalNumber, LPCWSTR& value) {
+        const bool hashed = part[0] == L'#';
+        const std::wstring_view digits = hashed ? std::wstring_view(part).substr(1) : std::wstring_view(part);
+        const bool numeric = !digits.empty() && digits.size() <= 5 &&
+            std::all_of(digits.begin(), digits.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+        if (hashed || (decimalNumber && numeric)) {
+            if (!numeric) return false;
+            const unsigned long number = std::wcstoul(std::wstring(digits).c_str(), nullptr, 10);
+            if (number == 0 || number > 0xffff) return false;
+            value = MAKEINTRESOURCEW(number);
+            return true;
+        }
+        value = part.c_str();
+        return true;
+    };
+    LPCWSTR type = MAKEINTRESOURCEW(23);
+    LPCWSTR name = nullptr;
+    if ((parts.size() == 2 && !identifier(parts[0], true, type)) || !identifier(parts.back(), false, name))
+        return false;
+    const HMODULE handle = LoadLibraryExW(path.c_str(), nullptr,
+        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!handle) return false;
+    struct Library final { HMODULE handle; ~Library() { FreeLibrary(handle); } } library{handle};
+    const HRSRC info = FindResourceW(handle, name, type);
+    const DWORD size = info ? SizeofResource(handle, info) : 0;
+    const HGLOBAL loaded = info ? LoadResource(handle, info) : nullptr;
+    const void* data = loaded ? LockResource(loaded) : nullptr;
+    if (!data || size == 0 || size > kMaxResourceImageBytes) return false;
+    bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+    return true;
+}
+
+// Decodes an encoded image (GIF, PNG, BMP, JPEG, ICO) to premultiplied BGRA at exactly
+// `width` x `height`, scaling as the layout box did.
+bool DecodeImageBytes(const std::vector<uint8_t>& bytes, UINT width, UINT height, std::vector<uint8_t>& pixels) {
+    pixels.clear();
+    if (bytes.empty() || width == 0 || height == 0) return false;
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    UINT sourceWidth = 0, sourceHeight = 0;
+    if (FAILED(CoCreateInstance(kWicImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->CreateStream(&stream)) ||
+        FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(bytes.data()), static_cast<DWORD>(bytes.size()))) ||
+        FAILED(factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(frame.Get(), kWicPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+            nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+        FAILED(converter->GetSize(&sourceWidth, &sourceHeight))) return false;
+    ComPtr<IWICBitmapSource> source = converter;
+    if (sourceWidth != width || sourceHeight != height) {
+        ComPtr<IWICBitmapScaler> scaler;
+        if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+            FAILED(scaler->Initialize(converter.Get(), width, height, WICBitmapInterpolationModeFant))) return false;
+        source = scaler;
+    }
+    pixels.resize(static_cast<size_t>(width) * height * 4);
+    if (FAILED(source->CopyPixels(nullptr, width * 4, static_cast<UINT>(pixels.size()), pixels.data()))) {
+        pixels.clear();
+        return false;
+    }
+    return true;
+}
+
+// An image the document takes from a resource of a trusted System32 module (Performance
+// Monitor's res://wdc.dll/perfmon.gif) is decoded from that resource rather than read
+// back from the host's paint, so it is exact whatever the scroll position, the cloak or
+// the host's print path.  `element` is the <img> itself or a link whose only content is
+// one; the image is placed at its own layout box inside the item's box.
+bool DecodeDocumentImage(IHTMLElement* element, const std::wstring& tag, const RECT& itemRect,
+    ImageListEntry& image) {
+    ComPtr<IHTMLElement> imageElement;
+    if (tag == L"IMG") {
+        imageElement = element;
+    } else {
+        ComPtr<IDispatch> childrenDispatch;
+        ComPtr<IHTMLElementCollection> children;
+        long count = 0;
+        if (FAILED(element->get_children(&childrenDispatch)) || FAILED(childrenDispatch.As(&children)) ||
+            FAILED(children->get_length(&count)) || count != 1) return false;
+        VARIANT at{}, unused{}; at.vt = VT_I4; at.lVal = 0;
+        ComPtr<IDispatch> childDispatch;
+        Text childTag;
+        if (FAILED(children->item(at, unused, &childDispatch)) || !childDispatch ||
+            FAILED(childDispatch.As(&imageElement)) || FAILED(imageElement->get_tagName(&childTag.value)) ||
+            childTag.String() != L"IMG") return false;
+    }
+    ComPtr<IHTMLImgElement> img;
+    ComPtr<IHTMLElement2> geometry;
+    Text source;
+    RECT imageRect{};
+    if (FAILED(imageElement.As(&img)) || FAILED(img->get_src(&source.value)) ||
+        FAILED(imageElement.As(&geometry)) || !Bounds(geometry.Get(), imageRect)) return false;
+    const int itemWidth = itemRect.right - itemRect.left;
+    const int itemHeight = itemRect.bottom - itemRect.top;
+    const int width = imageRect.right - imageRect.left;
+    const int height = imageRect.bottom - imageRect.top;
+    if (itemWidth <= 0 || itemHeight <= 0 || width <= 0 || height <= 0 ||
+        itemWidth > static_cast<int>(Ipc::kMaxImageDimension) ||
+        itemHeight > static_cast<int>(Ipc::kMaxImageDimension) || !Inside(imageRect, itemRect)) return false;
+    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> decoded;
+    if (!ReadSystemResource(source.String(), bytes) ||
+        !DecodeImageBytes(bytes, static_cast<UINT>(width), static_cast<UINT>(height), decoded)) return false;
+    image.imageWidth = static_cast<uint32_t>(itemWidth);
+    image.imageHeight = static_cast<uint32_t>(itemHeight);
+    image.imageFormat = L"bgra8-premultiplied";
+    image.imageData.assign(static_cast<size_t>(itemWidth) * itemHeight * 4, 0);
+    for (int row = 0; row < height; ++row) {
+        const size_t to = (static_cast<size_t>(imageRect.top - itemRect.top + row) * itemWidth +
+            static_cast<size_t>(imageRect.left - itemRect.left)) * 4;
+        std::memcpy(image.imageData.data() + to, decoded.data() + static_cast<size_t>(row) * width * 4,
+            static_cast<size_t>(width) * 4);
+    }
+    return true;
+}
 bool GetProperty(IDispatch* object, const wchar_t* name, Variant& value,
     VARIANT* argument = nullptr) {
     LPOLESTR property = const_cast<LPOLESTR>(name);
@@ -164,9 +323,14 @@ bool BoolProperty(IDispatch* object, const wchar_t* name, bool& result) {
     result = raw.value.boolVal != VARIANT_FALSE; return true;
 }
 bool DispatchValue(const VARIANT& value, ComPtr<IDispatch>& result) {
-    IUnknown* object = value.vt == VT_DISPATCH ? value.pdispVal :
-        value.vt == VT_UNKNOWN ? value.punkVal : nullptr;
-    return object && SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&result))) && result;
+    // A VT_DISPATCH value already is the object's IDispatch. The System Monitor's counter
+    // items refuse IUnknown::QueryInterface(IID_IDispatch) on it, so it is used as delivered.
+    if (value.vt == VT_DISPATCH) {
+        result = value.pdispVal;
+        return result != nullptr;
+    }
+    return value.vt == VT_UNKNOWN && value.punkVal &&
+        SUCCEEDED(value.punkVal->QueryInterface(IID_PPV_ARGS(&result))) && result;
 }
 bool ReadScroll(HWND window, NativeDocumentRegion& region) {
     SCROLLINFO horizontal{sizeof(horizontal), SIF_RANGE | SIF_PAGE | SIF_POS};
@@ -184,6 +348,67 @@ bool ReadScroll(HWND window, NativeDocumentRegion& region) {
     };
     return axis(SB_HORZ, horizontal, region.maximumX, region.offsetX) &&
         axis(SB_VERT, vertical, region.maximumY, region.offsetY);
+}
+// A report's Counters collection normally answers Item(index) for 1..Count. When an index
+// answers with no object, the collection's _NewEnum enumeration is the second source: it
+// walks the same counters in order. `detail` says what each source returned when neither
+// yields Count counters.
+bool CollectCounters(IDispatch* counters, long count, std::vector<ComPtr<IDispatch>>& result,
+    std::wstring& detail) {
+    result.clear();
+    std::wstring byIndex;
+    for (long index = 1; index <= count; ++index) {
+        VARIANT at{}; at.vt = VT_I4; at.lVal = index;
+        Variant value;
+        ComPtr<IDispatch> counter;
+        if (!GetProperty(counters, L"Item", value, &at)) {
+            byIndex = L"Item(" + std::to_wstring(index) + L") could not be fetched";
+            break;
+        }
+        if (!DispatchValue(value.value, counter)) {
+            byIndex = L"Item(" + std::to_wstring(index) + L") returned variant type " +
+                std::to_wstring(value.value.vt) +
+                (value.value.vt == VT_DISPATCH && !value.value.pdispVal ? L" holding no object" : L"");
+            break;
+        }
+        result.push_back(std::move(counter));
+    }
+    if (byIndex.empty()) return true;
+    result.clear();
+    DISPPARAMS none{};
+    Variant enumerator;
+    ComPtr<IUnknown> unknown;
+    ComPtr<IEnumVARIANT> walk;
+    if (FAILED(counters->Invoke(DISPID_NEWENUM, IID_NULL, LOCALE_USER_DEFAULT,
+            DISPATCH_METHOD | DISPATCH_PROPERTYGET, &none, &enumerator.value, nullptr, nullptr)) ||
+        (enumerator.value.vt != VT_UNKNOWN && enumerator.value.vt != VT_DISPATCH)) {
+        detail = byIndex + L"; the _NewEnum enumeration is unavailable";
+        return false;
+    }
+    unknown = enumerator.value.vt == VT_UNKNOWN ? enumerator.value.punkVal : enumerator.value.pdispVal;
+    if (!unknown || FAILED(unknown.As(&walk))) {
+        detail = byIndex + L"; the _NewEnum enumeration is not an IEnumVARIANT";
+        return false;
+    }
+    walk->Reset();
+    while (result.size() <= static_cast<size_t>(count)) {
+        Variant element;
+        ULONG fetched = 0;
+        if (walk->Next(1, &element.value, &fetched) != S_OK || fetched != 1) break;
+        ComPtr<IDispatch> counter;
+        if (!DispatchValue(element.value, counter)) {
+            detail = byIndex + L"; _NewEnum element " + std::to_wstring(result.size() + 1) +
+                L" is variant type " + std::to_wstring(element.value.vt) +
+                (element.value.vt == VT_DISPATCH && !element.value.pdispVal ? L" holding no object" : L"");
+            result.clear();
+            return false;
+        }
+        result.push_back(std::move(counter));
+    }
+    if (result.size() == static_cast<size_t>(count)) return true;
+    detail = byIndex + L"; _NewEnum yielded " + std::to_wstring(result.size()) + L" counters";
+    result.clear();
+    return false;
 }
 bool ReadReport(IHTMLObjectElement* element, NativeDocumentItem& item,
     NativeDocumentRegion& region, HWND document, HWND& report,
@@ -208,12 +433,42 @@ bool ReadReport(IHTMLObjectElement* element, NativeDocumentItem& item,
     if (FAILED(object.As(&nativeWindow)) || FAILED(nativeWindow->GetWindow(&root)) || !root)
         return Reject(reason, L"native report has no owned window");
     wchar_t rootClass[64]{};
-    if (!document || !IsChild(document, root) ||
-        !GetClassNameW(root, rootClass, 64) || wcscmp(rootClass, L"SysmonCtrl") != 0 ||
-        (GetWindowLongPtrW(root, GWL_STYLE) & WS_TABSTOP) != 0 ||
-        !WindowClassRegisteredBySystemModule(root, L"sysmon.ocx"))
-        return Reject(reason, L"native report root has no System Monitor window contract");
-    struct FindReport { HWND value = nullptr; HWND root = nullptr; int count = 0; bool complete = true; } found{nullptr, root};
+    // The object's IOleWindow can answer with its OLE site window (class Hatchwin) rather
+    // than the control's own: when that site frames exactly one visible SysmonCtrl, the
+    // control is the report root and the site becomes its first host ancestor.
+    int siteChildren = -1;
+    if (root && GetClassNameW(root, rootClass, 64) && wcscmp(rootClass, L"Hatchwin") == 0) {
+        HWND control = nullptr;
+        int visibleChildren = 0;
+        for (HWND child = GetWindow(root, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (!IsWindowVisible(child)) continue;
+            ++visibleChildren;
+            wchar_t childClass[64]{};
+            if (GetClassNameW(child, childClass, 64) && wcscmp(childClass, L"SysmonCtrl") == 0) control = child;
+        }
+        siteChildren = visibleChildren;
+        if (visibleChildren == 1 && control) root = control;
+    }
+    if (!document || !IsChild(document, root))
+        return Reject(reason, L"native report root is not inside the document window");
+    if (!GetClassNameW(root, rootClass, 64) || wcscmp(rootClass, L"SysmonCtrl") != 0)
+        return Reject(reason, std::wstring(L"native report root is a '") + rootClass +
+            L"' window, not SysmonCtrl" + (siteChildren >= 0
+                ? L" (its site frames " + std::to_wstring(siteChildren) + L" visible window(s), not one SysmonCtrl)"
+                : std::wstring()));
+    if ((GetWindowLongPtrW(root, GWL_STYLE) & WS_TABSTOP) != 0)
+        return Reject(reason, L"native report root is a keyboard tab stop");
+    if (!WindowClassRegisteredBySystemModule(root, L"sysmon.ocx")) {
+        wchar_t module[MAX_PATH]{};
+        const auto handle = reinterpret_cast<HMODULE>(GetClassLongPtrW(root, GCLP_HMODULE));
+        if (!handle || !GetModuleFileNameW(handle, module, MAX_PATH)) wcscpy_s(module, L"(unknown module)");
+        return Reject(reason, std::wstring(L"native report root's class is registered by ") + module +
+            L", not System32 sysmon.ocx");
+    }
+    struct FindReport {
+        HWND value = nullptr; HWND root = nullptr; int count = 0; bool complete = true;
+        wchar_t other[64]{};
+    } found{nullptr, root};
     EnumChildWindows(root, [](HWND child, LPARAM raw) -> BOOL {
         auto& result = *reinterpret_cast<FindReport*>(raw);
         if (!IsWindowVisible(child)) return TRUE;
@@ -223,22 +478,43 @@ bool ReadReport(IHTMLObjectElement* element, NativeDocumentItem& item,
             (GetWindowLongPtrW(child, GWL_STYLE) & WS_TABSTOP) == 0 &&
             WindowClassRegisteredBySystemModule(child, L"sysmon.ocx")) {
             result.value = child; ++result.count;
-        } else result.complete = false;
+        } else {
+            if (result.complete) {
+                GetClassNameW(child, result.other, 64);
+                if (!result.other[0]) wcscpy_s(result.other, L"(unnamed)");
+            }
+            result.complete = false;
+        }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&found));
-    if (!found.complete || found.count != 1 || !ReadScroll(found.value, region))
-        return Reject(reason, L"native report scroll contract is unavailable or ambiguous");
+    if (!found.complete)
+        return Reject(reason, std::wstring(L"native report hosts a visible '") + found.other +
+            L"' window besides its SysmonReport");
+    if (found.count != 1)
+        return Reject(reason, L"native report hosts " + std::to_wstring(found.count) +
+            L" SysmonReport windows instead of one");
+    if (!ReadScroll(found.value, region))
+        return Reject(reason, L"native report scroll range is unavailable");
     report = found.value;
     represented.push_back(root);
     represented.push_back(report);
     for (HWND parent = GetParent(root); parent && parent != document; parent = GetParent(parent)) {
         wchar_t name[64]{};
-        if (!IsChild(document, parent) || !GetClassNameW(parent, name, 64) || wcscmp(name, L"Hatchwin") != 0 ||
-            (GetWindowLongPtrW(parent, GWL_STYLE) & WS_TABSTOP) != 0 ||
-            (!WindowClassRegisteredBySystemModule(parent, L"ole32.dll") &&
-             !WindowClassRegisteredBySystemModule(parent, L"combase.dll") &&
-             !WindowClassRegisteredBySystemModule(parent, L"mshtml.dll")))
-            return Reject(reason, L"native report has an unrepresented native host ancestor");
+        GetClassNameW(parent, name, 64);
+        const bool named = IsChild(document, parent) && wcscmp(name, L"Hatchwin") == 0;
+        // sysmon.ocx registers its own hatch-window class for its in-place UI, so the
+        // control's component is as trusted as the report root it hosts.
+        const bool trusted = WindowClassRegisteredBySystemModule(parent, L"ole32.dll") ||
+            WindowClassRegisteredBySystemModule(parent, L"combase.dll") ||
+            WindowClassRegisteredBySystemModule(parent, L"mshtml.dll") ||
+            WindowClassRegisteredBySystemModule(parent, L"sysmon.ocx");
+        if (!named || (GetWindowLongPtrW(parent, GWL_STYLE) & WS_TABSTOP) != 0 || !trusted) {
+            wchar_t module[MAX_PATH]{};
+            const auto handle = reinterpret_cast<HMODULE>(GetClassLongPtrW(parent, GCLP_HMODULE));
+            if (!handle || !GetModuleFileNameW(handle, module, MAX_PATH)) wcscpy_s(module, L"(unknown module)");
+            return Reject(reason, std::wstring(L"native report has an unrepresented native host ancestor: '") +
+                (name[0] ? name : L"?") + L"' registered by " + module);
+        }
         represented.push_back(parent);
     }
     Variant countersValue;
@@ -248,15 +524,23 @@ bool ReadReport(IHTMLObjectElement* element, NativeDocumentItem& item,
         !DispatchValue(countersValue.value, counters) || !LongProperty(counters.Get(), L"Count", count) ||
         count < 0 || count > kMaxCounters)
         return Reject(reason, L"native report counter collection exceeds its readable bound");
+    std::vector<ComPtr<IDispatch>> collected;
+    std::wstring collectDetail;
+    if (!CollectCounters(counters.Get(), count, collected, collectDetail))
+        return Reject(reason, L"native report counters are not automation objects (" +
+            std::to_wstring(count) + L" counted; " + collectDetail + L")");
     for (long index = 1; index <= count; ++index) {
-        VARIANT at{}; at.vt = VT_I4; at.lVal = index;
-        Variant counterValue, path, value, number;
-        ComPtr<IDispatch> counter;
+        Variant path, value, number;
+        const auto& counter = collected[static_cast<size_t>(index - 1)];
         bool visible = false;
-        if (!GetProperty(counters.Get(), L"Item", counterValue, &at) ||
-            !DispatchValue(counterValue.value, counter) ||
-            !BoolProperty(counter.Get(), L"Visible", visible))
-            return Reject(reason, L"native report counter identity or visibility is unavailable");
+        const std::wstring which = L"native report counter " + std::to_wstring(index) + L" of " + std::to_wstring(count);
+        Variant visibleValue;
+        if (!GetProperty(counter.Get(), L"Visible", visibleValue))
+            return Reject(reason, which + L" has no readable Visible property");
+        if (visibleValue.value.vt != VT_BOOL)
+            return Reject(reason, which + L" reports Visible as variant type " +
+                std::to_wstring(visibleValue.value.vt) + L", not a boolean");
+        visible = visibleValue.value.boolVal != VARIANT_FALSE;
         if (!visible) continue;
         if (!GetProperty(counter.Get(), L"Path", path) || path.value.vt != VT_BSTR)
             return Reject(reason, L"native report counter path is unavailable");
@@ -273,6 +557,120 @@ bool ReadReport(IHTMLObjectElement* element, NativeDocumentItem& item,
     return true;
 }
 
+// MMC's own page chrome in views.htm: the notch icon beside the title (a decorative
+// control) and the event sink that forwards selection changes. Neither carries content
+// or offers an action, so the document does not have to account for them.
+bool InertMmcObject(IHTMLElement* element) {
+    ComPtr<IHTMLObjectElement> object;
+    Text id, classId;
+    if (FAILED(element->QueryInterface(IID_PPV_ARGS(&object))) || FAILED(element->get_id(&id.value)) ||
+        FAILED(object->get_classid(&classId.value))) return false;
+    return (id.String() == L"FolderIcon" &&
+            FluentShell::EqualsIgnoreCase(classId.String(), L"clsid:B0395DA5-6A15-4E44-9F36-9A9DC7A2F341")) ||
+        (id.String() == L"MMCEvents" &&
+            FluentShell::EqualsIgnoreCase(classId.String(), L"clsid:ADE6444B-C91F-4e37-92A4-5BB430A33340"));
+}
+
+struct TextRun final {
+    std::wstring text;
+    RECT rect{};
+    size_t ordinal = 0;
+};
+
+// The text an element holds directly beside inline children that carry text of their own
+// (views.htm's "<a>Start</a> the service": the verb is a link, the rest is loose text).
+// Each run is measured with a text range bounded by its neighbouring elements, so its box
+// is where the page laid that text out.
+bool ReadLooseText(IHTMLDocument2* document, IHTMLElement* parent, std::vector<TextRun>& runs,
+    std::wstring& reason) {
+    runs.clear();
+    ComPtr<IHTMLDOMNode> node;
+    ComPtr<IDispatch> childDispatch;
+    ComPtr<IHTMLDOMChildrenCollection> children;
+    long count = 0;
+    if (FAILED(parent->QueryInterface(IID_PPV_ARGS(&node))) || FAILED(node->get_childNodes(&childDispatch)) ||
+        FAILED(childDispatch.As(&children)) || FAILED(children->get_length(&count)) || count < 0 || count > 64)
+        return Reject(reason, L"native document inline content is unavailable or too long");
+    struct Child final {
+        ComPtr<IHTMLElement> element;
+        std::wstring text;
+        bool isText = false;
+    };
+    std::vector<Child> kids;
+    for (long index = 0; index < count; ++index) {
+        ComPtr<IDispatch> dispatch;
+        ComPtr<IHTMLDOMNode> child;
+        long type = 0;
+        if (FAILED(children->item(index, &dispatch)) || !dispatch || FAILED(dispatch.As(&child)) ||
+            FAILED(child->get_nodeType(&type)))
+            return Reject(reason, L"native document inline child is unavailable");
+        Child entry;
+        if (type == 3) {
+            Variant value;
+            if (FAILED(child->get_nodeValue(&value.value)) || value.value.vt != VT_BSTR)
+                return Reject(reason, L"native document text node has no value");
+            entry.isText = true;
+            if (value.value.bstrVal) entry.text.assign(value.value.bstrVal, SysStringLen(value.value.bstrVal));
+        } else if (type == 1) {
+            if (FAILED(dispatch.As(&entry.element))) return Reject(reason, L"native document inline element is unavailable");
+        } else {
+            continue;
+        }
+        kids.push_back(std::move(entry));
+    }
+    // Most containers hold no text of their own; they need no text range.
+    if (std::none_of(kids.begin(), kids.end(), [](const Child& child) {
+            return child.isText && !Compact(child.text).empty();
+        })) return true;
+    ComPtr<IHTMLElement> bodyElement;
+    ComPtr<IHTMLBodyElement> body;
+    if (FAILED(document->get_body(&bodyElement)) || FAILED(bodyElement.As(&body)))
+        return Reject(reason, L"native document text ranges are unavailable");
+    const auto rangeOf = [&](IHTMLElement* element, ComPtr<IHTMLTxtRange>& range) {
+        range.Reset();
+        return SUCCEEDED(body->createTextRange(&range)) && range && SUCCEEDED(range->moveToElementText(element));
+    };
+    ComPtr<IHTMLTxtRange> whole;
+    if (!rangeOf(parent, whole)) return Reject(reason, L"native document inline content has no text range");
+    ComPtr<IHTMLElement> previous;
+    size_t index = 0;
+    while (index < kids.size()) {
+        if (!kids[index].isText) {
+            previous = kids[index].element;
+            ++index;
+            continue;
+        }
+        std::wstring text;
+        while (index < kids.size() && kids[index].isText) text += kids[index++].text;
+        const ComPtr<IHTMLElement> next = index < kids.size() ? kids[index].element : nullptr;
+        if (Compact(text).empty()) continue;
+        ComPtr<IHTMLTxtRange> range, boundary;
+        if (FAILED(whole->duplicate(&range)) || !range)
+            return Reject(reason, L"native document text run has no text range");
+        if (previous && (!rangeOf(previous.Get(), boundary) ||
+                FAILED(range->setEndPoint(Text(L"StartToEnd").value, boundary.Get()))))
+            return Reject(reason, L"native document text run has no start boundary");
+        if (next && (!rangeOf(next.Get(), boundary) ||
+                FAILED(range->setEndPoint(Text(L"EndToStart").value, boundary.Get()))))
+            return Reject(reason, L"native document text run has no end boundary");
+        ComPtr<IHTMLTextRangeMetrics2> metrics;
+        ComPtr<IHTMLRect> bounds;
+        TextRun run;
+        if (FAILED(range.As(&metrics)) || FAILED(metrics->getBoundingClientRect(&bounds)) || !bounds ||
+            FAILED(bounds->get_left(&run.rect.left)) || FAILED(bounds->get_top(&run.rect.top)) ||
+            FAILED(bounds->get_right(&run.rect.right)) || FAILED(bounds->get_bottom(&run.rect.bottom)) ||
+            run.rect.right <= run.rect.left || run.rect.bottom <= run.rect.top)
+            return Reject(reason, L"native document text run has no layout box");
+        // Whitespace around a run is layout, not content: the box already excludes it.
+        const size_t first = text.find_first_not_of(L" \t\r\n");
+        const size_t last = text.find_last_not_of(L" \t\r\n");
+        run.text = text.substr(first, last - first + 1);
+        run.ordinal = runs.size();
+        runs.push_back(std::move(run));
+    }
+    return true;
+}
+
 bool ReadAction(IHTMLElement* element, const std::wstring& key, DocumentState& state,
     const DocumentState* previous, std::wstring& token, std::wstring& reason) {
     Variant onclick;
@@ -284,7 +682,8 @@ bool ReadAction(IHTMLElement* element, const std::wstring& key, DocumentState& s
     ActionBinding binding;
     binding.href = href.String();
     if (onclick.value.vt == VT_DISPATCH && onclick.value.pdispVal) {
-        if (FAILED(onclick.value.pdispVal->QueryInterface(IID_PPV_ARGS(&binding.handler)))) return false;
+        if (FAILED(onclick.value.pdispVal->QueryInterface(IID_PPV_ARGS(&binding.handler))))
+            return Reject(reason, L"native document link handler identity is unavailable");
     } else if (onclick.value.vt != VT_EMPTY && onclick.value.vt != VT_NULL) {
         return Reject(reason, L"native document link handler has an unsupported identity");
     }
@@ -399,7 +798,24 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
         }
         std::wstring represented;
         size_t textSize = 0;
-        size_t pixelBytes = 0, reportRows = 0;
+        size_t pixelBytes = 0, reportRows = 0, looseRuns = 0;
+        // The common end of every semantic item: its box is placed in its scroll region or
+        // the viewport, its text is bounded, and the text it stands for is accounted.
+        const auto commit = [&](NativeDocumentItem item, const std::wstring& representedText) {
+            if (item.regionIndex >= 0) {
+                const auto& region = snapshot.regions[item.regionIndex];
+                OffsetRect(&item.rect, region.offsetX - region.rect.left, region.offsetY - region.rect.top);
+                if (!Inside(item.rect, RECT{0, 0, region.contentWidth, region.contentHeight}))
+                    return Reject(reason, L"native document semantic element escapes its scroll content");
+            } else if (!Inside(item.rect, viewport)) {
+                return Reject(reason, L"native document semantic element escapes its viewport");
+            }
+            if (!BoundedText(item.name) || (textSize += item.name.size()) > kMaxDocumentText)
+                return Reject(reason, L"native document semantic text exceeds its bound");
+            represented += representedText;
+            snapshot.items.push_back(std::move(item));
+            return true;
+        };
         for (auto& value : elements) {
             auto parent = value.element;
             bool underBody = false, underHead = false;
@@ -420,7 +836,8 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
                     }
                 }
                 ComPtr<IHTMLElement> nextParent;
-                if (FAILED(parent->get_parentElement(&nextParent))) return false;
+                if (FAILED(parent->get_parentElement(&nextParent)))
+                    return Reject(reason, L"native document ancestry is unavailable");
                 parent = std::move(nextParent);
             }
             if (!underBody || underHead) continue;
@@ -439,6 +856,7 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
             if (!RepresentedInput(value.element.Get(), value.tag == L"A" && !value.absorbed))
                 return Reject(reason, L"native document has an unrepresented element input handler or focus target");
             if (value.absorbed) continue;
+            if (value.tag == L"OBJECT" && InertMmcObject(value.element.Get())) continue;
             if (!accessKey.String().empty()) return Reject(reason, L"native document access keys require an explicit key contract");
             static constexpr std::array tags{L"BODY", L"DIV", L"SPAN", L"TABLE", L"TBODY", L"TR", L"TD", L"TH",
                 L"NOBR", L"BR", L"P", L"B", L"I", L"U", L"STRONG", L"EM", L"FONT", L"A", L"IMG",
@@ -453,8 +871,12 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
                 FAILED(value.geometry->get_scrollLeft(&x)) || FAILED(value.geometry->get_scrollTop(&y)))
                 return Reject(reason, L"native document scroll facts are unavailable");
             const auto scrolls = [](const std::wstring& overflow) { return overflow == L"auto" || overflow == L"scroll"; };
+            // A box styled to scroll whose content fits and is not scrolled -- the BODY of
+            // a quirks-mode page such as Performance Monitor's overview -- moves nothing,
+            // so it is not a region; its descendants keep viewport coordinates.
+            const bool overflowing = scrollWidth > clientWidth || scrollHeight > clientHeight || x != 0 || y != 0;
             const bool scrollport = (scrolls(overflowX.String()) || scrolls(overflowY.String())) &&
-                clientWidth > 0 && clientHeight > 0;
+                clientWidth > 0 && clientHeight > 0 && overflowing;
             if (scrollport) {
                 if (value.region >= 0 || snapshot.regions.size() >= kMaxRegions)
                     return Reject(reason, L"native document nested or excessive scrollports are unsupported");
@@ -484,16 +906,35 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
                 ComPtr<IHTMLElementCollection> children;
                 long childCount = 0;
                 if (FAILED(value.element->get_children(&childrenDispatch)) ||
-                    FAILED(childrenDispatch.As(&children)) || FAILED(children->get_length(&childCount))) return false;
+                    FAILED(childrenDispatch.As(&children)) || FAILED(children->get_length(&childCount)))
+                    return Reject(reason, L"native document text element children are unavailable");
                 for (long childIndex = 0; childIndex < childCount; ++childIndex) {
                     VARIANT at{}, unused{}; at.vt = VT_I4; at.lVal = childIndex;
                     ComPtr<IDispatch> childDispatch; ComPtr<IHTMLElement> child; Text childText;
                     if (FAILED(children->item(at, unused, &childDispatch)) || !childDispatch ||
-                        FAILED(childDispatch.As(&child)) || FAILED(child->get_innerText(&childText.value))) return false;
+                        FAILED(childDispatch.As(&child)) || FAILED(child->get_innerText(&childText.value)))
+                        return Reject(reason, L"native document text element child text is unavailable");
                     if (!Compact(childText.String()).empty()) { textLeaf = false; break; }
                 }
             }
-            if (!link && !graphic && !object && !textLeaf) continue;
+            if (!link && !graphic && !object && !textLeaf) {
+                if (Compact(value.text).empty()) continue;
+                // Mixed content: an inline child carries text, and the element may hold more
+                // loose text beside it. Each run of that text is its own item.
+                std::vector<TextRun> runs;
+                if (!ReadLooseText(document, value.element.Get(), runs, reason)) return false;
+                for (const auto& run : runs) {
+                    NativeDocumentItem loose;
+                    loose.key = value.key + L":" + std::to_wstring(run.ordinal);
+                    loose.kind = L"text";
+                    loose.rect = run.rect;
+                    loose.regionIndex = value.region;
+                    loose.name = run.text;
+                    if (!commit(std::move(loose), Compact(run.text))) return false;
+                    ++looseRuns;
+                }
+                continue;
+            }
             NativeDocumentItem item;
             item.key = value.key; item.rect = value.rect; item.regionIndex = value.region;
             item.kind = link ? L"link" : graphic ? L"image" : object ? L"report" : L"text";
@@ -501,18 +942,32 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
                 value.tag[1] >= L'1' && value.tag[1] <= L'6') item.kind = L"heading";
             item.name = value.text;
             VARIANT_BOOL disabled = VARIANT_FALSE;
-            if (FAILED(element3->get_disabled(&disabled))) return false;
+            if (FAILED(element3->get_disabled(&disabled)))
+                return Reject(reason, L"native document element enabled state is unavailable");
             item.enabled = disabled == VARIANT_FALSE;
             if (item.rect.right <= item.rect.left || item.rect.bottom <= item.rect.top)
                 return Reject(reason, L"native document semantic element has no layout box");
             if (link && !ReadAction(value.element.Get(), value.key, next,
                 previous ? &*previous : nullptr, item.actionIdentity, reason)) return false;
             if (graphic || (link && Compact(value.text).empty())) {
-                DirectUiWindowEvidence pixels;
-                if (!window || !Inside(value.rect, viewport) ||
-                    !CaptureDirectUiVirtualImagePixels(window, value.rect, pixels, reason))
-                    return Reject(reason, L"native document image is outside its current paintable viewport");
-                item.image = ImageListEntry{pixels.imageWidth, pixels.imageHeight, pixels.imageFormat, std::move(pixels.imageData)};
+                ImageListEntry decoded;
+                if (DecodeDocumentImage(value.element.Get(), value.tag, value.rect, decoded)) {
+                    item.image = std::move(decoded);
+                } else {
+                    DirectUiWindowEvidence pixels;
+                    if (!window || !Inside(value.rect, viewport) ||
+                        !CaptureDirectUiVirtualImagePixels(window, value.rect, pixels, reason)) {
+                        const std::wstring evidence =
+                            L"native document image is outside its current paintable viewport (" + value.tag +
+                            L" at " + std::to_wstring(value.rect.left) + L"," + std::to_wstring(value.rect.top) +
+                            L"-" + std::to_wstring(value.rect.right) + L"," + std::to_wstring(value.rect.bottom) +
+                            L"; viewport " + std::to_wstring(viewport.right) + L"x" +
+                            std::to_wstring(viewport.bottom) + L"): " + reason;
+                        return Reject(reason, evidence);
+                    }
+                    item.image = ImageListEntry{pixels.imageWidth, pixels.imageHeight, pixels.imageFormat,
+                        std::move(pixels.imageData)};
+                }
                 if ((pixelBytes += item.image->imageData.size()) > 1024 * 1024)
                     return Reject(reason, L"native document images exceed their aggregate bound");
                 if (graphic) {
@@ -525,9 +980,19 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
                 NativeDocumentRegion region;
                 region.key = value.key; region.kind = L"report"; region.rect = value.rect;
                 HWND nativeReport = nullptr;
-                if (value.region >= 0 || snapshot.regions.size() >= kMaxRegions || !Inside(value.rect, viewport) ||
-                    FAILED(value.element.As(&embedded)) || !ReadReport(embedded.Get(), item, region,
-                        window, nativeReport, next.representedWindows, reason)) return false;
+                if (value.region >= 0)
+                    return Reject(reason, L"native document report inside a scrollport is unsupported");
+                if (snapshot.regions.size() >= kMaxRegions)
+                    return Reject(reason, L"native document has more regions than the adapter carries");
+                if (!Inside(value.rect, viewport))
+                    return Reject(reason, L"native document report is outside its viewport (" +
+                        std::to_wstring(value.rect.left) + L"," + std::to_wstring(value.rect.top) + L"-" +
+                        std::to_wstring(value.rect.right) + L"," + std::to_wstring(value.rect.bottom) +
+                        L"; viewport " + std::to_wstring(viewport.right) + L"x" + std::to_wstring(viewport.bottom) + L")");
+                if (FAILED(value.element.As(&embedded)))
+                    return Reject(reason, L"native document embedded object is unavailable");
+                if (!ReadReport(embedded.Get(), item, region, window, nativeReport,
+                        next.representedWindows, reason)) return false;
                 item.reportRegionIndex = static_cast<int>(snapshot.regions.size());
                 snapshot.regions.push_back(std::move(region));
                 next.regions.emplace(value.key, RegionBinding{nullptr, nativeReport});
@@ -535,21 +1000,20 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
                     return Reject(reason, L"native document report rows exceed their aggregate bound");
                 for (const auto& row : item.reportRows) textSize += row.path.size();
             }
-            if (value.region >= 0) {
-                const auto& region = snapshot.regions[value.region];
-                OffsetRect(&item.rect, region.offsetX - region.rect.left, region.offsetY - region.rect.top);
-                if (!Inside(item.rect, RECT{0, 0, region.contentWidth, region.contentHeight}))
-                    return Reject(reason, L"native document semantic element escapes its scroll content");
-            } else if (!Inside(item.rect, viewport)) {
-                return Reject(reason, L"native document semantic element escapes its viewport");
-            }
-            if (!BoundedText(item.name) || (textSize += item.name.size()) > kMaxDocumentText)
-                return Reject(reason, L"native document semantic text exceeds its bound");
-            if (!graphic && !object) represented += Compact(value.text);
-            snapshot.items.push_back(std::move(item));
+            if (!commit(std::move(item), graphic || object ? std::wstring() : Compact(value.text))) return false;
         }
         Text bodyText;
-        if (FAILED(body->get_innerText(&bodyText.value)) || represented != Compact(bodyText.String()) || snapshot.items.empty())
+        if (FAILED(body->get_innerText(&bodyText.value)))
+            return Reject(reason, L"native document body text is unavailable");
+        std::wstring expected = Compact(bodyText.String());
+        // Loose runs are gathered with the element that holds them, ahead of the inline
+        // children that come before them in reading order, so with runs only the
+        // multiset of characters can be compared; without runs the order must match too.
+        if (looseRuns != 0) {
+            std::sort(represented.begin(), represented.end());
+            std::sort(expected.begin(), expected.end());
+        }
+        if (represented != expected || snapshot.items.empty())
             return Reject(reason, L"native document has text outside its represented semantics");
         if (window) {
             struct Census { const DocumentState* state; bool complete = true; } census{&next};

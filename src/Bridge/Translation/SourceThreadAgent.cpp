@@ -6,6 +6,7 @@
 #include "DirectUiEngine.h"
 #include "MenuBarCapture.h"
 #include "ListViewActivation.h"
+#include "PerformanceChart.h"
 #include "WindowCapture.h"
 
 #include "../../Common/FluentShell.h"
@@ -14,6 +15,7 @@
 #include <prsht.h>
 #include <dwmapi.h>
 #include <oleacc.h>
+#include <richedit.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -163,6 +165,16 @@ struct CaptureReadScope final {
 };
 thread_local std::function<bool(HMENU, UINT, HWND, BOOL&)> g_remotePopupHandler;
 
+// The control sits inside one of MMC's OCX result views (the host of an ActiveX snap-in view).
+bool IsHostedInMmcOcxView(HWND window) noexcept {
+    wchar_t name[32]{};
+    for (HWND current = window ? GetParent(window) : nullptr; current; current = GetParent(current)) {
+        if (GetClassNameW(current, name, static_cast<int>(std::size(name))) &&
+            wcscmp(name, L"MMCOCXViewWindow") == 0) return true;
+    }
+    return false;
+}
+
 // Identity only: a provider commonly disables its opener (HWND or item) while its
 // native tracking call runs, and that is still the live anchor of the popup.
 bool PopupAnchorMatches(const ControlNode& node, const IslandActionRequest& request) noexcept {
@@ -177,8 +189,15 @@ bool PopupAnchorMatches(const ControlNode& node, const IslandActionRequest& requ
         return live.itemId == expected.itemId && live.diskId == expected.diskId && live.name == expected.name &&
             live.value == expected.value;
     }
-    if (request.kind == ControlKind::TreeView || request.kind == ControlKind::ListView)
+    if (request.kind == ControlKind::TreeView)
         return index < node.items.size() && node.items[index] == request.name;
+    if (request.kind == ControlKind::ListView) {
+        const std::wstring* label = ListViewItemLabel(node, request.index);
+        return label && *label == request.name;
+    }
+    if (request.kind == ControlKind::Toolbar)
+        return index < node.toolbarItems.size() && node.toolbarItems[index].dropDown &&
+            node.toolbarItems[index].commandId == request.commandId;
     return index < node.islandItems.size() && node.islandItems[index].dropDown &&
         node.islandItems[index].name == request.name && node.islandItems[index].actionName == request.action;
 }
@@ -187,8 +206,18 @@ bool InvokePopupOwner(const IslandActionRequest& request, std::wstring& reason) 
     if (GuiThreadOperationCancelled()) return false;
     if (request.kind == ControlKind::DiskView)
         return request.diskView && RequestDiskViewContextMenu(request.island, *request.diskView, request.index, reason);
-    if (request.kind == ControlKind::TreeView || request.kind == ControlKind::ListView)
-        return RequestItemContextMenu(request.island, request.kind, request.index, request.name, reason);
+    if (request.kind == ControlKind::Toolbar)
+        return RequestToolbarDropDown(request.island, request.index, request.commandId, reason);
+    if (request.kind == ControlKind::TreeView || request.kind == ControlKind::ListView) {
+        // A double-click: the item is selected and its control receives Enter.
+        if (request.action == L"openItem")
+            return RequestItemKeyActivation(request.island, request.kind, request.index, request.name, reason);
+        // A snap-in's tree hosted in an MMC OCX view (Device Manager's devices, an MFC control)
+        // ignores a synthesized WM_CONTEXTMENU and opens its menu from the Menu key itself.
+        const auto trigger = request.kind == ControlKind::TreeView && IsHostedInMmcOcxView(request.island)
+            ? ContextMenuTrigger::MenuKey : ContextMenuTrigger::ContextMenuMessage;
+        return RequestItemContextMenu(request.island, request.kind, request.index, request.name, reason, trigger);
+    }
     return InvokeAccessibleIslandItem(request.island, request.index, request.name, request.action, reason);
 }
 
@@ -410,6 +439,13 @@ bool StatusBarMutator(UINT message) noexcept {
     return message == SB_SIMPLE || message == SB_SETTEXTW;
 }
 
+// A rich edit control changes text and selection through its own messages as well as
+// WM_SETTEXT: Windows Forms streams a RichTextBox's text in.
+bool RichEditMutator(UINT message) noexcept {
+    return message == EM_STREAMIN || message == EM_SETTEXTEX || message == EM_EXSETSEL ||
+        message == EM_SETCHARFORMAT || message == EM_SETPARAFORMAT;
+}
+
 // Class-independent mutators. The WM_USER-range control families above share
 // numbers (TBM_SETLINESIZE is TB_GETBUTTON, PBM_SETSTATE is TB_SETSTATE), so they are
 // decided per class in RelevantMessageFor instead.
@@ -444,6 +480,9 @@ bool RelevantMessage(UINT message) noexcept {
     case LB_DELETESTRING:
     case LB_RESETCONTENT:
     case LB_SETCURSEL:
+    case LB_SETSEL:
+    case LB_SELITEMRANGE:
+    case LB_SELITEMRANGEEX:
     case LM_SETITEM:
     case LVM_SETITEMA:
     case LVM_SETITEMW:
@@ -476,6 +515,9 @@ bool RelevantMessage(UINT message) noexcept {
     case LVM_SORTGROUPS:
     case LVM_SETGROUPMETRICS:
     case LVM_SETVIEW:
+    // A windowed virtual list carries the rows around its top row.
+    case LVM_SCROLL:
+    case LVM_ENSUREVISIBLE:
     case TCM_SETCURSEL:
     case TCM_INSERTITEMA:
     case TCM_INSERTITEMW:
@@ -537,9 +579,19 @@ bool QueryOrPaintNotification(UINT code) noexcept {
     }
 }
 
-bool RelevantMessageFor(HWND window, UINT message, LPARAM lParam = 0) noexcept {
+// An edit control reports focus, scrolling and an imminent redraw through WM_COMMAND
+// as well as a real change (EN_CHANGE).  A RichEdit sends EN_UPDATE before every
+// redraw, so counting it would keep a multi-thread capture barrier from ever settling.
+// The EN_* codes from 0x100 up are used by no other control's WM_COMMAND notification.
+bool EditPresentationNotification(WORD code) noexcept {
+    return code == EN_SETFOCUS || code == EN_KILLFOCUS || code == EN_UPDATE ||
+        code == EN_HSCROLL || code == EN_VSCROLL || code == EN_MAXTEXT || code == EN_ERRSPACE;
+}
+
+bool RelevantMessageFor(HWND window, UINT message, LPARAM lParam = 0, WPARAM wParam = 0) noexcept {
     if (message == WM_NOTIFY && lParam &&
         QueryOrPaintNotification(reinterpret_cast<const NMHDR*>(lParam)->code)) return false;
+    if (message == WM_COMMAND && lParam && EditPresentationNotification(HIWORD(wParam))) return false;
     if (message < WM_USER || message >= WM_USER + 0x100) return RelevantMessage(message);
     if (!window) return false;
     wchar_t buffer[kMaxClassNameChars]{};
@@ -549,6 +601,8 @@ bool RelevantMessageFor(HWND window, UINT message, LPARAM lParam = 0) noexcept {
     if (FluentShell::EqualsIgnoreCase(type, UPDOWN_CLASSW)) return UpDownMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, PROGRESS_CLASSW)) return ProgressMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, STATUSCLASSNAMEW)) return StatusBarMutator(message);
+    if (FluentShell::EqualsIgnoreCase(type, MSFTEDIT_CLASS) ||
+        FluentShell::EqualsIgnoreCase(type, RICHEDIT_CLASSW)) return RichEditMutator(message);
     return false;
 }
 
@@ -593,7 +647,7 @@ LRESULT CALLBACK ControlSubclassProc(
         reinterpret_cast<SourceThreadAgent*>(refData & ~DWORD_PTR{ 1 }));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
     if (owner && !CaptureReadInProgress() &&
-        (RelevantMessageFor(window, message, lParam) || (statusBar && message == SB_SETMINHEIGHT)))
+        (RelevantMessageFor(window, message, lParam, wParam) || (statusBar && message == SB_SETMINHEIGHT)))
         owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY) {
         ForgetNativeDocument(window);
@@ -608,7 +662,7 @@ LRESULT CALLBACK RootSubclassProc(
     const auto owner = AgentForSubclass(reinterpret_cast<SourceThreadAgent*>(refData));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
     if (message == WM_CLOSE) MarkWindowCloseCompleted(window);
-    if (owner && !CaptureReadInProgress() && RelevantMessageFor(window, message, lParam))
+    if (owner && !CaptureReadInProgress() && RelevantMessageFor(window, message, lParam, wParam))
         owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY && owner) {
         owner->MarkDestroyed();
@@ -883,6 +937,18 @@ bool ApplySetCheck(
 
 bool ApplySelect(
     Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (node.kind == ControlKind::PerformanceLegend) {
+        // The legend's rows are the chart's counters: the click selects one in the native list and
+        // the control follows. The request is checked against the row count of the baseline.
+        const int requested = command->action.integerValue;
+        if (!node.performanceLegend || requested < 0 ||
+            static_cast<size_t>(requested) >= node.performanceLegend->rows.size()) return true;
+        if (AbortIfCancelled(command)) return false;
+        command->success = SelectPerformanceCounter(target, requested);
+        command->refused = !command->success;
+        if (!command->success) command->error = L"the chart did not select the counter";
+        return true;
+    }
     const bool selectable = node.kind == ControlKind::ComboBox ||
         node.kind == ControlKind::ListBox || node.kind == ControlKind::TabControl ||
         node.kind == ControlKind::TreeView;
@@ -922,8 +988,31 @@ bool ApplySelect(
     return true;
 }
 
+// A multi-select list box takes its selection as the control's own selection messages and then tells
+// its owner what a click would have: LBN_SELCHANGE.
+bool ApplySetListBoxSelection(
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (!node.multiSelect) return true;
+    const auto& requested = command->action.integerValues;
+    if (std::any_of(requested.begin(), requested.end(),
+            [&](int index) { return index < 0 || static_cast<size_t>(index) >= node.items.size(); })) return true;
+    if (AbortIfCancelled(command)) return false;
+    if (!SetListBoxSelection(target, std::vector<int>(requested.begin(), requested.end()))) {
+        // The control ran the selection and settled somewhere else: a refusal of this action.
+        command->refused = true;
+        command->error = L"the list did not keep the requested selection";
+        return true;
+    }
+    if (command->cancelled.load(std::memory_order_acquire)) return true;
+    SendMessageW(SyntheticNotificationTarget(agent->Root(), target), WM_COMMAND,
+        MAKEWPARAM(node.controlId, LBN_SELCHANGE), reinterpret_cast<LPARAM>(target));
+    command->success = true;
+    return true;
+}
+
 bool ApplySetSelection(
-    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (node.kind == ControlKind::ListBox) return ApplySetListBoxSelection(command, agent, target, node);
     if (node.kind != ControlKind::ListView) return true;
     if (AbortIfCancelled(command)) return false;
     const auto& requested = command->action.integerValues;
@@ -1016,8 +1105,30 @@ bool ApplyScrollBy(
     return true;
 }
 
+// A windowed virtual list follows its native top row, so moving the window is a
+// native scroll; the post-action capture then carries the rows around it.
+bool ApplySetTopIndex(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView || node.itemCount == 0) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->success = ScrollListViewToTop(target, command->action.itemIndex);
+    command->refused = !command->success;
+    if (!command->success) command->error = L"the list did not scroll to the requested row";
+    return true;
+}
+
 bool ApplySetItemCheck(
     Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind == ControlKind::PerformanceLegend) {
+        const int row = command->action.itemIndex;
+        if (!node.performanceLegend || row < 0 ||
+            static_cast<size_t>(row) >= node.performanceLegend->rows.size()) return true;
+        if (AbortIfCancelled(command)) return false;
+        command->success = SetPerformanceCounterVisible(target, row, command->action.booleanValue);
+        command->refused = !command->success;
+        if (!command->success) command->error = L"the chart did not change whether the counter is shown";
+        return true;
+    }
     if (node.kind != ControlKind::ListView || !node.checkBoxes) return true;
     const int index = command->action.itemIndex;
     if (index < 0 || static_cast<size_t>(index) >= ListViewItemCount(node)) return true;
@@ -1036,12 +1147,49 @@ bool ApplyToolbarCommand(
     return QueueNativeAction(command, agent, &node);
 }
 
+// A button's arrow: the owner answers TBN_DROPDOWN by tracking its own menu, so the request is
+// queued to run after this command returns, with popup interception armed for the button.
+bool ApplyToolbarDropDown(
+    Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if (node.kind != ControlKind::Toolbar || !agent) return true;
+    if (AbortIfCancelled(command)) return false;
+    const auto button = std::find_if(node.toolbarItems.begin(), node.toolbarItems.end(),
+        [&](const ToolbarItemSnapshot& candidate) {
+            return candidate.kind == ToolbarItemKind::PushButton && candidate.dropDown &&
+                candidate.commandId == command->action.menuCommandId;
+        });
+    if (button == node.toolbarItems.end()) return true;
+    command->deferredActionKind = kDeferredIslandAction;
+    command->success = agent->PostIslandAction(node, static_cast<int>(button - node.toolbarItems.begin()),
+        command->refused, &command->deferredActionToken);
+    if (!command->success && command->error.empty()) command->error = command->refused
+        ? L"another native popup action is already pending"
+        : L"the drop-down request could not be queued";
+    return true;
+}
+
 bool ApplySetValue(
     Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
+    if (node.kind == ControlKind::DatePicker || node.kind == ControlKind::TimePicker) {
+        const int requestedValue = command->action.integerValue;
+        if (requestedValue < node.minimum || requestedValue > node.maximum) return true;
+        if (AbortIfCancelled(command)) return false;
+        command->success = SetDateTimePickerValue(
+            agent->Root(), target, node.kind == ControlKind::TimePicker, requestedValue);
+        return true;
+    }
     if (node.kind != ControlKind::Slider && node.kind != ControlKind::UpDown) return true;
     const int requested = command->action.integerValue;
     if (requested < node.minimum || requested > node.maximum) return true;
     if (AbortIfCancelled(command)) return false;
+    if (node.kind == ControlKind::UpDown && IsWindowsFormsControl(target)) {
+        // The arrows of a NumericUpDown step by the control's own increment, so only one press
+        // in either direction is a request they can answer (the renderer asks for position +/- 1).
+        const long long delta = static_cast<long long>(requested) - node.position;
+        if (delta != 1 && delta != -1) return true;
+        command->success = StepWindowsFormsSpin(target, delta > 0);
+        return true;
+    }
     if (node.kind == ControlKind::Slider) {
         command->success = SetTrackbarPosition(
             agent->Root(), target, node.vertical, requested);
@@ -1135,6 +1283,20 @@ bool ApplyContextMenu(Command* command, SourceThreadAgent* agent, HWND, const Co
     if (!command->success && command->error.empty()) command->error = command->refused
         ? L"another native popup action is already pending"
         : L"the context-menu request could not be queued";
+    return true;
+}
+
+// A double-click on a result item: queued like a context-menu request (the activation can
+// open an application dialog from inside the control's own message handling).
+bool ApplyOpenItem(Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if ((node.kind != ControlKind::TreeView && node.kind != ControlKind::ListView) || !agent) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->deferredActionKind = kDeferredIslandAction;
+    command->success = agent->PostIslandAction(node, command->action.itemIndex,
+        command->refused, &command->deferredActionToken, true);
+    if (!command->success && command->error.empty()) command->error = command->refused
+        ? L"another native popup action is already pending"
+        : L"the item activation could not be queued";
     return true;
 }
 
@@ -1283,10 +1445,13 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"diskContext", &ApplyDiskContext },
     NodeActionEntry{ L"diskScroll", &ApplyDiskScroll },
     NodeActionEntry{ L"contextMenu", &ApplyContextMenu },
+    NodeActionEntry{ L"openItem", &ApplyOpenItem },
     NodeActionEntry{ L"toolbarCommand", &ApplyToolbarCommand },
+    NodeActionEntry{ L"toolbarDropDown", &ApplyToolbarDropDown },
     NodeActionEntry{ L"mdiCommand", &ApplyMdiCommand },
     NodeActionEntry{ L"setSplit", &ApplySetSplit },
     NodeActionEntry{ L"setScroll", &ApplySetScroll },
+    NodeActionEntry{ L"setTopIndex", &ApplySetTopIndex },
     NodeActionEntry{ L"setColumnOrder", &ApplySetColumnOrder },
     NodeActionEntry{ L"islandInvoke", &ApplyIslandInvoke },
     NodeActionEntry{ L"activateItem", &ApplyActivateItem },
@@ -1312,8 +1477,10 @@ bool InvokeOnNode(
     if (!node->visible || !node->enabled) return true;
     const NodeAction apply = FindNodeAction(action.action);
     const bool queued = action.action == L"invoke" || action.action == L"toolbarCommand" ||
+        action.action == L"toolbarDropDown" ||
         action.action == L"mdiCommand" || action.action == L"activateItem" || action.action == L"islandInvoke" ||
-        action.action == L"htmlInvoke" || action.action == L"diskContext" || action.action == L"contextMenu";
+        action.action == L"htmlInvoke" || action.action == L"diskContext" || action.action == L"contextMenu" ||
+        action.action == L"openItem";
     if (apply && !queued && GetWindowThreadProcessId(node->hwnd, nullptr) != GetCurrentThreadId()) {
         auto remote = std::shared_ptr<Command>(CreateCommand(command->kind, agent, command->cancellation), Release);
         if (!remote) { command->error = L"remote source command allocation failed"; return true; }
@@ -2144,7 +2311,8 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
         const auto* message = reinterpret_cast<CWPRETSTRUCT*>(lParam);
         const bool menuChanged = MenuMutationMessage(message->message, message->lParam);
         const bool observed = !CaptureReadInProgress() &&
-            (RelevantMessageFor(message->hwnd, message->message, message->lParam) || menuChanged);
+            (RelevantMessageFor(message->hwnd, message->message, message->lParam, message->wParam) ||
+                menuChanged);
         if (observed || message->message == WM_NCDESTROY || message->message == WM_CANCELMODE) {
             MarkCurrentThreadAgentsDirty(message->hwnd, message->message, observed && menuChanged);
         }
@@ -2154,8 +2322,8 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
 
 } // namespace
 
-bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam) noexcept {
-    return RelevantMessageFor(window, message, lParam);
+bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam, WPARAM wParam) noexcept {
+    return RelevantMessageFor(window, message, lParam, wParam);
 }
 
 bool IsOwnerDataListViewIndexedAction(
@@ -2539,16 +2707,24 @@ std::optional<Request> SourceThreadAgent::TakeDeferred(
 }
 
 bool SourceThreadAgent::PostIslandAction(
-    const ControlNode& node, int index, bool& refused, uint64_t* queuedToken) noexcept {
+    const ControlNode& node, int index, bool& refused, uint64_t* queuedToken, bool open) noexcept {
     refused = false;
     if (queuedToken) *queuedToken = 0;
     try {
         const bool itemContext = node.kind == ControlKind::TreeView || node.kind == ControlKind::ListView;
         const size_t count = node.kind == ControlKind::DiskView && node.diskView
             ? node.diskView->items.size()
+            : node.kind == ControlKind::ListView ? ListViewItemCount(node)
+            : node.kind == ControlKind::Toolbar ? node.toolbarItems.size()
             : itemContext ? node.items.size() : node.islandItems.size();
+        // A windowed list's row is addressed by its absolute index and has to be one
+        // the snapshot carries, since its label is the request's witness.
+        const std::wstring* itemLabel = node.kind == ControlKind::ListView
+            ? ListViewItemLabel(node, index)
+            : node.kind == ControlKind::TreeView && index >= 0 && static_cast<size_t>(index) < node.items.size()
+                ? &node.items[static_cast<size_t>(index)] : nullptr;
         if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() ||
-            index < 0 || static_cast<size_t>(index) >= count ||
+            index < 0 || static_cast<size_t>(index) >= count || (itemContext && !itemLabel) ||
             islandAction_.nextToken == 0) return false;
         if (islandAction_ || nativeAction_ || nativeActionRunning_ || remoteActions_.load() || trackedPopup_ ||
             (pendingIslandMenu_ && GetTickCount64() <= pendingIslandDeadline_)) {
@@ -2567,9 +2743,18 @@ bool SourceThreadAgent::PostIslandAction(
             deferred.dropDown = true;
             deferred.diskView = node.diskView;
         } else if (itemContext) {
-            deferred.name = node.items[index];
-            deferred.action = L"contextMenu";
+            deferred.name = *itemLabel;
+            // Opening an item raises no popup, so no popup is awaited for it.
+            deferred.action = open ? L"openItem" : L"contextMenu";
+            deferred.dropDown = !open;
+        } else if (node.kind == ControlKind::Toolbar) {
+            // A button's arrow asks its owner for a menu; the owner tracks it.
+            const auto& button = node.toolbarItems[static_cast<size_t>(index)];
+            if (!button.dropDown) return false;
+            deferred.name = button.text;
+            deferred.action = L"toolbarDropDown";
             deferred.dropDown = true;
+            deferred.commandId = button.commandId;
         } else {
             const auto& item = node.islandItems[index];
             deferred.name = item.name;
@@ -2960,7 +3145,10 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
         }
         const auto& action = request.action;
         if (action.action == L"close") {
-            SendMessageW(root_, WM_CLOSE, 0, 0);
+            // What the native close button does. A dialog that never handles WM_CLOSE (Performance
+            // Monitor's Add Counters) ignores it; DefWindowProc turns SC_CLOSE into the dialog's own
+            // cancel, and into WM_CLOSE for every window that does handle it.
+            SendMessageW(root_, WM_SYSCOMMAND, SC_CLOSE, 0);
         } else if (action.action == L"menuCommand") {
             if (current.menuBindingGeneration != action.expectedMenuBindingGeneration ||
                 GetMenu(root_) != request.menu || !IsMenu(request.menu) ||
@@ -2983,6 +3171,8 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
             }
         } else if (request.kind == ControlKind::Button) {
             SendMessageW(request.source, BM_CLICK, 0, 0);
+        } else if (request.kind == ControlKind::SysLink && IsWindowsFormsLinkLabelWindow(request.source)) {
+            if (node->items.size() == 1) InvokeWindowsFormsLink(request.source, node->items.front());
         } else if (request.kind == ControlKind::SysLink) {
             LITEM item{};
             item.mask = LIF_ITEMINDEX | LIF_STATE;
@@ -3036,6 +3226,8 @@ void SourceThreadAgent::RunNativeActionOnOwner(const NativeActionRequest& reques
             }
         } else if (request.kind == ControlKind::Button) {
             SendMessageW(request.source, BM_CLICK, 0, 0);
+        } else if (request.kind == ControlKind::SysLink && IsWindowsFormsLinkLabelWindow(request.source)) {
+            if (node.items.size() == 1) InvokeWindowsFormsLink(request.source, node.items.front());
         } else if (request.kind == ControlKind::SysLink) {
             LITEM item{};
             item.mask = LIF_ITEMINDEX | LIF_STATE;
@@ -3352,18 +3544,43 @@ void SourceThreadAgent::RunIslandActionOnSourceThread(const IslandActionRequest&
         if (GetCurrentThreadId() == threadId_ &&
             GetWindowThreadProcessId(request.island, nullptr) != threadId_) {
             const auto identity = captureContext_.nodeIds.find(request.island);
-            if (shuttingDown_.load() || trackedPopup_ || identity == captureContext_.nodeIds.end() ||
-                identity->second.nodeId != request.nodeId || identity->second.generation != request.generation ||
-                !IsApplicationCloaked(root_)) return;
+            const wchar_t* remoteRefusal =
+                shuttingDown_.load() ? L"the agent is shutting down" :
+                trackedPopup_ ? L"another native popup is tracking" :
+                identity == captureContext_.nodeIds.end() ? L"its window is not in the last capture" :
+                identity->second.nodeId != request.nodeId || identity->second.generation != request.generation
+                    ? L"its node identity changed" :
+                !IsApplicationCloaked(root_) ? L"native root is no longer cloaked" : nullptr;
+            if (remoteRefusal) {
+                FluentShell::Log(std::wstring(L"Remote island action refused: ") + remoteRefusal + L" (" +
+                    request.action + L" node=" + std::to_wstring(request.nodeId) + L")");
+                return;
+            }
             remotePopup_ = std::make_shared<RemotePopupState>();
             remotePopup_->request = request;
             const auto popup = remotePopup_;
+            // A control on another GUI thread can have its menu shown by this (the frame's)
+            // thread a moment after the request, as Event Viewer's WinForms lists do through
+            // MMC; the usual claim covers that, and a popup the control's own thread tracks
+            // first (RemotePopupState::claimed) retires it.
+            if (request.dropDown) {
+                pendingIslandMenu_ = request;
+                pendingIslandDeadline_ = GetTickCount64() + 2000;
+            }
             std::wstring error;
             PostRemoteAction(request.island, [this, request, popup](const auto& cancelled) {
-                if (cancelled->load() || !IsChild(root_, request.island) || !IsWindowVisible(request.island) ||
-                    !IsWindowEnabled(request.island) ||
-                    reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) != request.generation)
+                const wchar_t* refusal =
+                    cancelled->load() ? L"the request was cancelled" :
+                    !IsChild(root_, request.island) ? L"its window is gone" :
+                    !IsWindowVisible(request.island) ? L"its window is hidden" :
+                    !IsWindowEnabled(request.island) ? L"its window is disabled" :
+                    reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) != request.generation
+                        ? L"its window was recreated" : nullptr;
+                if (refusal) {
+                    FluentShell::Log(std::wstring(L"Remote island action refused on its thread: ") + refusal + L" (" +
+                        request.action + L" node=" + std::to_wstring(request.nodeId) + L")");
                     return;
+                }
                 auto previous = std::move(g_remotePopupHandler);
                 struct RestoreHandler {
                     std::function<bool(HMENU, UINT, HWND, BOOL&)> previous;
@@ -3373,10 +3590,14 @@ void SourceThreadAgent::RunIslandActionOnSourceThread(const IslandActionRequest&
                     return TrackRemoteIslandPopup(request, popup, cancelled, menu, flags, owner, result);
                 };
                 std::wstring reason;
+                FluentShell::Log(L"Remote island action running: " + request.action + L" node=" +
+                    std::to_wstring(request.nodeId) + L" index=" + std::to_wstring(request.index));
                 if (!cancelled->load() && !InvokePopupOwner(request, reason)) {
                     FluentShell::Log(L"Remote island action did not run: " + reason);
                 }
             }, error);
+            if (!error.empty())
+                FluentShell::Log(L"Remote island action was not posted: " + error);
             return;
         }
         const wchar_t* refusal =
@@ -3477,6 +3698,7 @@ bool SourceThreadAgent::TrackRemoteIslandPopup(const IslandActionRequest& reques
             IsChild(root_, request.island) &&
             reinterpret_cast<uintptr_t>(GetPropW(request.island, kNodeGenerationProperty)) == request.generation;
     };
+    state->claimed.store(true);
     if (!current()) return true;
     if ((flags & TPM_NONOTIFY) == 0) SendMessageW(owner, WM_INITMENUPOPUP, reinterpret_cast<WPARAM>(menu), 0);
     std::vector<MenuItemSnapshot> items;
@@ -3545,6 +3767,11 @@ bool SourceThreadAgent::TrackIslandPopupOnSourceThread(
     result = FALSE;
     if (GetCurrentThreadId() != threadId_ || shuttingDown_.load() || trackedPopup_ ||
         !pendingIslandMenu_ || !IsApplicationCloaked(root_)) return false;
+    if (remotePopup_ && remotePopup_->claimed.load()) {
+        // The control's own thread already tracked this request's popup.
+        pendingIslandMenu_.reset();
+        return false;
+    }
     const auto request = *pendingIslandMenu_;
     pendingIslandMenu_.reset();
     if (GetTickCount64() > pendingIslandDeadline_ || !IsChild(root_, request.island) ||

@@ -69,6 +69,9 @@
     <ClCompile Include="Bridge\Translation\OwnerDrawComboBox.cpp" />
     <ClCompile Include="Bridge\Translation\NativeDocument.cpp" />
     <ClCompile Include="Bridge\Translation\DiskView.cpp" />
+    <ClCompile Include="Bridge\Translation\PerformanceChart.cpp" />
+    <ClCompile Include="Bridge\Translation\RichText.cpp" />
+    <ClCompile Include="Bridge\Translation\Sysmon.cpp" />
     <ClCompile Include="Bridge\Translation\AccessibleIsland.cpp" />
     <ClCompile Include="Bridge\Translation\MmcHtmlDocument.cpp" />
     <ClCompile Include="Bridge\Translation\MenuBarCapture.cpp" />

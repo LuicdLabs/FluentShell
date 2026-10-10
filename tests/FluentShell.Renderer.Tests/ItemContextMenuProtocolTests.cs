@@ -28,12 +28,22 @@ public sealed class ItemContextMenuProtocolTests
         Validate(JsonSerializer.SerializeToElement(new ItemTextActionValue { Index = 4095, Text = "Row" }));
     }
 
+    // A windowed virtual list names its rows absolutely, past the per-array item cap.
+    [Theory]
+    [InlineData(4096)]
+    [InlineData(1_000_000)]
+    [InlineData(16_777_215)]
+    public void AnAbsoluteRowOfAWindowedListIsAdmitted(int index)
+    {
+        Validate(JsonSerializer.SerializeToElement(new ItemTextActionValue { Index = index, Text = "Row" }));
+    }
+
     [Theory]
     [InlineData("2")]
     [InlineData("{\"index\":2}")]
     [InlineData("{\"text\":\"Leaf\"}")]
     [InlineData("{\"index\":-1,\"text\":\"Leaf\"}")]
-    [InlineData("{\"index\":4096,\"text\":\"Leaf\"}")]
+    [InlineData("{\"index\":16777216,\"text\":\"Leaf\"}")]
     [InlineData("{\"index\":2,\"text\":\"Leaf\",\"extra\":true}")]
     [InlineData("{\"index\":2,\"text\":7}")]
     public void MalformedRequestsAreRejected(string value)

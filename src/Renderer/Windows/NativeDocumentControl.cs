@@ -73,7 +73,10 @@ internal sealed class NativeDocumentControl(Action<int> invoke,
                 var capturedIndex = index;
                 var link = new HyperlinkButton
                 {
-                    Content = item.Image is { } image ? Picture(image) : new TextBlock { Text = item.Name, TextWrapping = TextWrapping.Wrap },
+                    // The same 12 px body size as the document's text items: a link's box is as
+                    // wide as its native text, and a larger default would wrap a short verb.
+                    Content = item.Image is { } image ? Picture(image)
+                        : new TextBlock { Text = item.Name, FontSize = 12, TextWrapping = TextWrapping.Wrap },
                     Padding = new Thickness(0), MinWidth = 0, MinHeight = 0,
                     IsEnabled = item.Enabled,
                     HorizontalContentAlignment = HorizontalAlignment.Left,
@@ -96,6 +99,7 @@ internal sealed class NativeDocumentControl(Action<int> invoke,
                 };
             AutomationProperties.SetName(element, item.Name);
             Place(element, item.Rect, scale);
+            FitText(element, item.Rect, scale);
             (item.RegionIndex >= 0 ? content[item.RegionIndex].Children : Children).Add(element);
             _elements.Add(index, element);
         }
@@ -139,7 +143,40 @@ internal sealed class NativeDocumentControl(Action<int> invoke,
         SetLeft(element, rect.X * scale);
         SetTop(element, rect.Y * scale);
         element.Width = rect.Width * scale;
-        element.Height = rect.Height * scale;
+        // XAML lays CJK text out a little taller than GDI did, so inert text keeps its native
+        // width and may grow downward instead of losing its last line to a fixed height.
+        if (element is TextBlock) element.MinHeight = rect.Height * scale;
+        else element.Height = rect.Height * scale;
+    }
+
+    // A native text box one line tall: an inline run, a link, a short label.
+    private const int OneLineHeight = 22;
+
+    // XAML sets CJK text a little wider and taller than GDI did. A one-line item (an inline
+    // link or the run of text beside it fills exactly its text) therefore sizes to its text,
+    // never narrower than its native box, instead of wrapping its last character; a wrapped
+    // block keeps its native width and grows downward.
+    private static void FitText(FrameworkElement element, PixelRect rect, double scale)
+    {
+        var oneLine = rect.Height <= OneLineHeight;
+        TextBlock? text = element switch
+        {
+            HyperlinkButton { Content: TextBlock label } => label,
+            TextBlock block => block,
+            _ => null,
+        };
+        if (text is null) return;
+        text.TextWrapping = oneLine ? TextWrapping.NoWrap : TextWrapping.Wrap;
+        if (oneLine)
+        {
+            element.ClearValue(WidthProperty);
+            element.MinWidth = rect.Width * scale;
+        }
+        if (element is HyperlinkButton)
+        {
+            element.ClearValue(HeightProperty);
+            element.MinHeight = rect.Height * scale;
+        }
     }
 
     internal static int NativeOffset(double offset, double extent, int maximum) =>
@@ -241,6 +278,7 @@ internal sealed class NativeDocumentControl(Action<int> invoke,
         protected override string GetNameCore() => AutomationProperties.GetName(owner);
         protected override bool IsControlElementCore() => true;
         protected override bool IsContentElementCore() => false;
+        protected override bool IsEnabledCore() => ControlFactory.NodeEnabled(owner);
         protected override global::Windows.Foundation.Rect GetBoundingRectangleCore() =>
             ControlFactory.PhysicalLayoutBounds(owner, base.GetBoundingRectangleCore());
     }

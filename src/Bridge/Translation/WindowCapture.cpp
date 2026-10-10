@@ -1,4 +1,5 @@
 #include "WindowCapture.h"
+#include "CaptureTrace.h"
 #include "GuiThreadDispatch.h"
 #include "NativeDocument.h"
 
@@ -8,6 +9,7 @@
 
 #include <commctrl.h>
 
+#include <algorithm>
 #include <array>
 #include <unordered_set>
 #include <utility>
@@ -161,6 +163,16 @@ bool IsDialogControlParent(HWND child) noexcept {
         (exStyle & WS_EX_CONTROLPARENT) != 0;
 }
 
+// A child dialog that is not part of its parent's dialog-manager walk -- no DS_CONTROL, no
+// WS_EX_CONTROLPARENT, as with the pages of an OLE property frame -- runs its own IsDialogMessage loop:
+// Tab cycles inside it, and its controls are unreachable from the parent's walk.
+bool IsIndependentDialogPage(HWND window) noexcept {
+    wchar_t classBuffer[kMaxClassNameChars]{};
+    return FluentShell::EqualsIgnoreCase(ClassNameOf(window, classBuffer), L"#32770") &&
+        (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)) & WS_CHILD) != 0 &&
+        !IsDialogControlParent(window);
+}
+
 bool IsMdiChildWindow(HWND window) noexcept {
     return (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)) &
         WS_EX_MDICHILD) != 0;
@@ -174,7 +186,7 @@ bool IsMdiNavigationContainer(HWND window) noexcept {
 
 HWND NativeTabScope(HWND root, HWND child) noexcept {
     for (HWND parent = GetParent(child); parent && parent != root; parent = GetParent(parent)) {
-        if (IsMdiChildWindow(parent)) return parent;
+        if (IsMdiChildWindow(parent) || IsIndependentDialogPage(parent)) return parent;
     }
     return root;
 }
@@ -190,7 +202,7 @@ bool CaptureNativeTabOrder(
         if (!DispatchToWindowThread(child, [root, child, candidate] {
                 if (IsCompositeImplementationChild(child) || IsMdiNavigationContainer(child)) return;
                 const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
-                if (!IsDialogControlParent(child) && IsWindowVisible(child) &&
+                if (!IsDialogControlParent(child) && !IsIndependentDialogPage(child) && IsWindowVisible(child) &&
                     IsEffectivelyEnabled(root, child) && (style & WS_TABSTOP) != 0)
                     *candidate = NativeTabScope(root, child);
             }, reason)) return false;
@@ -200,12 +212,14 @@ bool CaptureNativeTabOrder(
 
     // Dialog-manager traversal is per container: an MDI child frame runs its own
     // IsDialogMessage loop, so the controls inside it are not reachable from the
-    // frame's walk. Each control belongs to its nearest MDI child, or the root
-    // when it has none. Even a control-parent style that exposes an MDI subtree
-    // to the root's walk must not assign that subtree the root's tab order.
+    // frame's walk, and neither are the controls of a child dialog that is no
+    // control parent (an OLE property page). Each control belongs to its nearest
+    // such container, or the root when it has none. Even a control-parent style
+    // that exposes an MDI subtree to the root's walk must not assign that
+    // subtree the root's tab order.
     std::vector<HWND> containers{ root };
     for (const HWND child : handles) {
-        if (IsMdiChildWindow(child) && IsWindowVisible(child)) {
+        if ((IsMdiChildWindow(child) || IsIndependentDialogPage(child)) && IsWindowVisible(child)) {
             containers.push_back(child);
         }
     }
@@ -221,7 +235,10 @@ bool CaptureNativeTabOrder(
         // WS_TABSTOP that this walk omits is not an effective dialog tab stop; keep
         // its style as evidence, but do not invent an order from HWND enumeration.
         std::unordered_set<HWND> visited;
-        HWND current = *seed;
+        // A null start answers the container's first tab stop, so the order begins where the native one
+        // does even when the container's first child is itself a tab stop (a walk begun at that child
+        // would number it last).
+        HWND current = nullptr;
         for (size_t attempt = 0; attempt <= handles.size() + candidates.size(); ++attempt) {
             auto nextValue = std::make_shared<HWND>(nullptr);
             if (!DispatchToWindowThread(container, [container, current, nextValue] {
@@ -388,7 +405,7 @@ bool CaptureMenuLevel(
                     false, item.enabled, mdiFrame, state, item.items, reason) ||
                 item.items.empty()) return false;
         } else {
-            if (topLevel || item.text.empty() || info.wID == 0 || info.wID >= 0xf000) {
+            if (topLevel || item.text.empty() || info.wID == 0 || IsSystemCommandId(info.wID)) {
                 wchar_t evidence[192]{};
                 swprintf_s(evidence,
                     L"menu command '%.32s' id=%u cannot use standard WM_COMMAND semantics",
@@ -418,6 +435,9 @@ struct ChildCaptureScope final {
     // The kind of every node already captured, so a child can be checked against the
     // parent that will own it in the projection.
     const std::unordered_map<HWND, ControlKind>* visibleNodeKinds = nullptr;
+    // The next tab index after the dialog manager's walk, for a Windows Forms tab stop
+    // the walk does not reach (WinForms moves focus with Tab itself).
+    int* nextExtraTabIndex = nullptr;
     int zIndex = 0;
 };
 
@@ -435,11 +455,17 @@ bool CaptureTopLevelFacets(
     // Escape cancels a dialog because the dialog manager maps it to IDCANCEL; an
     // ordinary top-level window receives the keystroke and normally ignores it.
     // Reporting cancel semantics for every window would make Escape close
-    // applications that never close on Escape.
+    // applications that never close on Escape.  A Windows Forms dialog (Event Viewer's
+    // filter, Task Scheduler's task properties) is cancelled by Escape through its
+    // CancelButton, which no window evidence names; it is a dialog when it is modal or
+    // has the dialog frame (WS_EX_DLGMODALFRAME: FormBorderStyle.FixedDialog), and the
+    // dialog it nearly always is closes the same way the form's own close button does.
     {
         wchar_t rootClass[kMaxClassNameChars]{};
         GetClassNameW(root, rootClass, static_cast<int>(std::size(rootClass)));
-        next.canCancel = FluentShell::EqualsIgnoreCase(rootClass, L"#32770");
+        const bool dialogFrame = (static_cast<DWORD>(GetWindowLongPtrW(root, GWL_EXSTYLE)) & WS_EX_DLGMODALFRAME) != 0;
+        next.canCancel = FluentShell::EqualsIgnoreCase(rootClass, L"#32770") ||
+            ((next.modal || dialogFrame) && std::wstring_view(rootClass).starts_with(L"WindowsForms10."));
     }
     next.generation = context.generation;
     next.revision = context.revision;
@@ -542,15 +568,19 @@ bool CaptureCommonNodeFacets(
     node.enabled = IsEffectivelyEnabled(scope.root, child);
     const bool nativeTabStop = (node.style & WS_TABSTOP) != 0;
     node.tabStop = nativeTabStop &&
-        (!node.enabled || scope.tabIndexes->contains(child));
+        (!node.enabled || scope.tabIndexes->contains(child) || IsWindowsFormsControl(child));
     if (const auto tab = scope.tabIndexes->find(child); tab != scope.tabIndexes->end()) {
         node.tabIndex = tab->second;
+    } else if (node.tabStop && node.enabled && scope.nextExtraTabIndex) {
+        // Windows Forms traversal follows the walk's controls, in capture order.
+        node.tabIndex = (*scope.nextExtraTabIndex)++;
     }
     node.dialogCode = static_cast<uint32_t>(SendMessageW(child, WM_GETDLGCODE, 0, 0));
     // A multiline Edit legitimately wants all keys; anything else asking for raw
     // key routing implements private keyboard behavior we cannot project.
     const bool standardTextKeyboard =
-        (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
+        (node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
+         node.kind == ControlKind::RichText) &&
         (static_cast<DWORD>(node.style) & ES_MULTILINE) != 0;
     if ((node.dialogCode & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE)) != 0 &&
         !standardTextKeyboard) {
@@ -571,9 +601,11 @@ bool CaptureCommonNodeFacets(
     // turn into a disabled dialog tab stop. Keep the raw style for caption
     // commands, and keep both structural MDI kinds outside dialog traversal.
     // A progress bar takes no keyboard input; a WS_TABSTOP a dialog template gave it
-    // would only make Tab land on nothing.
+    // would only make Tab land on nothing.  An inert painted surface is the same: a
+    // focusable header strip that publishes no action has nothing for focus to act on.
     if (node.kind == ControlKind::DialogContainer || node.kind == ControlKind::ProgressBar ||
-        node.kind == ControlKind::MdiClient || node.kind == ControlKind::MdiChild) {
+        node.kind == ControlKind::MdiClient || node.kind == ControlKind::MdiChild ||
+        node.kind == ControlKind::StaticBitmap || node.kind == ControlKind::GroupBox) {
         node.tabStop = false;
         node.tabIndex = -1;
     }
@@ -598,6 +630,16 @@ bool CaptureCommonNodeFacets(
         node.text.clear();
     }
     return true;
+}
+
+void TraceCaptureStage(HWND child, const wchar_t* stage) noexcept {
+    if (!CaptureTraceEnabled()) return;
+    try {
+        wchar_t className[64]{};
+        GetClassNameW(child, className, static_cast<int>(std::size(className)));
+        CaptureTrace(std::wstring(stage) + L" hwnd=" + Ipc::HwndToString(child) + L" class=" + className);
+    } catch (...) {
+    }
 }
 
 // Classify, identify, common facets, adapter-specific state.  Every stage
@@ -644,10 +686,14 @@ bool CaptureChildNode(
         node = std::move(work->node);
         return true;
     }
-    return ClassifyControl(child, node.kind, reason) &&
-        AssignNodeIdentity(child, context, node, reason) &&
-        CaptureCommonNodeFacets(child, scope, node, reason) &&
-        CaptureControlDetail(child, node, reason);
+    TraceCaptureStage(child, L"classify");
+    if (!ClassifyControl(child, node.kind, reason)) return false;
+    TraceCaptureStage(child, L"identity");
+    if (!AssignNodeIdentity(child, context, node, reason)) return false;
+    TraceCaptureStage(child, L"facets");
+    if (!CaptureCommonNodeFacets(child, scope, node, reason)) return false;
+    TraceCaptureStage(child, L"detail");
+    return CaptureControlDetail(child, node, reason);
 }
 
 // A WS_VISIBLE child draws nothing when its ancestors' client areas clip it away
@@ -710,6 +756,16 @@ bool CapturedChild(HWND root, HWND child) noexcept {
         DrawsInsideRoot(root, child) && !IsHiddenTabStrip(child);
 }
 
+// The outermost window between `child` and `root` that a sibling above covers but for
+// its edges, or null.
+HWND OutermostObscuredHost(HWND root, HWND child) noexcept {
+    HWND host = nullptr;
+    for (HWND current = child; current && current != root; current = GetParent(current)) {
+        if (ObscuredBySiblingAbove(current)) host = current;
+    }
+    return host;
+}
+
 bool ProbeChildOnOwner(HWND root, HWND child, bool& kept, ControlKind& kind, std::wstring& reason) {
     struct Probe final { bool kept = false; bool valid = true; ControlKind kind{}; std::wstring error; };
     auto probe = std::make_shared<Probe>();
@@ -743,6 +799,7 @@ bool CaptureChildNodes(
     std::wstring firstRejection;
     size_t rejections = 0;
     std::unordered_set<HWND> keptChildren;
+    std::unordered_set<HWND> droppedHosts;
     std::vector<HWND> nativeDocuments;
     for (const HWND child : enumeration.handles) {
         DWORD childProcess = 0;
@@ -772,6 +829,14 @@ bool CaptureChildNodes(
             }
             continue;
         }
+        // What the capture cannot project inside a host a sibling covers but for its
+        // edges is never on screen; the whole host is left out instead of the window.
+        // A covered host whose content is supported keeps its nodes, since a covered
+        // control is still reachable from the keyboard.
+        if (const HWND host = OutermostObscuredHost(root, child)) {
+            droppedHosts.insert(host);
+            continue;
+        }
         AppendWindowEvidence(child, childReason);
         if (rejections++ < 8) {
             try {
@@ -784,6 +849,13 @@ bool CaptureChildNodes(
         reason = std::move(firstRejection);
         return false;
     }
+    if (!droppedHosts.empty()) {
+        std::erase_if(keptChildren, [&](HWND child) {
+            return std::any_of(droppedHosts.begin(), droppedHosts.end(), [child](HWND host) {
+                return child == host || IsChild(host, child);
+            });
+        });
+    }
     std::unordered_map<HWND, int> tabIndexes;
     if (!CaptureNativeTabOrder(root, enumeration.handles, tabIndexes, reason)) return false;
 
@@ -795,6 +867,8 @@ bool CaptureChildNodes(
     scope.tabIndexes = &tabIndexes;
     scope.visibleNodeIds = &visibleNodeIds;
     scope.visibleNodeKinds = &visibleNodeKinds;
+    int nextExtraTabIndex = static_cast<int>(tabIndexes.size());
+    scope.nextExtraTabIndex = &nextExtraTabIndex;
     for (const HWND child : enumeration.handles) {
         if (!keptChildren.contains(child)) continue;
         // The menu-bar toolbar is projected as the surface's menu, so it must not also
@@ -1166,6 +1240,7 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.itemNativeIds.size());
         for (const uint32_t nativeId : node.itemNativeIds) HashBytes(hash, nativeId);
         HashBytes(hash, node.itemActivationSupported);
+        HashBytes(hash, node.itemDefaultActivation);
         HashBytes(hash, node.columns.size());
         for (const auto& column : node.columns) HashString(hash, column);
         HashBytes(hash, node.columnWidths.size());
@@ -1177,6 +1252,8 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, row.size());
             for (const auto& cell : row) HashString(hash, cell);
         }
+        HashBytes(hash, node.itemCount);
+        HashBytes(hash, node.itemWindowStart);
         HashBytes(hash, node.columnHeadersVisible);
         HashBytes(hash, node.checkBoxes);
         HashBytes(hash, node.checkedIndices.size());
@@ -1288,6 +1365,93 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, item.imageData.size());
             if (!item.imageData.empty())
                 HashRange(hash, item.imageData.data(), item.imageData.size());
+        }
+        HashBytes(hash, node.richParagraphs.size());
+        for (const auto& paragraph : node.richParagraphs) {
+            HashString(hash, paragraph.alignment);
+            HashBytes(hash, paragraph.bullet);
+            HashBytes(hash, paragraph.leftIndent);
+            HashBytes(hash, paragraph.firstLineIndent);
+            HashBytes(hash, paragraph.spaceBefore);
+            HashBytes(hash, paragraph.spaceAfter);
+            HashBytes(hash, paragraph.runs.size());
+            for (const auto& run : paragraph.runs) {
+                HashString(hash, run.text);
+                HashBytes(hash, run.bold);
+                HashBytes(hash, run.italic);
+                HashBytes(hash, run.underline);
+                HashBytes(hash, run.strike);
+                HashBytes(hash, run.size);
+                HashBytes(hash, run.color);
+            }
+        }
+        HashBytes(hash, node.performanceGraph.has_value());
+        if (node.performanceGraph) {
+            const auto& graph = *node.performanceGraph;
+            HashString(hash, graph.displayType);
+            HashBytes(hash, graph.minimum);
+            HashBytes(hash, graph.maximum);
+            HashBytes(hash, graph.sampleCount);
+            HashBytes(hash, graph.intervalMs);
+            HashBytes(hash, graph.scroll);
+            HashBytes(hash, graph.barSlot);
+            HashBytes(hash, graph.wrapped);
+            HashBytes(hash, graph.startTimeMs);
+            HashBytes(hash, graph.endTimeMs);
+            HashBytes(hash, graph.showVerticalGrid);
+            HashBytes(hash, graph.showHorizontalGrid);
+            HashBytes(hash, graph.showScaleLabels);
+            HashBytes(hash, graph.showTimeLabels);
+            HashString(hash, graph.title);
+            HashString(hash, graph.yAxisLabel);
+            HashBytes(hash, graph.backColor);
+            HashBytes(hash, graph.controlColor);
+            HashBytes(hash, graph.gridColor);
+            HashBytes(hash, graph.textColor);
+            HashBytes(hash, graph.barColor);
+            HashBytes(hash, graph.series.size());
+            for (const auto& series : graph.series) {
+                HashString(hash, series.name);
+                HashBytes(hash, series.color);
+                HashBytes(hash, series.width);
+                HashString(hash, series.style);
+                HashBytes(hash, series.scale);
+                HashBytes(hash, series.visible);
+                HashBytes(hash, series.highlighted);
+                HashBytes(hash, series.values.size());
+                for (const auto& value : series.values) {
+                    HashBytes(hash, value.has_value());
+                    if (value) HashBytes(hash, *value);
+                }
+            }
+        }
+        HashBytes(hash, node.performanceLegend.has_value());
+        if (node.performanceLegend) {
+            const auto& legend = *node.performanceLegend;
+            HashString(hash, legend.displayType);
+            HashBytes(hash, legend.columns.size());
+            for (const auto& column : legend.columns) {
+                HashString(hash, column.title);
+                HashBytes(hash, column.width);
+            }
+            HashBytes(hash, legend.rows.size());
+            for (const auto& row : legend.rows) {
+                HashBytes(hash, row.visible);
+                HashBytes(hash, row.color);
+                HashBytes(hash, row.width);
+                HashString(hash, row.style);
+                HashBytes(hash, row.selected);
+                HashBytes(hash, row.cells.size());
+                for (const auto& cell : row.cells) HashString(hash, cell);
+            }
+        }
+        HashBytes(hash, node.performanceValueBar.has_value());
+        if (node.performanceValueBar) {
+            HashBytes(hash, node.performanceValueBar->fields.size());
+            for (const auto& field : node.performanceValueBar->fields) {
+                HashString(hash, field.label);
+                HashString(hash, field.value);
+            }
         }
         HashString(hash, node.pageId);
         HashString(hash, node.semanticKey);

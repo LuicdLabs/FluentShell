@@ -52,6 +52,26 @@ public sealed class ListViewGroupTests
     }
 
     [Fact]
+    public void OnlyItemsNearTheNativeViewportAreBuilt()
+    {
+        // A 360 x 200 viewport: items within two viewports either side of it are built.
+        static PixelRect At(int x, int y, int width = 340, int height = 24) =>
+            new() { X = x, Y = y, Width = width, Height = height };
+        Assert.True(ListViewPresentation.InBuildWindow(At(0, 22), 360, 200));
+        Assert.True(ListViewPresentation.InBuildWindow(At(0, 600), 360, 200));
+        Assert.False(ListViewPresentation.InBuildWindow(At(0, 601), 360, 200));
+        Assert.True(ListViewPresentation.InBuildWindow(At(0, -424), 360, 200));
+        Assert.False(ListViewPresentation.InBuildWindow(At(0, -425), 360, 200));
+        Assert.True(ListViewPresentation.InBuildWindow(At(1080, 10), 360, 200));
+        Assert.False(ListViewPresentation.InBuildWindow(At(1081, 10), 360, 200));
+        // An item with no extent is collapsed in the native list (a group's rows, folded), so it is not built.
+        Assert.False(ListViewPresentation.InBuildWindow(At(0, 22, width: 0), 360, 200));
+        Assert.False(ListViewPresentation.InBuildWindow(At(0, 22, height: 0), 360, 200));
+        // Without a viewport to judge by, everything with an extent is built.
+        Assert.True(ListViewPresentation.InBuildWindow(At(0, 5000), 0, 0));
+    }
+
+    [Fact]
     public void UngroupedRowsRemainHiddenAndGroupReorderDoesNotRenumberItems()
     {
         var node = Grouped() with { ItemGroupIds = ["-2", "17"] };

@@ -333,7 +333,12 @@ public class ProtocolValidatorTests
         snapshot.Nodes.Add(child);
         ProtocolValidator.ValidateSnapshot(snapshot);
 
+        // A Windows Forms GroupBox owns its controls as child windows, so it is a container too.
         snapshot.Nodes[0] = NodeOfKind("groupBox") with { NodeId = "10", ZIndex = 0 };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // A control that frames nothing is not a parent.
+        snapshot.Nodes[0] = NodeOfKind("checkBox") with { NodeId = "10", ZIndex = 0 };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
 
         snapshot.Nodes.Clear();

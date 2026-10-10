@@ -40,14 +40,22 @@ internal sealed class ListViewGroupHeader : Button
         RequestExpanded = request;
         MinWidth = MinHeight = 0;
         Padding = new Thickness(4, 0, 4, 0);
+        // A native group heading is a line of text with a chevron, not a raised button: the button's
+        // chrome stays out of its resting state (hover and pressed still show it).
+        Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        BorderThickness = new Thickness(0);
         HorizontalContentAlignment = HorizontalAlignment.Stretch;
         IsTabStop = group.Collapsible;
-        Content = new TextBlock
+        var label = new TextBlock
         {
             Text = (group.Collapsible ? group.Collapsed ? "›  " : "⌄  " : string.Empty) + group.Header,
             TextAlignment = ListViewGroupPresentation.Alignment(group.HeaderAlignment),
             VerticalAlignment = VerticalAlignment.Center,
         };
+        // The heading is named and operated through the button; its caption is not a second element,
+        // which a list of a few hundred groups would otherwise triple.
+        AutomationProperties.SetAccessibilityView(label, AccessibilityView.Raw);
+        Content = label;
         AutomationProperties.SetName(this, group.Header);
         AutomationProperties.SetAutomationId(this, "fls-group-" + group.GroupId);
         Click += (_, _) => { if (group.Collapsible) request(group.Collapsed); };

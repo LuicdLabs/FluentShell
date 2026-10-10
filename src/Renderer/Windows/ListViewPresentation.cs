@@ -1,4 +1,5 @@
 using FluentShell.Renderer.Protocol;
+using FluentShell.Renderer.Runtime;
 using FluentShell.Renderer.ViewModels;
 using System.ComponentModel;
 using Microsoft.UI.Xaml;
@@ -12,6 +13,46 @@ namespace FluentShell.Renderer.Windows;
 
 internal static class ListViewPresentation
 {
+    // Minor 33: a windowed virtual list shows its carried rows between two spacers that
+    // stand for the rows it does not carry, so the scroll extent is the whole list's.
+
+    // The row at the top of the viewport, from the list's scroll offset.
+    internal static int RowAtOffset(double verticalOffset, double headerHeight, double rowHeight, int rowCount)
+    {
+        if (rowCount <= 0 || rowHeight <= 0 || double.IsNaN(verticalOffset)) return 0;
+        var row = Math.Floor(Math.Max(0, verticalOffset - headerHeight) / rowHeight);
+        return (int)Math.Clamp(row, 0, rowCount - 1);
+    }
+
+    // Whether the rows on screen, with a margin either side, lie inside the carried
+    // window.  The margin asks for the next window before any spacer comes into view.
+    internal static bool WindowCovers(int windowStart, int carried, int firstVisible, int visibleRows,
+        int rowCount, int margin)
+    {
+        var first = Math.Max(0, firstVisible - margin);
+        var last = Math.Min(rowCount, (long)firstVisible + visibleRows + margin);
+        return first >= windowStart && last <= (long)windowStart + carried;
+    }
+
+    // The spacer heights above and below the carried rows.
+    internal static (double Above, double Below) SpacerHeights(int windowStart, int carried, int rowCount,
+        double rowHeight) =>
+        (Math.Max(0, windowStart) * rowHeight, Math.Max(0, rowCount - windowStart - carried) * rowHeight);
+
+    // A positioned list is a Canvas holding every item of the native list, wherever its scroll position
+    // puts it, and the accessibility provider has to describe each one that exists: a list of a couple of
+    // hundred counter sets (Performance Monitor's Add Counters) kept it busy for seconds. Only an item that
+    // is shown, or lies within two viewports of the native viewport, is built; native scrolling recaptures
+    // the list and builds the rest as the viewport reaches it. The rectangle is in the list's client
+    // coordinates, so the native viewport is (0, 0, viewportWidth, viewportHeight).
+    internal static bool InBuildWindow(PixelRect rect, int viewportWidth, int viewportHeight)
+    {
+        if (rect.Width == 0 || rect.Height == 0) return false;
+        if (viewportWidth <= 0 || viewportHeight <= 0) return true;
+        return rect.Y + rect.Height >= -2 * viewportHeight && rect.Y <= 3 * viewportHeight &&
+            rect.X + rect.Width >= -2 * viewportWidth && rect.X <= 3 * viewportWidth;
+    }
+
     internal static IEnumerable<int> SelectionRange(int itemCount, int anchor, int destination)
     {
         if (itemCount <= 0 || destination < 0 || destination >= itemCount) return [];
@@ -153,22 +194,31 @@ internal sealed class ListViewActivationCoordinator : IDisposable
 
     internal void Request(int index)
     {
-        Cancel();
+        Cancel("a new request");
         if (_disposed || _applyingCanonical() || !_node.ItemActivationSupported ||
-            !_allows("activateItem") || index < 0 || index >= _node.ItemNativeIds.Count) return;
+            !_allows("activateItem") || index < 0 || index >= _node.ItemNativeIds.Count)
+        {
+            RendererDiagnostics.Log($"list activation node={_node.NodeId} index={index} not requested " +
+                $"(disposed={_disposed} applying={_applyingCanonical()} supported={_node.ItemActivationSupported} " +
+                $"allowed={_allows("activateItem")} ids={_node.ItemNativeIds.Count})");
+            return;
+        }
         _intent = new(index, _node.ItemNativeIds[index]);
         Flush();
     }
 
-    internal void Cancel()
+    // A gesture that is dropped says why: a double-click that does nothing has to be explainable from the log.
+    internal void Cancel(string reason = "")
     {
+        if (_intent is { } dropped && reason.Length != 0)
+            RendererDiagnostics.Log($"list activation node={_node.NodeId} index={dropped.Index} dropped: {reason}");
         _intent = null;
         _selectionRequested = _focusRequested = false;
     }
 
     private void OnRejected(string property)
     {
-        if (property is "selectedIndices" or "focusedIndex") Cancel();
+        if (property is "selectedIndices" or "focusedIndex") Cancel($"{property} was rejected");
     }
 
     private void OnCanonicalChanged(object? sender, PropertyChangedEventArgs args)
@@ -186,7 +236,7 @@ internal sealed class ListViewActivationCoordinator : IDisposable
             _flushQueued = false;
             Flush();
         });
-        if (!_flushQueued) Cancel();
+        if (!_flushQueued) Cancel("the dispatcher refused the continuation");
     }
 
     private void Flush()
@@ -197,7 +247,7 @@ internal sealed class ListViewActivationCoordinator : IDisposable
             ListViewActivationIntentPolicy.Decide(intent, _node.ItemNativeIds,
                 _node.SelectedIndices, _node.FocusedIndex) == ListViewActivationDecision.Drop)
         {
-            Cancel();
+            Cancel("the list or the item it named changed");
             return;
         }
         var selected = _node.SelectedIndices.Contains(intent.Index);
@@ -205,7 +255,7 @@ internal sealed class ListViewActivationCoordinator : IDisposable
         if ((_selectionRequested && !_node.HasPending("selectedIndices") && !selected) ||
             (_focusRequested && !_node.HasPending("focusedIndex") && !focused))
         {
-            Cancel();
+            Cancel("the native list did not select or focus the item");
             return;
         }
         if (!_selectionRequested)
@@ -233,7 +283,7 @@ internal sealed class ListViewActivationCoordinator : IDisposable
         if ((!selected && !_node.HasPending("selectedIndices")) ||
             (!focused && !_node.HasPending("focusedIndex")))
         {
-            Cancel();
+            Cancel("selection or focus could not be requested");
             return;
         }
         if (_node.HasPending("selectedIndices") || _node.HasPending("focusedIndex")) return;

@@ -88,6 +88,7 @@ internal sealed class DiskViewControl(Action<string, string> itemAction, Action<
     {
         protected override AutomationControlType GetAutomationControlTypeCore() => AutomationControlType.Group;
         protected override string GetClassNameCore() => "NativeDiskView";
+        protected override bool IsEnabledCore() => ControlFactory.NodeEnabled(owner);
         protected override object GetPatternCore(PatternInterface pattern) =>
             pattern == PatternInterface.Selection ? this : base.GetPatternCore(pattern);
         protected override global::Windows.Foundation.Rect GetBoundingRectangleCore() =>

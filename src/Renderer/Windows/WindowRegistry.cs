@@ -131,13 +131,28 @@ public sealed class WindowRegistry
 
     public void CloseAll()
     {
+        // Modal surfaces close before their owners, the deepest of a chain first (a Color
+        // chooser, then the property sheet that opened it, then the console): destroying an
+        // owner proxy first lets Win32 destroy the owned proxy underneath its WinUI Window,
+        // which then stalls the application's exit.
+        int ModalDepth(Guid surfaceId)
+        {
+            var depth = 0;
+            while (depth < 32 && _modalOwners.TryGetValue(surfaceId, out var owner))
+            {
+                surfaceId = owner;
+                ++depth;
+            }
+            return depth;
+        }
+        var ordered = _windows
+            .OrderByDescending(pair => ModalDepth(pair.Key))
+            .ThenByDescending(pair => pair.Value.ViewModel.Modal)
+            .ToArray();
         _modalOwners.Clear();
         _modalOwnerBlockCounts.Clear();
         _modalOwnerWasBlocked.Clear();
-        // Modal surfaces close before their owners: destroying an owner proxy first lets
-        // Win32 destroy the owned proxy underneath its WinUI Window, which then stalls the
-        // application's exit.
-        foreach (var (surfaceId, window) in _windows.OrderByDescending(pair => pair.Value.ViewModel.Modal).ToArray())
+        foreach (var (surfaceId, window) in ordered)
         {
             _retiredSurfaces.Remember(surfaceId);
             window.CloseFromBridge();

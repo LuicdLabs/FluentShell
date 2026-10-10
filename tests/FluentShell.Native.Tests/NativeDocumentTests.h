@@ -212,8 +212,6 @@ inline void CheckCensus(void (*check)(bool, const char*)) {
         const wchar_t* alternativeReason = nullptr;
     };
     const Rejection cases[] = {
-        {L"<div id='Extra'>Unrepresented <span>child text</span></div>", nullptr,
-            L"text outside its represented semantics", "native document dropped mixed parent text"},
         {L"<div id='Extra'><input value='Editable'></div>", nullptr,
             L"unrepresented element", "native document silently discarded an input control",
             L"element style or editing semantics"},
@@ -236,6 +234,37 @@ inline void CheckCensus(void (*check)(bool, const char*)) {
             std::wcerr << L"Native document unexpected admission/reason: " << reason << L'\n';
         check(!admitted && expectedReason, test.scenario);
     }
+}
+
+// A link followed by the rest of its sentence (views.htm's "<a>Start</a> the service") is
+// mixed content: the verb is a link item, and each run of loose text beside it is a text
+// item at the box the page laid it out in. Nothing is dropped, and MMC's two page-chrome
+// objects (the title notch and the event sink) are inert rather than refused reports.
+inline void CheckMixedContent(void (*check)(bool, const char*)) {
+    Fixture fixture;
+    if (!Load(fixture, L"<div id='Extra'>Before <a id='Verb' href='#verb'>verb</a> after<br>next line</div>"
+            L"<object id='MMCEvents' classid='clsid:ADE6444B-C91F-4e37-92A4-5BB430A33340'></object>", check))
+        return;
+    NativeDocumentSnapshot snapshot;
+    if (!Capture(fixture, snapshot, check)) return;
+    const int before = FindItem(snapshot, L"text", L"Before");
+    const int verb = FindItem(snapshot, L"link", L"verb");
+    const int after = FindItem(snapshot, L"text", L"after");
+    const int next = FindItem(snapshot, L"text", L"next line");
+    check(before >= 0 && verb >= 0 && after >= 0 && next >= 0,
+        "native document dropped loose text beside an inline link");
+    if (before < 0 || verb < 0 || after < 0 || next < 0) return;
+    const RECT& b = snapshot.items[before].rect;
+    const RECT& v = snapshot.items[verb].rect;
+    const RECT& a = snapshot.items[after].rect;
+    const RECT& n = snapshot.items[next].rect;
+    check(b.right <= v.left + 2 && v.right <= a.left + 2 && std::abs(b.top - v.top) <= 4 &&
+            std::abs(a.top - v.top) <= 4,
+        "loose text runs were not placed beside their link on its line");
+    check(n.top >= v.bottom - 2 && n.left <= v.left,
+        "loose text after a line break was not placed on the following line");
+    check(snapshot.items[verb].actionIdentity.size() != 0,
+        "the link beside loose text lost its action");
 }
 
 inline void CheckCancellationAndRetirement(void (*check)(bool, const char*)) {
@@ -303,10 +332,37 @@ inline void CheckCancellationAndRetirement(void (*check)(bool, const char*)) {
         "native document reused retired document or action identity after recapture");
 }
 
+// An image a trusted System32 module carries as a resource -- Performance Monitor's
+// res://wdc.dll/perfmon.gif inside an image-only link -- is decoded from that resource,
+// placed at its own layout box inside the item, whatever the host painted.
+inline void CheckResourceImage(void (*check)(bool, const char*)) {
+    Fixture fixture;
+    if (!Load(fixture, L"<a id='Glyph' href='#glyph' style='position:absolute;left:400px;top:46px;"
+            L"width:40px;height:40px;display:block;'><img src='res://wdc.dll/perfmon.gif' "
+            L"style='position:absolute;left:4px;top:4px;width:32px;height:32px;border:0'/></a>", check)) return;
+    NativeDocumentSnapshot snapshot;
+    if (!Capture(fixture, snapshot, check)) return;
+    const auto glyph = std::find_if(snapshot.items.begin(), snapshot.items.end(), [](const auto& item) {
+        return item.kind == L"link" && item.image.has_value();
+    });
+    check(glyph != snapshot.items.end() && glyph->image->imageWidth == 40 && glyph->image->imageHeight == 40 &&
+        glyph->image->imageData.size() == 40u * 40u * 4u,
+        "a res:// image of a System32 module was not decoded into its link's box");
+    if (glyph == snapshot.items.end() || glyph->image->imageData.size() != 40u * 40u * 4u) return;
+    const auto alphaAt = [&](int x, int y) { return glyph->image->imageData[(static_cast<size_t>(y) * 40 + x) * 4 + 3]; };
+    bool painted = false;
+    for (int y = 4; y < 36 && !painted; ++y)
+        for (int x = 4; x < 36 && !painted; ++x) painted = alphaAt(x, y) != 0;
+    check(painted && alphaAt(0, 0) == 0 && alphaAt(39, 39) == 0,
+        "a decoded resource image was not placed at its own layout box inside the link");
+}
+
 inline void Run(void (*check)(bool, const char*)) {
     CheckSemanticsAndIdentity(check);
     CheckCensus(check);
+    CheckMixedContent(check);
     CheckCancellationAndRetirement(check);
+    CheckResourceImage(check);
 }
 
 } // namespace NativeDocumentTests

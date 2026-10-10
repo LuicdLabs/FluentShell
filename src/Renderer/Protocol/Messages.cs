@@ -200,6 +200,9 @@ public sealed record ControlNode
     public List<string>? ItemGroupIds { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ItemActivationSupported { get; init; }
+    // Minor 34: a ListView or TreeView item may be opened (openItem: the control is sent Enter).
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ItemDefaultActivation { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<string>? ItemNativeIds { get; init; }
     public List<string> Columns { get; init; } = [];
@@ -207,6 +210,12 @@ public sealed record ControlNode
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<int>? ColumnOrder { get; init; }
     public List<List<string>> Rows { get; init; } = [];
+    // Minor 33: a large virtual report list carries the rows from ItemWindowStart on;
+    // ItemCount is the list's length and every index stays absolute.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ItemCount { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ItemWindowStart { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ColumnHeadersVisible { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -255,6 +264,14 @@ public sealed record ControlNode
     public NativeDocumentSnapshot? Document { get; init; }
     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
     public DiskViewSnapshot? DiskView { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public RichTextSnapshot? RichText { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PerformanceGraphSnapshot? PerformanceGraph { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PerformanceLegendSnapshot? PerformanceLegend { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PerformanceValueBarSnapshot? PerformanceValueBar { get; init; }
     public string? AdapterId { get; init; }
     public string? PageId { get; init; }
     public string? SemanticKey { get; init; }

@@ -161,10 +161,59 @@ struct Fixture final {
     }
 };
 
+// A dialog procedure says it handled WM_DRAWITEM by returning TRUE, which the sender reads back as the dialog's
+// DWL_MSGRESULT -- 0 -- so the result alone cannot tell a painted item from an ignored one.
+inline INT_PTR CALLBACK DrawingDialogProc(HWND, UINT message, WPARAM, LPARAM lParam) {
+    if (message == WM_MEASUREITEM && lParam) {
+        reinterpret_cast<MEASUREITEMSTRUCT*>(lParam)->itemHeight = 16;
+        return TRUE;
+    }
+    if (message == WM_DRAWITEM && lParam) {
+        const auto& draw = *reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        HBRUSH brush = CreateSolidBrush(RGB(10, 30, 180));
+        FillRect(draw.hDC, &draw.rcItem, brush);
+        DeleteObject(brush);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 } // namespace OwnerDrawCombos
 
 inline void TestOwnerDrawComboBoxes(void (*check)(bool, const char*)) {
     using namespace OwnerDrawCombos;
+    {
+        alignas(DWORD) BYTE bytes[64]{};
+        auto* dialogTemplate = reinterpret_cast<DLGTEMPLATE*>(bytes);
+        dialogTemplate->style = WS_POPUP | DS_MODALFRAME;
+        dialogTemplate->cx = 200;
+        dialogTemplate->cy = 120;
+        HWND dialog = CreateDialogIndirectParamW(GetModuleHandleW(nullptr), dialogTemplate, nullptr,
+            DrawingDialogProc, 0);
+        HWND combo = dialog ? CreateWindowExW(0, L"ComboBox", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
+            10, 10, 180, 200, dialog, reinterpret_cast<HMENU>(732), GetModuleHandleW(nullptr), nullptr) : nullptr;
+        check(dialog && combo, "dialog-hosted owner-draw ComboBox could not be created");
+        if (combo) {
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"First"));
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Second"));
+            SendMessageW(combo, CB_SETCURSEL, 1, 0);
+            ControlNode node;
+            node.kind = ControlKind::ComboBox;
+            node.nodeId = 3;
+            node.generation = 1;
+            node.hwnd = combo;
+            node.style = static_cast<uint64_t>(GetWindowLongPtrW(combo, GWL_STYLE));
+            std::wstring error;
+            const bool captured = CaptureControlDetail(combo, node, error);
+            check(captured && node.ownerDrawCombo && node.ownerDrawCombo->items.size() == 2 &&
+                node.ownerDrawCombo->items[0].normal.imageData.size() >= 4 &&
+                node.ownerDrawCombo->items[0].normal.imageData[0] == 180 &&
+                node.ownerDrawCombo->items[0].normal.imageData[3] == 255,
+                "an owner-draw ComboBox whose dialog procedure painted its items was refused as unhandled");
+        }
+        if (dialog) DestroyWindow(dialog);
+    }
     for (DWORD mode : { CBS_OWNERDRAWFIXED, CBS_OWNERDRAWVARIABLE }) {
         Fixture fixture(CBS_DROPDOWNLIST | mode | CBS_HASSTRINGS);
         check(fixture.ready, "owner-draw ComboBox fixture could not initialize");

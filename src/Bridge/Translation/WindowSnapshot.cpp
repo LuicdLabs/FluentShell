@@ -276,6 +276,11 @@ JsonObject NodeToJson(const ControlNode& node) {
         result.Insert(L"columnOrder", columnOrder);
         result.Insert(L"columnHeadersVisible",
             JsonValue::CreateBooleanValue(node.columnHeadersVisible));
+        if (node.itemCount != 0) {
+            result.Insert(L"itemCount", JsonValue::CreateNumberValue(static_cast<double>(node.itemCount)));
+            result.Insert(L"itemWindowStart",
+                JsonValue::CreateNumberValue(static_cast<double>(node.itemWindowStart)));
+        }
         result.Insert(L"checkBoxes", JsonValue::CreateBooleanValue(node.checkBoxes));
         JsonArray checkedIndices;
         for (const int index : node.checkedIndices) {
@@ -322,6 +327,8 @@ JsonObject NodeToJson(const ControlNode& node) {
         result.Insert(L"itemStateImages", itemStateImages);
     }
     if (node.kind == ControlKind::TreeView || node.kind == ControlKind::ListView) {
+        if (node.itemDefaultActivation)
+            result.Insert(L"itemDefaultActivation", JsonValue::CreateBooleanValue(true));
         JsonArray imageList;
         for (const auto& entry : node.imageList) {
             JsonObject image;
@@ -482,6 +489,120 @@ JsonObject NodeToJson(const ControlNode& node) {
         }
         value.Insert(L"items", entries);
         result.Insert(L"diskView", value);
+    }
+    if (node.kind == ControlKind::RichText) {
+        JsonArray entries;
+        for (const auto& paragraph : node.richParagraphs) {
+            JsonObject value;
+            value.Insert(L"alignment", JsonValue::CreateStringValue(paragraph.alignment));
+            value.Insert(L"bullet", JsonValue::CreateBooleanValue(paragraph.bullet));
+            value.Insert(L"leftIndent", JsonValue::CreateNumberValue(paragraph.leftIndent));
+            value.Insert(L"firstLineIndent", JsonValue::CreateNumberValue(paragraph.firstLineIndent));
+            value.Insert(L"spaceBefore", JsonValue::CreateNumberValue(paragraph.spaceBefore));
+            value.Insert(L"spaceAfter", JsonValue::CreateNumberValue(paragraph.spaceAfter));
+            JsonArray runs;
+            for (const auto& source : paragraph.runs) {
+                JsonObject run;
+                run.Insert(L"text", JsonValue::CreateStringValue(source.text));
+                run.Insert(L"bold", JsonValue::CreateBooleanValue(source.bold));
+                run.Insert(L"italic", JsonValue::CreateBooleanValue(source.italic));
+                run.Insert(L"underline", JsonValue::CreateBooleanValue(source.underline));
+                run.Insert(L"strike", JsonValue::CreateBooleanValue(source.strike));
+                run.Insert(L"size", JsonValue::CreateNumberValue(source.size));
+                run.Insert(L"color", JsonValue::CreateNumberValue(static_cast<double>(source.color)));
+                runs.Append(run);
+            }
+            value.Insert(L"runs", runs);
+            entries.Append(value);
+        }
+        JsonObject content;
+        content.Insert(L"paragraphs", entries);
+        result.Insert(L"richText", content);
+    }
+    if (node.kind == ControlKind::PerformanceGraph && node.performanceGraph) {
+        const auto& graph = *node.performanceGraph;
+        JsonObject content;
+        content.Insert(L"displayType", JsonValue::CreateStringValue(graph.displayType));
+        content.Insert(L"minimum", JsonValue::CreateNumberValue(graph.minimum));
+        content.Insert(L"maximum", JsonValue::CreateNumberValue(graph.maximum));
+        content.Insert(L"sampleCount", JsonValue::CreateNumberValue(graph.sampleCount));
+        content.Insert(L"intervalMs", JsonValue::CreateNumberValue(graph.intervalMs));
+        content.Insert(L"scroll", JsonValue::CreateBooleanValue(graph.scroll));
+        content.Insert(L"barSlot", JsonValue::CreateNumberValue(graph.barSlot));
+        content.Insert(L"wrapped", JsonValue::CreateBooleanValue(graph.wrapped));
+        // Milliseconds since the Unix epoch fit a double exactly (about 1.8e12 against 9e15).
+        content.Insert(L"startTimeMs", JsonValue::CreateNumberValue(static_cast<double>(graph.startTimeMs)));
+        content.Insert(L"endTimeMs", JsonValue::CreateNumberValue(static_cast<double>(graph.endTimeMs)));
+        content.Insert(L"showVerticalGrid", JsonValue::CreateBooleanValue(graph.showVerticalGrid));
+        content.Insert(L"showHorizontalGrid", JsonValue::CreateBooleanValue(graph.showHorizontalGrid));
+        content.Insert(L"showScaleLabels", JsonValue::CreateBooleanValue(graph.showScaleLabels));
+        content.Insert(L"showTimeLabels", JsonValue::CreateBooleanValue(graph.showTimeLabels));
+        content.Insert(L"title", JsonValue::CreateStringValue(graph.title));
+        content.Insert(L"yAxisLabel", JsonValue::CreateStringValue(graph.yAxisLabel));
+        content.Insert(L"backColor", JsonValue::CreateNumberValue(graph.backColor));
+        content.Insert(L"controlColor", JsonValue::CreateNumberValue(graph.controlColor));
+        content.Insert(L"gridColor", JsonValue::CreateNumberValue(graph.gridColor));
+        content.Insert(L"textColor", JsonValue::CreateNumberValue(graph.textColor));
+        content.Insert(L"barColor", JsonValue::CreateNumberValue(graph.barColor));
+        JsonArray series;
+        for (const auto& source : graph.series) {
+            JsonObject line;
+            line.Insert(L"name", JsonValue::CreateStringValue(source.name));
+            line.Insert(L"color", JsonValue::CreateNumberValue(source.color));
+            line.Insert(L"width", JsonValue::CreateNumberValue(source.width));
+            line.Insert(L"style", JsonValue::CreateStringValue(source.style));
+            line.Insert(L"scale", JsonValue::CreateNumberValue(source.scale));
+            line.Insert(L"visible", JsonValue::CreateBooleanValue(source.visible));
+            line.Insert(L"highlighted", JsonValue::CreateBooleanValue(source.highlighted));
+            JsonArray values;
+            for (const auto& value : source.values) {
+                values.Append(value ? JsonValue::CreateNumberValue(*value) : JsonValue::CreateNullValue());
+            }
+            line.Insert(L"values", values);
+            series.Append(line);
+        }
+        content.Insert(L"series", series);
+        result.Insert(L"performanceGraph", content);
+    }
+    if (node.kind == ControlKind::PerformanceLegend && node.performanceLegend) {
+        const auto& legend = *node.performanceLegend;
+        JsonObject content;
+        content.Insert(L"displayType", JsonValue::CreateStringValue(legend.displayType));
+        JsonArray columns;
+        for (const auto& source : legend.columns) {
+            JsonObject column;
+            column.Insert(L"title", JsonValue::CreateStringValue(source.title));
+            column.Insert(L"width", JsonValue::CreateNumberValue(source.width));
+            columns.Append(column);
+        }
+        content.Insert(L"columns", columns);
+        JsonArray rows;
+        for (const auto& source : legend.rows) {
+            JsonObject row;
+            row.Insert(L"visible", JsonValue::CreateBooleanValue(source.visible));
+            row.Insert(L"color", JsonValue::CreateNumberValue(source.color));
+            row.Insert(L"width", JsonValue::CreateNumberValue(source.width));
+            row.Insert(L"style", JsonValue::CreateStringValue(source.style));
+            row.Insert(L"selected", JsonValue::CreateBooleanValue(source.selected));
+            JsonArray cells;
+            for (const auto& cell : source.cells) cells.Append(JsonValue::CreateStringValue(cell));
+            row.Insert(L"cells", cells);
+            rows.Append(row);
+        }
+        content.Insert(L"rows", rows);
+        result.Insert(L"performanceLegend", content);
+    }
+    if (node.kind == ControlKind::PerformanceValueBar && node.performanceValueBar) {
+        JsonObject content;
+        JsonArray fields;
+        for (const auto& source : node.performanceValueBar->fields) {
+            JsonObject field;
+            field.Insert(L"label", JsonValue::CreateStringValue(source.label));
+            field.Insert(L"value", JsonValue::CreateStringValue(source.value));
+            fields.Append(field);
+        }
+        content.Insert(L"fields", fields);
+        result.Insert(L"performanceValueBar", content);
     }
     if (node.kind == ControlKind::NativeDocument && node.document) {
         const auto& document = *node.document;
@@ -714,9 +835,9 @@ bool ParseActionValue(
     }
     if (action.action == L"setCheck" || action.action == L"select" ||
         action.action == L"setValue" || action.action == L"menuCommand" ||
-        action.action == L"toolbarCommand") {
+        action.action == L"toolbarCommand" || action.action == L"toolbarDropDown") {
         if (value.ValueType() != JsonValueType::Number) {
-            error = L"setCheck/select/setValue/menuCommand/toolbarCommand requires an integer value";
+            error = L"setCheck/select/setValue/menuCommand/toolbarCommand/toolbarDropDown requires an integer value";
             return false;
         }
         const double number = value.GetNumber();
@@ -727,7 +848,8 @@ bool ParseActionValue(
             return false;
         }
         action.integerValue = static_cast<int>(number);
-        if (action.action == L"menuCommand" || action.action == L"toolbarCommand") {
+        if (action.action == L"menuCommand" || action.action == L"toolbarCommand" ||
+            action.action == L"toolbarDropDown") {
             if (action.integerValue <= 0 || action.integerValue > 0xffff) {
                 error = L"command ID is outside WM_COMMAND range";
                 return false;
@@ -765,15 +887,18 @@ bool ParseActionValue(
         action.itemIndex = static_cast<int>(index);
         return true;
     }
-    if (action.action == L"setFocusedIndex") {
+    // A windowed virtual list keeps absolute indices, so focus and the top row can
+    // name any of its rows.
+    if (action.action == L"setFocusedIndex" || action.action == L"setTopIndex") {
         if (value.ValueType() != JsonValueType::Number) {
-            error = L"setFocusedIndex requires an integer item index";
+            error = action.action + L" requires an integer item index";
             return false;
         }
         const double index = value.GetNumber();
+        const double minimum = action.action == L"setFocusedIndex" ? -1 : 0;
         if (!std::isfinite(index) || std::trunc(index) != index ||
-            index < -1 || index >= static_cast<double>(Ipc::kMaxListItems)) {
-            error = L"setFocusedIndex index is outside range";
+            index < minimum || index >= static_cast<double>(Ipc::kMaxVirtualListItems)) {
+            error = action.action + L" index is outside range";
             return false;
         }
         action.itemIndex = static_cast<int>(index);
@@ -833,9 +958,10 @@ bool ParseActionValue(
         }
         return true;
     }
-    // contextMenu carries the item's label as a witness: the request is rebased onto
-    // the current revision and refused if that index now names a different item.
-    if (action.action == L"setItemText" || action.action == L"contextMenu") {
+    // contextMenu and openItem carry the item's label as a witness: the request is rebased
+    // onto the current revision and refused if that index now names a different item.
+    const bool itemRequest = action.action == L"contextMenu" || action.action == L"openItem";
+    if (action.action == L"setItemText" || itemRequest) {
         if (value.ValueType() != JsonValueType::Object) {
             error = action.action + L" requires an object value";
             return false;
@@ -847,8 +973,8 @@ bool ParseActionValue(
             return false;
         }
         LONG index = -1;
-        if (!JsonInteger(object, L"index", index) || index < 0 ||
-            static_cast<size_t>(index) >= Ipc::kMaxListItems) {
+        const size_t limit = itemRequest ? Ipc::kMaxVirtualListItems : Ipc::kMaxListItems;
+        if (!JsonInteger(object, L"index", index) || index < 0 || static_cast<size_t>(index) >= limit) {
             error = action.action + L" index is outside range";
             return false;
         }
@@ -1120,6 +1246,8 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::StaticDecoration: return L"staticDecoration";
     case ControlKind::StaticBitmap: return L"staticBitmap";
     case ControlKind::UpDown: return L"upDown";
+    case ControlKind::DatePicker: return L"datePicker";
+    case ControlKind::TimePicker: return L"timePicker";
     case ControlKind::Separator: return L"separator";
     case ControlKind::Button: return L"button";
     case ControlKind::CheckBox: return L"checkBox";
@@ -1145,6 +1273,10 @@ const wchar_t* ControlKindName(ControlKind kind) noexcept {
     case ControlKind::AccessibleIsland: return L"accessibleIsland";
     case ControlKind::NativeDocument: return L"nativeDocument";
     case ControlKind::DiskView: return L"diskView";
+    case ControlKind::RichText: return L"richText";
+    case ControlKind::PerformanceGraph: return L"performanceGraph";
+    case ControlKind::PerformanceLegend: return L"performanceLegend";
+    case ControlKind::PerformanceValueBar: return L"performanceValueBar";
     }
     return L"static";
 }
@@ -1161,36 +1293,81 @@ bool IsProjectedContainerKind(ControlKind kind) noexcept {
     case ControlKind::PaneContainer:
     // Windows Forms parents its TabPage windows to the tab control itself.
     case ControlKind::TabControl:
+    // A Windows Forms GroupBox is a window its controls are children of, unlike a Win32 group
+    // box, whose controls are siblings drawn over it.
+    case ControlKind::GroupBox:
         return true;
     default:
         return false;
     }
 }
 
+namespace {
+
+// An unowned dialog the application runs modally: Windows Forms' ShowDialog() with no owner
+// parents the form to the desktop when no window of its thread is active (the projection's
+// proxy holds the foreground), and disables the thread's other top-level windows instead of
+// owning-chain blocking them.  That disabled window is the dialog's owner in everything but
+// the handle: the proxy blocks it exactly as it blocks a real owner.  Only a dialog-framed
+// window qualifies, so a main frame is never mistaken for a dialog of a disabled peer.
+HWND ModalPeerOwner(HWND window) noexcept {
+    if (!window || !IsWindowVisible(window) || !IsWindowEnabled(window) ||
+        GetAncestor(window, GA_ROOT) != window) return nullptr;
+    wchar_t className[16]{};
+    GetClassNameW(window, className, static_cast<int>(std::size(className)));
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE));
+    if ((exStyle & WS_EX_DLGMODALFRAME) == 0 && wcscmp(className, L"#32770") != 0) return nullptr;
+    struct Search final {
+        HWND window;
+        HWND found = nullptr;
+    } search{ window };
+    // The thread's windows come top of the z-order first: the disabled one nearest below
+    // the dialog is the window it was opened over.
+    EnumThreadWindows(GetWindowThreadProcessId(window, nullptr), [](HWND candidate, LPARAM raw) -> BOOL {
+        auto& search = *reinterpret_cast<Search*>(raw);
+        RECT bounds{};
+        if (candidate == search.window || !IsWindowVisible(candidate) || IsWindowEnabled(candidate) ||
+            GetAncestor(candidate, GA_ROOT) != candidate || !GetWindowRect(candidate, &bounds) ||
+            IsRectEmpty(&bounds)) return TRUE;
+        // A window the dialog itself owns is no owner of it, and a disabled window that is
+        // itself owned belongs to a deeper graph the projection does not reproduce.
+        const HWND owner = GetWindow(candidate, GW_OWNER);
+        if (owner && owner != GetDesktopWindow()) return TRUE;
+        search.found = candidate;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
+} // namespace
+
 // An owner holds the screen only while it is visible and has area.  A zero-size
 // visible popup is the classic invisible owner (odbcad32's ODBCAdmClass64), so it is
-// skipped exactly like a hidden one.
+// skipped exactly like a hidden one.  The desktop is where every unowned window lives,
+// never an owner (a Windows Forms dialog without an owner is parented to it).
 HWND EffectiveTopLevelOwner(HWND window) noexcept {
     HWND owner = window ? GetWindow(window, GW_OWNER) : nullptr;
+    const HWND desktop = GetDesktopWindow();
     for (size_t depth = 0; owner && depth < 256; ++depth) {
         RECT bounds{};
-        if (IsWindowVisible(owner) && GetWindowRect(owner, &bounds) && !IsRectEmpty(&bounds))
+        if (owner != desktop && IsWindowVisible(owner) && GetWindowRect(owner, &bounds) && !IsRectEmpty(&bounds))
             return owner;
         const HWND next = GetWindow(owner, GW_OWNER);
         if (next == owner) break;
         owner = next;
     }
-    return nullptr;
+    return ModalPeerOwner(window);
 }
 
 bool IsModalOwnedTopLevel(HWND window) noexcept {
     const HWND owner = EffectiveTopLevelOwner(window);
-    // One level of owner graph only.  A dialog whose owner is itself owned inherits
-    // DWM cloaking from that owner (DWM_CLOAKED_INHERITED), so a refusal could not
-    // show it again, and the foreground slot the committed gate requires stays with
-    // the native chain instead of moving to the proxy.
-    return owner != nullptr && IsWindowEnabled(owner) == FALSE &&
-        EffectiveTopLevelOwner(owner) == nullptr;
+    // The dialog manager states modality by disabling the owner.  The owner may itself
+    // be an owned dialog (a Color chooser opened from a property sheet opened from a
+    // console): such a chain is projected one dialog at a time, each proxy owned by
+    // the proxy beneath it, and handed back to native as a whole when one is refused
+    // (a dialog owned by a cloaked window inherits DWM_CLOAKED_INHERITED, so the owners
+    // are uncloaked together with it).
+    return owner != nullptr && IsWindowEnabled(owner) == FALSE;
 }
 
 const wchar_t* SurfaceKindName(SurfaceKind kind) noexcept {
@@ -1432,8 +1609,8 @@ bool ParseActionInvoke(
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
             L"setSelection", L"setFocusedIndex", L"setItemCheck", L"setItemText", L"activateItem", L"scrollBy", L"setValue", L"setExpand",
             L"setSplit", L"setColumnOrder", L"setGroupExpanded", L"islandInvoke", L"htmlInvoke", L"htmlScroll",
-            L"diskSelect", L"diskContext", L"diskScroll", L"contextMenu", L"setScroll",
-            L"menuCommand", L"popupCommand", L"toolbarCommand", L"mdiCommand",
+            L"diskSelect", L"diskContext", L"diskScroll", L"contextMenu", L"openItem", L"setScroll", L"setTopIndex",
+            L"menuCommand", L"popupCommand", L"toolbarCommand", L"toolbarDropDown", L"mdiCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -1452,8 +1629,10 @@ bool ParseActionInvoke(
             action.action == L"setGroupExpanded" ||
             action.action == L"islandInvoke" || action.action == L"htmlInvoke" || action.action == L"htmlScroll" ||
             action.action == L"diskSelect" || action.action == L"diskContext" || action.action == L"diskScroll" ||
-            action.action == L"contextMenu" || action.action == L"setScroll" ||
-            action.action == L"toolbarCommand" || action.action == L"mdiCommand";
+            action.action == L"contextMenu" || action.action == L"openItem" || action.action == L"setScroll" ||
+            action.action == L"setTopIndex" ||
+            action.action == L"toolbarCommand" || action.action == L"toolbarDropDown" ||
+            action.action == L"mdiCommand";
         if (requiresNode != action.nodeId.has_value()) {
             error = L"action.invoke nodeId does not match action semantics";
             return false;
@@ -1666,6 +1845,13 @@ bool ValidateActionForSnapshot(
         error = L"setCheck value is invalid for the node kind";
         return false;
     }
+    if (action.action == L"select" && node.kind == ControlKind::PerformanceLegend) {
+        // The legend always has a selected counter to show, so only a row can be chosen.
+        if (node.performanceLegend && action.integerValue >= 0 &&
+            static_cast<size_t>(action.integerValue) < node.performanceLegend->rows.size()) return true;
+        error = L"select names a counter the legend does not list";
+        return false;
+    }
     if (action.action == L"select") {
         // A tab control and a populated tree name an existing item. An empty
         // tree has nothing to select. A list or combo box can legitimately have
@@ -1682,8 +1868,9 @@ bool ValidateActionForSnapshot(
         return false;
     }
     if (action.action == L"setValue") {
-        if (node.kind != ControlKind::Slider && node.kind != ControlKind::UpDown) {
-            error = L"setValue requires a Trackbar or UpDown node";
+        if (node.kind != ControlKind::Slider && node.kind != ControlKind::UpDown &&
+            node.kind != ControlKind::DatePicker && node.kind != ControlKind::TimePicker) {
+            error = L"setValue requires a Trackbar, UpDown, or date/time picker node";
             return false;
         }
         if (action.integerValue < node.minimum || action.integerValue > node.maximum) {
@@ -1735,20 +1922,37 @@ bool ValidateActionForSnapshot(
         }
         return true;
     }
-    if (action.action == L"contextMenu") {
+    if (action.action == L"contextMenu" || action.action == L"openItem") {
         const bool tree = node.kind == ControlKind::TreeView;
         const size_t count = tree ? node.items.size()
             : node.kind == ControlKind::ListView ? ListViewItemCount(node) : 0;
         // Only a real comctl32 control answers the selection and WM_CONTEXTMENU
         // messages; a DirectUI-backed node has no such HWND contract.
         if ((!tree && node.kind != ControlKind::ListView) || !node.adapterId.empty() || action.itemIndex < 0 ||
-            static_cast<size_t>(action.itemIndex) >= count ||
-            static_cast<size_t>(action.itemIndex) >= node.items.size()) {
-            error = L"contextMenu requires a TreeView or ListView item index";
+            static_cast<size_t>(action.itemIndex) >= count) {
+            error = action.action + L" requires a TreeView or ListView item index";
             return false;
         }
-        if (node.items[static_cast<size_t>(action.itemIndex)] != action.text) {
-            error = L"contextMenu item changed before the request";
+        // Opening an item is offered only where the control activates by its Enter key.
+        if (action.action == L"openItem" && !node.itemDefaultActivation) {
+            error = L"openItem requires a node that offers default activation";
+            return false;
+        }
+        // The label is the witness, so the row has to be one the node carries.
+        const std::wstring* label = tree
+            ? (static_cast<size_t>(action.itemIndex) < node.items.size()
+                ? &node.items[static_cast<size_t>(action.itemIndex)] : nullptr)
+            : ListViewItemLabel(node, action.itemIndex);
+        if (!label || *label != action.text) {
+            error = action.action + L" item changed before the request";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setTopIndex") {
+        if (node.kind != ControlKind::ListView || node.itemCount == 0 || action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= node.itemCount) {
+            error = L"setTopIndex requires a row of a windowed virtual ListView";
             return false;
         }
         return true;
@@ -1760,6 +1964,16 @@ bool ValidateActionForSnapshot(
             (action.itemIndex >= 0 &&
                 static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node))) {
             error = L"activateItem requires a ListView item index with native activation";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"setSelection" && node.kind == ControlKind::ListBox) {
+        // Only a multi-select list box takes a selection as an index list.
+        if (!node.multiSelect ||
+            std::any_of(action.integerValues.begin(), action.integerValues.end(),
+                [&](int index) { return index < 0 || static_cast<size_t>(index) >= node.items.size(); })) {
+            error = L"setSelection requires a multi-select ListBox and indices inside it";
             return false;
         }
         return true;
@@ -1893,6 +2107,14 @@ bool ValidateActionForSnapshot(
         }
         return true;
     }
+    if (action.action == L"setItemCheck" && node.kind == ControlKind::PerformanceLegend) {
+        if (!node.performanceLegend || action.itemIndex < 0 ||
+            static_cast<size_t>(action.itemIndex) >= node.performanceLegend->rows.size()) {
+            error = L"setItemCheck names a counter the legend does not list";
+            return false;
+        }
+        return true;
+    }
     if (action.action == L"setItemCheck") {
         if (node.kind != ControlKind::ListView || !node.checkBoxes) {
             error = L"setItemCheck requires a checkbox-enabled ListView node";
@@ -1919,6 +2141,22 @@ bool ValidateActionForSnapshot(
             });
         if (item == node.toolbarItems.end() || !item->enabled || item->hidden) {
             error = L"toolbarCommand references an unknown, disabled, or hidden button";
+            return false;
+        }
+        return true;
+    }
+    if (action.action == L"toolbarDropDown") {
+        if (node.kind != ControlKind::Toolbar) {
+            error = L"toolbarDropDown requires a ToolbarWindow32 node";
+            return false;
+        }
+        const auto item = std::find_if(node.toolbarItems.begin(), node.toolbarItems.end(),
+            [&](const ToolbarItemSnapshot& candidate) {
+                return candidate.kind == ToolbarItemKind::PushButton && candidate.dropDown &&
+                    candidate.commandId == action.menuCommandId;
+            });
+        if (item == node.toolbarItems.end() || !item->enabled || item->hidden) {
+            error = L"toolbarDropDown references an unknown, disabled, hidden, or arrowless button";
             return false;
         }
         return true;
@@ -1980,14 +2218,15 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
     // capture into a stale rejection plus a full resync, so they carry the same
     // request semantics as invoke/close and are rebased onto the current revision
     // by HandleNativeAction.
-    return action == L"invoke" || action == L"toolbarCommand" || action == L"close" ||
+    return action == L"invoke" || action == L"toolbarCommand" || action == L"toolbarDropDown" ||
+        action == L"close" ||
         action == L"move" || action == L"resize" || action == L"setValue" ||
         action == L"setSplit" ||
         action == L"setColumnOrder" ||
         action == L"scrollBy" ||
         action == L"diskScroll" ||
         action == L"islandInvoke" || action == L"htmlInvoke" || action == L"htmlScroll" || action == L"popupCommand" ||
-        action == L"contextMenu" || action == L"setScroll" ||
+        action == L"contextMenu" || action == L"openItem" || action == L"setScroll" || action == L"setTopIndex" ||
         action == L"mdiCommand";
 }
 

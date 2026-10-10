@@ -65,12 +65,27 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // Minor 30 adds native documents, owner-draw ComboBox faces, and ListView groups.
 // Minor 31 adds the native Disk Management MSAA table and its semantic actions.
 // Minor 32 adds the contextMenu action for TreeView and ListView items.
-inline constexpr uint16_t kProtocolMinor = 32;
+// Minor 33 carries a large virtual report ListView as a window of rows (itemCount,
+// itemWindowStart) with absolute indices, and adds setTopIndex to move that window.
+// Minor 34 lets a ListView or TreeView offer itemDefaultActivation and adds the openItem
+// action: a double-click selects the item and sends its control the Enter key.
+// Minor 35 adds the richText kind: a read-only rich edit control carried as paragraphs of
+// formatted runs (bold, italic, underline, strike-through, size in points, colour).
+// Minor 36 adds Performance Monitor's chart as three kinds read from the System Monitor control:
+// performanceGraph (scale, grid, counters and their recorded samples), performanceLegend (one
+// row per counter) and performanceValueBar (Last, Average, Minimum, Maximum, Duration).
+// Minor 37 adds the datePicker and timePicker kinds (SysDateTimePick32): the value is the
+// position of a range, as for a slider -- a date's day number (days since 0001-01-01), a
+// time's second of the day -- and setValue changes it.
+inline constexpr uint16_t kProtocolMinor = 37;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
 inline constexpr size_t kMaxNodes = 512;
 inline constexpr size_t kMaxListItems = 4096;
+// A windowed virtual ListView may count this many rows; its window and every other
+// per-row array stay under kMaxListItems.
+inline constexpr size_t kMaxVirtualListItems = 16777216;
 inline constexpr size_t kMaxTabItems = 128;
 // itemDepths carries the nesting level of a projected TreeView item, so the
 // deepest admissible level is one less than the level count.

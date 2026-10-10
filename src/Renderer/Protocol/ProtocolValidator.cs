@@ -158,8 +158,8 @@ internal static class ProtocolValidator
             "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck",
             "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "setGroupExpanded",
             "islandInvoke", "htmlInvoke", "htmlScroll", "activateItem", "setFocusedIndex", "scrollBy",
-            "diskSelect", "diskContext", "diskScroll", "contextMenu", "setScroll",
-            "toolbarCommand", "mdiCommand",
+            "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex",
+            "toolbarCommand", "toolbarDropDown", "mdiCommand",
         };
 
     // Actions that carry no value at all.
@@ -191,8 +191,13 @@ internal static class ProtocolValidator
                 return;
             case "setFocusedIndex":
                 if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var focusedIndex) ||
-                    focusedIndex < -1 || focusedIndex >= ProtocolConstants.MaxItems)
+                    focusedIndex < -1 || focusedIndex >= ProtocolConstants.MaxVirtualListItems)
                     throw new ProtocolException("setFocusedIndex requires a focused item index or -1.");
+                return;
+            case "setTopIndex":
+                if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var topIndex) ||
+                    topIndex < 0 || topIndex >= ProtocolConstants.MaxVirtualListItems)
+                    throw new ProtocolException("setTopIndex requires a row index of a windowed list.");
                 return;
             case "scrollBy":
                 var scrollNames = value.ValueKind == JsonValueKind.Object
@@ -216,10 +221,11 @@ internal static class ProtocolValidator
             case "select":
             case "setValue":
             case "toolbarCommand":
+            case "toolbarDropDown":
                 if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out _))
-                    throw new ProtocolException("setCheck/select/setValue/toolbarCommand requires an integer value.");
-                if (action == "toolbarCommand" && value.GetInt32() is <= 0 or > 0xffff)
-                    throw new ProtocolException("toolbarCommand requires a standard WM_COMMAND ID.");
+                    throw new ProtocolException("setCheck/select/setValue/toolbarCommand/toolbarDropDown requires an integer value.");
+                if (action is "toolbarCommand" or "toolbarDropDown" && value.GetInt32() is <= 0 or > 0xffff)
+                    throw new ProtocolException("toolbarCommand and toolbarDropDown require a standard WM_COMMAND ID.");
                 return;
             case "setSelection":
                 ValidateCanonicalIndices(value, "setSelection");
@@ -241,18 +247,23 @@ internal static class ProtocolValidator
                     throw new ProtocolException($"{action} requires exactly a nonnegative integer index and its boolean flag.");
                 return;
             case "setItemText":
-            // contextMenu's text is the item label it was requested for, which the
-            // Bridge compares against the live item; a list label may be empty.
+            // contextMenu's and openItem's text is the item label they were requested for, which
+            // the Bridge compares against the live item; a list label may be empty.
             case "contextMenu":
+            case "openItem":
                 var textNames = value.ValueKind == JsonValueKind.Object
                     ? value.EnumerateObject().Select(property => property.Name)
                         .Order(StringComparer.Ordinal).ToArray()
                     : [];
-                var minimumText = action == "contextMenu" ? 0 : 1;
+                var itemRequest = action is "contextMenu" or "openItem";
+                var minimumText = itemRequest ? 0 : 1;
+                // A windowed virtual list keeps absolute row indices.
+                var textIndexLimit = itemRequest
+                    ? ProtocolConstants.MaxVirtualListItems : ProtocolConstants.MaxItems;
                 if (textNames is not ["index", "text"] ||
                     !value.TryGetProperty("index", out var textIndex) ||
                     !textIndex.TryGetInt32(out var textIndexValue) ||
-                    textIndexValue is < 0 or >= ProtocolConstants.MaxItems ||
+                    textIndexValue < 0 || textIndexValue >= textIndexLimit ||
                     !value.TryGetProperty("text", out var itemText) ||
                     itemText.ValueKind != JsonValueKind.String ||
                     (itemText.GetString()?.Length ?? 0) < minimumText ||
@@ -431,10 +442,11 @@ internal static class ProtocolValidator
                 // whose pages are its own child windows (Windows Forms), and a parent
                 // always precedes the child it owns, so a cycle cannot be described.
                 // An accessible island is never a parent: its elements own no HWND and
-                // travel as typed items on the island's own node.
+                // travel as typed items on the island's own node.  A group box is one
+                // when it is a Windows Forms GroupBox, whose controls are its children.
                 if (!nodeKinds.TryGetValue(node.ParentNodeId, out var parentKind) ||
                     parentKind is not ("dialogContainer" or "mdiClient" or "mdiChild"
-                        or "paneContainer" or "tabControl") ||
+                        or "paneContainer" or "tabControl" or "groupBox") ||
                     nodeZIndexes[node.ParentNodeId] >= node.ZIndex)
                     throw new ProtocolException(
                         "Control parent must be a preceding dialog, MDI, or container pane node: " +
@@ -485,6 +497,8 @@ internal static class ProtocolValidator
             ["tabControl"] = ValidateTabControl,
             ["slider"] = ValidateSlider,
             ["upDown"] = ValidateUpDown,
+            ["datePicker"] = ValidateDatePicker,
+            ["timePicker"] = ValidateTimePicker,
             ["dialogContainer"] = ValidateDialogContainer,
             ["mdiClient"] = ValidateMdiClient,
             ["mdiChild"] = ValidateMdiChild,
@@ -494,6 +508,10 @@ internal static class ProtocolValidator
             ["accessibleIsland"] = ValidateAccessibleIsland,
             ["nativeDocument"] = NativeDocumentProtocol.Validate,
             ["diskView"] = DiskViewProtocol.Validate,
+            ["richText"] = RichTextProtocol.Validate,
+            ["performanceGraph"] = PerformanceProtocol.ValidateGraph,
+            ["performanceLegend"] = PerformanceProtocol.ValidateLegend,
+            ["performanceValueBar"] = PerformanceProtocol.ValidateValueBar,
         };
 
     private static void ValidateNode(ControlNode node)
@@ -507,13 +525,24 @@ internal static class ProtocolValidator
             throw new ProtocolException("Only a native document node carries document state.");
         if (node.Kind != "diskView" && node.DiskView is not null)
             throw new ProtocolException("Only a disk view node carries disk view state.");
+        if (node.Kind != "richText" && node.RichText is not null)
+            throw new ProtocolException("Only a rich text node carries rich text state.");
+        if (node.Kind != "performanceGraph" && node.PerformanceGraph is not null)
+            throw new ProtocolException("Only a performance graph node carries graph state.");
+        if (node.Kind != "performanceLegend" && node.PerformanceLegend is not null)
+            throw new ProtocolException("Only a performance legend node carries legend state.");
+        if (node.Kind != "performanceValueBar" && node.PerformanceValueBar is not null)
+            throw new ProtocolException("Only a performance value bar node carries value bar state.");
+        if (node.Kind != "listView" && (node.ItemCount is not null || node.ItemWindowStart is not null))
+            throw new ProtocolException("Only a ListView node carries a row window.");
         ValidateRect(node.Rect, "node.rect");
         if (!KindRules.TryGetValue(node.Kind, out var extraRules))
             throw new ProtocolException("Unknown control node kind.");
         if (node.ZIndex is < 0 or >= ProtocolConstants.MaxNodes ||
             node.TabIndex is < -1 or >= ProtocolConstants.MaxNodes ||
-            node.Checked is < 0 or > 2 || node.SelectedIndex is < -1 or > 4095 ||
-            node.FocusedIndex is < -1 or >= ProtocolConstants.MaxItems ||
+            node.Checked is < 0 or > 2 ||
+            node.SelectedIndex is < -1 or >= ProtocolConstants.MaxVirtualListItems ||
+            node.FocusedIndex is < -1 or >= ProtocolConstants.MaxVirtualListItems ||
             node.SelectionStart is < 0 || node.SelectionLength is < 0)
             throw new ProtocolException("Control node state is outside the protocol range.");
         if (node.Editable && node.Kind != "comboBox")
@@ -536,6 +565,8 @@ internal static class ProtocolValidator
             node.ItemActivationSupported is not null || node.ItemNativeIds is not null ||
             node.GroupViewEnabled is not null || node.ListViewGroups is not null || node.ItemGroupIds is not null))
             throw new ProtocolException("Only ListView nodes can carry list presentation and activation state.");
+        if (node.Kind is not ("listView" or "treeView") && node.ItemDefaultActivation is not null)
+            throw new ProtocolException("Only ListView and TreeView nodes can carry itemDefaultActivation.");
         // Source-generated binding leaves an omitted collection null, so presence
         // is measured by content: an older peer that always emitted these arrays
         // empty is still admissible on a non-tree node.
@@ -1123,18 +1154,18 @@ internal static class ProtocolValidator
         if (node.Style is null || node.ExStyle is null)
             throw new ProtocolException("Dialog container requires native style evidence.");
         const ulong wsChild = 0x40000000;
-        const ulong dsControl = 0x00000400;
-        const ulong wsExControlParent = 0x00010000;
         const ulong unsupportedStyle = 0x00C00000 | 0x00040000 | 0x00800000 |
             0x00400000 | 0x00100000 | 0x00200000 | 0x00080000 | 0x00000080;
         const ulong unsupportedExStyle = 0x00000001 | 0x00000100 | 0x00000200 |
             0x00020000 | 0x00080000;
         var style = ParseHex64(node.Style, "dialogContainer.style");
         var exStyle = ParseHex64(node.ExStyle, "dialogContainer.exStyle");
-        if ((style & (wsChild | dsControl)) != (wsChild | dsControl) ||
-            (exStyle & wsExControlParent) == 0 ||
+        // A DS_CONTROL, WS_EX_CONTROLPARENT child dialog belongs to its parent's dialog-manager walk; one
+        // without them (the page of an OLE property frame) runs a dialog manager of its own. Either is a
+        // child window without chrome; the Bridge decides which navigation scope its controls form.
+        if ((style & wsChild) != wsChild ||
             (style & unsupportedStyle) != 0 || (exStyle & unsupportedExStyle) != 0)
-            throw new ProtocolException("Dialog container lacks required DS_CONTROL shape.");
+            throw new ProtocolException("Dialog container is not a chrome-free child dialog.");
     }
 
     private static void ValidateComboBox(ControlNode node)
@@ -1291,7 +1322,19 @@ internal static class ProtocolValidator
         if (mode is not ("report" or "largeIcon" or "smallIcon" or "list"))
             throw new ProtocolException("ListView view mode is unsupported.");
         var report = mode == "report";
-        var itemCount = report ? node.Rows.Count : node.Items.Count;
+        var carried = report ? node.Rows.Count : node.Items.Count;
+        // Minor 33: a large virtual report list carries a window of its rows; every
+        // index stays absolute against the list's full length.
+        var windowed = node.ItemCount is not null || node.ItemWindowStart is not null;
+        if (windowed && (node.ItemCount is not { } total || node.ItemWindowStart is not { } start ||
+                total <= 0 || total > ProtocolConstants.MaxVirtualListItems || start < 0 || !report ||
+                node.GroupViewEnabled == true || node.CheckBoxes == true ||
+                node.ItemActivationSupported == true || node.ItemNativeIds is { Count: > 0 } ||
+                node.Items.Count != node.Rows.Count || (long)start + carried > total ||
+                node.Rows.Where((row, index) => row.Count == 0 || row[0] != node.Items[index]).Any()))
+            throw new ProtocolException(
+                "A windowed ListView needs a report window inside its row count, without groups, checkboxes, or native activation.");
+        var itemCount = windowed ? node.ItemCount!.Value : carried;
         if (node.GroupViewEnabled == true && report && (node.Items.Count != node.Rows.Count ||
             node.Rows.Where((row, index) => row.Count == 0 || row[0] != node.Items[index]).Any()))
             throw new ProtocolException("Grouped report items must mirror their canonical first-column labels.");
@@ -1358,7 +1401,7 @@ internal static class ProtocolValidator
         if (node.FocusedIndex is not { } focusedIndex ||
             focusedIndex < -1 || focusedIndex >= itemCount)
             throw new ProtocolException("ListView focusedIndex is missing or outside its rows.");
-        ValidateItemImagery(node, itemCount);
+        ValidateItemImagery(node, carried);
         // The display order is a permutation of the logical columns, so the projection
         // can present them in header order without any index changing meaning.
         var order = node.ColumnOrder ?? [];
@@ -1479,6 +1522,29 @@ internal static class ProtocolValidator
             throw new ProtocolException("UpDown range, position, or step is missing.");
         if (maximum < minimum || position < minimum || position > maximum || smallChange <= 0)
             throw new ProtocolException("UpDown range, position, or step is invalid.");
+    }
+
+    // A date picker's range and position are day numbers (days since 0001-01-01), inside the
+    // years a calendar can show; the position is the shown date.
+    private static void ValidateDatePicker(ControlNode node)
+    {
+        if (node.Minimum is not { } minimum || node.Maximum is not { } maximum ||
+            node.Position is not { } position)
+            throw new ProtocolException("Date picker range or position is missing.");
+        if (minimum < ProtocolConstants.MinPickerDay || maximum > ProtocolConstants.MaxPickerDay ||
+            maximum < minimum || position < minimum || position > maximum)
+            throw new ProtocolException("Date picker range or position is invalid.");
+    }
+
+    // A time picker's position is the second of the day: its range is the day.
+    private static void ValidateTimePicker(ControlNode node)
+    {
+        if (node.Minimum is not { } minimum || node.Maximum is not { } maximum ||
+            node.Position is not { } position)
+            throw new ProtocolException("Time picker range or position is missing.");
+        if (minimum != 0 || maximum != ProtocolConstants.SecondsPerDay - 1 ||
+            position < 0 || position >= ProtocolConstants.SecondsPerDay)
+            throw new ProtocolException("Time picker range or position is invalid.");
     }
 
     // A control's image list travels once and every item indexes into it, so the
@@ -1706,8 +1772,11 @@ internal static class ProtocolValidator
         // A tree/list item's own context menu, opened by a contextMenu request.
         var item = node?.Kind is "treeView" or "listView" && node.AdapterId is null &&
             popup.ItemIndex < node.Items.Count;
-        if (!island && !disk && !item)
-            throw new ProtocolException("Popup menu must anchor to a native semantic dropdown, disk item, or tree/list item.");
+        // A toolbar button's drop-down menu, opened by a toolbarDropDown request.
+        var toolbar = node?.Kind == "toolbar" && node.ToolbarItems is not null &&
+            popup.ItemIndex < node.ToolbarItems.Count && node.ToolbarItems[popup.ItemIndex].DropDown == true;
+        if (!island && !disk && !item && !toolbar)
+            throw new ProtocolException("Popup menu must anchor to a native semantic dropdown, disk item, tree/list item, or toolbar drop-down.");
         ValidateMenuLevel(popup.Items, new MenuScope(), depth: 1,
             topLevel: false, parentPath: string.Empty);
     }
@@ -2063,7 +2132,7 @@ internal static class ProtocolValidator
                 foreach (var image in node.GetProperty("imageList").EnumerateArray())
                     RequireProperties(image, $"{context}.imageList.icon", RequiredImageProperties);
             }
-            if (kind is "slider" or "upDown")
+            if (kind is "slider" or "upDown" or "datePicker" or "timePicker")
             {
                 RequireProperties(node, $"{context}.{kind}", RequiredSliderProperties);
             }
@@ -2151,6 +2220,25 @@ internal static class ProtocolValidator
             if (kind == "diskView") DiskViewProtocol.RequireFields(node);
             else if (node.TryGetProperty("diskView", out _))
                 throw new ProtocolException("Only a disk view node carries disk view state.");
+            if (kind == "richText") RichTextProtocol.RequireFields(node);
+            else if (node.TryGetProperty("richText", out _))
+                throw new ProtocolException("Only a rich text node carries rich text state.");
+            if (kind == "performanceGraph")
+                PerformanceProtocol.RequireFields(node, "performanceGraph", "displayType", "minimum", "maximum",
+                    "sampleCount", "intervalMs", "scroll", "barSlot", "wrapped", "startTimeMs", "endTimeMs",
+                    "showVerticalGrid", "showHorizontalGrid", "showScaleLabels", "showTimeLabels",
+                    "title", "yAxisLabel", "backColor", "controlColor", "gridColor", "textColor", "barColor",
+                    "series");
+            else if (node.TryGetProperty("performanceGraph", out _))
+                throw new ProtocolException("Only a performance graph node carries graph state.");
+            if (kind == "performanceLegend")
+                PerformanceProtocol.RequireFields(node, "performanceLegend", "displayType", "columns", "rows");
+            else if (node.TryGetProperty("performanceLegend", out _))
+                throw new ProtocolException("Only a performance legend node carries legend state.");
+            if (kind == "performanceValueBar")
+                PerformanceProtocol.RequireFields(node, "performanceValueBar", "fields");
+            else if (node.TryGetProperty("performanceValueBar", out _))
+                throw new ProtocolException("Only a performance value bar node carries value bar state.");
             if (kind == "accessibleIsland")
             {
                 RequireProperties(node, $"{context}.accessibleIsland", "islandItems");
@@ -2234,7 +2322,9 @@ internal static class ProtocolValidator
         var previous = -1;
         foreach (var index in indices)
         {
-            if (index is < 0 or >= ProtocolConstants.MaxItems || index <= previous)
+            // Indices are absolute rows, which a windowed virtual list can number past
+            // the per-array cap; each node bounds them by its own row count.
+            if (index is < 0 or >= ProtocolConstants.MaxVirtualListItems || index <= previous)
                 throw new ProtocolException($"{field} must contain unique, strictly increasing in-range indices.");
             previous = index;
         }

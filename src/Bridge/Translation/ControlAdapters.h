@@ -44,6 +44,43 @@ bool CaptureControlDetail(HWND hwnd, ControlNode& node, std::wstring& reason);
 // adapter contract and are never separate projected nodes.
 bool IsCompositeImplementationChild(HWND hwnd) noexcept;
 
+// MMC's wait-cursor window: a transparent, unpainted child mmcndmgr.dll raises over
+// the frame's client area while a snap-in holds the console busy.  It is absorbed
+// (never a node), and while one is visible the session declines the frame's actions.
+bool IsMmcBusyShield(HWND hwnd) noexcept;
+bool HasVisibleMmcBusyShield(HWND root) noexcept;
+
+// A window that a visible, opaque sibling above it covers except for edges no wider
+// than a few pixels (MMC's result ListView over Print Management's HTML host).  It
+// and everything inside it show only that edge, so none of it is captured.
+bool ObscuredBySiblingAbove(HWND window) noexcept;
+bool InsideObscuredHost(HWND root, HWND window) noexcept;
+
+// A Windows Forms LinkLabel projects as a one-link SysLink.  It is activated through
+// its link's accessible default action (which raises LinkClicked) rather than through
+// SysLink messages it does not implement; the call fails closed unless the label
+// still publishes exactly that one enabled link.  Runs the application's handler, so
+// it belongs on the deferred native-action path, never inside a bounded command.
+bool IsWindowsFormsLinkLabelWindow(HWND hwnd) noexcept;
+
+// A window of a Windows Forms class.  Windows Forms moves focus with Tab inside its
+// own containers, so a WS_TABSTOP control there is a tab stop even where the dialog
+// manager's walk from the native root never reaches it (an MMC 3.0 snap-in view).
+bool IsWindowsFormsControl(HWND hwnd) noexcept;
+bool InvokeWindowsFormsLink(HWND linkLabel, const std::wstring& expectedName) noexcept;
+
+// The arrows of a Windows Forms NumericUpDown (UpDownBase.UpDownButtons): an accessible spin
+// box with an up and a down push button and no range of its own. The number beside it, in
+// the sibling edit, is the control's value. ReadWindowsFormsSpin refuses a window that is not
+// such a pair or whose number is not an integer; StepWindowsFormsSpin gives it the press a
+// pointer gives (the upper half steps up, the lower half down). GUI thread of the control only.
+struct WindowsFormsSpin final {
+    HWND edit = nullptr;
+    int value = 0;
+};
+bool ReadWindowsFormsSpin(HWND hwnd, WindowsFormsSpin& spin, std::wstring& reason) noexcept;
+bool StepWindowsFormsSpin(HWND buttons, bool up) noexcept;
+
 // The HTREEITEM at `index` in the same depth-first order the TreeView adapter
 // flattens its items into, or null when the index is outside that order.  Every
 // index-addressed TreeView action resolves its target through this walk, so a
@@ -93,16 +130,48 @@ bool ScrollPaneContainer(HWND container, bool vertical, bool byLines, int amount
 // reports. -1 when an owner-draw button offers no such evidence. GUI thread only.
 int ReadButtonCheckState(HWND button) noexcept;
 
+// How a request reaches an item's control once the item is selected. Most controls answer
+// the keyboard form of WM_CONTEXTMENU. Some (Device Manager's tree, an MFC control)
+// ignore a synthesized one and open their menu from the Menu key itself. EnterKey is the
+// activation of the item (what a double-click does), and DoubleClick is the pointer's own
+// double-click at the item for a control whose application listens to DoubleClick rather
+// than to the activation notification (a Windows Forms list: Task Scheduler's tasks).
+enum class ContextMenuTrigger { ContextMenuMessage, MenuKey, EnterKey, DoubleClick };
+
 // Opens the application's own context menu for one TreeView or ListView item: the
 // item (whose label must still be `expectedText`) is selected through the control's
-// selection messages, then WM_CONTEXTMENU is sent in its keyboard form. The caller
-// arms popup interception first; the application's TrackPopupMenu runs inside this.
+// selection messages, then the menu is requested by `trigger`. The caller arms popup
+// interception first; the application's TrackPopupMenu runs inside this.
 bool RequestItemContextMenu(HWND control, ControlKind kind, int index,
+    const std::wstring& expectedText, std::wstring& reason,
+    ContextMenuTrigger trigger = ContextMenuTrigger::ContextMenuMessage) noexcept;
+
+// Makes `indices` (ascending, without repeats) exactly the selection of a multi-select list box,
+// through the control's own selection messages, and reads back what it settled on: false when the
+// control is not a multi-select list box, an index is outside it, or it kept another selection.
+// The owner is not told (that is LBN_SELCHANGE, which the caller sends as a click would).
+bool SetListBoxSelection(HWND listBox, const std::vector<int>& indices) noexcept;
+
+// Asks the owner of a toolbar button's arrow for its drop-down menu: the toolbar's own click on
+// the arrow sends its parent TBN_DROPDOWN for the button, and the owner answers by tracking a
+// menu. The button (position and command id) must still be an enabled drop-down. The caller
+// arms popup interception first; the owner's TrackPopupMenu runs inside this.
+bool RequestToolbarDropDown(HWND toolbar, int index, uint32_t commandId, std::wstring& reason) noexcept;
+
+// Activates the item the way its control answers a double-click: the item is selected and the
+// Enter key is delivered to the control (MMC lists and snap-in trees open the item's default
+// action; Services opens its properties). A Windows Forms list is given the double-click
+// itself. The label is the witness, as for the context menu.
+bool RequestItemKeyActivation(HWND control, ControlKind kind, int index,
     const std::wstring& expectedText, std::wstring& reason) noexcept;
 
 // Scrolls a non-report ListView by a pixel delta through LVM_SCROLL. Report views
 // are refused here because their projection scrolls inside the WinUI presenter.
 bool ScrollListViewBy(HWND listView, int dx, int dy) noexcept;
+
+// Scrolls a report list so the row at `index` is its top row (or as close as the
+// list's own scroll range allows): how a windowed virtual list moves its window.
+bool ScrollListViewToTop(HWND listView, int index) noexcept;
 
 // Resolves a stable native ListView ID and verifies its reverse mapping. UINT_MAX
 // and IDs whose item was removed are invalid; ID zero is a valid native identity.
