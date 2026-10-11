@@ -1,10 +1,16 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
+#include <shobjidl.h>
+#include <wrl/client.h>
 
 #include <string>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 #pragma comment(linker,"\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 namespace {
@@ -21,6 +27,11 @@ enum ControlId : int {
     IdSaveConfirm = 1003,
     IdRichTaskDialog = 1004,
     IdInfoMessage = 1005,
+    IdChooseFont = 1006,
+    IdOpenFile = 1007,
+    IdSaveFile = 1008,
+    IdLegacyOpenFile = 1009,
+    IdLegacySaveFile = 1010,
     IdEdit = 1101,
     IdCheck = 1102,
     IdCombo = 1103,
@@ -90,6 +101,79 @@ void ReportResult(const wchar_t* source, int button, BOOL verification = FALSE) 
         source, button, verification ? L"true" : L"false");
     SetWindowTextW(gResult, text);
     AppendLog(text);
+}
+
+void ShowFontChooser() {
+    LOGFONTW font{};
+    font.lfHeight = -16;
+    font.lfWeight = FW_NORMAL;
+    wcscpy_s(font.lfFaceName, L"Segoe UI");
+    CHOOSEFONTW choice{ sizeof(choice) };
+    choice.hwndOwner = gMain;
+    choice.lpLogFont = &font;
+    choice.Flags = CF_SCREENFONTS | CF_EFFECTS | CF_INITTOLOGFONTSTRUCT;
+    const BOOL accepted = ChooseFontW(&choice);
+    wchar_t result[256]{};
+    if (accepted) {
+        swprintf_s(result, L"ChooseFont result: face=%s, tenthsOfPoint=%d, weight=%ld, italic=%u, color=0x%06lX",
+            font.lfFaceName, choice.iPointSize, font.lfWeight, font.lfItalic, choice.rgbColors);
+    } else {
+        swprintf_s(result, L"ChooseFont result: cancelled=%s, error=%lu",
+            CommDlgExtendedError() == 0 ? L"true" : L"false", CommDlgExtendedError());
+    }
+    SetWindowTextW(gResult, result);
+    AppendLog(result);
+}
+
+// These oracles exercise native dialog contracts only. Even Save returns a
+// selection to this process without creating, overwriting, or opening a file.
+void ShowCommonFileDialog(bool save, bool legacy) {
+    HRESULT result = E_FAIL;
+    if (legacy) {
+        wchar_t selection[32768]{};
+        OPENFILENAMEW dialog{ sizeof(dialog) };
+        dialog.hwndOwner = gMain;
+        dialog.lpstrFilter = L"Text files (*.txt)\0*.txt\0All files (*.*)\0*.*\0\0";
+        dialog.nFilterIndex = 1;
+        dialog.lpstrFile = selection;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(selection));
+        dialog.lpstrTitle = save ? L"Legacy save oracle (selection only)" : L"Legacy open oracle";
+        dialog.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST |
+            (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+        const BOOL accepted = save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog);
+        const DWORD error = accepted ? 0 : CommDlgExtendedError();
+        result = accepted ? S_OK : error ? HRESULT_FROM_WIN32(error) : HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    } else {
+        const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        result = initialized;
+        if (SUCCEEDED(initialized)) {
+            {
+                Microsoft::WRL::ComPtr<IFileDialog> dialog;
+                result = CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog,
+                    nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+                FILEOPENDIALOGOPTIONS options{};
+                const COMDLG_FILTERSPEC filters[] = {
+                    { L"Text files (*.txt)", L"*.txt" }, { L"All files (*.*)", L"*.*" }
+                };
+                if (SUCCEEDED(result)) result = dialog->GetOptions(&options);
+                if (SUCCEEDED(result)) result = dialog->SetOptions(options | FOS_NOCHANGEDIR | FOS_FORCEFILESYSTEM);
+                if (SUCCEEDED(result)) result = dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters);
+                if (SUCCEEDED(result)) result = dialog->SetTitle(save ? L"Save oracle (selection only)" : L"Open oracle");
+                if (SUCCEEDED(result)) result = dialog->Show(gMain);
+                if (SUCCEEDED(result)) {
+                    Microsoft::WRL::ComPtr<IShellItem> selection;
+                    result = dialog->GetResult(&selection);
+                }
+            }
+            CoUninitialize();
+        }
+    }
+    wchar_t report[192]{};
+    swprintf_s(report, L"%s %s dialog result: HRESULT=0x%08lX, cancelled=%s",
+        legacy ? L"Legacy" : L"Shell", save ? L"save" : L"open", static_cast<unsigned long>(result),
+        result == HRESULT_FROM_WIN32(ERROR_CANCELLED) ? L"true" : L"false");
+    SetWindowTextW(gResult, report);
+    AppendLog(report);
 }
 
 void ShowClassicMessageBox() {
@@ -578,6 +662,16 @@ LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam
         case IdInfoMessage:
             if (HIWORD(wParam) == BN_CLICKED) ShowInfoMessage();
             break;
+        case IdChooseFont:
+            ShowFontChooser();
+            break;
+        case IdOpenFile:
+        case IdSaveFile:
+        case IdLegacyOpenFile:
+        case IdLegacySaveFile:
+            ShowCommonFileDialog(LOWORD(wParam) == IdSaveFile || LOWORD(wParam) == IdLegacySaveFile,
+                LOWORD(wParam) == IdLegacyOpenFile || LOWORD(wParam) == IdLegacySaveFile);
+            break;
         case IdCreateUnsupported:
             if (HIWORD(wParam) == BN_CLICKED && !IsWindow(gUnsupported)) {
                 gUnsupported = CreateWindowExW(WS_EX_CLIENTEDGE, kUnsupportedClass, L"",
@@ -802,6 +896,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int show)
     AppendMenuW(fileMenu, MF_STRING, IdTaskDialog, L"&TaskDialog\tCtrl+T");
     AppendMenuW(fileMenu, MF_STRING, IdRichTaskDialog, L"&Rich TaskDialog");
     AppendMenuW(fileMenu, MF_STRING, IdInfoMessage, L"&Information message");
+    HMENU commonDialogs = CreatePopupMenu();
+    AppendMenuW(commonDialogs, MF_STRING, IdChooseFont, L"&Font chooser");
+    AppendMenuW(commonDialogs, MF_STRING, IdOpenFile, L"&Open file");
+    AppendMenuW(commonDialogs, MF_STRING, IdSaveFile, L"&Save file (selection only)");
+    AppendMenuW(commonDialogs, MF_STRING, IdLegacyOpenFile, L"&Legacy open file");
+    AppendMenuW(commonDialogs, MF_STRING, IdLegacySaveFile, L"Legacy save file (selection only)");
+    AppendMenuW(fileMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(commonDialogs), L"&Common dialogs");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, IdMenuResetProgress, L"&Reset progress");
     AppendMenuW(fileMenu, MF_POPUP,
