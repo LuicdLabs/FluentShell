@@ -46,6 +46,20 @@ internal static class PopupMenuAnchor
 {
     public static PixelRect? ItemRect(ControlNodeViewModel? node, PopupMenuSnapshot popup)
     {
+        if (node is { Kind: "diskView", Visible: true, DiskView: { } view } &&
+            node.NodeId == popup.NodeId && popup.ItemIndex >= 0 && popup.ItemIndex < view.Items.Count)
+        {
+            var native = view.Items[popup.ItemIndex].Rect;
+            return native with { X = native.X + view.ClientRect.X, Y = native.Y + view.ClientRect.Y };
+        }
+        // A toolbar button's menu opens under the button, whose rectangle is in the toolbar's own
+        // client coordinates, which is the origin the toolbar's element has.
+        if (node is { Kind: "toolbar", Visible: true } && node.NodeId == popup.NodeId &&
+            popup.ItemIndex >= 0 && popup.ItemIndex < node.ToolbarItems.Count)
+        {
+            var button = node.ToolbarItems[popup.ItemIndex];
+            return button.DropDown == true && button.Rect.Width > 0 && button.Rect.Height > 0 ? button.Rect : null;
+        }
         if (node is null || node.NodeId != popup.NodeId || node.Kind != "accessibleIsland" ||
             !node.Visible || popup.ItemIndex < 0 || popup.ItemIndex >= node.IslandItems.Count)
             return null;

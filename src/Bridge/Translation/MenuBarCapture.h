@@ -76,6 +76,9 @@ bool TakeRecordedMenu(
 struct MenuBarButton final {
     std::wstring text;
     bool enabled = true;
+    // False for a button MMC keeps in the bar but hides (Favorites, snap-in placeholders, the
+    // system-menu slot of an unmaximized child): it has no title on screen and offers no menu.
+    bool visible = true;
     bool operator==(const MenuBarButton&) const = default;
 };
 
@@ -91,6 +94,12 @@ struct MenuBarCommandBinding final {
     std::vector<std::wstring> ancestors;
     HWND owner = nullptr;
     UINT trackingFlags = 0;
+    // A snap-in's popup can be owned by a window MMC creates for that one tracking call
+    // (an `ATL:` hidden top-level window that forwards the command to the snap-in) and
+    // destroys after it. Such an owner is told by its class, because the handle recorded at
+    // read time is gone when the command is replayed; the replayed popup brings a new one.
+    bool ownerTransient = false;
+    std::wstring ownerClass;
 };
 
 // Metadata is read on the source thread without opening any popup.  It is also the
@@ -134,6 +143,11 @@ bool IsMenuBarToolbar(HWND toolbar) noexcept;
 // Fluent caption, so it is skipped rather than refused.
 bool IsWindowSystemMenu(HMENU menu) noexcept;
 
+// True for the IDs of SC_* system commands (SC_SIZE 0xF000 through SC_CONTEXTHELP 0xF180).
+// A menu command above that range is an ordinary WM_COMMAND: an MDI frame's Window menu
+// lists its children from idFirstChild (0xFF00 for MFC).
+constexpr bool IsSystemCommandId(unsigned id) noexcept { return id >= 0xF000 && id <= 0xF1FF; }
+
 // The toolbar a window uses as its menu bar, or null when it has none.
 HWND FindMenuBarToolbar(HWND root) noexcept;
 
@@ -149,7 +163,10 @@ bool CaptureMenuBarToolbar(
     const std::atomic<bool>& cancelled,
     std::vector<MenuItemSnapshot>& menu,
     std::wstring& reason,
-    std::vector<MenuBarCommandBinding>* commands = nullptr) noexcept;
+    std::vector<MenuBarCommandBinding>* commands = nullptr,
+    // Per button: opened no popup on the previous read. Such buttons get a short
+    // wait; the read updates the vector (resized to the button count).
+    std::vector<bool>* silentButtons = nullptr) noexcept;
 
 // Reopens just the bound native slot and resolves the selection while its HMENU
 // is alive. The hook returns TPM_RETURNCMD or notifies the actual tracking owner.

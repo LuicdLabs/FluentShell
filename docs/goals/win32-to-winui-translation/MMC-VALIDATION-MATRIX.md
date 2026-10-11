@@ -277,6 +277,386 @@ the extended HTML pane. Logs:
 Both processes exited after cleanup. The remaining barrier failure is therefore
 not confined to the extended view's HTML capture.
 
+## 2026-10-06/07: context menus, splitters, menus, WinForms consoles
+
+Protocol minor 32. All 545 Renderer tests, the full native suite and the production
+gates pass (`build/session-20261007-test2.log`).
+
+Interaction fixes, each verified live in a disposable console with
+`tools/Drive-ProjectedMmc.ps1` (real pointer input against the projection):
+
+- **TreeView/ListView right-click.** A new `contextMenu` action carries the item
+  index and its label as a witness (request-semantic, refused if the index names a
+  different item). The Bridge focuses the control, selects the item through the
+  control's own messages, and sends the keyboard form of `WM_CONTEXTMENU`. MMC
+  hit-tests the *cursor*, not the message's point, and routes the keyboard form to
+  the focused pane (Task Scheduler's focus otherwise rests in its WinForms view);
+  `tools/Probe-NativeContextMenu.ps1` records that behavior. The application's
+  `TrackPopupMenu` is answered by a WinUI flyout at the click point. MMC tracks its
+  menus with an owner outside the frame, so an armed agent on the tracking thread
+  now claims the popup even when the owner's root differs. Verified in compmgmt
+  (tree and list) and taskschd.
+- **Popup dismissal.** The selection a context menu makes arrives in the same patch,
+  and the WinUI tree/list then moves focus to the selected item a frame later, which
+  light-dismissed the flyout. A close within 400 ms that leaves focus in the anchor
+  reopens the flyout once instead of answering a dismissal.
+- **Menu-bar reads no longer steal activation.** Every navigation re-reads MMC's
+  toolbar menu bar; the read used to `SetForegroundWindow` the cloaked frame for
+  about 2 s, closing any open flyout and sending keystrokes to the hidden window.
+  Passive reads no longer activate it (command execution still does). Buttons that
+  opened no popup last time (Favorites, SnapinMenu) wait 150 ms instead of 700 ms.
+- **Splitter drags** track locally and make one native `setSplit` on release, as
+  MMC's own tracking bar does: a 24-move drag produced exactly one request, accepted
+  about 100 ms after release. Escape and lost capture abandon the drag.
+- **Native test crash fixed.** `LVM_GETGROUPINFOBYINDEX` with `LVGF_SUBTITLE` or
+  `LVGF_TASK` dereferences null in comctl32 10.0.26100 for a group that has neither;
+  those fields are no longer requested (it would have crashed the target).
+
+Console coverage additions:
+
+- **Windows Forms controls** (taskschd, eventvwr, tpm): owner-draw Labels and
+  Buttons are classified by their MSAA role and state; `TCS_RAGGEDRIGHT` and a
+  single-line strip that overflows into its own up-down are admitted; a tab control
+  is a container for the TabPage windows WinForms parents to it; leaf panels and
+  picture boxes with no tab stop and no accessible action project as their own
+  pixels; callback ListView icons are resolved as the control resolves them.
+- **Scrolling containers** (`scrollBars` on `paneContainer`, action `setScroll`):
+  children are clipped to the native viewport, WinUI scroll bars sit where the
+  native ones are, and scrolling goes through the application's own line/page
+  handling (WinForms ignores a synthetic `SB_THUMBPOSITION`).
+- **DirectUI scroll chrome**: an overflowing Actions pane hosts a real ScrollBar in
+  a `CtrlNotifySink`; it is absorbed as chrome and the elements scroll locally.
+- **Multi-thread capture barrier**: our own capture reads (toolbar `TB_GETBUTTON`,
+  which aliases `TBM_SETLINESIZE`, and `WM_NOTIFY` display-info/custom-draw) no
+  longer count as mutations; WM_USER-range codes are judged by the receiving
+  window's class. Barrier failures now name the first difference.
+- **Timing failures are retried**: a window whose GUI thread is busy (RSoP
+  processing) is deferred instead of spending its one attempt; an attach timeout,
+  an unstable barrier or a capture past its deadline is retried up to four times.
+
+All-console startup (`build/mmc-startup-20261007-032922/`, elevated, 12 s observation):
+**19 of 22 stable startups with Renderer cleanup**, up from 17 on 2026-10-03, with
+taskschd, rsop and tpm newly stable. eventvwr projected in its dedicated run
+(`build/mmc-startup-20261007-032646/`, after one transient retry while loading) but
+in the all-console run its later surface open timed out waiting for the source UI
+thread ("source UI thread did not acknowledge capture"), so it is intermittent, like
+the earlier Services barrier. WF and perfmon stay native (below).
+
+Known gaps from this pass: Event Viewer's overview section headers project as
+captured pixels that do not match the native gradient, and their collapse icons
+(clickable natively, but publishing no MSAA action) are inert in the projection.
+WF still stays native: its collapsible section headers are tab stops and its links
+are owner-draw WinForms LinkLabels, neither of which has an adapter. perfmon is
+unchanged (HTML host plus the `SysmonReport` control).
+
+## 2026-10-08: navigation census, recovery, and the remaining WinForms/HTML views
+
+`tools/Crawl-ProjectedMmc.ps1` walks a disposable console's scope tree breadth-first
+through the tree's own messages (`TVM_SELECTITEM`/`TVM_EXPAND`), waits past the
+reconcile hold, and records per node whether the frame is projected (DWM reports the
+native frame cloaked) with the Bridge lines for that process. Dialogs are cancelled:
+a native one by `WM_CLOSE`, a renderer-hosted prompt (a snap-in's MessageBox while the
+frame is projected) by its Cancel/No/OK button through UIA. The first census
+(`build/mmc-crawl-census-20261008b/`, 21 consoles) visited 254 nodes, 209 projected
+(82%). The same walk after this session's adapters
+(`build/mmc-crawl-census-20261008g/`) visited the same 254 nodes and projected **237
+(93%)**:
+
+| Console | Nodes | Native before | Native after |
+| --- | ---: | ---: | ---: |
+| `WF` | 9 | 9 | 0 |
+| `eventvwr` | 19 | 14 | 3 |
+| `printmanagement` | 10 | 3 | 0 |
+| `secpol` | 22 | 3 | 0 |
+| `taskschd` | 5 | 2 | 0 |
+| `compmgmt` | 14 | 1 | 1 (Performance) |
+| `comexp` | 10 | 1 | 1 (Event Viewer Subscriptions prompt) |
+| `perfmon` | 12 | 12 | 12 |
+| the other thirteen consoles | 153 | 0 | 0 |
+
+Every console but Performance Monitor now projects at every node except where it hands
+the whole window to a prompt it cannot project (below).
+
+Session-wide stability:
+
+- **Heartbeat expiry from a blocked pipe reader.** `HandleAction` ran native-action
+  admission on the pipe reader thread and could block on a surface's
+  `canonicalMutex` while a reconcile held it, so heartbeats went unread and the whole
+  session expired. Admission now runs on the action worker (`AdmitAction`); a
+  renderer-scoped surface fault is queued there as an internal rollback.
+- **Rollback is no longer permanent.** A projected window handed back to native
+  because of what it showed is re-attempted with backoff (2 s doubling to 30 s, 12
+  attempts, reset after a minute of stable projection), and a native navigation
+  (child-window topology change) brings the attempt forward. A window that never
+  projected waits for its view to change (the same topology signal, 1.5 s doubling to
+  30 s) instead of keeping one failed attempt forever; a refused capture shows
+  nothing, so these attempts cost no flash. Timing failures (an unacknowledged
+  command, an unstable barrier, a capture past its deadline) retry on a timer for up
+  to 90 s and then fall back to the topology watch.
+- **Reconcile grace.** A reconcile capture refused while a view is still loading
+  holds the projection for 3 s before rolling back.
+- **Capture cost.** Painted pixels of Windows Forms controls (inert surfaces, picture
+  buttons, glyph labels, the surface check) are rendered through WM_PRINT, which
+  WinForms answers through `OnPrint`; only other windows pay a compositor round trip
+  (`PW_RENDERFULLCONTENT`, now with one discarded first render, which DWM can answer
+  before it holds a freshly painted window). Event Viewer's overview capture dropped
+  from about 2 s to about 190 ms, and the console now projects at startup in 1.8 s.
+
+Adapter work:
+
+- **MMC busy shield.** `MMCWaitCursorWindow` (mmcndmgr.dll) is a transparent,
+  unpainted child MMC raises over the frame while a snap-in holds the console (Event
+  Viewer's Subscriptions prompt keeps it up). It is absorbed; the frame stays enabled
+  and focusable as natively, and the session declines everything but the window
+  frame's own commands while it is visible.
+- **Windows Forms:** virtual ListViews keep `LVIS_STATEIMAGEMASK` in their callback
+  mask (admitted when no state image list draws it); form-like panels whose own paint
+  is only the dialog face or window background project as plain frames (no chrome,
+  no splits between fields), as do panels whose children are all hidden; a read-only
+  RichEdit with one size/colour, no emphasis, links or objects projects as a read-only
+  text box (font binding of CJK/Latin runs is not formatting); LinkLabels project as
+  one-link SysLinks activated through the link's accessible default action; an
+  actionless focusable header strip (Firewall overview) projects as its pixels;
+  textless picture buttons and symbol-font (Marlett) labels/buttons carry their
+  painted faces with the face background keyed out.
+- **HTML:** a `res://` image of a System32 module (Performance Monitor's
+  `res://wdc.dll/perfmon.gif`, inside an image-only link) is decoded from the module's
+  resource with WIC; refusals now carry the element and geometry evidence.
+- **Covered hosts:** a window that a sibling above covers but for edges of at most
+  8 px shows only those edges; unsupported content inside it drops the host instead
+  of refusing the frame (Print Management lays MMC's result ListView over its
+  frameset host). Supported covered content keeps its nodes.
+- **Gate truthfulness:** container peers (MDI client, pane and dialog containers,
+  accessible islands, native documents, the disk view) report the native enabled state,
+  which MMC clears while a snap-in holds the console; SysLink gate failures name the
+  mismatched property. A Windows Forms tab stop the dialog manager's walk never reaches
+  (MMC 3.0 snap-in views) is still a tab stop and gets a tab index after the walk's.
+- **UIA gate no longer poisons the session:** a validation worker abandoned at its
+  deadline disables validation only until it finishes; a worker that was merely slow
+  re-enables it, one stuck in a provider never does.
+- **Windowed virtual lists (protocol minor 33):** an owner-data report ListView longer
+  than 512 rows without checkboxes or editable labels (Event Viewer's logs: 5,000+
+  events) is carried as a window of 192 rows around its native top row, with `itemCount`
+  and `itemWindowStart`. Every index (selection, focus, `contextMenu`) stays absolute
+  and is bounded by the full count; the projection shows the window between two spacers
+  that keep the whole list's scroll extent and moves it with `setTopIndex`, which scrolls
+  the native list so the requested row is its top row. At most one request is in flight,
+  the viewport is re-checked after each window arrives, and the scroll offset is restored
+  across the rebuild (a ListView rebuild resets it). Verified live against the Application
+  log with real wheel input: rows from the previous days are reachable and the list
+  returns to the top. A `setTopIndex` that does not land never rolls the window back.
+- **Tools:** `Drive-ProjectedMmc.ps1` gained `Expand`, `Key`, `Wait`, `WheelList` and
+  `ListState`; its tree lookups are exact (a prefix match had selected a sibling).
+
+### Later on 2026-10-08: Performance Monitor, the menu bar, selected rows, item activation
+
+Protocol minor 34. Everything below was driven live with `tools/Drive-ProjectedMmc.ps1`
+(real pointer and keyboard input plus UIA) against disposable consoles, never changing a
+policy, service, account or device; every dialog was cancelled or closed.
+
+- **Performance Monitor.** The root and Computer Management's Performance node project
+  (the counter collection is read through `Item(i)` with `_NewEnum` as the fallback). The
+  chart view (toolbar, legend ListView, status strip, graph) is still native, and the
+  other Performance Monitor nodes have not been re-walked since the census above.
+- **Menu bar.** MMC publishes hidden menus as `STATE_SYSTEM_INVISIBLE` buttons; capture
+  skips them. The MDI Window menu (ids from 0xFF00, which are ordinary commands) projects
+  and invokes; only `0xF000`-`0xF1FF` are system commands.
+- **Selected-row extended view (Services).** The HTML view's link ("Start") and its loose
+  text node project together; the service properties dialog opens and is cancelled.
+- **Item context menus.** Device Manager's menu opens from the Menu key (its OCX ignores a
+  synthesized `WM_CONTEXTMENU(-1,-1)`) and its device Properties dialog opens; Event
+  Viewer's event-list menu, which the frame thread creates asynchronously, is claimed and
+  projected. The Local Users and Groups user Properties dialog opens and is cancelled.
+- **Double-click and Enter (`openItem`).** Services' list double-click opens the service
+  Properties dialog. Event Viewer's list opens the projected event dialog by double-click
+  ("Event 10001, RestartManager") and by Enter on a selected row ("Event 16394,
+  Security-SPP"). Device Manager's tree opens the device Properties dialog by double-click
+  and by Enter on a selected leaf (the "ACPI x64-based PC" properties). Both gestures
+  reach the Bridge as `openItem`; the Bridge selects the item and posts its control Enter.
+- **Environment caveat.** The shell that ran these is non-elevated (Medium integrity,
+  `-RunAsInvoker`): Device Manager shows its two standard-user notices (cancelled with
+  OK) and `gpedit.msc` shows a Group Policy error dialog with only a Close button, so a
+  policy double-click in `gpedit` needs an elevated session and is not verified.
+- **Suites.** `.\test.ps1 -Configuration Release` passes: 596 Renderer tests, the full
+  native suite and the production gates (Bridge dependency, Bridge export, Injector CLI).
+- **Tools:** `Drive-ProjectedMmc.ps1` gained menu-bar steps (`MenuRoots`, `MenuBar`,
+  `MenuInvoke`), item steps (`TreeSelect`, `ListSelect`, `ListOpen`, `TreeOpen`, `Select`,
+  `Invoke`, `Items`), `Dialogs`/`CloseDialogs` (a button named with its mnemonic, such as
+  `Close(C)`, is a cancel path), and window/screen screenshots. `Crawl-ProjectedMmc.ps1`
+  re-checks stability after the reconcile hold.
+
+### 2026-10-09: the dialogs MMC opens
+
+Navigation projects; the dialogs a console opens are a separate boundary, because an owned
+dialog that cannot be projected hands the whole owner graph back to native. A survey with
+`tools/Drive-ProjectedMmc.ps1` (every dialog cancelled or closed, nothing changed) found
+these, each now fixed and verified live on the Medium-integrity shell (protocol minor 35):
+
+| Console | Dialog | Before | Cause and fix |
+| --- | --- | --- | --- |
+| empty | Add or Remove Snap-ins | projects | none needed |
+| `WmiMgmt` | WMI Control Properties | projects | none needed |
+| `certmgr` | Certificate (General, Details, Path) | whole console native | read-only RichEdit with bold runs: `richText` kind |
+| `taskschd` | task Properties (six tabs) | double-click did nothing, then rolled back | Windows Forms list needs the pointer's double-click; 120 px CheckBox minimum; false form-row splitter; surface-coloured bands past the caps; Marlett up/down buttons |
+| `eventvwr` | Actions menu commands | "owner window is gone" | per-call `ATL:` popup owner replaced on replay |
+| `eventvwr` | Filter Current Log | stayed native | unowned `ShowDialog()` is parented to the desktop: modal-peer owner |
+| `eventvwr` | Log Properties | stayed native | NumericUpDown arrows: spin-pair `upDown` adapter |
+| `eventvwr` | Create Custom View, Find | project | none needed beyond the above |
+| `eventvwr` | Create Basic Task wizard | stayed native | 1-pixel Panel rules (grouping role, full-height rule) |
+| `perfmon` | Add Counters | ended `mmc.exe` | comctl32 null read on a group without footer text: group text read under a structured handler; a positioned list builds only its viewport; UIA gate scaled to the snapshot; `close` is `SC_CLOSE` |
+| `perfmon` | chart Properties (five pages) | stayed native | pages are child dialogs with no `DS_CONTROL` (own tab scope); dialog-procedure owner-draw combos; owner-draw buttons; the Time Range bar as a picture |
+
+Two interaction checks ride on these: the projected NumericUpDown arrows step the native
+log-size field by its own increment (20480 to 20608 to 20544 in two presses up and one down),
+and Event Viewer's list and Device Manager's tree open their item from a double-click and from
+Enter.
+
+### Later on 2026-10-09: Performance Monitor's chart and the Add Counters dialog
+
+Protocol minor 36 (design notes: `CONTROL-ADAPTER-ROADMAP.md`, Tranche N). The chart view
+(`perfmon.msc`, Monitoring Tools, Performance Monitor) was the one navigation-census node that
+had stayed native. It projects now -- toolbar (with the graph-type drop-down arrow), the graph,
+the value strip and the legend -- from the System Monitor control's own state, and was driven
+live through the real pointer and UIA on a disposable, non-elevated console:
+
+- the chart draws as the native one does (slots, the red time bar, time-axis labels; line and
+  histogram, switched through the projected drop-down), and the legend's Show boxes and row
+  selection act on the control;
+- **Add Counters** (the chart's Add button, `Ctrl+A`) first ended `mmc.exe`: comctl32
+  6.10.26100 dereferences a null string when a ListView group has no footer, which every group
+  of that list is. Group text is now read under a structured handler. Then the dialog went back to native on the
+  UIA gate (a couple of hundred group bands, 1.3 s a transaction): a positioned list builds only
+  what its viewport shows and the gate's time grows with the snapshot. The dialog now projects;
+  a counter set expands through UIA, a counter is selected, `Add >>` puts it in the right list,
+  `OK` closes the dialog and the legend gains the row; Cancel and Escape close it (the
+  Bridge's `close` is `SC_CLOSE`, which this dialog needs: it ignores `WM_CLOSE`);
+- the chart's **Properties** dialog (`Ctrl+Q`; a property sheet whose five pages are sysmon.ocx child
+  dialogs) projects on every page -- General, Source, Data, Graph and Appearance -- and every
+  control answers real input (10 of 10 on General, 10 of 10 on Graph). Its pages are child dialogs
+  with no `DS_CONTROL`, so each is a navigation scope of its own; the capture also had to admit
+  owner-draw combos painted by a dialog procedure, owner-draw buttons, and the Time Range bar (a
+  picture). Switching away from the Source page after choosing the Database radio raises the "no data
+  source name" message box, which projects as a dialog of its own;
+- the suites pass: `.\test.ps1 -Configuration Release` (656 Renderer tests, the native suite, the
+  Bridge dependency and export gates, the Injector CLI gate);
+- the navigation census over `perfmon` visits its three monitoring nodes and projects all of them
+  (the data collector sets and reports need elevation).
+
+Dialog survey (`tools/Survey-ProjectedDialogs.ps1`, every dialog cancelled): the Add Counters and
+Properties flows are PROJECTED. Escape closes every Win32 dialog; the Windows Forms dialogs of Event
+Viewer and Task Scheduler ignored it (`canCancel` was `#32770`-only) until a WinForms form that is
+modal or has the dialog frame was treated as cancellable. Not carried: the chart's own pointer interactions (hover tooltips,
+double-click properties) and report/area chart types.
+
+The complete survey of the 19 flows (45 pages) over every console reachable without elevation ends
+with every page PROJECTED except Shared Folders' share properties (MISSING by design: this machine
+has only administrative shares, so the console shows its OK-only notice instead). Escape closes the
+dialog in every flow but four, each explained: the Task Scheduler and Event Viewer Log Properties
+dialogs raise a "discard changes?" prompt (which projects) because the survey had just edited their
+fields; the chart Properties sheet raises the "no data source name" message box; and Event
+Properties, a modeless Windows Forms window with a Close button, does not answer Escape (what the
+native form does is not established: the scripted native run cannot open it). Local Users and Groups'
+double-click flows passed in both runs.
+
+Startup probe on the final build (`Probe-MmcStartup.ps1 -Consoles all -ShowConsole -RunAsInvoker
+-AccessibilityDiagnostics`, a non-elevated shell, 22 consoles): 20 show stable startup and cleanup. The
+other two do not: `diskmgmt` shows the modal "you do not have access to Disk
+Management" box over a view whose lists are all empty, which capture refuses (`private container has no
+visible children to frame`); `tpm` swaps its overview for an empty ATL host about two seconds after
+start, so the capture barrier sees 55 nodes become 16 and the window goes back to native (3 of 3 runs
+for each, also with a 15 s and a 45 s observation). Both projected in the 2026-10-07 runs; the probe
+does not record the session's integrity level, so a session with access to Disk Management and the TPM
+is the likeliest difference, and an elevated re-run is the check.
+
+Presentation fixes that rode on these dialogs (all projected dialogs benefit): a Static draws like
+DrawText (alignment, top-aligned wrapped text clipped to its rectangle, no-prefix and ellipsis
+styles), native-sized combos no longer cut their labels in half, and check boxes and radio buttons use
+compact templates (`CompactControlStyles.cs`): WinUI's 20 px glyph in a 32 px cell was clipped to a native
+13 to 16 px control, so a radio button showed as an arc; it is now a whole circle with its dot, a check
+box a whole box with its tick, in every state (checked, unchecked, disabled), on the chart Properties
+pages, Task Scheduler's task Properties and the console Options dialog.
+
+Stability found by the same survey: a property sheet MMC opens from a snap-in is owned by a hidden
+`MMCDataWindow`, so the Bridge counts it as unowned and its proxy has no z-order tie to the console's.
+About a second after it opened, the console's menu-bar re-read published a structural patch; the
+console proxy rebuilt its controls and restored its remembered focus with `Focus(Programmatic)`, which
+activates the window it is in, and the console came to the front over the dialog (a click meant for the
+dialog's edit landed in the console's list; reproduced 5 of 5 on the Local Users and Groups group
+properties). A window now restores a rebuild's focus only while it is the active one and keeps it for
+its next activation otherwise; the same flow answers 4 of 4. This is the race the "z-order change to
+`TranslatedWindow`" item below was waiting on for these dialogs.
+
+### Later on 2026-10-09: dialogs opened from dialogs
+
+The survey opens every dialog from a console. Opening one from a *dialog* (a modal chain) was a
+separate boundary the owner graph had not crossed: it was one level deep, so the Color chooser the
+chart Properties sheet's Appearance page opens (a dialog owned by a dialog owned by the console) dropped
+the console, the sheet and the chooser to native, and nothing projected them again (the console's
+re-attempt after two seconds ran while the chooser was still open, and failed the committed gate). Design
+and the rules that came out of it: `CONTROL-ADAPTER-ROADMAP.md`, "Dialogs opened from dialogs".
+Driven live on a disposable, non-elevated console:
+
+- **Add Counters over the chart Properties sheet** (Data page, Add button): the whole chain projects
+  (console, sheet, Add Counters: three WinUI windows, three cloaked natives); Escape closes only Add
+  Counters and the sheet stays projected; Cancel on the sheet closes it. Survey flow
+  `perfmon-nested-add-counters`.
+- **Color chooser over the sheet** (Appearance page, Change under Color): projected at first, with blank
+  palettes (comdlg32 paints them through a subclass of a plain Static), which would have left the
+  dialog half dead. A Static that is a tab stop and has no text is refused as custom-drawn, so the
+  chooser stays native and fully working while it is open, with the sheet and console native under it
+  (held there for as long as it is open, with no re-attempt in between); about three seconds after it closes
+  the console is projected, then the sheet, in one discovery pass.
+- A console projected while a dialog is open natively (the console window is disabled) failed the
+  committed gate on the chart: the three custom elements reported themselves enabled, and the graph
+  stayed blank because it never drew to the extent it was given. Both fixed.
+- **Nested dialogs that project** (survey flows `empty-snapin-advanced`, `empty-snapin-target-computer`,
+  and by hand the Edit Extensions button): Add or Remove Snap-ins over the empty console, with Advanced, Extensions and the
+  Choose Target Computer page of a snap-in's wizard over it: each projects as the third window of the
+  chain, Escape closes only it, and the Add or Remove dialog stays projected.
+- **Nested dialogs that cannot project** hand the graph back and get it again: Local Users and Groups'
+  Select Users picker (`Link Window`, an editable RichEdit, a scroll bar) over a group's Properties went
+  native with the sheet (the console stays projected where it is a separate root: these sheets have a
+  hidden owner) and the sheet was projected again about four seconds after the picker closed; Task
+  Scheduler's New Trigger did the same until it could project (below). Device Manager's Driver Details
+  over a device's Properties raised a message box, which projects as a renderer prompt.
+- **Task Scheduler's New Trigger** (nested over a task's Properties, `taskschd-new-trigger`) projects
+  since protocol minor 37: its four `SysDateTimePick32` controls (start and expire, date and time) are
+  `datePicker`/`timePicker` nodes, and its Windows Forms group boxes own their controls. Driven by real
+  input: clicking the start date opens the projected calendar, day 20 sent `setValue`, the native picker
+  took it and the field read 2026/10/20; the time field's flyout (AM, hour 9, Accept) read 上午 09:11:09
+  with the native seconds kept. The dialog's eight check boxes and radio buttons all answer.
+- The complete survey was repeated on the final build of the day: 35 flows, 64 pages, every page
+  PROJECTED except Shared Folders' share properties (no ordinary share here). Escape closes every dialog
+  that has something to cancel with; it stays open on the Task Scheduler and Event Viewer editors that
+  prompt, Performance Monitor's sheet (the data-source message box), Event Properties (a modeless form) and
+  Customize View (only OK, natively too). Task Scheduler's New Trigger and Create Task pages have dynamic
+  panels, and the survey's blind `Interact` pass sometimes finds one control it picked before the panel
+  changed (`radio '' did not select`, a check box that did not toggle): by hand every one answers.
+
+### Later on 2026-10-09: the dialogs the consoles' own menus open
+
+The survey's flows open dialogs through list items and tree nodes. The File, Action and View menus of
+every console that projects a menu bar were listed (`MenuBar` steps) and each item that opens a dialog
+on the root node was opened and cancelled (flows `menu-*` in `dialog-survey.json`). Of 16 candidates,
+two kept their console native and are now projected, and one is another process:
+
+| Console | Dialog | Before | Cause and fix |
+| --- | --- | --- | --- |
+| empty, `eventvwr` | View, Customize | native | MMC's Customize View has a group box with `WS_TABSTOP` (a stop on nothing: a group box never takes focus): capture drops it from the traversal. All nine check boxes answer; Escape closes nothing, natively too (the dialog has only OK) |
+| `certmgr` | Action, Find Certificates | console rolled back | the search animation (`SysAnimate32`) is an inert picture of the frame it shows |
+| `printmanagement` | Action, Migrate Printers | no dialog | the migration wizard is a process of its own, not a window of the console |
+
+All of the others project on the first attempt: New Taskpad View wizard and Add/Remove Columns (empty
+console, WMI Control), Select Computer (Event Viewer, Services, Computer Management; the Event Viewer one is
+a Windows Forms form), Task Scheduler's Create Basic Task wizard, Create Task (five pages) and New Folder,
+Certificates' View Options, Print Management's Add/Remove Servers, and Authorization Manager's Options.
+Task Scheduler's wizard was walked page by page by real input (name, trigger type, Daily with its date and
+time pickers, Start a program): every page projects, Next stays disabled until the native form enables it,
+and the left-hand step list follows the page.
+
+Two consoles gave no menu items to list: Device Manager (its startup notices are modal over the console)
+and Windows Firewall (no projected menu bar when the survey ran, 4.5 s after the start).
+
 ## Installed console coverage
 
 Inventory: 21 top-level `C:\Windows\System32\*.msc` files, reconfirmed on 2026-10-02.
@@ -293,16 +673,16 @@ additional target. Rows remain pending or partial until their full view/dialog s
 | `certlm.msc` | Computer certificate stores, certificate list and viewer | Pending |
 | `certmgr.msc` | User certificate stores, certificate list and viewer | Pending |
 | `comexp.msc` | Component Services hierarchy and details | Pending |
-| `devmgmt.msc` | Device hierarchy, categories and property sheets | Pending |
+| `devmgmt.msc` | Device hierarchy, categories and property sheets | Partial: tree expansion, Menu-key context menu, device Properties by double-click and Enter (non-elevated shell: two standard-user notices) |
 | `DevModeRunAsUserConfig.msc` | Available local pages and dialogs | Pending |
 | `diskmgmt.msc` | Volume list, graphical disk view and property dialogs | Pending |
-| `eventvwr.msc` | Log tree, event lists, event details and filters | Pending |
+| `eventvwr.msc` | Log tree, event lists, event details and filters | Partial: log tree, windowed event list, event-list context menu, event Properties by double-click and Enter; filters pending |
 | `fsmgmt.msc` | Shares, Sessions, Open Files and properties | Pending |
-| `lusrmgr.msc` | Users, Groups and property dialogs | Pending |
-| `perfmon.msc` | Monitoring graph, collector sets and reports | Pending |
+| `lusrmgr.msc` | Users, Groups and property dialogs | Partial: user Properties dialog opened and cancelled |
+| `perfmon.msc` | Monitoring graph, collector sets and reports | Partial: root, Monitoring Tools and the chart view project (toolbar, graph, value strip, legend, Add Counters and Properties dialogs); collector sets and reports need elevation |
 | `printmanagement.msc` | Print servers, printer lists and properties | Pending |
 | `rsop.msc` | Available policy results, details and properties | Pending |
-| `services.msc` | Service list, extended/standard views and properties | Pending |
+| `services.msc` | Service list, extended/standard views and properties | Partial: list, selected-row extended view, service Properties by double-click |
 | `taskschd.msc` | Library, task lists, details, history and properties | Pending |
 | `tpm.msc` | Status, information and available dialogs | Pending |
 | `WF.msc` | Profiles, rules, monitoring and property dialogs | Pending |
@@ -367,9 +747,22 @@ or all unsupported snap-in adapters.
 
 - Verify the new virtual-list and stable-ID contracts through nested MMC pages,
   including refusal followed by a new explicit user action.
-- Exercise the native result-list double-click contract in additional snap-ins
-  and property dialogs; the current live success covers two Computer Management
-  navigation steps.
+- Exercise the result-list double-click and Enter contract (`openItem` for MMC views,
+  native activation elsewhere) in the remaining snap-ins and property dialogs; the live
+  successes cover Computer Management navigation, Services, Event Viewer and Device
+  Manager. A `gpedit.msc` policy double-click needs an elevated session.
+- Survey the dialog flows of the remaining consoles (Task Scheduler, Certificates, Disk
+  Management, Print Management, Windows Firewall, Shared Folders, Local Security Policy,
+  Component Services, the empty console's Add/Remove Snap-ins), cancel-only.
+- Performance Monitor: the chart's log and SQL data sources, report and area chart types, and the
+  data collector sets and reports (elevation); the Font chooser and the log-file picker the Properties
+  pages open have not been driven (by the adapter registry's rules they stay native while open:
+  `CBS_SIMPLE` combos, the shell's item dialog; the Color chooser was driven, see "dialogs opened from
+  dialogs").
+- Confirm that the z-order change to `TranslatedWindow` (no `AppWindow.Show` when the
+  window is already visible, no presenter writes when nothing changed) removes the race
+  that left a dialog behind its owner; and Event Viewer's scope-tree context menus under
+  heavy navigation, which can still arrive late or be lost.
 - Investigate `services` native source-command starvation, then repeat committed
   UIA enumeration and dispatcher-liveness checks with report virtualization.
 - Diagnose the immediate-launch Injector failure report followed by successful

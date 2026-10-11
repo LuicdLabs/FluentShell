@@ -6,7 +6,7 @@
 
 namespace FluentShell {
 
-// Hard deny: never inject, never L0-touch. Shell / XAML hosts / security.
+// Hard deny: never inject. Shell / XAML hosts / security.
 inline bool IsProcessDenied(std::wstring_view exeName) {
     static const wchar_t* kDenied[] = {
         // Core OS
@@ -53,7 +53,7 @@ inline bool IsProcessDenied(std::wstring_view exeName) {
     return false;
 }
 
-// Window classes that belong to system XAML / shell chrome — never L0.
+// Window classes that belong to system XAML / shell chrome cannot be projected.
 inline bool IsShellOrXamlWindowClass(std::wstring_view className) {
     if (className.empty()) return false;
     // WinUI / XAML islands
@@ -75,12 +75,6 @@ inline bool IsShellOrXamlWindowClass(std::wstring_view className) {
         return true;
     }
     return false;
-}
-
-inline bool IsProcessDeniedByPid(DWORD pid) {
-    auto path = GetProcessImagePath(pid);
-    if (path.empty()) return true; // unknown → safe deny for L0
-    return IsProcessDenied(FileNameOf(path));
 }
 
 } // namespace FluentShell

@@ -52,7 +52,31 @@ public static class ProtocolConstants
     // Minor 28 adds the staticBitmap kind (SS_BITMAP pictures under the large-bitmap cap)
     // and the upDown kind (msctls_updown32 stepped through setValue); a BS_ICON/BS_BITMAP
     // push button may carry its picture in the image fields.
-    public const ushort Minor = 28;
+    // Minor 29 retires exact application pages in favor of capability-derived DirectUI
+    // semantics and adds owned toolbar hot, disabled, and pressed image variants.
+    // Minor 31 adds the native Disk Management MSAA table and semantic actions.
+    // Minor 32 adds the contextMenu action for TreeView and ListView items.
+    // Minor 33 carries a large virtual report ListView as a window of rows (itemCount,
+    // itemWindowStart) with absolute indices, and adds setTopIndex to move the window.
+    // Minor 34 lets a ListView or TreeView offer itemDefaultActivation and adds the openItem
+    // action: a double-click selects the item and sends its control the Enter key.
+    // Minor 35 adds the richText kind: a read-only rich edit control carried as paragraphs
+    // of formatted runs (bold, italic, underline, strike-through, size in points, colour).
+    // Minor 36 adds Performance Monitor's chart as three kinds read from the System Monitor
+    // control: performanceGraph (scale, grid, counters and their recorded samples),
+    // performanceLegend (one row per counter) and performanceValueBar (Last, Average, Minimum,
+    // Maximum, Duration).
+    // Minor 37 adds the datePicker and timePicker kinds (SysDateTimePick32): the value is the
+    // position of a range, as for a slider -- a date's day number (days since 0001-01-01), a
+    // time's second of the day -- and setValue changes it.
+    // Minor 38 completes the translated dialogs: a task dialog's nodes may carry
+    // presentation variants (mainInstruction, commandLink*, elevated, expando*) and a
+    // command link's note as helpText, and its text is a sysLink with one label per
+    // link, named by index through activateItem.
+    public const ushort Minor = 38;
+    // Minor 32 also lets a container carry its scroll bars; one setScroll moves at
+    // most this many application line steps.
+    public const int MaxScrollLines = 100;
     public const string GenericDirectUiAdapterId = "microsoft.windows.directui.semantic.v1";
     public const string GenericDirectUiPageId = "semantic-v1";
     public const int HeaderSize = 32;
@@ -61,11 +85,19 @@ public static class ProtocolConstants
     public const int MaxStringChars = 65_536;
     public const int MaxNodes = 512;
     public const int MaxItems = 4_096;
+    // A windowed virtual ListView may count this many rows; its window and every
+    // per-row array stay under MaxItems.
+    public const int MaxVirtualListItems = 16_777_216;
     public const int MaxTabItems = 128;
     // itemDepths carries a projected TreeView item's nesting level, so the
     // deepest admissible level is one less than the level count.
     public const int MaxTreeDepth = 31;
     public const int MaxToolbarItems = 64;
+    // A date picker's range lies inside the years a calendar picker is built for, as
+    // DateOnly day numbers (days since 0001-01-01); a time picker's position is the second of the day.
+    public static readonly int MinPickerDay = new DateOnly(1900, 1, 1).DayNumber;
+    public static readonly int MaxPickerDay = new DateOnly(2200, 12, 31).DayNumber;
+    public const int SecondsPerDay = 24 * 60 * 60;
     public const int MaxPaneSplits = 8;
     public const int MaxChromeRegions = 4;
     public const int MaxChromeRegionDimension = 1_024;

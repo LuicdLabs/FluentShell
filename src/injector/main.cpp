@@ -1,6 +1,5 @@
 #include "../Common/FluentShell.h"
 #include "../Common/ProcessPolicy.h"
-#include "../Renderer.Dwm/DwmRenderer.h"
 
 #include <TlHelp32.h>
 #include <wincrypt.h>
@@ -509,24 +508,6 @@ bool InjectBridge(DWORD pid, const std::wstring& expectedTargetPath) {
     return false;
 }
 
-void RunL0Diagnostic() {
-    auto rules = FluentShell::Dwm::DefaultRules();
-    auto apply = [](HWND hwnd, const FluentShell::MatchRule& rule, void*) -> bool {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        if (FluentShell::IsProcessDeniedByPid(pid)) return true;
-        wchar_t className[128]{};
-        GetClassNameW(hwnd, className, static_cast<int>(std::size(className)));
-        if (FluentShell::IsShellOrXamlWindowClass(className)) return true;
-        FluentShell::Dwm::ApplyToWindow(hwnd, rule.dwm);
-        wchar_t title[256]{};
-        GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
-        std::wcout << L"[L0 diagnostic] " << className << L" | " << title << L"\n";
-        return true;
-    };
-    FluentShell::Dwm::EnumTopLevelWindows(rules, apply, nullptr);
-}
-
 int InjectRequestedTarget(const InjectOptions& options) {
     const auto canonical = CanonicalFilePath(options.requestedImagePath);
     if (!canonical) {
@@ -580,8 +561,7 @@ void PrintUsage() {
     std::wcout <<
         L"FluentShell.Injector - explicit Win32 to WinUI translation\n\n"
         L"Usage:\n"
-        L"  FluentShell.Injector inject <absolute-image-path> [--pid <pid>] [--sha256 <hex>]\n"
-        L"  FluentShell.Injector l0                 One-pass DWM diagnostic\n\n"
+        L"  FluentShell.Injector inject <absolute-image-path> [--pid <pid>] [--sha256 <hex>]\n\n"
         L"Injection requires one canonical image path. If more than one matching process is\n"
         L"running, --pid is mandatory. Bridge is loaded directly; Renderer\\FluentShell.Renderer.exe\n"
         L"must be present beside the injector directory. System-wide and name-only injection\n"
@@ -605,10 +585,6 @@ int wmain(int argc, wchar_t** argv) {
         }
         EnableDebugPrivilege();
         return InjectRequestedTarget(*options);
-    }
-    if (command == L"l0" && argc == 2) {
-        RunL0Diagnostic();
-        return 0;
     }
     PrintUsage();
     return 1;

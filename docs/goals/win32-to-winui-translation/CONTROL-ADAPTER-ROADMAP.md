@@ -243,6 +243,36 @@ native.
   that, because nothing built a dialog snapshot outside the live hook path.
 - Admission failures now name the offending node and field instead of only the rule.
 
+### Translated Dialogs Completed (protocol minor 38, 2026-10-10)
+
+The lane used to lay every MessageBox out at a fixed 540x300 with English labels, and
+virtualized only a static TaskDialog subset (anything with a callback, radio buttons,
+command links, hyperlinks, a progress bar or expandable details went native, where its
+DirectUI content handed the owner graph back to native).
+
+- Layout: dialogs are sized to their text, measured with DirectWrite (Segoe UI and the
+  system fallback, the font XAML draws; GDI's font linking measured CJK too narrow and
+  clipped it), with native-like margins, the icon beside the text, and the buttons
+  right-aligned in a shaded command band. Bounds include the proxy's frame.
+- Labels: user32's own (`MB_GetString`): `確定`, `是(&Y)`. A lone OK closes on Escape.
+- `MessageBoxIndirectW` is hooked (resource text, `MB_USERICON` as a picture node), and
+  `TaskDialog` alongside `TaskDialogIndirect` (in the comctl32 that exports it).
+- TaskDialog: every `TASKDIALOGCONFIG` feature (custom and common buttons, command links
+  with notes and shields, radio buttons, verification, expandable information in the
+  content or footer area, footer and footer icon, application icons, hyperlinks,
+  normal and marquee progress, `cxWidth`, positioning) and the callback contract
+  (`TDN_*` on the caller's thread with a real HWND; `TDM_*` including navigation,
+  progress, element text, enable/elevation state and icon updates; `S_FALSE` vetoes).
+- Protocol minor 38: a task dialog's nodes carry presentation variants
+  (`mainInstruction`, `commandLink*`, `elevated`, `expando*`) and a command link's note
+  as `helpText`; its text is a `sysLink` with one label per link, named by index through
+  `activateItem`. A window surface still admits a single-link SysLink only.
+- Evidence: `TestVirtualDialogSnapshots` and `TestVirtualTaskDialogCallbacks` (native),
+  `TaskDialogProtocolTests` (renderer), and LegacyDialogHost's "Rich TaskDialog" and
+  "Information message" commands driven live, including a MessageBox raised from the
+  task dialog's callback and a navigation; Device Manager's "no driver files" message
+  box over a device's Properties.
+
 ### Tranche J: Accessible Islands And The Full Toolbar Surface
 
 Some private container classes host their content as objects that own no HWND at
@@ -652,6 +682,442 @@ was `DirectUIHWND`: it hosts the Actions pane's content as HWND-less elements, s
 geometric container rule correctly reported it had no visible children to frame.
 Tranche J admits it.
 
+### Tranche K: Windows Forms Result Panes And Large Virtual Lists (2026-10-08)
+
+MMC 3.0 snap-ins (Event Viewer, Task Scheduler, Windows Firewall, TPM) host Windows
+Forms views, and Event Viewer's logs are owner-data lists of thousands of rows. Each
+adapter below is admitted by evidence the control publishes, never by class name alone.
+
+- **A form-like panel is a frame when its own paint is only the system surface.**
+  `ProbePaneContainer` also admits a container whose visible client area, minus its
+  children, is one opaque colour equal to `COLOR_3DFACE` or `COLOR_WINDOW` -- the
+  surface the projection already draws behind every control -- and one whose children
+  are all hidden. The check renders the container twice (over black and over white, as
+  the chrome capture does) and compares only what is on screen. Such a frame carries no
+  chrome and offers no splits, because a gap between two fields is nothing the user can
+  drag natively. An empty tab stop is not a frame: it is a control that has not painted.
+- **Windows Forms controls are painted through `WM_PRINT`.** They draw in `OnPrint`, so
+  their pixels come straight from the window in milliseconds instead of a compositor
+  round trip per render (Event Viewer's overview capture fell from about 2 s to about
+  190 ms). Any window that answers `WM_PRINT` with nothing is read from the compositor.
+- **Read-only RichEdit projects as a read-only text box** when the text object model
+  reports one size and colour, no emphasis, hidden, raised or lowered run, no link and
+  no embedded object. CJK/Latin font binding is not formatting. An editable RichEdit
+  would lose its formatting through a plain-text edit and keeps its refusal.
+- **A LinkLabel is a one-link SysLink.** Its accessible object publishes the link as a
+  child (`ROLE_SYSTEM_LINK`) with a default action; the label is told from a plain
+  Label by those children. Activation is the link's own `accDoDefaultAction`, which
+  raises `LinkClicked`, on the deferred native-action path because the handler may
+  open a dialog.
+- **Symbol-font text is glyphs.** A Windows Forms label or button in Marlett, Webdings,
+  Wingdings or a Segoe icon font, and a textless picture button, carry their painted
+  face as an image with the face background keyed out, instead of projecting the
+  letters (`5` for a chevron, `r` for a close cross).
+- **An actionless focusable strip is its pixels.** A tab-stop `WindowsForms10.Window.*`
+  at most 32 px tall that has no children and publishes no accessible action (Windows
+  Firewall's overview section headers) is an inert painted surface and leaves keyboard
+  traversal.
+- **A window another covers but for its edges is not on screen.** MMC lays Print
+  Management's result ListView over the HTML host that positions it. The host and its
+  content are left out of the capture, and unsupported content inside one drops the
+  host rather than refusing the frame.
+- **MMC's busy shield is input semantics, not content.** The transparent
+  `MMCWaitCursorWindow` (mmcndmgr.dll) is absorbed and the session declines everything
+  but the window frame's commands while it is visible.
+- **A `res://` image of a System32 module is decoded from its resource.** The image is
+  placed at its own layout box inside the item's box, so it is exact whatever the scroll
+  position, the cloak or the host's print path; the document's own paint is read back
+  only for an image that is not such a resource.
+- **Large virtual report lists are windowed.** An owner-data report ListView of more
+  than 512 rows without checkboxes or editable labels is carried as 192 rows around its
+  native top row (`itemCount`, `itemWindowStart`; protocol minor 33). Indices stay
+  absolute on the wire and are bounded by the full count; the projection draws the
+  window between two spacers that keep the whole list's extent and moves it with
+  `setTopIndex`, which scrolls the native list so the requested row is its top row. One
+  request is in flight at a time, the viewport is checked again after each window
+  arrives, the scroll offset is restored across the rebuild, and a request that does not
+  land never rolls the window back.
+
+### Tranche L: MMC Menus, Selected-Row Views, And Item Activation (2026-10-08)
+
+The console's own chrome and result panes: what MMC hides, what its HTML views mix, and
+how an item is opened from the keyboard or by double-click.
+
+- **The MSAA menu bar skips what MMC hides.** MMC's menu bar is a `ToolbarWindow32` that
+  publishes its buttons through MSAA; a menu that does not apply to the current view keeps
+  its button with `STATE_SYSTEM_INVISIBLE`. Capture reads that state, leaves hidden buttons
+  out and refuses to select one, so the projected bar shows what the native bar shows.
+- **System commands are `SC_*` only.** MFC numbers an MDI Window menu's items from 0xFF00,
+  which an "above 0xF000" test took for system commands and refused as not `WM_COMMAND`.
+  Only 0xF000-0xF1FF are system commands (`IsSystemCommandId`, shared by the menu-bar and
+  popup-level captures); every other id is an ordinary command.
+- **A selected row's extended view mixes elements and loose text.** The Services
+  `views.htm` view puts a script link ("Start") beside bare text nodes. Text-node runs are
+  measured through `IHTMLTxtRange` (`getBoundingClientRect`), bounded by their neighbouring
+  elements, and the document is compared as a multiset whenever any exist. The
+  `FolderIcon` and `MMCEvents` objects MMC injects into these views are inert and skipped.
+- **A counter collection is read through `Item(i)`, then `_NewEnum`.** sysmon's counter
+  items refuse `QueryInterface(IID_IDispatch)`, so the VARIANT's own `IDispatch` is used,
+  and a failed read names the step that failed. Performance Monitor's root and Computer
+  Management's Performance node project.
+- **A context menu may need the Menu key.** Device Manager's result tree is an MFC OCX
+  that ignores a synthesized `WM_CONTEXTMENU(-1,-1)` but opens its menu from `VK_APPS`.
+  `ContextMenuTrigger` names how a request is delivered (context-menu message, Menu key,
+  Enter key); a TreeView hosted in an OCX view uses the Menu key.
+- **A popup another thread creates is claimed, not left native.** Event Viewer's list runs
+  on its own GUI thread and the frame thread creates the popup asynchronously. The frame's
+  agent arms a pending island menu for the request and the remote popup is marked claimed,
+  so the popup is tracked and projected instead of retired as a stray.
+- **A default activation is a request, not a guess (protocol minor 34).** A virtual MMC
+  result list publishes no native activation, and a snap-in tree's leaf opens on Enter.
+  Inside an MMC frame such a node offers `itemDefaultActivation` (never the scope tree,
+  whose double-click expands). The projection sends `openItem { index, text }` with the
+  absolute index and the label as witness; the Bridge selects that item and posts its
+  control Enter (`WM_KEYDOWN`/`WM_KEYUP`, `VK_RETURN`) on the deferred native-action path,
+  because the handler may enter a modal loop. `openItem` is request-semantic (rebased onto
+  the current revision like `invoke`), and a refused one is recoverable.
+- **The projection recognizes the gesture itself.** A double-click is counted from raw
+  presses at window level (`ItemPressTracker`): the first press can rebuild the item
+  presenter and even replace the node's view model, which cancels a double-tap the
+  presenter had recognized. Enter is heard among handled events, because the row
+  container consumes it as its own invoke before it reaches the list or the tree. The
+  list's listener serves native `activateItem` on Enter as well.
+
+### Tranche M: Snap-in Dialogs, Windows Forms Forms And Rich Text (2026-10-09)
+
+What a survey of the dialogs MMC opens turned up (each fixed row names the evidence).
+
+- **A Windows Forms list opens its item from whichever input its application listens to.**
+  Task Scheduler's task list answers the accessible default action with success and opens
+  nothing, and ignores Enter; its application listens to `DoubleClick`. Event Viewer's event
+  list is the reverse: it opens on Enter and ignores a synthesized click (the application
+  reads the pointer, which is not where the projection's request is). A Windows Forms
+  ListView inside an MMC frame therefore offers `itemDefaultActivation` instead of
+  `itemActivationSupported`, and `openItem` sends Enter first (it names the selected item
+  exactly) and, only when that opened no captioned window within a modal call's duration
+  (300 ms) plus a short grace (250 ms, messages dispatched), gives the control
+  `WM_LBUTTONDBLCLK` and `WM_LBUTTONUP` at the item's label. Every other control keeps the
+  Enter key. A refusal or a request that never reaches the list's thread is logged
+  (`Remote island action refused / running / did not run`), which used to be silent.
+- **Focus that already landed is not moved back.** The tab control and the tree each pulled
+  keyboard focus to their selected header or item on every `GotFocus`, and that event
+  bubbles from everything inside. Clicking an edit on a property page left focus on the
+  selected tab header, so no edit on any tab page took typing; clicking a tree item
+  focused the previous selection and scrolled the tree to it, so a double-click's second
+  press met another row. Only keyboard focus that lands on a header (or the tab control)
+  and focus that lands on the tree itself are redirected.
+- **Opening a tree node does not rebuild the tree.** An `itemExpanded` patch rebuilt every row
+  and reset the scroll offset to the top; a change of icons did the same. When labels, depths
+  and child flags are unchanged the nodes' open state and icons are applied in place, and a
+  rebuild that remains restores the vertical offset once layout has made the extent tall
+  enough again.
+- **A default minimum never exceeds the native extent.** WinUI's `CheckBox` is 120 px wide at
+  least, so a 65 px "Hidden" box reported bounds the native control did not have and the
+  committed UIA gate refused the whole dialog. `ApplyBounds` clears a `MinWidth`/`MinHeight`
+  larger than the extent it has just assigned.
+- **A split runs across its container.** The strip between a form's label and its field has a
+  neighbour on both sides and was offered as a draggable splitter. A split must reach from
+  one edge (or a painted caption band) to the other and cover at least half the container's
+  extent; capture and `SetPaneSplit` read the same `ResolveSplits` list, so indices agree.
+- **A band that is only the surface is nothing to carry.** A painted band that is one uniform
+  system surface colour -- the dialog face, the window background, or a themed tab body's
+  neutral near-white (#F9F9F9 under the Windows 11 theme) -- is the background the projection
+  already draws behind every control. It is not captured as chrome (it showed as a slightly
+  different patch on the projection's own surface), and one wider than the chrome caps no
+  longer refuses a frame that has nothing custom in it.
+- **A glyph button shows its face.** An owner-draw Windows Forms button answers `WM_GETFONT`
+  with nothing, so a symbol font ("67" for a drop-down arrow, Marlett "5"/"6" for up and down)
+  is invisible to the font test. A button no larger than 36 px with at most three characters,
+  and a standard push button in a symbol font, carry their painted face as a picture; a face
+  that does not render leaves a standard button as a button with its characters.
+- **A snap-in popup's owner is replaced, not remembered.** Event Viewer's Action and View
+  menus are owned by a hidden `ATL:` top-level window MMC creates for each tracking call and
+  destroys after it, so the owner recorded at read time is gone when a command is replayed.
+  A recorded owner outside the frame is told by its class, and the replayed popup is accepted
+  with a new owner of that class on the same thread. A stale refusal names the check that
+  failed.
+- **An unowned modal dialog is modal to the window disabled for it.** `Form.ShowDialog()`
+  without an owner is parented to the desktop and disables the thread's other top-level
+  windows. The desktop is no owner; a dialog-framed window resolves the disabled top-level
+  nearest below it on its thread as its owner, so the proxy blocks it like a real owner.
+- **Formatted read-only text is carried as runs (protocol minor 35).** A read-only RichEdit
+  with more than one character format (a certificate's bold labels and bullets) is the
+  `richText` kind: paragraphs of runs read through the text object model, each run one
+  constant format (bold, italic, underline, strike-through, size in points, colour), with
+  paragraph alignment, a bullet, indents and spacing. The projection is a scroller around a
+  text block and reports as a pane. Links, embedded objects, hidden, raised or lowered
+  text, background colours and numbered lists refuse the control.
+- **A Windows Forms NumericUpDown is an UpDown beside its edit.** `UpDownBase.UpDownButtons`
+  is a small leaf that paints two arrows: an accessible spin box with an up and a down push
+  button that publish no action, stepping when its upper or lower half is pressed. It
+  projects as an `upDown` whose position is the integer in the sibling edit and whose range
+  is open; a step sends the control the press a pointer gives. A number that is not an
+  integer refuses the control.
+- **A Panel's 1-pixel rules are inert pictures.** A Panel answers as an accessible grouping,
+  and a rule a few pixels thick may run the whole height of a page (the divider a wizard draws
+  beside its page), which the box cap would have refused.
+
+### Tranche N: Performance Monitor's Chart (2026-10-09)
+
+The chart view of Performance Monitor (perfmon.msc, Monitoring Tools) was the last node of the
+navigation census that stayed native. It hosts the System Monitor control (sysmon.ocx): a
+toolbar, the graph (`ChartGraphClass`, around an ATL window of wvc.dll that draws it), a value
+strip (`PerfStatus`) and an owner-draw legend (`PerfLegend` around a `SysListView32`). Pixels of
+the graph say nothing about the counters behind them, so the contract is the control's own
+state: three kinds, `performanceGraph`, `performanceLegend` and `performanceValueBar` (protocol
+minor 36), each probed by class *and* by identity (the class is registered by System32's
+sysmon.ocx, the part sits directly in a `SysmonCtrl` whose object answers `IPersist` with the
+System Monitor CLSID and whose methods are code in sysmon.ocx).
+
+- **The control is read through its vtable, never its IDispatch.** Its automation dispatch
+  resolves names through one process-wide `ITypeLib` pointer that sysmon.ocx clears when *any*
+  instance is destroyed, and MMC destroys the previous view's instance (the Performance page's
+  embedded counter report) moments after it creates the chart's: from then on
+  `GetIDsOfNames` answers `E_UNEXPECTED` and `Invoke` `E_FAIL` for every instance in the
+  process while the control itself keeps working. The vtable interfaces (`ISystemMonitor`,
+  `ISystemMonitor2`, `ICounterItem`, `ICounterItem2`) never touch that pointer, so
+  `SysmonInterfaces.h` declares them by hand in the type library's slot order
+  (`tools\Dump-TypeLib.ps1 C:\Windows\System32\sysmon.ocx` prints it) and `Sysmon.cpp` calls
+  them under a structured-exception guard. The control's interface pointer is the OLE drop
+  target it registers on its window (`OleDropTargetInterface`), queried for `ISystemMonitor2`.
+- **A live chart's history is recorded from the control's own event.** `GetDataAt` answers only
+  for log and SQL sources (it returns `E_UNEXPECTED` when the data source type is not 2 or 3,
+  checked in the disassembly), so there is no history to read. The control does publish
+  `DISystemMonitorEvents::OnSampleCollected` once per sample; the Bridge advises a sink on that
+  connection point (the control owns the subscription and drops it when destroyed) and, for each
+  event, keeps every counter's `GetValue` -- the values the control plots -- with the time. The
+  history starts when the part is first probed, a moment after the view appears, which is when
+  the native chart starts too. A sink that fires after its window is gone does nothing.
+- **Slots are laid out as the control lays them out (compared against a native chart).** A
+  wrapping chart (the default) writes sample n into slot n mod N with a red time bar at the
+  newest sample and leaves the previous pass right of the bar until it is overwritten; the slot
+  just after the bar is blank (the control clears the sample the next one overwrites), so the
+  line has a one-slot gap there. A scrolling chart keeps the newest sample last. The graph
+  carries one value (or null) per slot, the bar's slot, whether the chart has wrapped, and the
+  times of the first and last slot's samples. Samples sit at the right end of their share of the
+  plot's width, which is where the native chart draws them. The time axis labels the time of the
+  sample each slot holds -- the first slot at the left edge, the last at the right edge, and a
+  slot every nice number of seconds (a step at least 2.2 label widths wide) between -- so after a
+  wrap the left label is newer than the interior and right ones, as it is natively. A histogram
+  has no time axis and no time bar: its bars are the counters' latest values, each centred in its
+  share of the plot (a lone counter's bar is the middle two fifths), and the legend's swatches
+  are solid bars.
+- **The value strip's labels come from the control.** Last, Average, Minimum, Maximum and
+  Duration are string-table entries of sysmon.ocx (128 to 132, localized by its MUI file), the
+  numbers are the selected counter's `GetValue` and `GetStatistics` in the user's number format
+  (three decimals, digit grouping when the control groups), and the duration is the data point
+  count times the interval. The legend's cells are the native list's own text (the control keeps
+  the text of the columns it draws itself); its Show box and row selection are the list's own
+  item state, set through the list so the control reacts as it does to a click and then checked
+  against the counter.
+- **Only what the projection can draw is admitted.** Current-activity data (not a log or SQL
+  source), the line and histogram types (not report, area or stacked area), 2 to 1000 data
+  points, at most 64 counters and an interval of 0.1 s to an hour. Anything else keeps the whole
+  window native, so switching the chart to Report from the toolbar rolls the console back and
+  switching to Line again projects it again.
+- **Gaps between the control's children are margins, not splitters.** Its toolbar, graph, strip
+  and legend are 10 px apart, which the container rule (strips of at most 14 px that span the
+  container) took for three draggable splitters. `ResolveSplits` offers none for a System
+  Monitor control.
+- **A toolbar button's arrow is its own gesture.** `TBSTYLE_EX_DRAWDDARROWS` (the only extended
+  style the control's toolbar sets) is accepted. A `BTNS_DROPDOWN` button projects as one button
+  with two parts: its body is the button's command (here "change graph type", which cycles) and
+  its arrow is the new `toolbarDropDown` action (the button's command id). The Bridge answers it
+  the way the toolbar's own click does -- `WM_NOTIFY`/`TBN_DROPDOWN` with the button's id and
+  rectangle sent to the toolbar's parent -- from a deferred source-thread request with popup
+  interception armed, so the owner's `TrackPopupMenu` is carried as the same popup menu a
+  context menu is, anchored under the button.
+
+Not carried: log and SQL data sources, the report and area types, and the chart's own pointer
+interactions (hover tooltips, double-click properties); a scrolling chart's layout follows the
+documented behaviour and has not been compared against a native scrolling chart.
+
+#### The Add Counters dialog (same day)
+
+The chart's Add button opens the PDH counter browser: a dialog whose "Available counters" list is a
+grouped report `SysListView32` (one collapsible group per counter set), whose instances list is a
+multi-select ListBox, and whose "Added counters" list is a second grouped list. It crashed the
+target at first (the whole of `mmc.exe` ended inside comctl32); what it needed:
+
+- **A multi-select ListBox is an index list.** `LBS_EXTENDEDSEL` and `LBS_MULTIPLESEL` lists are
+  admitted: the capture reads `LB_GETSELITEMS`, the renderer's ListBox takes the matching selection
+  mode, and `setSelection` carries every selected index (a `LBN_SELCHANGE` is sent as a click would
+  send it). Multi-column, owner-draw and virtual lists stay refused.
+- **comctl32 6.10.26100 ends the application when a ListView group has no footer.** Its
+  `LVM_GETGROUPINFO(BYINDEX)` copies the header, footer, subtitle and task text into the caller's
+  buffer with an unchecked string copy, so a group inserted without a footer is a null read inside
+  comctl32 (WER: `Comctl32.dll` offset 0x7D418, then `0xC000041D`). It looked like a hang
+  because the faulting thread sat in WER. Group text is read one field per query through the
+  class window procedure under a structured handler (an exception raised below `SendMessage`
+  crosses a kernel callback and never reaches the sender's handler), and a null read is an
+  absent text. `TestListViewGroupsWithoutText` pins it.
+- **A positioned list builds only what its viewport shows.** A grouped (or icon) ListView is a
+  Canvas holding every item of the native list wherever its scroll position puts it, and the XAML
+  accessibility provider has to describe each element that exists: a couple of hundred group
+  bands made one UIA transaction last longer than a gate waits (1.3 s a stage, 1 s allowed), and
+  the dialog went back to native. Items within two viewports of the native viewport are built;
+  a group's rows that the native list collapses (no extent) and bands far off are not (rows keep
+  a collapsed placeholder in `control.Items`, which selection indexes; bands come after every
+  row, so they are simply absent). Native scrolling recaptures the list, which builds the rest.
+  A group band is one UIA element now (the button), not three. A list that indexes its realized
+  rows (check boxes, in-place rename) keeps them all.
+- **The UIA gate scales with the snapshot** (`BudgetFor`): 1 s per transaction and 5 s per pass for
+  a small tree, more in proportion to controls, rows and group bands, up to 4 s and 14 s.
+- **Escape and the close button reach dialogs that ignore `WM_CLOSE`.** The Bridge's `close`
+  action sent `WM_CLOSE`, which this dialog neither handles nor turns into a cancel (posted or sent,
+  it stays open). It now sends `WM_SYSCOMMAND`/`SC_CLOSE`, which is what the native close button
+  sends: `DefWindowProc` turns it into the dialog's own cancel, and into `WM_CLOSE` for a window
+  that handles that.
+
+Verified live (disposable console, non-elevated): the dialog opens projected, a counter set expands
+through UIA, "% Processor Time" is selected, `Add >>` puts it in the right list under its group,
+`OK` closes the dialog and the legend gains the row; Cancel and Escape close it.
+
+#### The chart's Properties dialog (same day)
+
+The toolbar's Properties button (`Ctrl+Q`) opens a comctl32 property sheet: a `#32770` frame with a
+tab control, OK / Cancel / Apply, and a DS_CONTROL host dialog holding the active page. The five
+pages (General, Source, Data, Graph, Appearance) are sysmon.ocx dialog templates created as child
+dialogs with `WS_CHILD | DS_SHELLFONT` and no `DS_CONTROL` (`tools\Dump-DialogResources.ps1
+C:\Windows\System32\sysmon.ocx` lists every control of every page). What it needed, in the order the
+log named it:
+
+- **A child dialog that is no control parent is a navigation scope of its own.** Such a page runs a
+  dialog manager of its own (Tab cycles inside it), so the frame's `GetNextDlgTabItem` walk never
+  reaches its controls. `ProbeDialogContainer` admits any chrome-free child dialog (`DialogContainer`),
+  `IsIndependentDialogPage` makes each visible one an extra tab container next to the MDI children, and
+  the renderer's `ValidateDialogContainer` no longer demands the DS_CONTROL shape.
+  `TestTabOrderScopes` pins it.
+- **A container's tab order starts at its first tab stop.** The walk began after the container's first
+  child, so a container whose first child was itself a tab stop numbered it last (a null start to
+  `GetNextDlgTabItem` answers the first one). The MDI regression test had encoded the rotated order.
+- **An owner-draw ComboBox whose owner is a dialog procedure.** A dialog procedure answers
+  `WM_DRAWITEM` through `DWL_MSGRESULT`, which the sender reads as 0 even though the item was painted,
+  so the capture treated every painted item as refused. Painting (a render that changed its fill) now
+  counts as handling it. The Data page's colour, width and style combos paint their line previews this
+  way.
+- **An owner-draw button of a framework other than Windows Forms.** A push button whose owner paints
+  its whole face is carried as that picture and clicks the control when pressed -- up to a button
+  picture's size (96 px). A wider face that no key reaches (the Appearance page's colour swatch) is
+  the inert picture it shows (`StaticBitmap`); a wider one that takes focus has no contract.
+- **The Time Range bar** (`IntervalBar`, a window sysmon.ocx registered, on the Source page) is an
+  inert painted picture like the Disk Management legend: the range of a log is not edited by
+  dragging it in the projection.
+- **A Static draws like DrawText.** Left, centred or right (`SS_LEFT/CENTER/RIGHT`), wrapped at its
+  width unless `SS_SIMPLE`/`SS_LEFTNOWORDWRAP`, from the *top* of its rectangle unless
+  `SS_CENTERIMAGE`, an ellipsis for `SS_*ELLIPSIS`, `&` shown as is under `SS_NOPREFIX`, and
+  everything that does not fit clipped to the control's own rectangle (a label narrower than its text
+  showed the middle of two lines). The text fills the control's slot rather than being centred in it,
+  because the automation peer expands a centred text's rectangle symmetrically to report the
+  control's bounds -- which moved a top-aligned message by half its height and failed the UIA gate.
+- **Native-sized check boxes, radio buttons and combos keep their labels.** WinUI's 5 px of top
+  padding and top-aligned label cut the text of a 13 to 16 px control (and a combo's text, 10 px of
+  room in 22): a combo's padding is `8,0,0,0` and the label is centred.
+- **Check boxes and radio buttons use compact templates** (`CompactControlStyles.cs`). WinUI's own
+  template lays the glyph out in a 32 px cell and draws it 20 px wide, so a native control 13 to 16 px
+  tall clipped it: a radio button showed as an arc. The compact `Style`s keep every state (pointer
+  over, pressed, disabled, checked, indeterminate) and the Fluent look but draw a 16 px glyph centred
+  on the label's line, with a 4 px gap. A label wraps only when the control is tall enough for two
+  lines (`WrapWhenTall`): the capture does not carry `BS_MULTILINE`, and a one-line control clips at its
+  edge as the native one does instead of dropping its last word onto a second line it cannot show. A
+  style is built once, only if every theme resource it names exists in the application's dictionaries
+  (a missing one fails later, inside layout); otherwise the control keeps WinUI's template and the
+  renderer log says `compact ... style not used`.
+- **Windows Forms dialogs close on Escape.** `canCancel` was true only for `#32770`, so Event
+  Viewer's and Task Scheduler's dialogs ignored Escape; a WinForms form that is modal or has the dialog
+  frame (`WS_EX_DLGMODALFRAME`, `FormBorderStyle.FixedDialog`) now cancels like its close button does.
+  (MMC opens these unowned -- the owner chain is hidden -- so "modal" alone matched none of them.)
+- **A check box or radio button answers a click anywhere in its rectangle.** WinUI's template has no
+  background on its root, so a 567 px native radio with a short label answered only on its glyph and
+  text; both now carry a transparent background.
+
+Verified live: all five pages project with their controls (edits, check boxes, radio buttons, combos,
+the counter list, the owner-draw previews) and every control answers real input; the Source page's
+Database radio makes leaving the page raise the "no data source name" message box, which projects
+too. Known gaps: a label a few pixels wider than its native control (a Chinese "(W)" accelerator on a
+tight radio button) still loses the last pixel or two of its closing parenthesis. The Color chooser (the
+Appearance page's Change button, nested over the sheet) stays native while open and the console and
+sheet are projected again about three seconds after it closes (below). The Font chooser (three
+`CBS_SIMPLE` combo boxes, which no adapter admits) and the log-file picker (the shell's item dialog) have
+not been driven; by the registry's rules neither projects, and the same hand-back applies.
+
+#### Dialogs opened from dialogs (owner chains)
+
+The owner graph used to be one level deep: a dialog whose owner was itself owned (Add Counters or the
+Color chooser opened from the chart's Properties sheet, which the console owns) was never projected, and
+its appearance handed the whole graph back to native, where it stayed. `IsModalOwnedTopLevel` is now only
+"the owner is disabled", so a chain of modal dialogs projects one dialog at a time, each proxy owned by the
+proxy beneath it (the renderer already blocks whichever owner a modal window names). What the Bridge had to
+learn to make a refusal survivable:
+
+- **Order.** Discovery decides roots first, then every depth of owner in turn (a nested dialog is above
+  its owner in the z-order it enumerates in). An owned window waits in `ownedWaiting_` without spending its
+  one attempt until its direct owner is a projection, so a graph handed back to native is projected again
+  from its root and its dialogs are offered after it (`ReleaseOwnedWindows`).
+- **Hand-back.** A refused modal dialog (`refusedDialogs_`) hands every projected owner back to native
+  together (`HandOwnerGraphToNative`; DWM cloaking is inherited down the owner chain). The roots wait in
+  `ownerGraphDeferrals_`, a dialog owner gets its attempt back. Before this, the refusal of a *first-level*
+  modal dialog left its owner native for good.
+- **Hold.** A root stays native while anything in its owner subtree, at any depth, is a modeless window
+  or a refused dialog; the timed retry that `WatchTopology` gives a refused window does not release it.
+  The hold ends two seconds after the last such window has gone.
+- **Custom-drawn statics.** The Color chooser projected with blank palettes (two `SS_SIMPLE` statics with
+  `WS_TABSTOP` that comdlg32 subclasses and paints). A Static that takes the focus and has no text is now
+  refused as a custom-drawn control, which keeps that dialog native and fully working.
+- **Closing order.** `WindowRegistry.CloseAll` and the Bridge's `RestoreAll` take the deepest dialog of a
+  chain first: an owner proxy destroyed before the proxy it owns takes it down from under its XAML window.
+
+Two renderer defects surfaced by projecting a console while a dialog was open natively (the console
+window is disabled, and the same state arises after any rollback): the chart's three custom elements
+(graph, legend, value strip) reported themselves enabled whatever the native state (their peers did not
+override `IsEnabledCore`), and the graph, applied at size zero before layout, was never drawn when the
+control got no `SizeChanged` and no live sample patch followed; it now draws to the extent the factory
+gave it.
+
+#### Date and time pickers, and group boxes that own their controls (minor 37)
+
+Task Scheduler's New Trigger dialog (nested over a task's Properties) was refused for its
+`SysDateTimePick32` controls, and then for its Windows Forms group boxes.
+
+- **`datePicker` / `timePicker`.** A picker's value travels in the range fields every node already
+  carries, so the wire needed no new field and `setValue` no new shape: a date picker's `position` is
+  its day number (days since 0001-01-01, `DateOnly.DayNumber`; `DateTimePickerValue.h` and the
+  renderer count the same), its range the native `DTM_GETRANGE` clamped to 1900-2200 (what a calendar
+  picker is built for); a time picker's is the second of the day (0 to 86399). The probe takes the stock
+  formats (short, short with century, long date; time) and refuses `DTS_SHOWNONE` (a no-date check
+  box), `DTS_APPCANPARSE` (the application parses the text) and a date picker whose text shows a time of
+  day (a Windows Forms Custom format keeps the stock style bits and the format cannot be read back). The
+  spin arrows a time picker owns are an implementation child. `setValue` sets `DTM_SETSYSTEMTIME`
+  keeping the half the picker does not show, reads the value back (the control clamps to its range) and
+  sends the parent the `DTN_DATETIMECHANGE` a user's change sends, which is the only way a Windows Forms
+  `DateTimePicker` learns its new `Value` (`SetDateTimePickerValue`).
+- **Renderer.** A date picker is WinUI's `CalendarDatePicker` (a subclass whose peer reports the
+  native name, `Button`); a time picker is a button showing the native text that opens WinUI's
+  `TimePickerFlyout`. Seconds have no column there, so a time chosen keeps the native seconds. UIA reports
+  both as a button with Invoke.
+- **Group boxes are containers.** A Windows Forms `GroupBox` is a window its controls are children of
+  (a Win32 group box's controls are siblings), so a `groupBox` node may be a parent: the Bridge's
+  `IsProjectedContainerKind`, the renderer validator's parent rule and a `SemanticGroupControl` with a
+  child layer (frame and caption take no input, as before).
+- **Clipped controls.** A native panel larger than the panel that clips it (the trigger dialog's
+  scrolling-style pages) is reported by XAML as its own rectangle; the committed gate accepts the clipped
+  or the whole rectangle for a node its parent clips.
+- **Escape after a click that took the focus away.** Toggling controls of a dialog can leave keyboard
+  focus on the XAML island's input site with no element to route a key to (the focused control was
+  disabled or hidden by the native response), and the Escape handler sat on the content canvas, so the
+  dialog ignored Escape from then on. It now sits on the window's root (the menu bar's own keys are
+  excluded), which sees the key whatever holds the focus.
+
+#### Two small admissions from the menu census
+
+- **A group box with `WS_TABSTOP`** (MMC's Customize View) used to be refused. A group box never takes the
+  focus, so the bit is a stop on nothing: the probe admits the box and capture drops it from the traversal
+  (no tab stop, no tab index), like a progress bar's.
+- **An animation control** (`SysAnimate32`: Find Certificates' flashlight) is an inert picture of the
+  frame it shows at capture (`StaticBitmap`, the painted-surface path the Time Range bar uses); it is
+  blank until a search starts, and a later frame arrives with a later capture. One that is a tab stop is
+  refused.
+
 ### Tranche G: MDI Frames
 
 - Project the MDI client area and each MDI child frame as real nested WinUI
@@ -682,18 +1148,18 @@ Tranche J admits it.
 
 ### Tranche F: Application Adapters
 
-- Match canonical executable identity/version plus HWND and UIA signatures.
+- Match canonical executable identity and signer plus bounded HWND and UIA evidence.
 - Package capture, actions, invalidation, presentation, and rollback tests as
   one versioned adapter.
 - Never enable an application adapter globally by class name alone.
 
 This is the only supported lane for private/custom HWND contracts.
 
-The DirectUI translation engine is implemented in `DirectUiEngine.cpp` with
-both declarative exact profiles and fail-closed, capability-derived per-surface
-profiles; see `DIRECTUI-APPLICATION-ADAPTERS.md`. Exact profiles remain for
-MdSched `10.0.26100.7309` and RecoveryDrive `10.0.26100.33296`. Generated
-profiles are restricted to Microsoft-signed canonical System32 images, and every
+The DirectUI translation engine in `DirectUiEngine.cpp` derives every surface's
+contract from its current HWND and UIA evidence; see `DIRECTUI-APPLICATION-ADAPTERS.md`.
+Protocol minor 29 removes the exact MdSched and RecoveryDrive profiles and their
+adapter IDs. The remaining capability-derived contracts are restricted to
+Microsoft-signed canonical System32 images, and every
 projected slot takes its kind from the registered Win32 adapter that backs it, so
 the DirectUI lane's boundary is this roadmap's boundary rather than a second list
 maintained per application. Tranche A/B statics and buttons, Tranche C's one-row
@@ -791,9 +1257,21 @@ no item rectangle at all. With these, `sigverif`, `cliconfg` and `iexpress`'s fi
 project. `eudcedit` stays native because its visible MDI frame (a ComboBox inside its
 status bar, MFC control bars) is unsupported, so its startup dialog stays native with it.
 
-The remaining recurring Win32 gaps are owner-draw ComboBox, grouped ListView and toolbar
-image-list variants; each needs its own adapter row under the contract above rather
-than a wider class allowlist.
+Follow-up on 2026-10-04 (protocol minor 29) adds owned hot, disabled, and pressed
+toolbar image-list variants. Each referenced image must match its button's normal
+icon dimensions, stay within the 96 px icon cap, and fit the existing aggregate
+toolbar pixel budget together with all other states. The renderer chooses the state
+image from the projected button's enabled, hover, pressed, and checked state;
+reconciliation refreshes or removes those images when the native lists change.
+Pressed buttons without a pressed image use the normal image; checked buttons use
+the hot image even without hover, and hover uses hot only for flat/list toolbars.
+Missing state images fall back to normal, while malformed or mismatched
+lists keep the whole surface native. This extends the toolbar adapter, not the
+owner-draw ComboBox or grouped ListView boundary, and does not establish projection
+for `mstsc` or WinForms views on a separate GUI thread.
+
+The remaining recurring Win32 gaps include owner-draw ComboBox and grouped ListView;
+each needs a bounded adapter contract rather than a wider class allowlist.
 
 ## Completion Rule
 

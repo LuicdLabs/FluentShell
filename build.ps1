@@ -58,11 +58,13 @@ function Reset-ProductionOutput {
 
 $msbuild = Find-MSBuild
 $nuget = Find-NuGet
-if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-    throw ".NET SDK not found"
-}
-if (-not (Test-Path -LiteralPath $RendererProject)) {
-    throw "Renderer project missing: $RendererProject"
+if (-not $CoreOnly) {
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        throw ".NET SDK not found"
+    }
+    if (-not (Test-Path -LiteralPath $RendererProject)) {
+        throw "Renderer project missing: $RendererProject"
+    }
 }
 
 Write-Host "Restoring native packages..."
@@ -70,9 +72,11 @@ Write-Host "Restoring native packages..."
     -PackagesDirectory (Join-Path $Root "packages") -NonInteractive
 if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
 
-Write-Host "Restoring renderer..."
-& dotnet restore $RendererProject -r win-x64
-if ($LASTEXITCODE -ne 0) { throw "renderer restore failed" }
+if (-not $CoreOnly) {
+    Write-Host "Restoring renderer..."
+    & dotnet restore $RendererProject -r win-x64
+    if ($LASTEXITCODE -ne 0) { throw "renderer restore failed" }
+}
 
 if ($RestoreOnly) {
     Write-Host "Restore complete."
@@ -84,7 +88,6 @@ Reset-ProductionOutput
 $targets = if ($CoreOnly) {
     @(
         "third_party\detours\detours.vcxproj",
-        "src\FluentShell.Core.vcxproj",
         "src\FluentShell.Bridge.vcxproj",
         "src\FluentShell.Injector.vcxproj",
         "src\PoC\LegacyDialogHost\LegacyDialogHost.vcxproj"
@@ -99,24 +102,28 @@ foreach ($target in $targets) {
     if ($LASTEXITCODE -ne 0) { throw "Build failed: $target" }
 }
 
-Write-Host "Publishing out-of-process renderer..."
-& dotnet publish $RendererProject `
-    --configuration $Configuration `
-    --runtime win-x64 `
-    --self-contained true `
-    --no-restore `
-    --output $RendererOutput `
-    -p:PublishSingleFile=false `
-    -p:PublishTrimmed=false `
-    -p:WindowsAppSDKSelfContained=true
-if ($LASTEXITCODE -ne 0) { throw "renderer publish failed" }
+if (-not $CoreOnly) {
+    Write-Host "Publishing out-of-process renderer..."
+    & dotnet publish $RendererProject `
+        --configuration $Configuration `
+        --runtime win-x64 `
+        --self-contained true `
+        --no-restore `
+        --output $RendererOutput `
+        -p:PublishSingleFile=false `
+        -p:PublishTrimmed=false `
+        -p:WindowsAppSDKSelfContained=true
+    if ($LASTEXITCODE -ne 0) { throw "renderer publish failed" }
+}
 
 $required = @(
     (Join-Path $OutputRoot "FluentShell.Injector.exe"),
     (Join-Path $OutputRoot "FluentShell.Bridge.dll"),
-    (Join-Path $OutputRoot "LegacyDialogHost.exe"),
-    (Join-Path $RendererOutput "FluentShell.Renderer.exe")
+    (Join-Path $OutputRoot "LegacyDialogHost.exe")
 )
+if (-not $CoreOnly) {
+    $required += Join-Path $RendererOutput "FluentShell.Renderer.exe"
+}
 foreach ($file in $required) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
         throw "Required production output missing: $file"
@@ -141,7 +148,11 @@ Write-Host ""
 Write-Host "Build OK. Production outputs:"
 Get-ChildItem -LiteralPath $OutputRoot | Format-Table Name, Length, LastWriteTime
 Write-Host ""
-Write-Host "Run the translation oracle:"
-Write-Host "  `$target = (Resolve-Path '$OutputRoot\LegacyDialogHost.exe').Path"
-Write-Host "  Start-Process `$target"
-Write-Host "  $OutputRoot\FluentShell.Injector.exe inject `$target"
+if ($CoreOnly) {
+    Write-Host "Native-only output is ready. Run a full build before using the translation oracle."
+} else {
+    Write-Host "Run the translation oracle:"
+    Write-Host "  `$target = (Resolve-Path '$OutputRoot\LegacyDialogHost.exe').Path"
+    Write-Host "  Start-Process `$target"
+    Write-Host "  $OutputRoot\FluentShell.Injector.exe inject `$target"
+}

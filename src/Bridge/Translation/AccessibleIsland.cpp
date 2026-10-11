@@ -159,6 +159,25 @@ bool ReadState(IAccessible* target, const VARIANT& id, long& state) noexcept {
 // The island's children, skipping the ones the provider declares invisible.  A child
 // that owns children of its own is refused: a nested tree is a different contract
 // than a flat list of elements and would need its own admission rules.
+}  // namespace
+
+bool IsDirectUiScrollChrome(HWND window) noexcept {
+    const auto classIs = [](HWND hwnd, const wchar_t* expected) {
+        wchar_t name[32]{};
+        return GetClassNameW(hwnd, name, 32) > 0 && FluentShell::EqualsIgnoreCase(name, expected);
+    };
+    if (!window || !IsWindow(window)) return false;
+    if (classIs(window, L"ScrollBar")) return true;
+    if (!classIs(window, L"CtrlNotifySink")) return false;
+    bool onlyScrollBars = true;
+    for (HWND child = GetWindow(window, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        if (IsWindowVisible(child) && !classIs(child, L"ScrollBar")) onlyScrollBars = false;
+    }
+    return onlyScrollBars;
+}
+
+namespace {
+
 bool CollectElements(
     IAccessible* root,
     std::vector<IslandElement>& elements,
@@ -203,6 +222,12 @@ bool CollectElements(
         }
         if ((state & STATE_SYSTEM_INVISIBLE) != 0) continue;
         if (element.object) {
+            // A DirectUI scroll viewer hosts a real ScrollBar window, which MSAA lists
+            // among the elements. It is chrome, not an element: the projection scrolls
+            // the elements itself, so it is neither an item nor a reason to refuse.
+            HWND hosted = nullptr;
+            if (SUCCEEDED(WindowFromAccessibleObject(element.object.value, &hosted)) &&
+                hosted && IsDirectUiScrollChrome(hosted)) continue;
             long nested = 0;
             if (SUCCEEDED(element.object->get_accChildCount(&nested)) && nested > 0) {
                 ok = Reject(reason, L"island child owns an accessible subtree");

@@ -33,16 +33,22 @@ struct PopupMenuDecision final {
 class PopupMenuState final {
 public:
     uint64_t Begin(uint64_t nodeId, int itemIndex, std::vector<MenuItemSnapshot> items) {
-        if (current_ || nextPopupId_ == 0 || nodeId == 0 || itemIndex < 0 || items.empty())
+        return BeginWithId(nodeId, itemIndex, std::move(items), nextPopupId_);
+    }
+
+    // A surface spanning GUI threads shares its token allocator across these
+    // independently owned menu states. Older tokens never name another popup.
+    uint64_t BeginWithId(uint64_t nodeId, int itemIndex, std::vector<MenuItemSnapshot> items, uint64_t popupId) {
+        if (current_ || nextPopupId_ == 0 || popupId < nextPopupId_ || nodeId == 0 || itemIndex < 0 || items.empty())
             return 0;
         PopupMenuSnapshot next;
-        next.popupId = nextPopupId_;
+        next.popupId = popupId;
         next.nodeId = nodeId;
         next.itemIndex = itemIndex;
         next.items = std::move(items);
         current_ = std::move(next);
-        nextPopupId_ = nextPopupId_ == std::numeric_limits<uint64_t>::max()
-            ? 0 : nextPopupId_ + 1;
+        nextPopupId_ = popupId == std::numeric_limits<uint64_t>::max()
+            ? 0 : popupId + 1;
         return current_->popupId;
     }
 

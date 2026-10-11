@@ -63,7 +63,7 @@ public sealed class SiblingZOrderPresentationTests
     [Theory]
     [InlineData("nativeBacking", "0x1234")]
     [InlineData("uiaVirtual", null)]
-    public void DirectUiSlotsRetainTheirProfileOrderEvenWithNativeBacking(
+    public void DirectUiSlotsRetainTheirSemanticOrderEvenWithNativeBacking(
         string sourceKind, string? nativeHwnd)
     {
         ControlNodeViewModel Slot(int index) => ControlNodeViewModel.FromSnapshot(

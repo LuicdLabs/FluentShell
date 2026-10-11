@@ -26,6 +26,7 @@ internal sealed class ControlFactory
     internal const int DialogIconZIndex = ProtocolConstants.MaxNodes;
     internal const int PaneSplitterZIndex = 1000;
     private const double NativeFontSize = 12;
+    private const double MainInstructionFontSize = 15;
     // The floor for a label fitted into the width the native control committed to.  A
     // menu bar rendered a fraction smaller is readable; one that reads "Favorit" is not.
     private const double MinimumFittedFontSize = 9;
@@ -39,16 +40,20 @@ internal sealed class ControlFactory
     private readonly IReadOnlyDictionary<string, string> _radioGroups;
     private readonly IReadOnlyDictionary<string, ControlNodeViewModel> _nodes;
 
+    private readonly ItemPressTracker _itemPresses;
+
     public ControlFactory(
         int dpi,
         IEnumerable<ControlNodeViewModel> nodes,
         Action<ControlNodeViewModel, string, object?> action,
         Func<bool> isApplyingCanonical,
         Func<bool> isImeComposing,
-        PresentationLifetime lifetime)
+        PresentationLifetime lifetime,
+        ItemPressTracker? itemPresses = null)
     {
         _scale = 96.0 / dpi;
         _lifetime = lifetime;
+        _itemPresses = itemPresses ?? new ItemPressTracker();
         _action = (node, kind, value) => lifetime.Invoke(() => action(node, kind, value));
         _isApplyingCanonical = () => !lifetime.IsActive || isApplyingCanonical();
         _isImeComposing = isImeComposing;
@@ -64,6 +69,8 @@ internal sealed class ControlFactory
             "static" => CreateStatic(viewModel),
             "staticIcon" or "staticBitmap" => CreateStaticIcon(viewModel),
             "upDown" => CreateUpDown(viewModel),
+            "datePicker" => CreateDatePicker(viewModel),
+            "timePicker" => CreateTimePicker(viewModel),
             "staticDecoration" => CreateStaticDecoration(viewModel),
             "separator" => new Border { Height = 1, Background = new SolidColorBrush(Microsoft.UI.Colors.Gray) },
             "button" => CreateButton(viewModel),
@@ -86,6 +93,12 @@ internal sealed class ControlFactory
             "mdiClient" => new SemanticMdiClient(),
             "paneContainer" => CreatePaneContainer(viewModel),
             "accessibleIsland" => CreateAccessibleIsland(viewModel),
+            "nativeDocument" => CreateNativeDocument(viewModel),
+            "diskView" => CreateDiskView(viewModel),
+            "richText" => CreateRichText(viewModel),
+            "performanceGraph" => CreatePerformanceGraph(viewModel),
+            "performanceLegend" => CreatePerformanceLegend(viewModel),
+            "performanceValueBar" => CreatePerformanceValueBar(viewModel),
             "mdiChild" => CreateMdiChild(viewModel),
             "statusBar" => CreateStatusBar(viewModel),
             "toolbar" => CreateToolbar(viewModel),
@@ -104,10 +117,23 @@ internal sealed class ControlFactory
         else if (viewModel.Kind != "staticDecoration")
         {
             Bind(element, UIElement.IsHitTestVisibleProperty, nameof(viewModel.Enabled), BindingMode.OneWay);
+            // Containers report the native enabled state through their peers.
+            _lifetime.Subscribe(viewModel, (_, args) =>
+            {
+                if (args.PropertyName == nameof(viewModel.Enabled) &&
+                    FrameworkElementAutomationPeer.FromElement(element) is { } peer)
+                    peer.RaisePropertyChangedEvent(AutomationElementIdentifiers.IsEnabledProperty,
+                        !viewModel.Enabled, viewModel.Enabled);
+            });
         }
         ApplyBounds(element, viewModel);
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
+            if (args.PropertyName is nameof(viewModel.TabStop) or nameof(viewModel.TabIndex))
+            {
+                element.IsTabStop = viewModel.Kind == "sysLink" ? false : viewModel.TabStop;
+                element.TabIndex = Math.Max(0, viewModel.TabIndex);
+            }
             if (args.PropertyName == nameof(viewModel.Rect)) ApplyBounds(element, viewModel);
             if (args.PropertyName == nameof(viewModel.AutomationName) ||
                 args.PropertyName == nameof(viewModel.Text))
@@ -129,8 +155,8 @@ internal sealed class ControlFactory
     internal static int ProjectionZIndexFor(ControlNodeViewModel viewModel) =>
         // HWND children are captured front to back; XAML draws larger indexes
         // in front. Keep nodes in 0..511 so container chrome stays behind them.
-        // Virtual dialogs and DirectUI profile slots already carry paint order,
-        // including a profile's HWND-backed slots, and must not be reversed.
+        // Virtual dialogs and DirectUI semantic slots already carry paint order,
+        // including their HWND-backed slots, and must not be reversed.
         viewModel.NativeHwnd is not null && viewModel.AdapterId.Length == 0
             ? ProtocolConstants.MaxNodes - 1 - viewModel.ZIndex
             : viewModel.ZIndex;
@@ -196,22 +222,53 @@ internal sealed class ControlFactory
                 ? brush : new SolidColorBrush(fallback);
     }
 
-    private static ContentControl CreateStatic(ControlNodeViewModel viewModel)
+    // A native Static draws its text with DrawText: left, centred or right as SS_LEFT / SS_CENTER /
+    // SS_RIGHT say, wrapped at the control's width unless it is SS_SIMPLE or SS_LEFTNOWORDWRAP, from the
+    // top of the rectangle unless SS_CENTERIMAGE centres it, with the `&` mnemonic markup stripped unless
+    // SS_NOPREFIX, an ellipsis for the SS_*ELLIPSIS styles -- and clips whatever does not fit to the
+    // control's own rectangle.  A label that is too narrow for its text therefore shows its first line,
+    // where a centred, unclipped TextBlock showed the middle of two.
+    private ContentControl CreateStatic(ControlNodeViewModel viewModel)
     {
-        var text = new TextBlock
+        const ulong ssTypeMask = 0x1F, ssCenter = 1, ssRight = 2, ssSimple = 0x0B, ssLeftNoWordWrap = 0x0C;
+        const ulong ssNoPrefix = 0x80, ssCenterImage = 0x200, ssEllipsisMask = 0xC000;
+        var text = new TextBlock { FontSize = NativeFontSize };
+        // A task dialog's main instruction is its heading (DialogSnapshots.cpp
+        // measures it at the same size and weight).
+        if (viewModel.PresentationVariant == "mainInstruction")
         {
-            FontSize = NativeFontSize,
-            TextWrapping = TextWrapping.Wrap,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
+            text.FontSize = MainInstructionFontSize;
+            text.FontWeight = new global::Windows.UI.Text.FontWeight { Weight = 600 };
+        }
+        void ApplyStyle()
+        {
+            var type = viewModel.Style & ssTypeMask;
+            var ellipsis = (viewModel.Style & ssEllipsisMask) != 0;
+            text.TextAlignment = type switch
+            {
+                ssCenter => TextAlignment.Center,
+                ssRight => TextAlignment.Right,
+                _ => TextAlignment.Left,
+            };
+            text.TextWrapping = type is ssSimple or ssLeftNoWordWrap || ellipsis ? TextWrapping.NoWrap : TextWrapping.Wrap;
+            text.TextTrimming = ellipsis ? TextTrimming.CharacterEllipsis : TextTrimming.None;
+            // Stretch, not Top: a TextBlock draws its text from the top of a slot taller than it, and the
+            // slot is what the automation peer reports as the control's bounds (it expands a centred
+            // text's rectangle symmetrically to the control's size, which is wrong for a top-aligned one).
+            text.VerticalAlignment = (viewModel.Style & ssCenterImage) != 0 ? VerticalAlignment.Center : VerticalAlignment.Stretch;
+        }
+        ApplyStyle();
         // A Static's label carries the same `&` mnemonic markup a Button's does: the
         // native control draws the letter underlined, not the ampersand.  Projecting the
         // raw string shows "&Number to dial:" where the application shows "Number to
         // dial:", and makes the label wider than the slot the control sized for it.
-        Bind(text, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay,
-            MnemonicTextConverter);
+        if ((viewModel.Style & ssNoPrefix) != 0)
+            Bind(text, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay);
+        else
+            Bind(text, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay,
+                MnemonicTextConverter);
         AutomationProperties.SetAccessibilityView(text, AccessibilityView.Raw);
-        return new SemanticStaticTextControl
+        var control = new SemanticStaticTextControl
         {
             Content = text,
             MinWidth = 0,
@@ -221,6 +278,18 @@ internal sealed class ControlFactory
             VerticalContentAlignment = VerticalAlignment.Stretch,
             IsHitTestVisible = false,
         };
+        // The rectangle is at least one line tall: WinUI's line box is taller than the native font's, so a
+        // native label one native line high would lose the descenders of its only line.
+        control.SizeChanged += (_, args) =>
+            control.Clip = new RectangleGeometry
+            {
+                Rect = new Rect(0, 0, args.NewSize.Width, Math.Max(args.NewSize.Height, text.FontSize * 1.4)),
+            };
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.Style)) ApplyStyle();
+        });
+        return control;
     }
 
     // DirectUI bitmap variants are drawn stretched to their slot; a classic SS_ICON
@@ -279,12 +348,16 @@ internal sealed class ControlFactory
 
     private static ContentControl CreateGroupBox(ControlNodeViewModel viewModel)
     {
+        // The frame and caption take no input of their own: what lies under the frame's line
+        // (a Win32 group box's controls are its siblings) is clicked through it, and a
+        // Windows Forms GroupBox's controls are placed in the layer above.
         var border = new Border
         {
             Margin = new Thickness(0, 8, 0, 0),
             BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Gray),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(4),
+            IsHitTestVisible = false,
         };
         var caption = new TextBlock
         {
@@ -292,17 +365,19 @@ internal sealed class ControlFactory
             Margin = new Thickness(10, 0, 0, 0),
             Padding = new Thickness(4, 0, 4, 0),
             VerticalAlignment = VerticalAlignment.Top,
+            IsHitTestVisible = false,
         };
         Bind(caption, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+        var children = new Canvas { Background = null };
         var layout = new Grid();
         layout.Children.Add(border);
         layout.Children.Add(caption);
-        return new SemanticGroupControl
+        layout.Children.Add(children);
+        return new SemanticGroupControl(children)
         {
             Content = layout,
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
             VerticalContentAlignment = VerticalAlignment.Stretch,
-            IsHitTestVisible = false,
         };
     }
 
@@ -345,15 +420,16 @@ internal sealed class ControlFactory
             Padding = new Thickness(4, 0, 4, 0),
             HorizontalContentAlignment = HorizontalAlignment.Center,
         };
-        if (viewModel.PresentationVariant == "commandLink")
+        if (viewModel.PresentationVariant is "commandLink" or "commandLinkNoIcon" or "commandLinkElevated")
         {
             var content = new StackPanel { Orientation = Orientation.Vertical };
-            content.Children.Add(new TextBlock
+            var title = new TextBlock
             {
-                Text = Win32Mnemonic.DisplayText(viewModel.Text),
                 FontWeight = new global::Windows.UI.Text.FontWeight { Weight = 600 },
                 TextWrapping = TextWrapping.Wrap,
-            });
+            };
+            Bind(title, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+            content.Children.Add(title);
             if (!string.IsNullOrEmpty(viewModel.HelpText))
             {
                 content.Children.Add(new TextBlock
@@ -363,9 +439,38 @@ internal sealed class ControlFactory
                     TextWrapping = TextWrapping.Wrap,
                 });
             }
-            control.Content = content;
-            control.HorizontalContentAlignment = HorizontalAlignment.Left;
-            control.Padding = new Thickness(10, 4, 10, 4);
+            // A task dialog's command link leads with an arrow, or with the shield
+            // when the command needs elevation; the DirectUI lane's has neither.
+            var glyph = viewModel.PresentationVariant switch
+            {
+                "commandLinkElevated" => "",
+                "commandLinkNoIcon" => null,
+                _ when string.IsNullOrEmpty(viewModel.AdapterId) => "",
+                _ => null,
+            };
+            control.Content = glyph is null ? content : WithLeadingGlyph(content, glyph, 16, VerticalAlignment.Top);
+            control.HorizontalContentAlignment = HorizontalAlignment.Stretch;
+            control.VerticalContentAlignment = VerticalAlignment.Center;
+            control.Padding = new Thickness(10, 6, 10, 6);
+        }
+        else if (viewModel.PresentationVariant is "elevated" or "expandoCollapsed" or "expandoExpanded")
+        {
+            var label = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
+            Bind(label, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+            var glyph = viewModel.PresentationVariant switch
+            {
+                "elevated" => "",
+                "expandoExpanded" => "",
+                _ => "",
+            };
+            control.Content = WithLeadingGlyph(label, glyph, 12, VerticalAlignment.Center);
+            if (viewModel.PresentationVariant != "elevated")
+            {
+                // The expando button is a disclosure toggle, not a command button.
+                control.HorizontalContentAlignment = HorizontalAlignment.Left;
+                control.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+                control.BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            }
         }
         else if (!string.IsNullOrEmpty(viewModel.ImageData))
         {
@@ -398,15 +503,48 @@ internal sealed class ControlFactory
         return control;
     }
 
+    // A glyph beside a button's content; the glyph is decoration and stays out of
+    // the accessibility tree.
+    private static Grid WithLeadingGlyph(UIElement content, string glyph, double size, VerticalAlignment alignment)
+    {
+        var icon = new FontIcon
+        {
+            Glyph = glyph,
+            FontSize = size,
+            Margin = new Thickness(0, alignment == VerticalAlignment.Top ? 2 : 0, 8, 0),
+            VerticalAlignment = alignment,
+        };
+        AutomationProperties.SetAccessibilityView(icon, AccessibilityView.Raw);
+        var layout = new Grid();
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        layout.Children.Add(icon);
+        Grid.SetColumn((FrameworkElement)content, 1);
+        layout.Children.Add(content);
+        return layout;
+    }
+
     private CheckBox CreateCheckBox(ControlNodeViewModel viewModel, bool threeState)
     {
+        // WinUI's CheckBox is 120 px wide at least: a narrower native one (a 65 px "Hidden" box)
+        // would report bounds the native control does not have.
         var control = new CheckBox
         {
+            Style = CompactControlStyles.CheckBox,
             FontSize = NativeFontSize,
+            MinWidth = 0,
             MinHeight = 0,
+            // The default 5 px of top padding (and a top-aligned label) push the text of a native-sized
+            // box -- 13 to 16 px tall -- past the control's bottom edge, where it is clipped.
+            Padding = CompactControlStyles.LabelPadding,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            // A native check box answers a click anywhere in its rectangle; a template whose root has no
+            // background answers only on its glyph and text.
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
             IsThreeState = threeState,
             IsChecked = ToNullableBool(viewModel.Checked),
         };
+        CompactControlStyles.WrapWhenTall(control);
         Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
         RoutedEventHandler changed = (_, _) =>
         {
@@ -432,12 +570,18 @@ internal sealed class ControlFactory
     {
         var control = new RadioButton
         {
+            Style = CompactControlStyles.RadioButton,
             FontSize = NativeFontSize,
             MinWidth = 0,
             MinHeight = 0,
+            Padding = CompactControlStyles.LabelPadding,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            // Hit-testable over the whole rectangle, like the native control (see CreateCheckBox).
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
             IsChecked = viewModel.Checked == 1,
             GroupName = _radioGroups[viewModel.NodeId],
         };
+        CompactControlStyles.WrapWhenTall(control);
         Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
         control.Checked += (_, _) =>
         {
@@ -559,6 +703,83 @@ internal sealed class ControlFactory
         return control;
     }
 
+    // A read-only rich edit control in its formats (minor 35): a scroller around a text block of
+    // runs, so a long text scrolls and a selection copies the way the native control's does. It
+    // reports as a pane (the scroller's role), named by the control's text.
+    private ScrollViewer CreateRichText(ControlNodeViewModel viewModel)
+    {
+        var block = new RichTextBlock
+        {
+            IsTextSelectionEnabled = true,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = NativeFontSize,
+            Padding = new Thickness(4, 0, 4, 0),
+        };
+        var control = new ScrollViewer
+        {
+            Content = block,
+            MinWidth = 0,
+            MinHeight = 0,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            VerticalScrollMode = ScrollMode.Auto,
+            HorizontalScrollMode = ScrollMode.Disabled,
+        };
+        void Apply() => RichTextPresenter.Apply(block, viewModel.RichText, NativeFontSize);
+        Apply();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.RichText)) Apply();
+        });
+        return control;
+    }
+
+    // Performance Monitor's chart (minor 36): the graph, its legend and its value strip are drawn
+    // from the data the Bridge read from the System Monitor control.
+    private PerformanceGraphControl CreatePerformanceGraph(ControlNodeViewModel viewModel)
+    {
+        var control = new PerformanceGraphControl(_scale, NativeFontSize);
+        control.Apply(viewModel.PerformanceGraph);
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.PerformanceGraph)) control.Apply(viewModel.PerformanceGraph);
+        });
+        return control;
+    }
+
+    private PerformanceLegendControl CreatePerformanceLegend(ControlNodeViewModel viewModel)
+    {
+        // A click on a row selects the counter, and the Show box toggles whether it is plotted: the
+        // same select and setItemCheck requests a list makes, answered by the control behind it.
+        var control = new PerformanceLegendControl(_scale, NativeFontSize,
+            index =>
+            {
+                if (!_isApplyingCanonical() && AllowsAction(viewModel, "select")) _action(viewModel, "select", index);
+            },
+            (index, visible) =>
+            {
+                if (!_isApplyingCanonical() && AllowsAction(viewModel, "setItemCheck"))
+                    _action(viewModel, "setItemCheck", new ListViewCheckActionValue { Index = index, Checked = visible });
+            });
+        control.Apply(viewModel.PerformanceLegend);
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.PerformanceLegend)) control.Apply(viewModel.PerformanceLegend);
+        });
+        return control;
+    }
+
+    private PerformanceValueBarControl CreatePerformanceValueBar(ControlNodeViewModel viewModel)
+    {
+        var control = new PerformanceValueBarControl(NativeFontSize);
+        control.Apply(viewModel.PerformanceValueBar);
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.PerformanceValueBar)) control.Apply(viewModel.PerformanceValueBar);
+        });
+        return control;
+    }
+
     private PasswordBox CreatePasswordBox(ControlNodeViewModel viewModel)
     {
         var control = new PasswordBox
@@ -584,15 +805,18 @@ internal sealed class ControlFactory
 
     private ComboBox CreateComboBox(ControlNodeViewModel viewModel)
     {
-        var control = new ComboBox
+        var control = new OwnerDrawComboBoxControl
         {
             FontSize = NativeFontSize,
             MinHeight = 0,
+            // The default 12,5,0,7 padding leaves a native 21 to 24 px combo 10 px for its 16 px line.
+            Padding = new Thickness(8, 0, 0, 0),
             ItemsSource = viewModel.Items,
             SelectedIndex = viewModel.SelectedIndex,
             IsEditable = viewModel.Editable,
             Text = viewModel.DraftText,
         };
+        control.ApplyNativeFaces(viewModel, _scale);
         Bind(control, ComboBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
         _lifetime.OnDispose(() => control.ClearValue(ComboBox.TextProperty));
         var retryTimer = control.DispatcherQueue.CreateTimer();
@@ -603,7 +827,7 @@ internal sealed class ControlFactory
         void CommitDraft()
         {
             retryTimer.Stop();
-            if (!viewModel.Editable || _isApplyingCanonical() || !AllowsAction(viewModel, "setText") ||
+            if (!_lifetime.IsActive || !viewModel.Editable || _isApplyingCanonical() || !AllowsAction(viewModel, "setText") ||
                 control.Text == viewModel.Text || control.Text == pendingText) return;
             if (_isImeComposing())
             {
@@ -619,7 +843,7 @@ internal sealed class ControlFactory
         control.LostFocus += (_, _) => CommitDraft();
         control.SelectionChanged += (_, _) =>
         {
-            if (!_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
+            if (_lifetime.IsActive && !_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
                 control.SelectedIndex != viewModel.SelectedIndex)
             {
                 retryTimer.Stop();
@@ -634,13 +858,58 @@ internal sealed class ControlFactory
         };
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.SelectedIndex = viewModel.SelectedIndex;
+            if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.ApplyCanonicalSelection(viewModel.SelectedIndex);
             if (args.PropertyName == nameof(viewModel.Editable)) control.IsEditable = viewModel.Editable;
+            if (args.PropertyName == nameof(viewModel.OwnerDrawCombo)) control.ApplyNativeFaces(viewModel, _scale);
             if (args.PropertyName == nameof(viewModel.DraftText) && control.Text != viewModel.DraftText)
                 control.Text = viewModel.DraftText;
             if (args.PropertyName == nameof(viewModel.Text)) pendingText = null;
         });
         return control;
+    }
+
+    // A right-click, Shift+F10 or the Menu key on a tree/list item asks the native
+    // application for that item's own context menu. The native menu then arrives as
+    // the snapshot's popupMenu and is shown where the request was made.
+    // `index` names one of the node's carried items; a windowed list adds its window
+    // start, because the action names the row absolutely.
+    private bool RequestContextMenu(ControlNodeViewModel viewModel, FrameworkElement element,
+        FrameworkElement? item, int index, ContextRequestedEventArgs args, int indexOffset = 0)
+    {
+        if (_isApplyingCanonical() || !_lifetime.IsActive || index < 0 ||
+            index >= viewModel.Items.Count || !AllowsAction(viewModel, "contextMenu")) return false;
+        if (args.TryGetPosition(element, out var point))
+            viewModel.ContextMenuAnchor = (point.X, point.Y);
+        else if (item is not null)
+        {
+            // Keyboard requests have no pointer: open below the item's label.
+            var corner = item.TransformToVisual(element).TransformPoint(
+                new global::Windows.Foundation.Point(16, item.ActualHeight));
+            viewModel.ContextMenuAnchor = (corner.X, corner.Y);
+        }
+        else viewModel.ContextMenuAnchor = (0, 0);
+        // The label is the item's witness: the Bridge refuses the request if the
+        // index has since come to name a different native item.
+        _action(viewModel, "contextMenu", new ItemTextActionValue { Index = index + indexOffset, Text = viewModel.Items[index] });
+        return true;
+    }
+
+    // Opens an item the way its control answers a double-click: the Bridge selects it and sends
+    // the control the Enter key. The label is the witness, as for a context menu. False when
+    // the node offers no such activation.
+    private bool RequestOpenItem(ControlNodeViewModel viewModel, int index, int indexOffset = 0)
+    {
+        if (_isApplyingCanonical() || !_lifetime.IsActive || index < 0 || index >= viewModel.Items.Count ||
+            !viewModel.ItemDefaultActivation || !AllowsAction(viewModel, "openItem")) return false;
+        _action(viewModel, "openItem", new ItemTextActionValue { Index = index + indexOffset, Text = viewModel.Items[index] });
+        return true;
+    }
+
+    private static T? AncestorOrSelf<T>(DependencyObject? source, DependencyObject stop) where T : DependencyObject
+    {
+        while (source is not null && source != stop && source is not T)
+            source = VisualTreeHelper.GetParent(source);
+        return source as T;
     }
 
     internal static bool AllowsAction(ControlNodeViewModel viewModel, string action) =>
@@ -653,21 +922,53 @@ internal sealed class ControlFactory
         itemStyle.Setters.Add(new Setter(Control.MinHeightProperty, 22d));
         itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(4, 0, 4, 0)));
         itemStyle.Setters.Add(new Setter(Control.VerticalContentAlignmentProperty, VerticalAlignment.Center));
+        // A multi-select list (LBS_EXTENDEDSEL takes ctrl and shift, LBS_MULTIPLESEL alone toggles each
+        // click) is chosen as an index list; any other list has one current item.
+        var multiple = viewModel.MultiSelect;
         var control = new ListBox
         {
             FontSize = NativeFontSize,
             ItemsSource = viewModel.Items,
-            SelectedIndex = viewModel.SelectedIndex,
             ItemContainerStyle = itemStyle,
+            SelectionMode = !multiple ? SelectionMode.Single
+                : (viewModel.Style & 0x0800) != 0 ? SelectionMode.Extended : SelectionMode.Multiple,
         };
+        var applying = false;
+        void ApplySelection()
+        {
+            applying = true;
+            try
+            {
+                if (!multiple)
+                {
+                    control.SelectedIndex = viewModel.SelectedIndex;
+                    return;
+                }
+                control.SelectedItems.Clear();
+                foreach (var index in viewModel.SelectedIndices)
+                    if (index >= 0 && index < viewModel.Items.Count) control.SelectedItems.Add(viewModel.Items[index]);
+            }
+            finally
+            {
+                applying = false;
+            }
+        }
+        ApplySelection();
         control.SelectionChanged += (_, _) =>
         {
-            if (!_isApplyingCanonical() && AllowsAction(viewModel, "select") &&
-                control.SelectedIndex != viewModel.SelectedIndex) _action(viewModel, "select", control.SelectedIndex);
+            if (applying || _isApplyingCanonical()) return;
+            if (multiple)
+            {
+                var selection = CanonicalSelectionIndices(control.SelectedItems.Cast<object>().Select(control.Items.IndexOf));
+                if (AllowsAction(viewModel, "setSelection") && !viewModel.SelectedIndices.SequenceEqual(selection))
+                    _action(viewModel, "setSelection", selection);
+            }
+            else if (AllowsAction(viewModel, "select") && control.SelectedIndex != viewModel.SelectedIndex)
+                _action(viewModel, "select", control.SelectedIndex);
         };
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.SelectedIndex = viewModel.SelectedIndex;
+            if (args.PropertyName is nameof(viewModel.SelectedIndex) or nameof(viewModel.SelectedIndices)) ApplySelection();
         });
         return control;
     }
@@ -689,30 +990,48 @@ internal sealed class ControlFactory
         };
         void RebuildText()
         {
-            if (viewModel.Items.Count != 1 ||
-                !TrySplitSysLinkText(viewModel.Text, viewModel.Items[0], out var segments)) return;
+            if (!TrySplitSysLinkRuns(viewModel.Text, viewModel.Items, out var runs)) return;
             var paragraph = new Paragraph();
-            if (segments.Prefix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Prefix });
-            var link = new Hyperlink
+            var linkIndex = 0;
+            foreach (var (value, isLink) in runs)
             {
-                IsTabStop = viewModel.TabStop,
-                TabIndex = Math.Max(0, viewModel.TabIndex),
-            };
-            link.Inlines.Add(new Run { Text = segments.Label });
-            AutomationProperties.SetName(link, segments.Label);
-            link.Click += (_, _) =>
-            {
-                if (!_isApplyingCanonical() && AllowsAction(viewModel, "invoke")) _action(viewModel, "invoke", null);
-            };
-            paragraph.Inlines.Add(link);
-            if (segments.Suffix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Suffix });
+                if (!isLink)
+                {
+                    paragraph.Inlines.Add(new Run { Text = value });
+                    continue;
+                }
+                var index = linkIndex++;
+                var link = new Hyperlink
+                {
+                    IsTabStop = viewModel.TabStop,
+                    TabIndex = Math.Max(0, viewModel.TabIndex),
+                };
+                link.Inlines.Add(new Run { Text = value });
+                AutomationProperties.SetName(link, value);
+                // A native SysLink has one link and is invoked; a task dialog's text
+                // names which of its links was clicked.
+                link.Click += (_, _) =>
+                {
+                    if (_isApplyingCanonical()) return;
+                    if (viewModel.Items.Count == 1)
+                    {
+                        if (AllowsAction(viewModel, "invoke")) _action(viewModel, "invoke", null);
+                    }
+                    else if (AllowsAction(viewModel, "activateItem"))
+                    {
+                        _action(viewModel, "activateItem", index);
+                    }
+                };
+                paragraph.Inlines.Add(link);
+            }
             text.Blocks.Clear();
             text.Blocks.Add(paragraph);
         }
         RebuildText();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName is nameof(viewModel.Text) or nameof(viewModel.Items)) RebuildText();
+            if (args.PropertyName is nameof(viewModel.Text) or nameof(viewModel.Items) or
+                nameof(viewModel.TabStop) or nameof(viewModel.TabIndex)) RebuildText();
         });
         return control;
     }
@@ -737,10 +1056,147 @@ internal sealed class ControlFactory
         var pendingScroll = false;
         var sentScrollX = 0;
         var sentScrollY = 0;
+        bool Positioned() => viewModel.ListViewMode != "report" || viewModel.GroupViewEnabled;
         ScrollViewer? scrollHook = null;
+
+        // Minor 33: a windowed virtual list shows the rows it carries between two spacers
+        // standing for the rows it does not, so the scroll extent is the whole list's.
+        // Scrolling past the carried rows asks the native list to move its top row there,
+        // and the next snapshot carries the rows around it.  Indices on the wire stay
+        // absolute; control.Items holds the window.
+        // Fresh spacers on every rebuild: an element still parented by the old header or
+        // footer presenter cannot be given to a new one (WinUI reports that as the
+        // misleading COMException 0x800F1000, "no installed components were detected").
+        var topSpacer = new Border { IsHitTestVisible = false };
+        var bottomSpacer = new Border { IsHitTestVisible = false };
+        FrameworkElement? columnHeader = null;
+        var rowHeight = 22.0;
+        var windowStart = 0;
+        var windowPlaced = false;
+        var requestedTop = -1;
+        // Rebuilding the items resets a ListView's scroll offset, but the spacers keep
+        // the whole list's extent, so the offset the user was at is still the right one
+        // after a window move; it is put back once the new rows have a layout.
+        double? restoreOffset = null;
+        var restoreAttempts = 0;
+        ScrollViewer? windowScroll = null;
+        Microsoft.UI.Dispatching.DispatcherQueueTimer? windowTimer = null;
+        int Absolute(int local) => local < 0 ? local : local + windowStart;
+        void ApplyWindowSpacers()
+        {
+            if (!viewModel.IsWindowedList) return;
+            var (above, below) = ListViewPresentation.SpacerHeights(
+                windowStart, control.Items.Count, viewModel.ItemCount, rowHeight);
+            topSpacer.Height = above;
+            bottomSpacer.Height = below;
+        }
+        void RequestWindowForViewport()
+        {
+            if (!_lifetime.IsActive || !viewModel.IsWindowedList || _isApplyingCanonical() ||
+                windowScroll is not { } scroll || scroll.ViewportHeight <= 0) return;
+            // While an offset restore waits for its layout the scroll position is the
+            // reset one (row 0), which is no evidence of where the user is looking.
+            if (restoreOffset is not null)
+            {
+                if (++restoreAttempts > 40) restoreOffset = null;
+                else
+                {
+                    ScheduleWindowCheck();
+                    return;
+                }
+            }
+            var first = ListViewPresentation.RowAtOffset(scroll.VerticalOffset,
+                columnHeader?.ActualHeight ?? 0, rowHeight, viewModel.ItemCount);
+            var visible = Math.Max(1, (int)Math.Ceiling(scroll.ViewportHeight / rowHeight));
+            if (ListViewPresentation.WindowCovers(windowStart, control.Items.Count, first, visible,
+                    viewModel.ItemCount, margin: 4) || !AllowsAction(viewModel, "setTopIndex")) return;
+            // One request at a time: the native list scrolls and recaptures for each, so a
+            // continuing scroll is answered by asking again, for where the viewport is
+            // then, once the window that answers this request has arrived.
+            if (viewModel.HasPending("setTopIndex") || first == requestedTop)
+            {
+                ScheduleWindowCheck();
+                return;
+            }
+            requestedTop = first;
+            RendererDiagnostics.Log($"windowed list node={viewModel.NodeId} asks for top row {first} " +
+                $"(window {windowStart}+{control.Items.Count}, offset {scroll.VerticalOffset:F0}, row {rowHeight:F1}px)");
+            _action(viewModel, "setTopIndex", first);
+        }
+        var rebuildQueued = false;
+        void QueueWindowRebuild()
+        {
+            if (rebuildQueued) return;
+            rebuildQueued = true;
+            control.DispatcherQueue.TryEnqueue(() =>
+            {
+                rebuildQueued = false;
+                if (_lifetime.IsActive) RebuildRows();
+            });
+        }
+        void ScheduleWindowCheck()
+        {
+            if (!viewModel.IsWindowedList || !_lifetime.IsActive) return;
+            if (windowTimer is null)
+            {
+                windowTimer = control.DispatcherQueue.CreateTimer();
+                windowTimer.Interval = TimeSpan.FromMilliseconds(120);
+                windowTimer.IsRepeating = false;
+                windowTimer.Tick += (_, _) => RequestWindowForViewport();
+                _lifetime.OnDispose(windowTimer.Stop);
+            }
+            if (!windowTimer.IsRunning) windowTimer.Start();
+        }
+        void OnWindowScroll(object? sender, ScrollViewerViewChangedEventArgs args)
+        {
+            if (!_isApplyingCanonical()) ScheduleWindowCheck();
+        }
+        void TrackWindowViewport()
+        {
+            if (!viewModel.IsWindowedList) return;
+            var scroll = FindScrollViewer(control);
+            if (!ReferenceEquals(scroll, windowScroll))
+            {
+                if (windowScroll is not null) windowScroll.ViewChanged -= OnWindowScroll;
+                windowScroll = scroll;
+                if (windowScroll is not null) windowScroll.ViewChanged += OnWindowScroll;
+            }
+            if (control.Items.Count > 0 && control.ContainerFromIndex(0) is FrameworkElement row &&
+                row.ActualHeight > 1 && Math.Abs(row.ActualHeight - rowHeight) > 0.5)
+            {
+                rowHeight = row.ActualHeight;
+                ApplyWindowSpacers();
+            }
+            if (restoreOffset is { } target && windowScroll is { ViewportHeight: > 0 } restoring)
+            {
+                if (Math.Abs(restoring.VerticalOffset - target) < 1 || ++restoreAttempts > 20)
+                {
+                    RendererDiagnostics.Log($"windowed list node={viewModel.NodeId} offset restored to " +
+                        $"{restoring.VerticalOffset:F0} (wanted {target:F0}) after {restoreAttempts} layout(s)");
+                    restoreOffset = null;
+                }
+                else restoring.ChangeView(null, target, null, true);
+            }
+            // The first window sits around the native list's top row; the projection
+            // opens there instead of at row 0, which would ask to scroll the native list.
+            if (!windowPlaced && windowScroll is { ViewportHeight: > 0 } placed)
+            {
+                windowPlaced = true;
+                if (windowStart > 0)
+                {
+                    var perPage = (int)Math.Floor(placed.ViewportHeight / rowHeight);
+                    placed.ChangeView(null, (columnHeader?.ActualHeight ?? 0) + (windowStart + perPage) * rowHeight,
+                        null, true);
+                }
+            }
+        }
+        _lifetime.OnDispose(() =>
+        {
+            if (windowScroll is not null) windowScroll.ViewChanged -= OnWindowScroll;
+        });
         void OnListScroll(object? sender, ScrollViewerViewChangedEventArgs args)
         {
-            if (pendingScroll || _isApplyingCanonical() || viewModel.ListViewMode == "report" ||
+            if (pendingScroll || _isApplyingCanonical() || !Positioned() ||
                 sender is not ScrollViewer scroll || !_lifetime.IsActive) return;
             if (!ListViewPresentation.TryIncrementalScroll(
                     scroll.HorizontalOffset, scroll.VerticalOffset,
@@ -753,7 +1209,8 @@ internal sealed class ControlFactory
         }
         void ApplyItemLayout()
         {
-            if (!_lifetime.IsActive || viewModel.ListViewMode == "report" || control.ItemsPanelRoot is not Canvas canvas) return;
+            if (_lifetime.IsActive) TrackWindowViewport();
+            if (!_lifetime.IsActive || !Positioned() || control.ItemsPanelRoot is not Canvas canvas) return;
             var scroll = FindScrollViewer(control);
             if (!ReferenceEquals(scroll, scrollHook))
             {
@@ -815,13 +1272,29 @@ internal sealed class ControlFactory
             return focused is ListViewItem item ? control.IndexFromContainer(item) : control.SelectedIndex;
         }
 
+        // Native activation (stable identities and an accessible default action) when the row
+        // has it; otherwise the control is sent Enter, where the node offers that.
+        bool OffersActivation() =>
+            (viewModel.ItemActivationSupported && AllowsAction(viewModel, "activateItem")) ||
+            (viewModel.ItemDefaultActivation && AllowsAction(viewModel, "openItem"));
+
         void ActivateItem(int index)
         {
-            if (!_lifetime.IsActive || _isApplyingCanonical() || !viewModel.ItemActivationSupported ||
+            if (!_lifetime.IsActive || _isApplyingCanonical() ||
                 index < 0 || index >= control.Items.Count || index >= viewModel.Items.Count ||
-                index >= viewModel.ItemNativeIds.Count ||
-                rowContents.Any(content => content.IsEditing) || !AllowsAction(viewModel, "activateItem")) return;
-            activation.Request(index);
+                rowContents.Any(content => content.IsEditing))
+            {
+                RendererDiagnostics.Log($"list activation node={viewModel.NodeId} index={index} ignored " +
+                    $"(active={_lifetime.IsActive} applying={_isApplyingCanonical()} items={control.Items.Count}/{viewModel.Items.Count})");
+                return;
+            }
+            if (viewModel.ItemActivationSupported && index < viewModel.ItemNativeIds.Count &&
+                AllowsAction(viewModel, "activateItem"))
+            {
+                activation.Request(index);
+                return;
+            }
+            RequestOpenItem(viewModel, index, windowStart);
         }
 
         ActivatableListViewItem WrapItem(FrameworkElement content, int index, string name)
@@ -834,15 +1307,14 @@ internal sealed class ControlFactory
             var container = new ActivatableListViewItem
             {
                 Content = content,
-                Activate = viewModel.ItemActivationSupported && AllowsAction(viewModel, "activateItem")
-                    ? InvokeCurrentItem : null,
+                Activate = OffersActivation() ? InvokeCurrentItem : null,
             };
             AutomationProperties.SetName(container, name);
             container.DoubleTapped += (_, args) =>
             {
                 if (IsListItemEditor(args.OriginalSource as DependencyObject, container)) return;
                 InvokeCurrentItem();
-                args.Handled = viewModel.ItemActivationSupported && AllowsAction(viewModel, "activateItem");
+                args.Handled = OffersActivation();
             };
             return container;
         }
@@ -869,6 +1341,7 @@ internal sealed class ControlFactory
                     VerticalAlignment = VerticalAlignment.Top,
                 };
                 AutomationProperties.SetName(check, label);
+                AutomationProperties.SetAutomationId(check, "fls-item-check-" + index);
                 RoutedEventHandler changed = (_, _) =>
                 {
                     if (generation != itemPresentationGeneration || applyingSelection || _isApplyingCanonical() || !AllowsAction(viewModel, "setItemCheck")) return;
@@ -889,6 +1362,7 @@ internal sealed class ControlFactory
             }
             var container = WrapItem(visual, index, label);
             var rect = viewModel.ItemRects[index];
+            container.Visibility = rect.Width == 0 || rect.Height == 0 ? Visibility.Collapsed : Visibility.Visible;
             container.MinWidth = container.MinHeight = 0;
             container.Width = rect.Width * _scale;
             container.Height = rect.Height * _scale;
@@ -997,6 +1471,7 @@ internal sealed class ControlFactory
                         VerticalAlignment = VerticalAlignment.Center,
                     };
                     AutomationProperties.SetName(checkBox, string.Join(" ", cells));
+                    AutomationProperties.SetAutomationId(checkBox, "fls-item-check-" + rowIndex);
                     RoutedEventHandler changed = (_, _) =>
                     {
                         if (generation != itemPresentationGeneration || applyingSelection || _isApplyingCanonical()) return;
@@ -1075,17 +1550,22 @@ internal sealed class ControlFactory
             applyingSelection = true;
             try
             {
+                // Selection is absolute; only the carried rows show it.
                 if (viewModel.MultiSelect)
                 {
                     control.SelectedItems.Clear();
                     foreach (var index in viewModel.SelectedIndices)
                     {
-                        if (index >= 0 && index < control.Items.Count)
-                            control.SelectedItems.Add(control.Items[index]);
+                        var local = index - windowStart;
+                        if (local >= 0 && local < control.Items.Count)
+                            control.SelectedItems.Add(control.Items[local]);
                     }
                 }
                 else
-                    control.SelectedIndex = viewModel.SelectedIndices.FirstOrDefault(-1);
+                {
+                    var local = viewModel.SelectedIndices.FirstOrDefault(-1) - windowStart;
+                    control.SelectedIndex = local >= 0 && local < control.Items.Count ? local : -1;
+                }
             }
             finally
             {
@@ -1105,7 +1585,7 @@ internal sealed class ControlFactory
             try
             {
                 var report = viewModel.ListViewMode == "report";
-                if (!report)
+                if (Positioned())
                     control.ItemsPanel = positionedPanel;
                 else if (viewModel.CheckBoxes)
                 {
@@ -1125,9 +1605,34 @@ internal sealed class ControlFactory
                 }
                 ScrollViewer.SetHorizontalScrollMode(control, ScrollMode.Enabled);
                 ScrollViewer.SetHorizontalScrollBarVisibility(control, ScrollBarVisibility.Auto);
-                control.Header = ShouldRenderListViewHeader(viewModel)
+                columnHeader = ShouldRenderListViewHeader(viewModel) && !viewModel.GroupViewEnabled
                     ? BuildCells(viewModel.Columns, header: true)
                     : null;
+                // A restore still waiting for a layout keeps the offset it was taken at:
+                // the offset read now is the reset one.
+                if (viewModel.IsWindowedList && windowPlaced && windowScroll is { } current && restoreOffset is null)
+                {
+                    restoreOffset = current.VerticalOffset;
+                    restoreAttempts = 0;
+                    RendererDiagnostics.Log($"windowed list node={viewModel.NodeId} window {windowStart} -> " +
+                        $"{viewModel.ItemWindowStart} ({viewModel.Rows.Count} rows of {viewModel.ItemCount}) " +
+                        $"keeping offset {current.VerticalOffset:F0}");
+                }
+                windowStart = viewModel.IsWindowedList ? viewModel.ItemWindowStart : 0;
+                // A new window answers the last request for one.
+                requestedTop = -1;
+                control.Footer = null;
+                if (viewModel.IsWindowedList)
+                {
+                    topSpacer = new Border { IsHitTestVisible = false };
+                    bottomSpacer = new Border { IsHitTestVisible = false };
+                    var head = new StackPanel();
+                    if (columnHeader is not null) head.Children.Add(columnHeader);
+                    head.Children.Add(topSpacer);
+                    control.Header = head;
+                    control.Footer = bottomSpacer;
+                }
+                else control.Header = columnHeader;
                 control.Items.Clear();
                 rowChecks.Clear();
                 rowContents.Clear();
@@ -1135,15 +1640,84 @@ internal sealed class ControlFactory
                 var icons = ItemIcons(viewModel, count);
                 // A Canvas needs the extent occupied by its items only. The
                 // ScrollViewer supplies its own viewport minimum after chrome.
-                if (!report) contentBounds = ListViewPresentation.ContentBounds(viewModel.ItemRects, new PixelRect());
+                if (Positioned()) contentBounds = ListViewPresentation.ContentBounds(
+                    viewModel.ItemRects.Concat(viewModel.ListViewGroups.SelectMany(group => new[] { group.HeaderRect, group.FooterRect })).ToArray(), new PixelRect());
+                void Position(FrameworkElement element, PixelRect rect)
+                {
+                    element.MinWidth = element.MinHeight = 0;
+                    element.Width = rect.Width * _scale;
+                    element.Height = rect.Height * _scale;
+                    element.Margin = new Thickness(0);
+                    element.Visibility = rect.Width == 0 || rect.Height == 0 ? Visibility.Collapsed : Visibility.Visible;
+                    Canvas.SetLeft(element, (rect.X - contentBounds.X) * _scale);
+                    Canvas.SetTop(element, (rect.Y - contentBounds.Y) * _scale);
+                }
+                // A list that indexes its realized rows (check boxes, in-place rename) keeps them all;
+                // see ListViewPresentation.InBuildWindow for the rest.
+                bool InBuildWindow(PixelRect rect) =>
+                    viewModel.CheckBoxes || viewModel.EditableLabels ||
+                    ListViewPresentation.InBuildWindow(rect, viewModel.Rect.Width, viewModel.Rect.Height);
                 for (var index = 0; index < count; ++index)
-                    control.Items.Add(report
+                {
+                    // A row the viewport will not show keeps its place in control.Items (selection and
+                    // focus are indexes into it) as an empty, collapsed container.
+                    if (Positioned() && !InBuildWindow(viewModel.ItemRects[index]))
+                    {
+                        control.Items.Add(new ListViewItem { Visibility = Visibility.Collapsed, IsTabStop = false, IsHitTestVisible = false });
+                        continue;
+                    }
+                    var row = report
                         ? WrapItem(BuildCells(viewModel.Rows[index], header: false, index, icons[index]),
                             index, string.Join(" ", viewModel.Rows[index]))
-                        : BuildIconItem(index, icons[index]));
-                pendingScroll = !report;
+                        : BuildIconItem(index, icons[index]);
+                    if (report && viewModel.GroupViewEnabled) Position(row, viewModel.ItemRects[index]);
+                    control.Items.Add(row);
+                }
+                if (viewModel.GroupViewEnabled)
+                {
+                    var generation = itemPresentationGeneration;
+                    void Band(FrameworkElement content, PixelRect bounds, bool interactive)
+                    {
+                        var container = new ListViewItem
+                        {
+                            Content = content, IsTabStop = false, IsHitTestVisible = interactive,
+                            Padding = new Thickness(0), HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                            VerticalContentAlignment = VerticalAlignment.Stretch,
+                        };
+                        // A band is structure around the rows, not a row: its content (the group heading,
+                        // the footer text, the column titles) is the element, so the carrier stays out of
+                        // the accessibility tree rather than doubling every band in it.
+                        AutomationProperties.SetAccessibilityView(container, AccessibilityView.Raw);
+                        Position(container, bounds);
+                        control.Items.Add(container);
+                    }
+                    // Bands come after every row, so one the viewport will not show is simply not built.
+                    foreach (var group in viewModel.ListViewGroups.Where(group => !group.Hidden))
+                    {
+                        if (InBuildWindow(group.HeaderRect))
+                            Band(new ListViewGroupHeader(group, expanded =>
+                            {
+                                if (!_lifetime.IsActive || generation != itemPresentationGeneration || _isApplyingCanonical() ||
+                                    !AllowsAction(viewModel, "setGroupExpanded")) return;
+                                _action(viewModel, "setGroupExpanded", new ListViewGroupExpandActionValue
+                                { GroupId = group.GroupId, Expanded = expanded });
+                            }), group.HeaderRect, group.Collapsible);
+                        if (group.Footer.Length != 0 && InBuildWindow(group.FooterRect)) Band(new TextBlock
+                        {
+                            Text = group.Footer, TextAlignment = ListViewGroupPresentation.Alignment(group.FooterAlignment),
+                            VerticalAlignment = VerticalAlignment.Center,
+                        }, group.FooterRect, false);
+                    }
+                    if (ShouldRenderListViewHeader(viewModel))
+                        Band(BuildCells(viewModel.Columns, header: true), new PixelRect
+                        {
+                            Width = viewModel.ColumnWidths.Sum(), Height = 22,
+                        }, true);
+                }
+                pendingScroll = Positioned();
                 sentScrollX = 0;
                 sentScrollY = 0;
+                ApplyWindowSpacers();
                 ApplyItemLayout();
             }
             finally
@@ -1152,19 +1726,35 @@ internal sealed class ControlFactory
             }
             ApplyCanonicalSelection();
             ApplyCanonicalChecks();
+            // The user may have kept scrolling while the window was on its way.
+            ScheduleWindowCheck();
         }
 
         control.SelectionChanged += (_, _) =>
         {
             if (applyingSelection || _isApplyingCanonical()) return;
-            activation.Cancel();
+            activation.Cancel("the selection was changed by the user");
             var selection = CanonicalSelectionIndices(control.SelectedItems
                 .Cast<object>()
-                .Select(item => control.Items.IndexOf(item)));
+                .Select(item => control.Items.IndexOf(item)).Where(index => index < viewModel.Items.Count));
+            if (control.SelectedItems.Cast<object>().Any(item => control.Items.IndexOf(item) >= viewModel.Items.Count))
+            {
+                ApplyCanonicalSelection();
+                return;
+            }
+            if (viewModel.IsWindowedList)
+            {
+                // A windowed list's rows are named absolutely, and a multiple selection
+                // keeps the selected rows the window does not carry.
+                var carried = control.Items.Count;
+                selection = CanonicalSelectionIndices(selection.Select(Absolute).Concat(viewModel.MultiSelect
+                    ? viewModel.SelectedIndices.Where(index => index < windowStart || index >= windowStart + carried)
+                    : []));
+            }
             if (!viewModel.SelectedIndices.SequenceEqual(selection) &&
                 AllowsAction(viewModel, "setSelection"))
                 _action(viewModel, "setSelection", selection);
-            var focus = FocusedItemIndex();
+            var focus = Absolute(FocusedItemIndex());
             if (focus < 0 && selection.Length > 0) focus = selection[^1];
             if (focus >= 0 && focus != viewModel.FocusedIndex &&
                 AllowsAction(viewModel, "setFocusedIndex"))
@@ -1174,6 +1764,7 @@ internal sealed class ControlFactory
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects) or
                 nameof(viewModel.ListViewMode) or nameof(viewModel.ItemActivationSupported) or
+                nameof(viewModel.ListViewGroups) or
                 nameof(viewModel.ItemNativeIds) or
                 nameof(viewModel.Columns) or nameof(viewModel.ColumnWidths) or
                 nameof(viewModel.ColumnOrder) or
@@ -1181,7 +1772,11 @@ internal sealed class ControlFactory
                 nameof(viewModel.CheckBoxes) or nameof(viewModel.ItemImages) or
                 nameof(viewModel.EditableLabels))
             {
-                RebuildRows();
+                // One snapshot announces Items, ItemImages and Rows one after another, and a
+                // window of rows is expensive to build, so a windowed list builds once, after
+                // the snapshot has been applied.
+                if (viewModel.IsWindowedList) QueueWindowRebuild();
+                else RebuildRows();
             }
             else if (args.PropertyName == nameof(viewModel.MultiSelect))
             {
@@ -1200,25 +1795,40 @@ internal sealed class ControlFactory
         // single-click or focus/navigation gesture always replaces the old intent.
         control.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, _) =>
         {
-            if (!_isApplyingCanonical()) activation.Cancel();
+            if (!_isApplyingCanonical()) activation.Cancel("a pointer press");
         }), true);
         control.GotFocus += (_, _) =>
         {
-            if (!applyingSelection && !_isApplyingCanonical()) activation.Cancel();
+            if (!applyingSelection && !_isApplyingCanonical()) activation.Cancel("focus moved");
         };
+        // The row container consumes Enter as part of its own invoke handling before it
+        // bubbles here, so the activation gesture listens to handled events too.
+        control.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler((_, args) =>
+        {
+            if (!_lifetime.IsActive || args.Key != VirtualKey.Enter ||
+                IsListItemEditor(args.OriginalSource as DependencyObject, control)) return;
+            var index = FocusedItemIndex();
+            ActivateItem(index);
+            if (index >= 0 && OffersActivation()) args.Handled = true;
+        }), true);
         control.KeyDown += (_, args) =>
         {
             if (!_lifetime.IsActive) return;
             if (args.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down or
                 VirtualKey.Home or VirtualKey.End or VirtualKey.PageUp or VirtualKey.PageDown or
                 VirtualKey.Tab or VirtualKey.Space or VirtualKey.F2 or VirtualKey.Escape)
-                activation.Cancel();
-            if (viewModel.ListViewMode != "report" && !args.Handled &&
+                activation.Cancel("a navigation key");
+            if (Positioned() && !args.Handled &&
                 args.Key is VirtualKey.Left or VirtualKey.Right or VirtualKey.Up or VirtualKey.Down or VirtualKey.Home or VirtualKey.End &&
                 !IsListItemEditor(args.OriginalSource as DependencyObject, control))
             {
                 var current = FocusedItemIndex();
                 var next = ListViewPresentation.Navigate(viewModel.ItemRects, current, args.Key);
+                var visibleOrder = viewModel.GroupViewEnabled
+                    ? ListViewGroupPresentation.VisibleOrder(viewModel.ListViewGroups, viewModel.ItemGroupIds)
+                    : Enumerable.Range(0, viewModel.Items.Count).ToArray();
+                if (args.Key == VirtualKey.Home) next = visibleOrder.FirstOrDefault(-1);
+                if (args.Key == VirtualKey.End) next = visibleOrder.LastOrDefault(-1);
                 if (next >= 0 && control.ContainerFromIndex(next) is ListViewItem destination)
                 {
                     var shift = (InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift) &
@@ -1233,8 +1843,12 @@ internal sealed class ControlFactory
                         try
                         {
                             control.SelectedItems.Clear();
-                            foreach (var index in ListViewPresentation.SelectionRange(control.Items.Count, selectionAnchor, next))
+                            foreach (var position in ListViewPresentation.SelectionRange(visibleOrder.Length,
+                                Array.IndexOf(visibleOrder, selectionAnchor), Array.IndexOf(visibleOrder, next)))
+                            {
+                                var index = visibleOrder[position];
                                 control.SelectedItems.Add(control.Items[index]);
+                            }
                         }
                         finally { applyingSelection = false; }
                         if (!_isApplyingCanonical() && AllowsAction(viewModel, "setSelection"))
@@ -1258,14 +1872,6 @@ internal sealed class ControlFactory
                 args.Handled = true;
                 return;
             }
-            if (args.Key == VirtualKey.Enter && !args.Handled &&
-                !IsListItemEditor(args.OriginalSource as DependencyObject, control))
-            {
-                var index = FocusedItemIndex();
-                ActivateItem(index);
-                args.Handled = viewModel.ItemActivationSupported && index >= 0 && AllowsAction(viewModel, "activateItem");
-                return;
-            }
             // F2 is the native in-place rename gesture; Space toggles the checkbox
             // column exactly as the native list does.
             var focusedIndex = FocusedItemIndex();
@@ -1280,6 +1886,16 @@ internal sealed class ControlFactory
                 focusedIndex is < 0 || focusedIndex >= rowChecks.Count) return;
             rowChecks[focusedIndex].IsChecked = rowChecks[focusedIndex].IsChecked != true;
             args.Handled = true;
+        };
+        control.ContextRequested += (_, args) =>
+        {
+            var source = args.OriginalSource as DependencyObject;
+            // An in-place label editor keeps its own text context menu.
+            if (args.Handled || IsListItemEditor(source, control)) return;
+            var container = AncestorOrSelf<ListViewItem>(source, control);
+            var index = container is not null ? control.IndexFromContainer(container) : FocusedItemIndex();
+            container ??= index >= 0 ? control.ContainerFromIndex(index) as ListViewItem : null;
+            args.Handled = RequestContextMenu(viewModel, control, container, index, args, indexOffset: windowStart);
         };
         RebuildRows();
         return control;
@@ -1381,9 +1997,8 @@ internal sealed class ControlFactory
                         TextTrimming = TextTrimming.CharacterEllipsis,
                         TextWrapping = TextWrapping.NoWrap,
                     };
-                    FrameworkElement content = face is not null
-                        ? new Image { Source = face, Stretch = Stretch.None }
-                        : label!;
+                    var image = face is null ? null : new Image { Source = face, Stretch = Stretch.None };
+                    FrameworkElement content = image is not null ? image : label!;
                     if (item.DropDown == true)
                     {
                         // The button carries an arrow that asks its owner for a menu, so the
@@ -1469,11 +2084,34 @@ internal sealed class ControlFactory
                             IsTabStop = item.Enabled && !item.Hidden,
                         };
                         AutomationProperties.SetName(button, Win32Mnemonic.DisplayText(item.Text));
-                        button.Click += (_, _) => Emit();
+                        if (item.DropDown == true)
+                        {
+                            // Two parts in one button, as comctl32 draws it: the body is the button's command
+                            // and the arrow asks the owner for its menu (TBN_DROPDOWN). Only a button whose
+                            // whole face is the arrow (BTNS_WHOLEDROPDOWN) never has a command of its own.
+                            var arrowWidth = Math.Min(item.Rect.Width * _scale * 0.5, 15 * _scale);
+                            var onArrow = false;
+                            button.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, args) =>
+                            {
+                                var x = args.GetCurrentPoint(button).Position.X;
+                                onArrow = item.WholeDropDown == true || x >= button.ActualWidth - arrowWidth;
+                            }), true);
+                            button.Click += (_, _) =>
+                            {
+                                var arrow = onArrow || item.WholeDropDown == true;
+                                onArrow = false;
+                                if (!arrow) Emit();
+                                else if (generation == presentationGeneration && !_isApplyingCanonical() &&
+                                         AllowsAction(viewModel, "toolbarDropDown"))
+                                    _action(viewModel, "toolbarDropDown", commandId);
+                            };
+                        }
+                        else button.Click += (_, _) => Emit();
                         element = button;
                     }
                     if (face is not null)
                     {
+                        BindToolbarImageState((ButtonBase)element, image!, item, face, viewModel.Style);
                         var tooltip = Win32Mnemonic.DisplayText(item.Text);
                         if (tooltip.Length != 0) ToolTipService.SetToolTip(element, tooltip);
                     }
@@ -1490,7 +2128,7 @@ internal sealed class ControlFactory
         Rebuild();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName == nameof(viewModel.ToolbarItems)) Rebuild();
+            if (args.PropertyName is nameof(viewModel.ToolbarItems) or nameof(viewModel.Style)) Rebuild();
         });
         return control;
     }
@@ -1503,6 +2141,38 @@ internal sealed class ControlFactory
             item.ImageFormat is null && item.ImageData is null)
             return null;
         return BitmapFromBase64(item.ImageWidth, item.ImageHeight, item.ImageFormat, item.ImageData);
+    }
+
+    private static void BindToolbarImageState(ButtonBase button, Image image,
+        ToolbarItemSnapshot item, WriteableBitmap normal, ulong nativeStyle)
+    {
+        const ulong hotTrackingStyles = 0x0800 | 0x1000; // TBSTYLE_FLAT | TBSTYLE_LIST.
+        var hotTracking = (nativeStyle & hotTrackingStyles) != 0;
+        static WriteableBitmap? Decode(ImageListEntry? entry) => entry is null ? null :
+            BitmapFromBase64(entry.ImageWidth, entry.ImageHeight, entry.ImageFormat, entry.ImageData);
+        var hot = Decode(item.HotImage);
+        var disabled = Decode(item.DisabledImage);
+        var pressed = Decode(item.PressedImage);
+        void Apply()
+        {
+            image.Source = ToolbarImagePresentation.Select(item, button.IsEnabled,
+                button.IsPointerOver, button.IsPressed,
+                button is ToggleButton { IsChecked: true }, hotTracking) switch
+            {
+                ToolbarImageState.Hot => hot,
+                ToolbarImageState.Disabled => disabled,
+                ToolbarImageState.Pressed => pressed,
+                _ => normal,
+            };
+        }
+        // IsPressed also covers keyboard activation and capture cancellation;
+        // IsEnabled reflects the toolbar's inherited effective enabled state.
+        button.RegisterPropertyChangedCallback(ButtonBase.IsPressedProperty, (_, _) => Apply());
+        button.RegisterPropertyChangedCallback(ButtonBase.IsPointerOverProperty, (_, _) => Apply());
+        button.RegisterPropertyChangedCallback(Control.IsEnabledProperty, (_, _) => Apply());
+        if (button is ToggleButton)
+            button.RegisterPropertyChangedCallback(ToggleButton.IsCheckedProperty, (_, _) => Apply());
+        Apply();
     }
 
     // Every owned pixel buffer arrives validated as canonical premultiplied BGRA. The
@@ -1584,17 +2254,27 @@ internal sealed class ControlFactory
                 Index = index,
                 Position = position,
             });
+        }, (vertical, position, lines) =>
+        {
+            if (_isApplyingCanonical() || !AllowsAction(viewModel, "setScroll")) return;
+            _action(viewModel, "setScroll", new SetScrollActionValue
+            {
+                Vertical = vertical,
+                Position = position,
+                Lines = lines,
+            });
         });
         void Apply()
         {
             control.ApplySplits(viewModel.Splits, _scale);
             control.ApplyChrome(viewModel.ChromeRegions, _scale);
+            control.ApplyScrollBars(viewModel.ScrollBars, viewModel.ClientRect, _scale);
         }
         Apply();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Splits) or nameof(viewModel.Rect) or
-                nameof(viewModel.ChromeRegions))
+                nameof(viewModel.ChromeRegions) or nameof(viewModel.ScrollBars) or nameof(viewModel.ClientRect))
                 Apply();
         });
         return control;
@@ -1604,6 +2284,43 @@ internal sealed class ControlFactory
     // Fluent control for each one and drives it by asking the provider to perform that
     // element's own default action.  The action string is also the accessible
     // description, so what the projection promises is what the provider named.
+    private FrameworkElement CreateDiskView(ControlNodeViewModel viewModel)
+    {
+        var control = new DiskViewControl(
+            (action, id) => { if (!_isApplyingCanonical()) _action(viewModel, action, new DiskViewItemActionValue { ItemId = id }); },
+            position => { if (!_isApplyingCanonical()) _action(viewModel, "diskScroll", new DiskViewScrollActionValue { Position = position }); });
+        void Apply() { if (viewModel.DiskView is { } view) control.Apply(view, _scale); }
+        Apply();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.DiskView) or nameof(viewModel.Rect)) Apply();
+        });
+        return control;
+    }
+
+    private FrameworkElement CreateNativeDocument(ControlNodeViewModel viewModel)
+    {
+        var control = new NativeDocumentControl(
+            index =>
+            {
+                if (_isApplyingCanonical() || viewModel.Document is not { } document ||
+                    index < 0 || index >= document.Items.Count) return;
+                var item = document.Items[index];
+                _action(viewModel, "htmlInvoke", new NativeDocumentInvokeActionValue
+                {
+                    Index = index, DocumentId = document.DocumentId,
+                    Key = item.Key, ActionIdentity = item.ActionIdentity,
+                });
+            },
+            request => { if (!_isApplyingCanonical()) _action(viewModel, "htmlScroll", request); });
+        void Apply() { if (viewModel.Document is { } document) control.Apply(document, _scale); }
+        Apply();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Document) or nameof(viewModel.Rect)) Apply();
+        });
+        return control;
+    }
     private FrameworkElement CreateAccessibleIsland(ControlNodeViewModel viewModel)
     {
         if (viewModel.IslandItems.Count > 0 && viewModel.IslandItems[0].Kind == "pageTab")
@@ -1738,12 +2455,64 @@ internal sealed class ControlFactory
                 StateIcons(viewModel, viewModel.Items.Count),
                 viewModel.SelectedIndex);
         }
+        control.Tree.ContextRequested += (_, args) =>
+        {
+            var source = args.OriginalSource as DependencyObject;
+            if (args.Handled || source is TextBox) return;
+            var index = control.ItemIndexFor(source, out var container);
+            args.Handled = RequestContextMenu(viewModel, control, container, index, args);
+        };
+        // A double-click (or Enter) on a leaf of a snap-in's tree opens the item (Device Manager
+        // opens the device's properties). An item with children keeps the expand/collapse a
+        // double-click already means.
+        bool ActivateLeaf(int index) =>
+            index >= 0 && index < viewModel.ItemHasChildren.Count && !viewModel.ItemHasChildren[index] &&
+            RequestOpenItem(viewModel, index);
+        // The tree's own items handle these gestures (expansion, invocation), and the first press
+        // of a double-click can rebuild the items under the pointer, which cancels a recognized
+        // double-tap. So a second press on the same item within the system double-click time is
+        // the gesture, and the handlers listen for events that are already marked handled too.
+        control.Tree.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((_, args) =>
+        {
+            if (args.OriginalSource is TextBox || !args.GetCurrentPoint(control.Tree).Properties.IsLeftButtonPressed) return;
+            var index = control.ItemIndexFor(args.OriginalSource as DependencyObject, out var container);
+            var doubled = _itemPresses.Note(viewModel.NodeId, container is null ? -1 : index,
+                Environment.TickCount64, ProjectedDoubleClickTime.Milliseconds);
+            if (viewModel.ItemDefaultActivation)
+                RendererDiagnostics.Log($"tree press node={viewModel.NodeId} index={index} container={container is not null} doubled={doubled}");
+            if (doubled && !ActivateLeaf(index))
+                RendererDiagnostics.Log(
+                    $"tree double-click was not opened node={viewModel.NodeId} index={index} " +
+                    $"leaf={index >= 0 && index < viewModel.ItemHasChildren.Count && !viewModel.ItemHasChildren[index]} " +
+                    $"defaultActivation={viewModel.ItemDefaultActivation} openItem={AllowsAction(viewModel, "openItem")}");
+        }), true);
+        control.Tree.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler((_, args) =>
+        {
+            if (args.Key != VirtualKey.Enter || args.OriginalSource is TextBox) return;
+            if (ActivateLeaf(control.SelectedIndex)) args.Handled = true;
+        }), true);
         Rebuild();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
+            // A node opening or closing, or an icon changing, does not change the hierarchy: the
+            // nodes that stand for it keep their place (and the tree its scroll position).
+            if (args.PropertyName == nameof(viewModel.ItemDepths) && HasRenderableTreeShape(viewModel) &&
+                control.TryApplyExpansion(viewModel.Items, viewModel.ItemDepths, viewModel.ItemExpanded, viewModel.ItemHasChildren))
+                return;
+            if (args.PropertyName == nameof(viewModel.ItemImages) && HasRenderableTreeShape(viewModel) &&
+                control.HasHierarchy(viewModel.Items, viewModel.ItemDepths, viewModel.ItemHasChildren))
+            {
+                control.ApplyIcons(ItemIcons(viewModel, viewModel.Items.Count, viewModel.SelectedIndex));
+                control.ApplyStateIcons(StateIcons(viewModel, viewModel.Items.Count));
+                return;
+            }
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemDepths) or
                 nameof(viewModel.ItemImages) or nameof(viewModel.EditableLabels))
+            {
+                if (viewModel.ItemDefaultActivation)
+                    RendererDiagnostics.Log($"tree node={viewModel.NodeId} rebuilt for {args.PropertyName}");
                 Rebuild();
+            }
             else if (args.PropertyName == nameof(viewModel.SelectedIndex))
             {
                 control.ApplySelection(viewModel.SelectedIndex);
@@ -1938,11 +2707,73 @@ internal sealed class ControlFactory
         return control;
     }
 
+    // A native date or time picker (minor 37): the value is the position of a range -- a day
+    // number or a second of the day -- and a chosen value is asked of the native control as
+    // setValue, like a slider's.
+    private SemanticDatePicker CreateDatePicker(ControlNodeViewModel viewModel)
+    {
+        var control = new SemanticDatePicker
+        {
+            FontSize = NativeFontSize,
+            MinWidth = 0,
+            MinHeight = 0,
+            Padding = new Thickness(6, 0, 0, 0),
+            PlaceholderText = string.Empty,
+        };
+        control.DayRequested += day =>
+        {
+            if (_isApplyingCanonical() || day == viewModel.Position || !AllowsAction(viewModel, "setValue")) return;
+            _action(viewModel, "setValue", day);
+        };
+        void ApplyCanonical() => control.Apply(viewModel.Minimum, viewModel.Maximum, viewModel.Position);
+        ApplyCanonical();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Minimum) or nameof(viewModel.Maximum) or nameof(viewModel.Position))
+                ApplyCanonical();
+        });
+        return control;
+    }
+
+    private SemanticTimePicker CreateTimePicker(ControlNodeViewModel viewModel)
+    {
+        var control = new SemanticTimePicker(NativeFontSize);
+        control.SecondRequested += second =>
+        {
+            if (_isApplyingCanonical() || second == viewModel.Position || !AllowsAction(viewModel, "setValue")) return;
+            _action(viewModel, "setValue", second);
+        };
+        control.Apply(viewModel.Position, viewModel.Text);
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Position) or nameof(viewModel.Text))
+                control.Apply(viewModel.Position, viewModel.Text);
+        });
+        return control;
+    }
+
     internal static SysLinkSegments SplitSysLinkText(string text, string label)
     {
         if (!TrySplitSysLinkText(text, label, out var segments))
             throw new ArgumentException("SysLink label must occur exactly once in its text.", nameof(label));
         return segments;
+    }
+
+    // The text as plain and link runs, in order.
+    private static bool TrySplitSysLinkRuns(string text, IReadOnlyList<string> labels,
+        out List<(string Text, bool IsLink)> runs)
+    {
+        runs = [];
+        if (!ProtocolValidator.TryLocateSysLinkLabels(text, labels, out var starts)) return false;
+        var cursor = 0;
+        for (var index = 0; index < labels.Count; index++)
+        {
+            if (starts[index] > cursor) runs.Add((text[cursor..starts[index]], false));
+            runs.Add((labels[index], true));
+            cursor = starts[index] + labels[index].Length;
+        }
+        if (cursor < text.Length) runs.Add((text[cursor..], false));
+        return true;
     }
 
     private static bool TrySplitSysLinkText(string text, string label, out SysLinkSegments segments)
@@ -1962,12 +2793,13 @@ internal sealed class ControlFactory
         multiSelect ? ListViewSelectionMode.Extended : ListViewSelectionMode.Single;
 
     internal static bool HasRenderableListViewShape(ControlNodeViewModel viewModel) =>
-        viewModel.ListViewMode == "report"
+        (!viewModel.GroupViewEnabled || (viewModel.ItemRects.Count == viewModel.Items.Count &&
+            viewModel.ItemGroupIds.Count == viewModel.Items.Count)) && (viewModel.ListViewMode == "report"
             ? viewModel.Columns.Count != 0 &&
               viewModel.ColumnWidths.Count == viewModel.Columns.Count &&
               viewModel.Rows.All(row => row.Count == viewModel.Columns.Count)
             : viewModel.Columns.Count == 0 && viewModel.Rows.Count == 0 &&
-              viewModel.ItemRects.Count == viewModel.Items.Count;
+              viewModel.ItemRects.Count == viewModel.Items.Count);
 
     internal static bool ShouldRenderListViewHeader(ControlNodeViewModel viewModel) =>
         viewModel.ListViewMode == "report" && viewModel.ColumnHeadersVisible;
@@ -1982,7 +2814,7 @@ internal sealed class ControlFactory
         return false;
     }
 
-    private static ScrollViewer? FindScrollViewer(DependencyObject root)
+    internal static ScrollViewer? FindScrollViewer(DependencyObject root)
     {
         for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); ++index)
         {
@@ -2067,6 +2899,8 @@ internal sealed class ControlFactory
         "SolidBackgroundFillColorBaseBrush",
         "ControlStrongStrokeColorDefaultBrush",
         "ControlStrokeColorOnAccentSecondaryBrush",
+        "LayerFillColorAltBrush",
+        "DividerStrokeColorDefaultBrush",
     ];
 
     internal static void WarmThemeResources()
@@ -2096,11 +2930,19 @@ internal sealed class ControlFactory
     internal static bool AcceptsReturnFor(ControlNodeViewModel viewModel) =>
         viewModel.Multiline && (viewModel.DialogCode & 0x0004u) != 0;
 
+    // A plain panel has no IsEnabled of its own, so its peer would always report
+    // enabled.  A projected container answers with its native window's state instead,
+    // which is what lets a container the application disabled (MMC disables its MDI
+    // client while a snap-in holds the console) project truthfully.
+    internal static bool NodeEnabled(FrameworkElement element) =>
+        element.DataContext is not ControlNodeViewModel model || model.Enabled;
+
     internal static AutomationControlType AutomationControlTypeFor(string kind) => kind switch
     {
         "static" => AutomationControlType.Text,
         "staticIcon" or "staticBitmap" => AutomationControlType.Image,
         "upDown" => AutomationControlType.Spinner,
+        "datePicker" or "timePicker" => AutomationControlType.Button,
         "sysLink" => AutomationControlType.Pane,
         "listView" => AutomationControlType.List,
         "treeView" => AutomationControlType.Tree,
@@ -2109,7 +2951,10 @@ internal sealed class ControlFactory
         "dialogContainer" => AutomationControlType.Pane,
         "mdiClient" => AutomationControlType.Pane,
         "paneContainer" => AutomationControlType.Pane,
-        "accessibleIsland" => AutomationControlType.Group,
+        "richText" => AutomationControlType.Pane,
+        "performanceGraph" or "performanceValueBar" => AutomationControlType.Pane,
+        "performanceLegend" => AutomationControlType.List,
+        "accessibleIsland" or "nativeDocument" or "diskView" => AutomationControlType.Group,
         "mdiChild" => AutomationControlType.Window,
         "statusBar" => AutomationControlType.StatusBar,
         "toolbar" => AutomationControlType.ToolBar,
@@ -2179,9 +3024,15 @@ internal sealed class ControlFactory
         Canvas.SetTop(element, rect.Y * _scale);
         element.Width = Math.Max(0, viewModel.Rect.Width * _scale);
         element.Height = Math.Max(0, viewModel.Rect.Height * _scale);
+        // The native control defines the extent. A default minimum larger than it (WinUI's
+        // CheckBox is 120 px wide at least, a ComboBox or TextBox 64) would report bounds the
+        // native control does not have.
+        if (element.MinWidth > element.Width) element.MinWidth = 0;
+        if (element.MinHeight > element.Height) element.MinHeight = 0;
         if (viewModel.Kind is "dialogContainer" or "tabControl" or "toolbar" or "treeView"
-            or "mdiClient" or "mdiChild" or "paneContainer" or "accessibleIsland"
-            or "statusBar" or "staticDecoration")
+            or "mdiClient" or "mdiChild" or "paneContainer" or "accessibleIsland" or "nativeDocument"
+            or "statusBar" or "staticDecoration" or "richText"
+            or "performanceGraph" or "performanceLegend" or "performanceValueBar")
         {
             element.Clip = new RectangleGeometry
             {
@@ -2505,12 +3356,14 @@ internal sealed class SemanticStaticTextAutomationPeer(SemanticStaticTextControl
     }
 }
 
-internal sealed class SemanticGroupControl : ContentControl
+internal sealed class SemanticGroupControl(Canvas children) : ContentControl, ISemanticContainer
 {
+    public UIElementCollection Children => children.Children;
+
     protected override AutomationPeer OnCreateAutomationPeer() => new SemanticGroupAutomationPeer(this);
 }
 
-internal sealed class SemanticTabControl : ContentControl
+internal sealed class SemanticTabControl : ContentControl, ISemanticContainer
 {
     private readonly Action<int> _selectionRequested;
     private readonly List<TabViewItem> _headers = [];
@@ -2520,20 +3373,38 @@ internal sealed class SemanticTabControl : ContentControl
     private readonly Dictionary<TabViewItem, double> _pillWidths = [];
     private readonly Dictionary<TabViewItem, int> _indices = [];
     private readonly Canvas _headerCanvas = new() { Background = null };
+    // Windows Forms parents its TabPage windows (and the strip's own up-down) to the
+    // tab control itself, so those projected nodes live here, above the strip.
+    private readonly Canvas _pageCanvas = new() { Background = null };
+    // Fills the control without taking input, so its peer measures the control's own
+    // slot. The rendered content alone (headers, pages) neither starts at the
+    // control's origin nor spans it once a strip overflows or pages are present.
+    private readonly BoundsFrame _frame = new();
     private int _selectedIndex = -1;
     private bool _applyingSelection;
 
     public SemanticTabControl(Action<int> selectionRequested)
     {
         _selectionRequested = selectionRequested;
-        Content = _headerCanvas;
+        var layers = new Grid { Background = null };
+        layers.Children.Add(_frame);
+        layers.Children.Add(_headerCanvas);
+        layers.Children.Add(_pageCanvas);
+        Content = layers;
         Background = null;
         BorderThickness = new Thickness(0);
         Padding = new Thickness(0);
         HorizontalContentAlignment = HorizontalAlignment.Stretch;
         VerticalContentAlignment = VerticalAlignment.Stretch;
-        GotFocus += (_, _) =>
+        GotFocus += (_, args) =>
         {
+            // Keyboard focus that lands on a header or on the control itself goes to the selected
+            // header, as the native tab control takes the Tab key. Focus that a click gave a header,
+            // or that sits in a control of the page, is where the user put it: this event bubbles
+            // from the page, and pulling that focus back to the header left every edit on a
+            // property page unable to take typing.
+            if (args.OriginalSource is not TabViewItem && !ReferenceEquals(args.OriginalSource, this)) return;
+            if (args.OriginalSource is UIElement { FocusState: not FocusState.Keyboard }) return;
             if (_selectedIndex >= 0 && _selectedIndex < _headers.Count &&
                 !_headers[_selectedIndex].FocusState.Equals(FocusState.Keyboard))
                 _headers[_selectedIndex].Focus(FocusState.Keyboard);
@@ -2543,6 +3414,22 @@ internal sealed class SemanticTabControl : ContentControl
     public IReadOnlyList<TabViewItem> Headers => _headers;
     public IReadOnlyList<TabView> Rows => _rows;
     public UIElementCollection Children => _headerCanvas.Children;
+    UIElementCollection ISemanticContainer.Children => _pageCanvas.Children;
+    public UIElementCollection PageChildren => _pageCanvas.Children;
+    internal FrameworkElement Frame => _frame;
+
+    // A transparent, non-interactive canvas whose peer exists only to be measured.
+    internal sealed class BoundsFrame : Canvas
+    {
+        public BoundsFrame()
+        {
+            Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            IsHitTestVisible = false;
+            AutomationProperties.SetAccessibilityView(this, AccessibilityView.Raw);
+        }
+
+        protected override AutomationPeer OnCreateAutomationPeer() => new FrameworkElementAutomationPeer(this);
+    }
     public int SelectedIndex => _selectedIndex;
     public global::Windows.Foundation.Rect HeaderUnionBounds { get; private set; }
 
@@ -2770,7 +3657,11 @@ internal sealed class SemanticTabControlAutomationPeer(SemanticTabControl owner)
     protected override bool IsControlElementCore() => true;
     protected override object GetPatternCore(PatternInterface patternInterface) =>
         patternInterface == PatternInterface.Selection ? this : base.GetPatternCore(patternInterface);
+    // The tab items, then the projected nodes a Windows Forms tab control parents
+    // (its pages and the strip's up-down), which are its own children natively too.
     protected override IList<AutomationPeer> GetChildrenCore() => owner.Headers
+        .Cast<UIElement>()
+        .Concat(owner.PageChildren)
         .Select(CreatePeerForElement)
         .Where(peer => peer is not null)
         .Cast<AutomationPeer>()
@@ -2778,6 +3669,10 @@ internal sealed class SemanticTabControlAutomationPeer(SemanticTabControl owner)
     protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
     {
         var reported = base.GetBoundingRectangleCore();
+        // The frame fills the control exactly, so its screen bounds are the slot's.
+        if (CreatePeerForElement(owner.Frame) is { } frame &&
+            frame.GetBoundingRectangle() is { Width: > 0, Height: > 0 } slot)
+            return slot;
         return ExpandHeaderUnionBounds(
             reported, owner.HeaderUnionBounds, owner.ActualWidth, owner.ActualHeight);
     }
@@ -3005,6 +3900,11 @@ internal sealed class SemanticTreeViewControl : ContentControl
     private readonly List<TreeViewNode> _nodes = [];
     private readonly Dictionary<TreeViewNode, int> _indices = [];
     private readonly List<ProjectedItemContent> _contents = [];
+    // The hierarchy the nodes were built from: what a change of only the open state, or only
+    // the icons, is compared against so those can be applied without rebuilding.
+    private readonly List<string> _labels = [];
+    private readonly List<int> _depths = [];
+    private readonly List<bool> _hasChildren = [];
     private int _selectedIndex = -1;
     private bool _applyingCanonical;
 
@@ -3025,8 +3925,13 @@ internal sealed class SemanticTreeViewControl : ContentControl
         _tree.SelectionChanged += OnSelectionChanged;
         _tree.Expanding += OnExpanding;
         _tree.Collapsed += OnCollapsed;
-        GotFocus += (_, _) =>
+        GotFocus += (_, args) =>
         {
+            // Focus that lands on the tree itself goes to its selected item. Focus that landed on
+            // an item already is where the user (or the arrow keys) put it: moving it back to the
+            // previous selection stole a clicked item's focus and scrolled the tree to the old
+            // selection, so a double-click's second press met another row.
+            if (args.OriginalSource is TreeViewItem) return;
             if (SelectedContainer is Control container &&
                 !container.FocusState.Equals(FocusState.Keyboard))
                 container.Focus(FocusState.Keyboard);
@@ -3052,6 +3957,20 @@ internal sealed class SemanticTreeViewControl : ContentControl
             ? _tree.ContainerFromNode(_nodes[_selectedIndex]) as UIElement
             : null;
 
+    // The native index of the item that contains `source`, or the selected item
+    // when the request did not come from an item (keyboard focus on the tree).
+    public int ItemIndexFor(DependencyObject? source, out TreeViewItem? container)
+    {
+        while (source is not null && source != _tree && source is not TreeViewItem)
+            source = VisualTreeHelper.GetParent(source);
+        container = source as TreeViewItem;
+        if (container is not null && _tree.NodeFromContainer(container) is { } node &&
+            _indices.TryGetValue(node, out var index))
+            return index;
+        container = SelectedContainer as TreeViewItem;
+        return _selectedIndex;
+    }
+
     // Labels are native item text, not menu text: an ampersand in a tree item is
     // a literal character, so no mnemonic collapsing happens here.
     public void Rebuild(
@@ -3069,6 +3988,11 @@ internal sealed class SemanticTreeViewControl : ContentControl
             throw new ArgumentException(
                 "Tree labels, depths, expansion, child flags, and icons must have matching counts.",
                 nameof(depths));
+        // Replacing every row resets the scroll offset to the top, so the item under a pointer
+        // would change because some property of the tree did (the second press of a double-click
+        // landed on another device). The offset is put back once layout has restored the extent.
+        var scroll = ControlFactory.FindScrollViewer(_tree);
+        var keptOffset = scroll?.VerticalOffset ?? 0;
         _applyingCanonical = true;
         try
         {
@@ -3107,12 +4031,71 @@ internal sealed class SemanticTreeViewControl : ContentControl
                     hasChildren[index] && _nodes[index].Children.Count == 0;
                 _nodes[index].IsExpanded = expanded[index];
             }
+            _labels.Clear();
+            _labels.AddRange(labels);
+            _depths.Clear();
+            _depths.AddRange(depths);
+            _hasChildren.Clear();
+            _hasChildren.AddRange(hasChildren);
             ApplySelectionCore(selectedIndex);
         }
         finally
         {
             _applyingCanonical = false;
         }
+        if (scroll is not null && keptOffset >= 1) RestoreOffset(scroll, keptOffset);
+    }
+
+    // True when the nodes already stand for exactly this hierarchy (same labels, depths and
+    // child flags), so only the state that hangs on it has changed.
+    public bool HasHierarchy(
+        IReadOnlyList<string> labels, IReadOnlyList<int> depths, IReadOnlyList<bool> hasChildren) =>
+        _nodes.Count > 0 && labels.Count == _labels.Count &&
+        _labels.SequenceEqual(labels) && _depths.SequenceEqual(depths) &&
+        _hasChildren.SequenceEqual(hasChildren);
+
+    // Opening or closing a node changes nothing else about the tree, and a rebuild would throw
+    // away the scroll position and every realized item. False when the hierarchy itself differs.
+    public bool TryApplyExpansion(IReadOnlyList<string> labels, IReadOnlyList<int> depths,
+        IReadOnlyList<bool> expanded, IReadOnlyList<bool> hasChildren)
+    {
+        if (expanded.Count != _nodes.Count || !HasHierarchy(labels, depths, hasChildren)) return false;
+        _applyingCanonical = true;
+        try
+        {
+            for (var index = 0; index < _nodes.Count; ++index)
+                if (_nodes[index].IsExpanded != expanded[index]) _nodes[index].IsExpanded = expanded[index];
+        }
+        finally
+        {
+            _applyingCanonical = false;
+        }
+        return true;
+    }
+
+    public void ApplyStateIcons(IReadOnlyList<ImageSource?> icons)
+    {
+        for (var index = 0; index < _contents.Count && index < icons.Count; ++index)
+            _contents[index].ApplyStateIcon(icons[index]);
+    }
+
+    private void RestoreOffset(ScrollViewer scroll, double target)
+    {
+        var attempts = 0;
+        void Restore(object? sender, object args)
+        {
+            // Layout reports the extent in steps while the items realize: keep asking until the
+            // offset holds, and give up after a bounded number of layouts.
+            if (Math.Abs(scroll.VerticalOffset - target) < 1 || ++attempts > 20)
+            {
+                _tree.LayoutUpdated -= Restore;
+                RendererDiagnostics.Log(
+                    $"tree scroll restore wanted {target:F0}, offset {scroll.VerticalOffset:F0} (extent {scroll.ScrollableHeight:F0}) after {attempts} layout(s)");
+                return;
+            }
+            scroll.ChangeView(null, target, null, true);
+        }
+        _tree.LayoutUpdated += Restore;
     }
 
     public void ApplySelection(int selectedIndex)
@@ -3239,21 +4222,144 @@ internal sealed class SemanticMdiClient : Canvas, ISemanticContainer
 // panes it divides, so the native layout stays the truth.
 internal sealed class SemanticPaneContainer : Canvas, ISemanticContainer
 {
+    internal const int ScrollBarZIndex = ControlFactory.PaneSplitterZIndex + 1;
+    private static readonly TimeSpan WheelFlushInterval = TimeSpan.FromMilliseconds(60);
+
     private readonly Action<int, int> _splitRequested;
+    private readonly Action<bool, int?, int?> _scrollRequested;
     private readonly List<SemanticPaneSplitter> _splitters = [];
     private readonly List<Image> _chrome = [];
+    // The projected child nodes live in their own canvas so a scrolling container
+    // can clip them to its native viewport while its bars sit outside that clip.
+    private readonly Canvas _content = new();
+    private readonly List<(ScrollBarSnapshot Bar, ScrollBar Control)> _bars = [];
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _wheelTimer;
+    private int _pendingWheelLines;
+    private bool _pendingWheelVertical = true;
 
-    public SemanticPaneContainer(Action<int, int> splitRequested)
+    public SemanticPaneContainer(Action<int, int> splitRequested, Action<bool, int?, int?> scrollRequested)
     {
         _splitRequested = splitRequested;
+        _scrollRequested = scrollRequested;
         IsTabStop = false;
         // A Canvas with no Background renders no visual at all, which collapses its
         // UIA bounding rectangle onto the union of its children and makes the
         // Bridge's geometry gate compare the wrong rectangle.
         Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        Children.Add(_content);
         // The splitters span the container, and its own size arrives after the
         // factory has built them.
         SizeChanged += (_, _) => ApplyExtents();
+        PointerWheelChanged += OnPointerWheelChanged;
+    }
+
+    UIElementCollection ISemanticContainer.Children => _content.Children;
+
+    // The native scroll bars, drawn as WinUI bars where the window draws them. Only a
+    // completed gesture asks the application to scroll: a thumb drag sends its final
+    // position, an arrow or track click its line or page step.
+    public void ApplyScrollBars(IReadOnlyList<ScrollBarSnapshot> bars, PixelRect viewport, double scale)
+    {
+        _content.Clip = bars.Count == 0 ? null : new RectangleGeometry
+        {
+            Rect = new Rect(viewport.X * scale, viewport.Y * scale, viewport.Width * scale, viewport.Height * scale),
+        };
+        while (_bars.Count > bars.Count)
+        {
+            Children.Remove(_bars[^1].Control);
+            _bars.RemoveAt(_bars.Count - 1);
+        }
+        for (var index = 0; index < bars.Count; ++index)
+        {
+            var bar = bars[index];
+            if (index == _bars.Count || _bars[index].Bar.Vertical != bar.Vertical)
+            {
+                if (index < _bars.Count) Children.Remove(_bars[index].Control);
+                var control = new ScrollBar
+                {
+                    Orientation = bar.Vertical ? Orientation.Vertical : Orientation.Horizontal,
+                    IndicatorMode = ScrollingIndicatorMode.MouseIndicator,
+                    IsTabStop = false,
+                };
+                var slot = index;
+                control.Scroll += (_, args) => OnBarScroll(slot, args);
+                Canvas.SetZIndex(control, ScrollBarZIndex);
+                Children.Add(control);
+                if (index == _bars.Count) _bars.Add((bar, control));
+                else _bars[index] = (bar, control);
+            }
+            var target = _bars[index].Control;
+            _bars[index] = (bar, target);
+            // SCROLLINFO's last reachable position is nMax - nPage + 1.
+            var page = Math.Max(bar.Page, 1);
+            target.Minimum = bar.Minimum;
+            target.Maximum = Math.Max(bar.Minimum, bar.Maximum - page + 1);
+            target.ViewportSize = bar.Page;
+            target.LargeChange = page;
+            target.SmallChange = 1;
+            target.Value = Math.Clamp(bar.Position, target.Minimum, target.Maximum);
+            target.IsEnabled = bar.Enabled;
+            target.Width = Math.Max(0, bar.Rect.Width * scale);
+            target.Height = Math.Max(0, bar.Rect.Height * scale);
+            Canvas.SetLeft(target, bar.Rect.X * scale);
+            Canvas.SetTop(target, bar.Rect.Y * scale);
+        }
+    }
+
+    private void OnBarScroll(int slot, ScrollEventArgs args)
+    {
+        if (slot >= _bars.Count) return;
+        var vertical = _bars[slot].Bar.Vertical;
+        switch (args.ScrollEventType)
+        {
+            case ScrollEventType.SmallIncrement: _scrollRequested(vertical, null, 1); break;
+            case ScrollEventType.SmallDecrement: _scrollRequested(vertical, null, -1); break;
+            // Track clicks and thumb releases name where the bar now is; the Bridge
+            // walks the application there with its own page and line steps.
+            case ScrollEventType.LargeIncrement:
+            case ScrollEventType.LargeDecrement:
+            case ScrollEventType.ThumbPosition:
+            case ScrollEventType.First:
+            case ScrollEventType.Last:
+                _scrollRequested(vertical, (int)Math.Round(args.NewValue), null);
+                break;
+        }
+    }
+
+    private void OnPointerWheelChanged(object sender, PointerRoutedEventArgs args)
+    {
+        if (_bars.Count == 0 || args.Handled) return;
+        var point = args.GetCurrentPoint(this).Properties;
+        var horizontal = point.IsHorizontalMouseWheel ||
+            Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(VirtualKey.Shift)
+                .HasFlag(global::Windows.UI.Core.CoreVirtualKeyStates.Down);
+        var vertical = !horizontal;
+        if (!_bars.Any(entry => entry.Bar.Vertical == vertical && entry.Bar.Enabled)) return;
+        // Three lines per notch, like the system default; a horizontal wheel's
+        // positive delta scrolls right, a vertical one's scrolls up.
+        var lines = point.MouseWheelDelta / 40 * (horizontal && point.IsHorizontalMouseWheel ? 1 : -1);
+        if (lines == 0) return;
+        args.Handled = true;
+        if (_pendingWheelLines != 0 && _pendingWheelVertical != vertical) FlushWheel();
+        _pendingWheelVertical = vertical;
+        _pendingWheelLines = Math.Clamp(_pendingWheelLines + lines,
+            -ProtocolConstants.MaxScrollLines, ProtocolConstants.MaxScrollLines);
+        if (_wheelTimer is null && DispatcherQueue is { } queue)
+        {
+            _wheelTimer = queue.CreateTimer();
+            _wheelTimer.IsRepeating = false;
+            _wheelTimer.Interval = WheelFlushInterval;
+            _wheelTimer.Tick += (_, _) => FlushWheel();
+        }
+        if (_wheelTimer is { IsRunning: false }) _wheelTimer.Start();
+    }
+
+    private void FlushWheel()
+    {
+        _wheelTimer?.Stop();
+        var lines = _pendingWheelLines;
+        _pendingWheelLines = 0;
+        if (lines != 0) _scrollRequested(_pendingWheelVertical, null, lines);
     }
 
     private void ApplyExtents()
@@ -3336,6 +4442,7 @@ internal sealed class SemanticPaneContainerAutomationPeer(SemanticPaneContainer 
     protected override string GetNameCore() => AutomationProperties.GetName(owner);
     protected override bool IsControlElementCore() => true;
     protected override bool IsContentElementCore() => false;
+    protected override bool IsEnabledCore() => ControlFactory.NodeEnabled(owner);
     protected override global::Windows.Foundation.Rect GetBoundingRectangleCore() =>
         ControlFactory.PhysicalLayoutBounds(owner, base.GetBoundingRectangleCore());
 }
@@ -3350,6 +4457,13 @@ internal sealed class SemanticAccessibleIsland : Canvas
     private const double ItemFontSize = 12;
 
     private readonly Action<int> _invoked;
+    // A DirectUI host whose elements overflow it (MMC's Actions pane in a small
+    // window) scrolls them with its own hosted ScrollBar. The projection scrolls the
+    // elements locally instead, as a report ListView does: every element is published
+    // with its real rectangle, so nothing has to be scrolled natively to reach it.
+    private readonly Canvas _items = new();
+    private readonly ScrollViewer _viewport;
+    private bool _presented;
 
     public SemanticAccessibleIsland(Action<int> invoked)
     {
@@ -3358,13 +4472,41 @@ internal sealed class SemanticAccessibleIsland : Canvas
         // A Canvas with no Background renders no visual at all, which collapses its UIA
         // bounding rectangle onto the union of its children.
         Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        _viewport = new ScrollViewer
+        {
+            Content = _items,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            HorizontalScrollMode = ScrollMode.Disabled,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            ZoomMode = ZoomMode.Disabled,
+            IsTabStop = false,
+        };
+        Children.Add(_viewport);
+        SizeChanged += (_, args) =>
+        {
+            _viewport.Width = args.NewSize.Width;
+            _viewport.Height = args.NewSize.Height;
+        };
     }
 
     public void ApplyItems(IReadOnlyList<AccessibleIslandItem> items, double scale)
     {
+        // Elements scrolled above the host have negative rectangles; the content
+        // starts at the first one, and the first presentation opens at the native
+        // scroll position. Later rebuilds keep whatever the user scrolled to.
+        var top = items.Count == 0 ? 0 : Math.Min(0, items.Min(item => item.Rect.Y));
+        _items.Width = items.Count == 0 ? 0 : items.Max(item => item.Rect.X + item.Rect.Width) * scale;
+        _items.Height = items.Count == 0 ? 0 : (items.Max(item => item.Rect.Y + item.Rect.Height) - top) * scale;
+        if (!_presented && top < 0)
+        {
+            var offset = -top * scale;
+            _viewport.DispatcherQueue.TryEnqueue(() => _viewport.ChangeView(null, offset, null, true));
+        }
+        _presented = true;
         // The elements are rebuilt whenever the provider's description changes, which
         // is the same contract a projected Toolbar's buttons follow.
-        Children.Clear();
+        var children = _items.Children;
+        children.Clear();
         for (var index = 0; index < items.Count; ++index)
         {
             var item = items[index];
@@ -3398,7 +4540,7 @@ internal sealed class SemanticAccessibleIsland : Canvas
             AutomationProperties.SetHelpText(element,
                 item.Description.Length != 0 ? item.Description : item.ActionName);
             Canvas.SetLeft(element, item.Rect.X * scale);
-            Canvas.SetTop(element, item.Rect.Y * scale);
+            Canvas.SetTop(element, (item.Rect.Y - top) * scale);
             element.Width = Math.Max(0, item.Rect.Width * scale);
             // XAML lays CJK text out a little taller than GDI did, so inert text keeps its
             // native width and wraps at the same width but may grow downward rather than
@@ -3407,8 +4549,18 @@ internal sealed class SemanticAccessibleIsland : Canvas
                 element.MinHeight = Math.Max(0, item.Rect.Height * scale);
             else
                 element.Height = Math.Max(0, item.Rect.Height * scale);
-            Children.Add(element);
+            children.Add(element);
         }
+    }
+
+    // Where a dropdown element's popup opens, in this island's coordinates: below
+    // the element as currently scrolled, not where its native rectangle would be.
+    public global::Windows.Foundation.Point? ItemAnchor(int index, bool rightToLeft)
+    {
+        if (index < 0 || index >= _items.Children.Count || _items.Children[index] is not FrameworkElement element)
+            return null;
+        return element.TransformToVisual(this).TransformPoint(new global::Windows.Foundation.Point(
+            rightToLeft ? element.ActualWidth : 0, element.ActualHeight));
     }
 
     private FrameworkElement BuildActionable(AccessibleIslandItem item, int index)
@@ -3482,6 +4634,7 @@ internal sealed class SemanticAccessibleIslandAutomationPeer(SemanticAccessibleI
     protected override string GetNameCore() => AutomationProperties.GetName(owner);
     protected override bool IsControlElementCore() => true;
     protected override bool IsContentElementCore() => false;
+    protected override bool IsEnabledCore() => ControlFactory.NodeEnabled(owner);
     protected override global::Windows.Foundation.Rect GetBoundingRectangleCore() =>
         ControlFactory.PhysicalLayoutBounds(owner, base.GetBoundingRectangleCore());
 }
@@ -3490,16 +4643,53 @@ internal sealed class SemanticAccessibleIslandAutomationPeer(SemanticAccessibleI
 // Fluent divider inside exactly that gap and widens only the invisible grab target when
 // the native strip is too thin to hit.  The position it reports is always in the
 // container's own client pixels.
+// Native splitters, MMC's among them, draw a tracking bar while the pointer moves and
+// resize the panes once, on release. Resizing per pointer move would cost a source-
+// thread command, a native re-layout and a full recapture for every frame of the drag,
+// so the projection tracks locally and makes exactly one native request.
+internal sealed class PaneSplitDrag
+{
+    public bool Active { get; private set; }
+    public int Origin { get; private set; }
+    public int Preview { get; private set; }
+
+    public void Begin(int origin)
+    {
+        Active = true;
+        Origin = origin;
+        Preview = origin;
+    }
+
+    public bool Move(int position)
+    {
+        if (!Active || position == Preview) return false;
+        Preview = position;
+        return true;
+    }
+
+    // The single native request a completed drag makes, or null when it did not move.
+    public int? Complete()
+    {
+        if (!Active) return null;
+        Active = false;
+        return Preview == Origin ? null : Preview;
+    }
+
+    public void Cancel() => Active = false;
+}
+
 internal sealed class SemanticPaneSplitter : ContentControl
 {
-    // A drag emits at most one native resize per interval: the native panes are
-    // resized for real, and every frame of a 60 Hz drag would be a source-thread
-    // command plus a recapture.
-    private const long EmitIntervalMilliseconds = 60;
+    // How long a released tracking bar waits for the canonical split before it
+    // returns to the native position (a refusal publishes nothing new).
+    private static readonly TimeSpan SettleTimeout = TimeSpan.FromMilliseconds(1500);
     private const int KeyboardStep = 8;
 
     private readonly Action<int> _positionRequested;
-    private readonly Stopwatch _sinceEmit = Stopwatch.StartNew();
+    private readonly PaneSplitDrag _drag = new();
+    private readonly TranslateTransform _offset = new();
+    private int? _settling;
+    private Microsoft.UI.Dispatching.DispatcherQueueTimer? _settleTimer;
     // The divider is a child rather than this control's own Background: a bare
     // ContentControl with only a brush renders no visual of its own, which collapses
     // its bounding rectangle and leaves nothing on screen to grab.
@@ -3511,9 +4701,7 @@ internal sealed class SemanticPaneSplitter : ContentControl
     };
     private PaneSplit _split = new();
     private double _scale = 1;
-    private bool _dragging;
     private double _grabOffset;
-    private int _lastEmitted = int.MinValue;
 
     public SemanticPaneSplitter(Action<int> positionRequested)
     {
@@ -3528,15 +4716,20 @@ internal sealed class SemanticPaneSplitter : ContentControl
         VerticalContentAlignment = VerticalAlignment.Stretch;
         Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
         Content = _divider;
+        RenderTransform = _offset;
         ApplyDividerBrush(false);
         PointerEntered += (_, _) => ApplyDividerBrush(true);
-        PointerExited += (_, _) => { if (!_dragging) ApplyDividerBrush(false); };
+        PointerExited += (_, _) => { if (!_drag.Active) ApplyDividerBrush(false); };
         PointerPressed += OnPointerPressed;
         PointerMoved += OnPointerMoved;
         PointerReleased += OnPointerReleased;
+        // Losing capture mid-drag (Alt+Tab, a modal) abandons the drag, as a native
+        // tracking loop does; the panes never moved, so nothing needs undoing.
         PointerCaptureLost += (_, _) =>
         {
-            _dragging = false;
+            if (!_drag.Active) return;
+            _drag.Cancel();
+            ShowTrackingBar(null);
             ApplyDividerBrush(false);
         };
         KeyDown += OnKeyDown;
@@ -3579,6 +4772,45 @@ internal sealed class SemanticPaneSplitter : ContentControl
             ProtectedCursor = InputSystemCursor.Create(InputSystemCursorShape.SizeNorthSouth);
         }
         AutomationProperties.SetName(this, split.Vertical ? "Vertical splitter" : "Horizontal splitter");
+        // A reconcile can land mid-drag; the bar keeps following the pointer. After
+        // release it stays where it was dropped until the native split leaves the
+        // drag's origin (the request landed) or the settle timeout passes.
+        if (_drag.Active) ShowTrackingBar(_drag.Preview);
+        else if (_settling is { } dropped && split.Position == _drag.Origin) ShowTrackingBar(dropped);
+        else ShowTrackingBar(null);
+    }
+
+    private void ShowTrackingBar(int? position)
+    {
+        if (position is not { } at || at == _split.Position)
+        {
+            _settling = null;
+            _settleTimer?.Stop();
+            _offset.X = _offset.Y = 0;
+            Opacity = 1;
+            return;
+        }
+        var delta = (at - _split.Position) * _scale;
+        _offset.X = _split.Vertical ? delta : 0;
+        _offset.Y = _split.Vertical ? 0 : delta;
+        // The tracking bar is a ghost of the divider; the panes stay where the
+        // native window still has them until the single request lands.
+        Opacity = 0.75;
+    }
+
+    private void Settle(int position)
+    {
+        _settling = position;
+        ShowTrackingBar(position);
+        if (_settleTimer is null && DispatcherQueue is { } queue)
+        {
+            _settleTimer = queue.CreateTimer();
+            _settleTimer.IsRepeating = false;
+            _settleTimer.Interval = SettleTimeout;
+            _settleTimer.Tick += (_, _) => ShowTrackingBar(null);
+        }
+        _settleTimer?.Stop();
+        _settleTimer?.Start();
     }
 
     // A splitter divides the whole container, so it spans it across its own axis.
@@ -3588,25 +4820,14 @@ internal sealed class SemanticPaneSplitter : ContentControl
         else Width = Math.Max(0, width);
     }
 
-    // Native client pixels for a point in this splitter's own coordinate space.
-    private int PositionFor(Point point)
+    // Native client pixels for the pointer, measured in the container so the
+    // tracking bar's own render offset does not feed back into the position.
+    private int PositionFor(PointerRoutedEventArgs args)
     {
-        var container = Parent as FrameworkElement;
-        var inContainer = container is null
-            ? point
-            : TransformToVisual(container).TransformPoint(point);
-        var device = (_split.Vertical ? inContainer.X : inContainer.Y) - _grabOffset;
+        var point = args.GetCurrentPoint(Parent as UIElement ?? this).Position;
+        var device = (_split.Vertical ? point.X : point.Y) - _grabOffset;
         var native = (int)Math.Round(device / _scale);
         return Math.Clamp(native, _split.Minimum, _split.Maximum);
-    }
-
-    private void Emit(int position, bool force)
-    {
-        if (position == _lastEmitted) return;
-        if (!force && _sinceEmit.ElapsedMilliseconds < EmitIntervalMilliseconds) return;
-        _lastEmitted = position;
-        _sinceEmit.Restart();
-        _positionRequested(position);
     }
 
     private void OnPointerPressed(object sender, PointerRoutedEventArgs args)
@@ -3614,43 +4835,65 @@ internal sealed class SemanticPaneSplitter : ContentControl
         var point = args.GetCurrentPoint(this).Position;
         // Grabbing anywhere on the strip keeps the pointer on the same spot of the
         // splitter for the whole drag instead of snapping its edge to the cursor.
-        _grabOffset = _split.Vertical ? point.X : point.Y;
-        _dragging = CapturePointer(args.Pointer);
+        // The strip's own left/top edge sits `overhang` before the native position.
+        var overhang = (_split.Vertical ? Width : Height) / 2 - Math.Max(1, _split.Thickness * _scale) / 2;
+        _grabOffset = (_split.Vertical ? point.X : point.Y) - overhang;
+        if (!CapturePointer(args.Pointer)) return;
+        _drag.Begin(_split.Position);
+        ShowTrackingBar(null);
         Focus(FocusState.Pointer);
         args.Handled = true;
     }
 
     private void OnPointerMoved(object sender, PointerRoutedEventArgs args)
     {
-        if (!_dragging) return;
-        Emit(PositionFor(args.GetCurrentPoint(this).Position), force: false);
+        if (!_drag.Active) return;
+        if (_drag.Move(PositionFor(args))) ShowTrackingBar(_drag.Preview);
         args.Handled = true;
     }
 
     private void OnPointerReleased(object sender, PointerRoutedEventArgs args)
     {
-        if (!_dragging) return;
-        Emit(PositionFor(args.GetCurrentPoint(this).Position), force: true);
+        if (!_drag.Active) return;
+        _drag.Move(PositionFor(args));
+        var target = _drag.Complete();
         ReleasePointerCapture(args.Pointer);
-        _dragging = false;
         args.Handled = true;
+        if (target is not { } position)
+        {
+            ShowTrackingBar(null);
+            return;
+        }
+        Settle(position);
+        _positionRequested(position);
     }
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
+        if (args.Key == VirtualKey.Escape && _drag.Active)
+        {
+            // Escape abandons a drag exactly like a native tracking loop.
+            _drag.Cancel();
+            ShowTrackingBar(null);
+            args.Handled = true;
+            return;
+        }
         var step = args.Key switch
         {
             VirtualKey.Left or VirtualKey.Up => -KeyboardStep,
             VirtualKey.Right or VirtualKey.Down => KeyboardStep,
             _ => 0,
         };
-        if (step == 0) return;
+        if (step == 0 || _drag.Active) return;
         args.Handled = true;
         RequestPosition(_split.Position + step);
     }
 
-    public void RequestPosition(int position) =>
-        Emit(Math.Clamp(position, _split.Minimum, _split.Maximum), force: true);
+    public void RequestPosition(int position)
+    {
+        position = Math.Clamp(position, _split.Minimum, _split.Maximum);
+        if (position != _split.Position) _positionRequested(position);
+    }
 
     protected override AutomationPeer OnCreateAutomationPeer() =>
         new SemanticPaneSplitterAutomationPeer(this);
@@ -3692,6 +4935,7 @@ internal sealed class SemanticMdiClientAutomationPeer(SemanticMdiClient owner) :
     protected override string GetNameCore() => AutomationProperties.GetName(owner);
     protected override bool IsControlElementCore() => true;
     protected override bool IsContentElementCore() => false;
+    protected override bool IsEnabledCore() => ControlFactory.NodeEnabled(owner);
 }
 
 internal readonly record struct MdiChildPresentation(
@@ -3883,6 +5127,7 @@ internal sealed class SemanticDialogContainerAutomationPeer(SemanticDialogContai
     protected override string GetNameCore() => AutomationProperties.GetName(owner);
     protected override bool IsControlElementCore() => true;
     protected override bool IsContentElementCore() => false;
+    protected override bool IsEnabledCore() => ControlFactory.NodeEnabled(owner);
 }
 
 internal sealed class SemanticGroupAutomationPeer(SemanticGroupControl owner) : FrameworkElementAutomationPeer(owner)

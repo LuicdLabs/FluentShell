@@ -1,38 +1,17 @@
 # DirectUI application adapters
 
-The DirectUI translation engine is profile-driven and has two admission lanes.
-Exact application pages are declarative `DirectUiWindowProfile` rows in
-`DirectUiProfiles.cpp`. Other Microsoft-signed canonical System32 surfaces
-generate a sealed per-surface semantic profile from native A, UIA U, native B
-evidence. The engine contains no executable-name or page-name behavior branches.
+The DirectUI translation engine has one capability-derived admission path.
+Microsoft-signed canonical System32 surfaces generate a sealed per-surface
+semantic profile from native A, UIA U, native B evidence. There are no
+per-executable or per-page profile tables, fixed binary versions, or
+application resource IDs in the engine.
 
-## Profiles
+The previous MdSched and RecoveryDrive exact-page contracts and their protocol
+adapter IDs were removed. Those tools must meet the same observed capability
+contract as every other supported DirectUI surface. A changed or unknown
+provider shape keeps the whole native window visible.
 
-| adapterId | page | executable | fixed version |
-|---|---|---|---|
-| `microsoft.mdsched.directui` | initial | System32\MdSched.exe | 10.0.26100.7309 |
-| `microsoft.recoverydrive.directui` | first | System32\RecoveryDrive.exe | 10.0.26100.33296 |
-
-MdSched projects its initial dialog: virtual MainIcon (trusted 32x32
-RT_GROUP_ICON 5000 pixels from the admitted signed image), MainInstruction,
-ContentText, two command links, and Cancel. All three buttons dispatch through
-restore-before-click handoff.
-
-RecoveryDrive's exact profile projects its first wizard page: disabled virtual
-back button, wizard title/header texts, the native page explanatory text, the
-native id-1000 checkbox (projected and toggled in place through the native click
-state machine), Next, and Cancel. `wizardicon` has no trusted pixel source and is
-not projected; its semantic slot stays declared so an unexpected mutation still
-rejects the surface. Next uses a restore-before-action handoff.
-
-Later RecoveryDrive pages, and every other built-in DirectUI page, are admitted
-through the capability-derived lane below rather than by adding
-executable-specific rows. That is deliberate: a page row pins one localized build
-of one executable, so per-page rows can never cover the system's DirectUI surface
-area, while a capability the adapter registry already proves holds on every page
-that uses the same control.
-
-## The capability-derived lane
+## Capability-derived admission
 
 `adapterId = microsoft.windows.directui.semantic.v1`, `pageId = semantic-v1`.
 Each admitted UIA element becomes exactly one slot, and its projected kind comes
@@ -108,18 +87,16 @@ MDI frame owns child windows whose lifetime the page contract does not describe.
 
 ## Admission contract
 
-A fixed profile row pins: canonical System32 image path, exact fixed binary file
-version, Microsoft Windows embedded or catalog Authenticode signer, root window class, an exact
-census of implementation HWND classes below the DirectUI host (every count is
-an equality), and a slot table where each slot declares its projection kind,
-UIA automation id/control type/class/enabled/focusable/actionable contract,
-native backing style/control id, action routing, and optional trusted icon
-resource. Labels are captured as localized evidence and are never matched
-against English text. A generated profile instead pins the canonical System32
-path and Microsoft Windows signature, root class, exact visible/hidden HWND
-class inventory, every native style/control ID, UIA role/class/framework/pattern
-shape, AutomationId, geometry scope, enabled/focus state, action route, and — for
-a composite — the native item count its absorbed UIA subtree must keep matching.
+The generated profile pins the canonical System32 path and Microsoft Windows
+embedded or catalog Authenticode signature, root class, exact visible/hidden
+HWND class inventory, every native style/control ID, UIA role/class/framework/
+pattern shape, AutomationId, geometry scope, enabled/focus state, action route,
+and — for a composite — the native item count its absorbed UIA subtree must
+keep matching. The native dialog tab cycle must contain exactly the DirectUI
+host; generated slot indexes describe traversal within it. Labels remain
+localized evidence, without comparisons to English text. Image pixels come
+only from a supported native backing control; the adapter does not load
+application-specific icon resources.
 
 Admission is a native A, MTA UIA U, native B transaction. A and B run on the
 source GUI thread; U runs on a Bridge-owned MTA worker while that thread pumps
@@ -212,7 +189,7 @@ binding exists.
 
 ## Failure
 
-Any census drift, UIA shape change, signer/version/path mismatch, backing HWND
+Any census drift, UIA shape change, signer/path mismatch, backing HWND
 recreation, epoch change outside the tolerated retry, composite item-count
 change, or UIA failure rejects the whole window back to native. There is never a
 partially projected page. An in-place mutation that touches anything but the
@@ -224,16 +201,24 @@ generated topology publishes progress, check, text, selection, item-check,
 geometry, and enabled-state revisions. An HWND inventory or root-shape change no longer closes the proxy: it is what a
 replaced page looks like from reconcile, so the surface keeps its projection and
 the new page is re-admitted in place through the same contract initial admission
-uses. A surface first admitted through a declarative row gives that row the first
-look at the replacement and then degrades to the capability-derived lane, because
-a page row describes exactly one page while a capability holds across all of them.
-Only a page that lane cannot admit within the swap window falls back, and it
+uses. Every replacement page runs that same capability-derived admission path.
+Only a page it cannot admit within the swap window falls back, and it
 clears the one-shot discovery record on the way out.
 
-Runtime acceptance currently covers MdSched, RecoveryDrive first/Please wait/
+Previous runtime acceptance covered MdSched, RecoveryDrive first/Please wait/
 Connect USB surfaces including seamless Next and Back page transitions, and the
-first ClearType Text Tuner surface (`cttune.exe`) without an exact application
-profile. Two limits are known and deliberate: a page whose replacement changes the
+first ClearType Text Tuner surface (`cttune.exe`). The 2026-10-04 protocol 29
+startup check confirms ClearType still projects through capability-derived
+admission and its renderer exits after target cleanup. MdSched now stays native:
+its virtual `MainInstructionIcon` has no generic visual capture contract. The
+deleted per-executable resource lookup is not a substitute for that missing
+adapter. RecoveryDrive exited before injection at ordinary integrity with
+RunAsInvoker, so its generic path remains unverified. The translation oracle and
+empty MMC also passed startup projection and renderer cleanup in this run.
+Evidence is in `build/implementation-startup-smoke/` and
+`build/mmc-startup-20261004-103920/`.
+
+Two limits are known and deliberate: a page whose replacement changes the
 top-level window's size can flash the uncovered edge during the re-admission
 uncloak, because the proxy geometry is pinned until the new snapshot is published;
 and a page that opens an owned modal instead of navigating is resolved by the

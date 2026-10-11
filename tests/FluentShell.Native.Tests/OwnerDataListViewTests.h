@@ -36,8 +36,8 @@ struct Fixture final {
     bool wrongThread = false;
     bool ready = false;
 
-    explicit Fixture(DWORD mode) {
-        root = CreateWindowExW(0, L"Static", L"owner-data-list-view-regression",
+    explicit Fixture(DWORD mode, const wchar_t* rootClass = L"Static") {
+        root = CreateWindowExW(0, rootClass, L"owner-data-list-view-regression",
             WS_OVERLAPPEDWINDOW, 0, 0, 440, 260, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
         if (!root) return;
         SetWindowSubclass(root, Owner, 991, reinterpret_cast<DWORD_PTR>(this));
@@ -280,7 +280,7 @@ inline void TestBounds(void (*check)(bool, const char*)) {
         "a virtual data-set resize during callbacks produced an inconsistent snapshot");
     fixture.SetCount();
     ControlKind kind{};
-    for (const UINT callbackMask : { LVIS_STATEIMAGEMASK, LVIS_OVERLAYMASK, LVIS_CUT, LVIS_DROPHILITED }) {
+    for (const UINT callbackMask : { LVIS_OVERLAYMASK, LVIS_CUT, LVIS_DROPHILITED }) {
         SendMessageW(fixture.list, LVM_SETCALLBACKMASK, callbackMask, 0);
         const int beforeCallbacks = fixture.textReads;
         check(!ClassifyControl(fixture.list, kind, error) &&
@@ -288,6 +288,21 @@ inline void TestBounds(void (*check)(bool, const char*)) {
             !fixture.Capture(node, error) && fixture.textReads == beforeCallbacks,
             "virtual callback-owned state imagery was admitted without projection semantics");
     }
+    // Windows Forms puts state images in every virtual list's callback mask.  With no
+    // state image list nothing is drawn for them, so the list stays admitted; once a
+    // state image list exists the owner's answer becomes visible and is refused.
+    SendMessageW(fixture.list, LVM_SETCALLBACKMASK, LVIS_STATEIMAGEMASK, 0);
+    check(ClassifyControl(fixture.list, kind, error) && kind == ControlKind::ListView &&
+        fixture.Capture(node, error),
+        "a virtual list's invisible callback state images blocked its projection");
+    const HIMAGELIST stateImages = ImageList_Create(16, 16, ILC_COLOR32, 1, 1);
+    const auto previousStateImages = reinterpret_cast<HIMAGELIST>(
+        SendMessageW(fixture.list, LVM_SETIMAGELIST, LVSIL_STATE, reinterpret_cast<LPARAM>(stateImages)));
+    check(!ClassifyControl(fixture.list, kind, error) &&
+        error.find(L"LVIS_STATEIMAGEMASK") != std::wstring::npos,
+        "virtual callback state images were admitted although a state image list draws them");
+    SendMessageW(fixture.list, LVM_SETIMAGELIST, LVSIL_STATE, reinterpret_cast<LPARAM>(previousStateImages));
+    if (stateImages) ImageList_Destroy(stateImages);
     SendMessageW(fixture.list, LVM_SETCALLBACKMASK, 0, 0);
     fixture.callbackMaskDuringRead = LVIS_OVERLAYMASK;
     check(!fixture.Capture(node, error) && error.find(L"callback state") != std::wstring::npos,
@@ -298,9 +313,91 @@ inline void TestBounds(void (*check)(bool, const char*)) {
         "virtual application-owned checkboxes were offered as stored state images");
 }
 
+// A list MMC hosts without the stable-identity activation contract, and a tree a snap-in
+// hosts for its result view, are opened on a double-click (openItem sends the control Enter).
+// The console's own scope tree, and any list or tree outside an MMC frame, are not offered it.
+inline void TestDefaultActivation(void (*check)(bool, const char*)) {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    const auto registerClass = [&](const wchar_t* name) {
+        WNDCLASSW wc{};
+        wc.hInstance = instance;
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.lpszClassName = name;
+        return RegisterClassW(&wc);
+    };
+    const ATOM frameClass = registerClass(L"MMCMainFrame");
+    const ATOM viewClass = registerClass(L"MMCViewWindow");
+    ControlNode node;
+    std::wstring error;
+    {
+        Fixture frame(LVS_REPORT, L"MMCMainFrame");
+        check(frame.ready, "default-activation list fixture was not created");
+        if (frame.ready) {
+            check(frame.Capture(node, error) && node.itemDefaultActivation && !node.itemActivationSupported,
+                "a virtual MMC result list was not offered default-verb activation");
+            WindowSnapshot snapshot;
+            snapshot.nodes = { node };
+            check(SerializeWindowOpen(L"00112233445566778899aabbccddeeff", snapshot)
+                    .find("\"itemDefaultActivation\":true") != std::string::npos,
+                "default-verb activation was not serialized");
+        }
+    }
+    {
+        Fixture plain(LVS_REPORT);
+        check(plain.ready && plain.Capture(node, error) && !node.itemDefaultActivation,
+            "a virtual list outside an MMC frame was offered default-verb activation");
+        WindowSnapshot snapshot;
+        snapshot.nodes = { node };
+        check(SerializeWindowOpen(L"00112233445566778899aabbccddeeff", snapshot)
+                .find("itemDefaultActivation") == std::string::npos,
+            "an absent default-verb activation offer was serialized");
+    }
+    const HWND frame = CreateWindowExW(0, L"MMCMainFrame", L"console", WS_OVERLAPPEDWINDOW,
+        0, 0, 400, 300, nullptr, nullptr, instance, nullptr);
+    const HWND view = frame ? CreateWindowExW(0, L"MMCViewWindow", L"", WS_CHILD | WS_VISIBLE,
+        0, 0, 390, 280, frame, nullptr, instance, nullptr) : nullptr;
+    const HWND host = view ? CreateWindowExW(0, L"Static", L"", WS_CHILD | WS_VISIBLE,
+        200, 0, 190, 280, view, nullptr, instance, nullptr) : nullptr;
+    const auto makeTree = [&](HWND parent) {
+        const HWND tree = parent ? CreateWindowExW(0, WC_TREEVIEWW, L"", WS_CHILD | WS_VISIBLE | TVS_HASLINES,
+            0, 0, 150, 200, parent, nullptr, instance, nullptr) : nullptr;
+        if (tree) {
+            TVINSERTSTRUCTW insert{};
+            insert.hParent = TVI_ROOT;
+            insert.hInsertAfter = TVI_LAST;
+            insert.item.mask = TVIF_TEXT;
+            insert.item.pszText = const_cast<LPWSTR>(L"Computer");
+            SendMessageW(tree, TVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&insert));
+        }
+        return tree;
+    };
+    const HWND scopeTree = makeTree(view);
+    const HWND resultTree = makeTree(host);
+    check(frame && view && host && scopeTree && resultTree, "default-activation tree fixtures were not created");
+    const auto capture = [&](HWND tree, ControlNode& out) {
+        out = {};
+        out.kind = ControlKind::TreeView;
+        out.nodeId = 80;
+        out.generation = 1;
+        out.hwnd = tree;
+        return CaptureControlDetail(tree, out, error);
+    };
+    if (scopeTree && resultTree) {
+        ControlNode scope, result;
+        check(capture(scopeTree, scope) && !scope.itemDefaultActivation,
+            "the MMC scope tree was offered default-verb activation");
+        check(capture(resultTree, result) && result.itemDefaultActivation,
+            "a snap-in's result tree was not offered default-verb activation");
+    }
+    if (frame) DestroyWindow(frame);
+    if (viewClass) UnregisterClassW(L"MMCViewWindow", instance);
+    if (frameClass) UnregisterClassW(L"MMCMainFrame", instance);
+}
+
 } // namespace OwnerDataListView
 
 inline void TestOwnerDataListViews(void (*check)(bool, const char*)) {
+    OwnerDataListView::TestDefaultActivation(check);
     OwnerDataListView::TestMode(LVS_REPORT, L"report", check);
     OwnerDataListView::TestMode(LVS_ICON, L"largeIcon", check);
     OwnerDataListView::TestMode(LVS_SMALLICON, L"smallIcon", check);

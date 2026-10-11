@@ -25,6 +25,9 @@ public sealed class TranslatedWindow : Window
     private PresentationLifetime? _controlLifetime;
     private PresentationLifetime? _popupLifetime;
     private readonly PopupMenuCoordinator _popupCommands = new();
+    // Counts item presses across presenter rebuilds, so a double-click survives the first
+    // press's own patch.
+    private readonly ItemPressTracker _itemPresses = new();
     private readonly List<MenuItemViewModel> _popupItems = [];
     private global::Windows.Foundation.Point? _popupPosition;
     private bool _popupSyncQueued;
@@ -36,6 +39,11 @@ public sealed class TranslatedWindow : Window
     // that carries the newer revision second, so the replay has to wait for that patch
     // or it would be refused for exactly the same reason.
     private readonly Dictionary<string, NodeActionReplay> _staleReplays = new(StringComparer.Ordinal);
+    // A menu-bar command has no node: the item as clicked is kept by event id until the
+    // Bridge answers, and a refused one waits like a node action for the patch that
+    // carries the newer revision.
+    private readonly Dictionary<string, MenuActionReplay> _menuClicks = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, MenuActionReplay> _staleMenuReplays = new(StringComparer.Ordinal);
     private readonly TaskCompletionSource _loaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly AppWindow _appWindow;
     private readonly Dictionary<string, FrameworkElement> _controls = new(StringComparer.Ordinal);
@@ -54,6 +62,11 @@ public sealed class TranslatedWindow : Window
     private bool _retired;
     private bool _interactionBlocked;
     private uint _renderDpi;
+    // Whether this window is the active one, and the focus a rebuild would have restored while it was
+    // not: moving XAML focus into an inactive window activates it, which lifted a console above the
+    // dialog the user had just opened over it.
+    private bool _windowActive;
+    private (string NodeId, int SelectionStart, int SelectionLength)? _deferredFocus;
 
     public WindowViewModel ViewModel { get; }
     public nint Hwnd { get; }
@@ -71,7 +84,22 @@ public sealed class TranslatedWindow : Window
         Grid.SetRow(_canvas, 1);
         _root.Children.Add(_canvas);
         Content = _root;
-        _canvas.KeyDown += OnCanvasKeyDown;
+        Activated += (_, args) =>
+        {
+            RendererDiagnostics.Log(
+                $"window activation={args.WindowActivationState} popup={_popupFlyout is not null} " +
+                $"surface={ViewModel.SurfaceId} title='{ViewModel.Title}'");
+            _windowActive = args.WindowActivationState != WindowActivationState.Deactivated;
+            if (_windowActive && _deferredFocus is { } pending)
+            {
+                _deferredFocus = null;
+                RestoreFocus(pending);
+            }
+        };
+        // On the root, not the canvas: a click that disables the focused control (or a native
+        // response that hides it) leaves keyboard focus on the island's input site, with no element
+        // to route a key to; the root still sees it, and Escape must still cancel the dialog.
+        _root.KeyDown += OnRootKeyDown;
         _root.AddHandler(UIElement.PointerPressedEvent, new Microsoft.UI.Xaml.Input.PointerEventHandler((_, args) =>
         {
             if (Environment.GetEnvironmentVariable("FLUENTSHELL_DIAG_ACCESSIBILITY") != "1") return;
@@ -205,6 +233,7 @@ public sealed class TranslatedWindow : Window
         PresenterActionIntent? presenterReplay = null;
         BoundsActionIntent? boundsReplay = null;
         NodeActionReplay? nodeReplay = null;
+        MenuActionReplay? menuReplay = null;
         RendererDiagnostics.Log($"window.patch event={patch.EventId ?? "-"} rev={patch.Revision} stateBefore={ViewModel.State} inFlight={_presenterActions.InFlightEventId ?? "-"}");
         _applyingCanonical = true;
         try
@@ -235,6 +264,11 @@ public sealed class TranslatedWindow : Window
             {
                 nodeReplay = queuedReplay;
             }
+            if (patch.EventId is not null &&
+                _staleMenuReplays.Remove(patch.EventId, out var queuedMenuReplay))
+            {
+                menuReplay = queuedMenuReplay;
+            }
             if (structural) RebuildControls();
             ApplyWindowState(ShouldApplyCanonicalPlacement(
                 _committed, placementChanged, placementActionPatch, LocalPlacementPending));
@@ -243,10 +277,11 @@ public sealed class TranslatedWindow : Window
         {
             _applyingCanonical = false;
         }
-        RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"}");
+        RendererDiagnostics.Log($"window.patch applied rev={ViewModel.Revision} state={ViewModel.State} replay={(presenterReplay?.Action ?? "-")} inFlight={_presenterActions.InFlightEventId ?? "-"} surface={ViewModel.SurfaceId}");
         if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
         if (boundsReplay is { } boundsIntent) QueueOrEmitBoundsAction(boundsIntent);
         if (nodeReplay is { } nodeIntent) EmitStaleReplay(nodeIntent);
+        if (menuReplay is { } menuIntent) EmitStaleMenuReplay(menuIntent);
         QueuePopupSynchronization();
     }
 
@@ -296,6 +331,18 @@ public sealed class TranslatedWindow : Window
                         pending.RetryCount < NodeActionReplayPolicy.MaxStaleRetries;
                     pending.Node?.RejectPending(pending.Property, result.EventId, willReplay);
                     if (pending.Property == "close") _closePending = false;
+                    // A menu click that lost a race with a reconcile is kept for the patch that
+                    // carries the newer revision (see MenuActionReplayPolicy); any other
+                    // refusal of a menu command is final.
+                    if (result.Status == "stale" && pending.Action == "menuCommand" &&
+                        _menuClicks.Remove(result.EventId, out var staleClick) &&
+                        staleClick.RetryCount < NodeActionReplayPolicy.MaxStaleRetries)
+                    {
+                        _staleMenuReplays[result.EventId] = staleClick with
+                        {
+                            RetryCount = staleClick.RetryCount + 1,
+                        };
+                    }
                     // A revision race is not a refusal of the request: the Bridge only
                     // says the snapshot the request named is no longer current.  An
                     // action that carries the absolute state the user asked for can be
@@ -315,6 +362,8 @@ public sealed class TranslatedWindow : Window
                     pending.Node?.AcceptPending(pending.Property, result.EventId);
                 }
             }
+            // Only a refusal as stale keeps the clicked item (taken above).
+            if (result.Status != "stale") _menuClicks.Remove(result.EventId);
             if (result.Status == "stale")
             {
                 _presenterActions.MarkStale(result.EventId);
@@ -382,6 +431,8 @@ public sealed class TranslatedWindow : Window
             _closePending = false;
             _pending.Clear();
             _staleReplays.Clear();
+            _staleMenuReplays.Clear();
+            _menuClicks.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
@@ -414,6 +465,8 @@ public sealed class TranslatedWindow : Window
             _closePending = false;
             _pending.Clear();
             _staleReplays.Clear();
+            _staleMenuReplays.Clear();
+            _menuClicks.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
@@ -428,8 +481,56 @@ public sealed class TranslatedWindow : Window
         }
     }
 
+    // The control the user is working in, by node and with its text selection: a rebuild replaces
+    // every control, and without this the new ones start with no focus (the user's next
+    // keystroke goes nowhere).
+    private (string NodeId, int SelectionStart, int SelectionLength)? CaptureFocus()
+    {
+        if (Content?.XamlRoot is not { } root ||
+            Microsoft.UI.Xaml.Input.FocusManager.GetFocusedElement(root) is not DependencyObject focused) return null;
+        for (DependencyObject? current = focused; current is not null; current = VisualTreeHelper.GetParent(current))
+        {
+            if (current is FrameworkElement { DataContext: ControlNodeViewModel node })
+            {
+                var text = focused as TextBox;
+                return (node.NodeId, text?.SelectionStart ?? 0, text?.SelectionLength ?? 0);
+            }
+        }
+        return null;
+    }
+
+    private void RestoreFocus((string NodeId, int SelectionStart, int SelectionLength)? focus)
+    {
+        if (focus is not { } target || !_controls.TryGetValue(target.NodeId, out var control)) return;
+        // A window the user is not in keeps the focus for its next activation instead of taking it now.
+        if (!_windowActive)
+        {
+            _deferredFocus = target;
+            return;
+        }
+        void Apply()
+        {
+            if (!control.IsLoaded || _retired) return;
+            if (control.Focus(FocusState.Programmatic) && control is TextBox text)
+                text.Select(Math.Clamp(target.SelectionStart, 0, text.Text.Length),
+                    Math.Clamp(target.SelectionLength, 0, Math.Max(0, text.Text.Length - target.SelectionStart)));
+        }
+        if (control.IsLoaded) Apply();
+        else
+        {
+            RoutedEventHandler? loaded = null;
+            loaded = (_, _) =>
+            {
+                control.Loaded -= loaded;
+                Apply();
+            };
+            control.Loaded += loaded;
+        }
+    }
+
     private void RebuildControls()
     {
+        var focus = CaptureFocus();
         _controlLifetime?.Dispose();
         var lifetime = _controlLifetime = new PresentationLifetime();
         _canvas.Children.Clear();
@@ -448,9 +549,11 @@ public sealed class TranslatedWindow : Window
         var factory = new ControlFactory(
             Math.Max(1, (int)Math.Round(dpi)), ViewModel.Nodes, EmitNodeAction,
             () => !CanEmitActions,
-            IsImeComposing, lifetime);
+            IsImeComposing, lifetime, _itemPresses);
         var icon = CreateDialogIcon();
         if (icon is not null) _canvas.Children.Add(icon);
+        var band = CreateDialogContentArea(dpi);
+        if (band is not null) _canvas.Children.Add(band);
         foreach (var node in ViewModel.Nodes)
         {
             var control = factory.Create(node);
@@ -471,6 +574,7 @@ public sealed class TranslatedWindow : Window
                     "Validated control parent is not a projected container.");
             }
         }
+        RestoreFocus(focus);
         QueuePopupSynchronization();
     }
 
@@ -527,17 +631,39 @@ public sealed class TranslatedWindow : Window
         _popupItems.Clear();
         _popupItems.AddRange(popup.Items.Select(MenuItemViewModel.FromSnapshot));
         var popupId = popup.PopupId;
+        RendererDiagnostics.Log($"popup show id={popupId} node={popup.NodeId} item={popup.ItemIndex} at={position.X:F0},{position.Y:F0} items={popup.Items.Count} default={popup.Items.FindIndex(entry => entry.IsDefault)}");
         var lifetime = _popupLifetime = new PresentationLifetime();
         var flyout = new MenuProjectionFactory(
             item => RespondToPopup(popupId, item.ItemId), lifetime, popupId).CreateFlyout(_popupItems);
         _popupFlyout = flyout;
         _popupPosition = position;
+        var openedAt = Environment.TickCount64;
         flyout.Closed += (_, _) =>
         {
             // Programmatic hiding clears this reference first. Click also records
             // its terminal response in this input turn. Defer dismissal so a
             // Closed notification delivered before Click cannot win that race.
             if (!ReferenceEquals(_popupFlyout, flyout)) return;
+            var focused = _root.XamlRoot is { } xamlRoot
+                ? Microsoft.UI.Xaml.Input.FocusManager.GetFocusedElement(xamlRoot) as DependencyObject
+                : null;
+            RendererDiagnostics.Log($"popup closed id={popupId} focus={focused?.GetType().Name ?? "none"}");
+            // The selection the native context menu made arrives in the same patch,
+            // and a WinUI tree/list then moves focus to its newly selected item a
+            // frame later, which light-dismisses the flyout. No user gesture lands
+            // within that window, so reopen once instead of answering a dismissal.
+            if (Environment.TickCount64 - openedAt < SpuriousPopupCloseMilliseconds &&
+                _reopenedPopupId != popupId && IsWithinNode(focused, popup.NodeId))
+            {
+                _reopenedPopupId = popupId;
+                RendererDiagnostics.Log($"popup reopened id={popupId} after its anchor took focus");
+                _popupLifetime?.Dispose();
+                _popupLifetime = null;
+                _popupFlyout = null;
+                _popupPosition = null;
+                QueuePopupSynchronization();
+                return;
+            }
             DispatcherQueue.TryEnqueue(() =>
             {
                 if (ReferenceEquals(_popupFlyout, flyout)) RespondToPopup(popupId, null);
@@ -558,20 +684,43 @@ public sealed class TranslatedWindow : Window
         }
     }
 
+    private const long SpuriousPopupCloseMilliseconds = 400;
+    private string? _reopenedPopupId;
+
+    private bool IsWithinNode(DependencyObject? element, string nodeId)
+    {
+        if (element is null || !_controls.TryGetValue(nodeId, out var owner)) return false;
+        for (var current = element; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (ReferenceEquals(current, owner)) return true;
+        return false;
+    }
+
     private bool TryGetPopupPosition(
         PopupMenuSnapshot popup, out global::Windows.Foundation.Point position)
     {
         position = default;
         var node = ViewModel.Nodes.FirstOrDefault(candidate => candidate.NodeId == popup.NodeId);
+        // An item context menu opens where the projected request was made.
+        if (node is { Kind: "treeView" or "listView", Visible: true, ContextMenuAnchor: { } anchor } &&
+            _controls.TryGetValue(popup.NodeId, out var owner) && owner.XamlRoot is not null)
+        {
+            position = owner.TransformToVisual(_canvas).TransformPoint(
+                new global::Windows.Foundation.Point(anchor.X, anchor.Y));
+            return double.IsFinite(position.X) && double.IsFinite(position.Y);
+        }
         if (PopupMenuAnchor.ItemRect(node, popup) is not { } rect ||
             !_controls.TryGetValue(popup.NodeId, out var control) || control.XamlRoot is null)
             return false;
         // MMC disables More Actions while its native tracking call is pending.
         // That is still the live anchor; enabled state does not retire the popup.
         var scale = 96.0 / RenderDpi;
-        position = control.TransformToVisual(_canvas).TransformPoint(new global::Windows.Foundation.Point(
-            (rect.X + (ViewModel.Rtl ? rect.Width : 0)) * scale,
-            (rect.Y + rect.Height) * scale));
+        var local = control is SemanticAccessibleIsland island &&
+            island.ItemAnchor(popup.ItemIndex, ViewModel.Rtl) is { } scrolled
+            ? scrolled
+            : new global::Windows.Foundation.Point(
+                (rect.X + (ViewModel.Rtl ? rect.Width : 0)) * scale,
+                (rect.Y + rect.Height) * scale);
+        position = control.TransformToVisual(_canvas).TransformPoint(local);
         return double.IsFinite(position.X) && double.IsFinite(position.Y);
     }
 
@@ -622,13 +771,55 @@ public sealed class TranslatedWindow : Window
             _ => (string.Empty, string.Empty),
         };
         if (glyph.Length == 0) return null;
-        var icon = new FontIcon { Glyph = glyph, FontSize = 32 };
+        // DialogSnapshots.cpp lays the text out beside a 32 DIP icon at the 20 DIP margin.
+        var icon = new FontIcon { Glyph = glyph, FontSize = 32, Width = 32, Height = 32 };
         AutomationProperties.SetName(icon, name);
-        Canvas.SetLeft(icon, 16);
-        Canvas.SetTop(icon, 16);
+        Canvas.SetLeft(icon, DialogMargin);
+        Canvas.SetTop(icon, DialogMargin);
         Canvas.SetZIndex(icon, ControlFactory.DialogIconZIndex);
         return icon;
     }
+
+    private const double DialogMargin = 20;
+    // kDialogBandPaddingDip in DialogSnapshots.h: the band starts this far above its first row.
+    private const double DialogBandPadding = 12;
+
+    // A translated message box or task dialog has a content area over a command band,
+    // as a ContentDialog does: the content is a lighter layer down to the band's top,
+    // which is its first row of buttons (or the verification check box) less the band
+    // padding.  A dialog with no band is all content.
+    private Border? CreateDialogContentArea(double dpi)
+    {
+        if (ViewModel.SurfaceKind is not ("messageBox" or "taskDialog")) return null;
+        double? firstRow = null;
+        foreach (var node in ViewModel.Nodes)
+        {
+            var bandMember = node.Kind == "checkBox" ||
+                node.Kind == "button" && !node.PresentationVariant.StartsWith("commandLink", StringComparison.Ordinal);
+            if (!bandMember) continue;
+            var top = node.Rect.Y * 96.0 / dpi;
+            firstRow = firstRow is { } current ? Math.Min(current, top) : top;
+        }
+        var height = firstRow is { } row ? Math.Max(0, row - DialogBandPadding) : _canvas.Height;
+        var area = new Border
+        {
+            Width = _canvas.Width,
+            Height = height,
+            Background = DialogBrush("LayerFillColorAltBrush", Microsoft.UI.Colors.White),
+            BorderBrush = DialogBrush("DividerStrokeColorDefaultBrush", Microsoft.UI.Colors.LightGray),
+            BorderThickness = new Thickness(0, 0, 0, firstRow is null ? 0 : 1),
+            IsHitTestVisible = false,
+        };
+        AutomationProperties.SetAccessibilityView(area, AccessibilityView.Raw);
+        Canvas.SetZIndex(area, -1);
+        return area;
+    }
+
+    private static Brush DialogBrush(string key, global::Windows.UI.Color fallback) =>
+        Application.Current?.Resources is { } resources &&
+        resources.TryGetValue(key, out var value) && value is Brush brush
+            ? brush
+            : new SolidColorBrush(fallback);
 
     internal static bool ShouldApplyCanonicalBounds(bool committed, string canonicalState) =>
         !committed || canonicalState == "normal";
@@ -692,7 +883,10 @@ public sealed class TranslatedWindow : Window
             if (ViewModel.Visible)
             {
                 if (!SetCloaked(false)) throw new InvalidOperationException("Unable to uncloak renderer proxy.");
-                _appWindow.Show(false);
+                // Show brings the window to the top of the z-order, so a window that is already
+                // up is left alone: every later patch would otherwise lift it above a dialog
+                // opened over it in the meantime.
+                if (!_appWindow.IsVisible) _appWindow.Show(false);
                 if (applyCanonicalPlacement) ApplyPresenterState();
             }
             else
@@ -745,11 +939,19 @@ public sealed class TranslatedWindow : Window
     private void ApplyPresenterState()
     {
         if (_appWindow.Presenter is not OverlappedPresenter presenter) return;
+        // Only a real change is asked of the presenter: ShowWindow(SW_RESTORE) on a window that
+        // is already restored still activates it and lifts it in the z-order.
         switch (ViewModel.State)
         {
-            case "minimized": presenter.Minimize(); break;
-            case "maximized": presenter.Maximize(); break;
-            default: presenter.Restore(); break;
+            case "minimized":
+                if (presenter.State != OverlappedPresenterState.Minimized) presenter.Minimize();
+                break;
+            case "maximized":
+                if (presenter.State != OverlappedPresenterState.Maximized) presenter.Maximize();
+                break;
+            default:
+                if (presenter.State != OverlappedPresenterState.Restored) presenter.Restore();
+                break;
         }
     }
 
@@ -769,14 +971,40 @@ public sealed class TranslatedWindow : Window
             "setItemText" => "items",
             "setValue" => "position",
             "setExpand" => "itemExpanded",
+            "setGroupExpanded" => "listViewGroups",
             "setSplit" => "splits",
+            "setScroll" => "scrollBars",
             "setColumnOrder" => "columnOrder",
             "islandInvoke" => "islandItems",
+            "htmlInvoke" or "htmlScroll" => "document",
+            "diskSelect" or "diskContext" or "diskScroll" => "diskView",
             _ => action,
         };
 
-    private void EmitMenuAction(MenuItemViewModel item) =>
-        EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId);
+    private void EmitMenuAction(MenuItemViewModel item) => EmitMenuClick(item, 0);
+
+    private void EmitMenuClick(MenuItemViewModel item, int retryCount)
+    {
+        var eventId = EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId, retryCount);
+        if (eventId is not null)
+            _menuClicks[eventId] = new MenuActionReplay(item.ItemId, item.CommandId, item.Text, retryCount);
+    }
+
+    // Re-send a menu command the Bridge refused as stale, now that the revision it was
+    // refused against has arrived -- when the user's item is still there as they saw it.
+    private void EmitStaleMenuReplay(MenuActionReplay replay)
+    {
+        var item = MenuActionReplayPolicy.Resolve(ViewModel.Menu, replay);
+        if (item is null)
+        {
+            RendererDiagnostics.Log(
+                $"stale menu replay dropped command={replay.CommandId} item={replay.ItemId}");
+            return;
+        }
+        RendererDiagnostics.Log(
+            $"stale menu replay command={replay.CommandId} retry={replay.RetryCount} rev={ViewModel.Revision}");
+        EmitMenuClick(item, replay.RetryCount);
+    }
 
     private string? EmitAction(ControlNodeViewModel? node, string property, string action, object? value) =>
         EmitAction(node, property, action, value, 0);
@@ -793,7 +1021,8 @@ public sealed class TranslatedWindow : Window
         var terminalPopup = action == "popupCommand" && !_applyingCanonical &&
             _committed && _interactive && !_retired;
         if (!CanEmitActions && !terminalPopup) return null;
-        if ((property == "invoke" || property == "close" ||
+        if ((property == "invoke" || property == "close" || property == "contextMenu" || property == "openItem" ||
+             property == "toolbarDropDown" ||
              property.StartsWith("menu:", StringComparison.Ordinal) ||
              property.StartsWith("popup:", StringComparison.Ordinal)) &&
             _pending.Values.Any(pending =>
@@ -802,6 +1031,7 @@ public sealed class TranslatedWindow : Window
             return null;
         }
         var eventId = _nextEventId();
+        RendererDiagnostics.Log($"action.emit event={eventId} action={action} node={node?.NodeId ?? "-"} rev={ViewModel.Revision}");
         node?.RegisterPending(property, eventId);
         _pending[eventId] = new PendingNodeAction(node, property, action, value, retryCount);
         if (property is "state" or "bounds") _placementEventIds.Add(eventId);
@@ -853,8 +1083,14 @@ public sealed class TranslatedWindow : Window
         EmitAction(null, "close", "close", null);
     }
 
-    private void OnCanvasKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
+    private void OnRootKeyDown(object sender, Microsoft.UI.Xaml.Input.KeyRoutedEventArgs args)
     {
+        // The menu bar answers its own Enter and Escape (it opens and closes its menus).
+        if (_menuBar is not null && args.OriginalSource is DependencyObject source)
+        {
+            for (DependencyObject? current = source; current is not null; current = VisualTreeHelper.GetParent(current))
+                if (ReferenceEquals(current, _menuBar)) return;
+        }
         if (_popupFlyout is not null && args.Key == global::Windows.System.VirtualKey.Escape &&
             _popupCommands.PopupId is { } popupId)
         {

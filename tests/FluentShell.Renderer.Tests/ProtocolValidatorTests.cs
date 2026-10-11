@@ -183,95 +183,6 @@ public class ProtocolValidatorTests
     }
 
     [Fact]
-    public void AdapterPagesAreClosedToExtraSemantics()
-    {
-        // MdSched: three virtual presentation slots plus three handoff buttons.
-        var snapshot = TestData.Snapshot() with
-        {
-            SurfaceKind = "window",
-            AdapterId = "microsoft.mdsched.directui",
-            PageId = "initial",
-            Nodes = [],
-        };
-        string[] keys = ["MainIcon", "MainInstruction", "ContentText", "CommandLink.0", "CommandLink.1", "Cancel"];
-        string[] kinds = ["staticIcon", "static", "static", "button", "button", "button"];
-        string[] variants = ["mainIcon", "instruction", "content", "commandLink", "commandLink", "standard"];
-        for (var index = 0; index < keys.Length; ++index)
-        {
-            var interactive = index >= 3;
-            snapshot.Nodes.Add(new ControlNode
-            {
-                NodeId = (100 + index).ToString(), Generation = "1",
-                NativeHwnd = interactive ? $"0x{200 + index:X}" : null,
-                Kind = kinds[index], ZIndex = index, TabIndex = interactive ? index - 3 : -1,
-                Rect = new PixelRect { X = 10, Y = 10 + index * 40, Width = index == 0 ? 32 : 200, Height = index == 0 ? 32 : 32 },
-                Visible = true, Enabled = true, TabStop = interactive, Text = $"localized {index}",
-                AutomationName = $"localized {index}", Items = [],
-                ImageWidth = index == 0 ? 32 : null, ImageHeight = index == 0 ? 32 : null,
-                ImageFormat = index == 0 ? "bgra8-premultiplied" : null,
-                ImageData = index == 0 ? Convert.ToBase64String(new byte[32 * 32 * 4]) : null,
-                AdapterId = snapshot.AdapterId, PageId = snapshot.PageId, SemanticKey = keys[index],
-                SourceKind = interactive ? "nativeBacking" : "uiaVirtual",
-                PresentationVariant = variants[index], SupportedActions = interactive ? ["invoke"] : [],
-                HelpText = string.Empty, AccessKey = string.Empty,
-            });
-        }
-        ProtocolValidator.ValidateSnapshot(snapshot);
-
-        snapshot.Nodes[3] = snapshot.Nodes[3] with { SupportedActions = ["invoke", "close"] };
-        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
-        snapshot.Nodes[3] = snapshot.Nodes[3] with { SupportedActions = ["invoke"], SemanticKey = "Unexpected" };
-        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
-        snapshot.Nodes[3] = snapshot.Nodes[3] with { SemanticKey = "CommandLink.0", NativeHwnd = null };
-        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
-
-        // RecoveryDrive: disabled virtual back button, three texts, a native
-        // checkbox with setCheck, and two handoff buttons.
-        var recovery = TestData.Snapshot() with
-        {
-            SurfaceKind = "window",
-            AdapterId = "microsoft.recoverydrive.directui",
-            PageId = "first",
-            Nodes = [],
-        };
-        string[] rKeys = ["backbutton", "wizardtitle", "headertitle", "pageText", "backupSystemFiles", "nextbutton", "cancelbutton"];
-        string[] rKinds = ["button", "static", "static", "static", "checkBox", "button", "button"];
-        string[] rVariants = ["standard", "wizardTitle", "header", "content", "standard", "standard", "standard"];
-        string[] rSources = ["uiaVirtual", "uiaVirtual", "uiaVirtual", "nativeBacking", "nativeBacking", "nativeBacking", "nativeBacking"];
-        string[][] rActions = [[], [], [], [], ["setCheck"], ["invoke"], ["invoke"]];
-        for (var index = 0; index < rKeys.Length; ++index)
-        {
-            var backing = rSources[index] == "nativeBacking";
-            recovery.Nodes.Add(new ControlNode
-            {
-                NodeId = (200 + index).ToString(), Generation = "1",
-                NativeHwnd = backing ? $"0x{300 + index:X}" : null,
-                Kind = rKinds[index], ZIndex = index, TabIndex = index >= 4 ? index - 4 : -1,
-                Rect = new PixelRect { X = 10, Y = 10 + index * 40, Width = 200, Height = 32 },
-                Visible = true, Enabled = index != 0, TabStop = index >= 4, Text = $"localized {index}",
-                AutomationName = $"localized {index}", Items = [],
-                AdapterId = recovery.AdapterId, PageId = recovery.PageId, SemanticKey = rKeys[index],
-                SourceKind = rSources[index],
-                PresentationVariant = rVariants[index],
-                SupportedActions = [.. rActions[index]],
-                HelpText = string.Empty, AccessKey = string.Empty,
-            });
-        }
-        ProtocolValidator.ValidateSnapshot(recovery);
-
-        // The disabled back button must stay inert: enabling it violates the
-        // exact page contract the Bridge profile admitted.
-        recovery.Nodes[0] = recovery.Nodes[0] with { Enabled = true };
-        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(recovery));
-        recovery.Nodes[0] = recovery.Nodes[0] with { Enabled = false, SupportedActions = ["invoke"] };
-        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(recovery));
-        recovery.Nodes[0] = recovery.Nodes[0] with { SupportedActions = [] };
-        // An unknown adapter id is never admissible.
-        var unknown = recovery with { AdapterId = "microsoft.unknown.directui" };
-        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(unknown));
-    }
-
-    [Fact]
     public void GenericDirectUiPageIsDynamicButCapabilityClosed()
     {
         var adapter = ProtocolConstants.GenericDirectUiAdapterId;
@@ -422,7 +333,12 @@ public class ProtocolValidatorTests
         snapshot.Nodes.Add(child);
         ProtocolValidator.ValidateSnapshot(snapshot);
 
+        // A Windows Forms GroupBox owns its controls as child windows, so it is a container too.
         snapshot.Nodes[0] = NodeOfKind("groupBox") with { NodeId = "10", ZIndex = 0 };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+
+        // A control that frames nothing is not a parent.
+        snapshot.Nodes[0] = NodeOfKind("checkBox") with { NodeId = "10", ZIndex = 0 };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
 
         snapshot.Nodes.Clear();

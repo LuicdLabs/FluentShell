@@ -75,12 +75,11 @@ the native frame inset, the child's own controls in the native client band, and
 caption commands routed as the `WM_SYSCOMMAND` the native caption button posts.
 `LegacyDialogHost.exe --mdi` is the acceptance oracle for that shape.
 
-Built-in DirectUI surfaces such as MdSched, RecoveryDrive, and the ClearType
-Text Tuner are admitted by a separate profile-driven engine. Two pinned
-executables have exact page profiles; every other Microsoft-signed canonical
-System32 page is admitted by capability, taking each projected slot's kind from
+Built-in DirectUI surfaces use one capability-derived engine restricted to
+Microsoft-signed canonical System32 images. It generates each surface's semantic
+contract from the current HWND and UIA evidence, taking each projected slot's kind from
 the same Win32 adapter registry as above and rejecting the whole window on any
-role that registry cannot prove. See
+role that registry cannot prove. There are no executable-version or per-page profiles. See
 `docs/goals/win32-to-winui-translation/DIRECTUI-APPLICATION-ADAPTERS.md`.
 
 ## Safety Boundary
@@ -92,8 +91,6 @@ pinning is rejected on purpose until it is implemented. Shell, security, and XAM
 processes are hard-denied, along with the FluentShell renderer and FluentShell's own tools.
 Process-name injection, system-wide discovery, and injection watch modes do not exist in the
 production Injector.
-
-The one-shot `l0` command is the only diagnostic exposed by the production Injector.
 
 ## Build And Test
 
@@ -148,11 +145,5 @@ Expected behavior:
 - Dialog button IDs and verification state return to the native host and appear in its result field/log.
 - Selecting close veto rejects a proxy close because the native `WM_CLOSE` handler keeps the HWND alive.
 - Creating the custom child or terminating the renderer restores the whole native window without terminating the target.
-
-## Diagnostics
-
-```powershell
-.\FluentShell.Injector.exe l0
-```
 
 Reference source under `ref_src` is read-only. WinUIShell informs the server/IPC/lifetime shape; its reflection RPC layer is not copied. The GPL-licensed modernizer sample is behavioral research only and contributes no copied implementation.

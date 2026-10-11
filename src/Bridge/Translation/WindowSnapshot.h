@@ -44,6 +44,17 @@ enum class ControlKind {
     StaticDecoration,
     StaticBitmap,
     UpDown,
+    NativeDocument,
+    DiskView,
+    RichText,
+    PerformanceGraph,
+    PerformanceLegend,
+    PerformanceValueBar,
+    // SysDateTimePick32.  The value travels in the range fields every node already
+    // carries: a date picker's position is its day number (days since 0001-01-01), a time
+    // picker's the second of the day, both stepped through setValue.
+    DatePicker,
+    TimePicker,
     Count,
 };
 
@@ -67,6 +78,20 @@ struct PaneSplitSnapshot final {
     int thickness = 0;
     int minimum = 0;
     int maximum = 0;
+};
+
+// A standard window scroll bar of a container whose application scrolls its child
+// windows (a WinForms AutoScroll panel). The rect is in the node's own window-
+// relative coordinates; position is the application's, moved only through its own
+// WM_VSCROLL/WM_HSCROLL handling.
+struct ScrollBarSnapshot final {
+    bool vertical = true;
+    bool enabled = true;
+    int minimum = 0;
+    int maximum = 0;
+    int page = 0;
+    int position = 0;
+    RECT rect{};
 };
 
 // One rectangle of a container's client area that no child covers and that is too
@@ -100,6 +125,197 @@ struct AccessibleIslandItemSnapshot final {
     std::vector<uint8_t> imageData;
 };
 
+// An owned icon from a native image list. Item-bearing controls address shared
+// entries by projection index; toolbar state variants carry one optional entry.
+struct ImageListEntry final {
+    uint32_t imageWidth = 0;
+    uint32_t imageHeight = 0;
+    std::wstring imageFormat;
+    std::vector<uint8_t> imageData;
+};
+
+// A DOM scrollport or the standard native scrollbar of an embedded report.
+// Coordinates remain physical pixels; native report ranges remain native units.
+struct NativeDocumentRegion final {
+    std::wstring key;
+    std::wstring kind;
+    RECT rect{};
+    int contentWidth = 0;
+    int contentHeight = 0;
+    int maximumX = 0;
+    int maximumY = 0;
+    int offsetX = 0;
+    int offsetY = 0;
+};
+
+struct NativeReportRow final {
+    std::wstring path;
+    double value = 0;
+    bool available = false;
+};
+
+struct NativeDocumentItem final {
+    std::wstring key;
+    std::wstring kind;
+    RECT rect{};
+    int regionIndex = -1;
+    int reportRegionIndex = -1;
+    std::wstring name;
+    std::wstring actionIdentity;
+    bool enabled = true;
+    std::optional<ImageListEntry> image;
+    std::vector<NativeReportRow> reportRows;
+};
+
+struct NativeDocumentSnapshot final {
+    std::wstring documentId;
+    std::vector<NativeDocumentRegion> regions;
+    std::vector<NativeDocumentItem> items;
+};
+
+struct OwnerDrawComboItemSnapshot final {
+    ImageListEntry normal;
+    ImageListEntry selected;
+};
+
+// The Windows Disk Management graphical view's own MSAA table. IDs are native
+// positive child IDs, never disk numbers or indexes into an independent query.
+struct DiskViewItemSnapshot final {
+    uint32_t itemId = 0;
+    uint32_t diskId = 0;
+    std::wstring kind;
+    RECT rect{};
+    std::wstring name;
+    std::wstring value;
+    bool enabled = true;
+    bool selected = false;
+    bool focused = false;
+};
+
+struct DiskViewSnapshot final {
+    std::wstring name;
+    RECT clientRect{};
+    RECT scrollRect{};
+    int scrollMinimum = 0;
+    int scrollMaximum = 0;
+    int scrollPosition = 0;
+    int scrollPage = 0;
+    std::vector<DiskViewItemSnapshot> items;
+};
+
+// One run of a read-only rich edit control's text: a constant character format. Sizes are in
+// points; the colour is 0xRRGGBB, or -1 for the control's automatic text colour.
+struct RichRunSnapshot final {
+    std::wstring text;
+    bool bold = false;
+    bool italic = false;
+    bool underline = false;
+    bool strike = false;
+    float size = 0;
+    int64_t color = -1;
+};
+
+// A paragraph of runs. Indents and spacing are in points; the alignment names its edge.
+struct RichParagraphSnapshot final {
+    std::wstring alignment = L"left";
+    bool bullet = false;
+    float leftIndent = 0;
+    float firstLineIndent = 0;
+    float spaceBefore = 0;
+    float spaceAfter = 0;
+    std::vector<RichRunSnapshot> runs;
+};
+
+// One counter's line on Performance Monitor's graph. `values` has one entry per graph slot, in
+// drawing order, and none where the counter had no sample for that slot.
+struct PerformanceSeriesSnapshot final {
+    std::wstring name;
+    // 0xRRGGBB.
+    uint32_t color = 0;
+    int width = 1;
+    std::wstring style = L"solid";
+    // The factor the control multiplies a value by before it plots it.
+    double scale = 1;
+    bool visible = true;
+    bool highlighted = false;
+    std::vector<std::optional<double>> values;
+};
+
+// The System Monitor control's chart as data: its scale, grid and counters, and the samples the
+// Bridge was told about. The slots lay the samples out as the control does: wrapping (a time bar
+// sweeps across and old samples remain to its right until overwritten) or scrolling.
+struct PerformanceGraphSnapshot final {
+    std::wstring displayType = L"line";
+    double minimum = 0;
+    double maximum = 100;
+    int sampleCount = 100;
+    int intervalMs = 1000;
+    bool scroll = false;
+    // Wrapping charts only: the slot of the newest sample, where the time bar stands; -1 otherwise.
+    int barSlot = -1;
+    // A wrapping chart that has written past its last slot: the slots after the bar hold the
+    // previous pass's samples, so they are older by one pass than the slots before it.
+    bool wrapped = false;
+    // The time of slot 0's sample (in the pass in progress) and of the last slot's, in
+    // milliseconds since the Unix epoch. The axis labels the time of the sample each slot holds.
+    int64_t startTimeMs = 0;
+    int64_t endTimeMs = 0;
+    bool showVerticalGrid = false;
+    bool showHorizontalGrid = false;
+    bool showScaleLabels = true;
+    bool showTimeLabels = true;
+    std::wstring title;
+    std::wstring yAxisLabel;
+    // The plot's own background, and the control's behind the labels around it.
+    uint32_t backColor = 0xFFFFFF;
+    uint32_t controlColor = 0xF0F0F0;
+    uint32_t gridColor = 0x808080;
+    uint32_t textColor = 0;
+    uint32_t barColor = 0xFF0000;
+    std::vector<PerformanceSeriesSnapshot> series;
+};
+
+struct PerformanceLegendColumnSnapshot final {
+    std::wstring title;
+    int width = 0;
+};
+
+struct PerformanceLegendRowSnapshot final {
+    bool visible = true;
+    uint32_t color = 0;
+    int width = 1;
+    std::wstring style = L"solid";
+    bool selected = false;
+    // The cells after Show and Color: one per remaining column.
+    std::vector<std::wstring> cells;
+};
+
+// The legend under the graph: one row per counter, in the columns the native legend has. Its
+// swatches follow the chart's type: a line for a line graph, a solid bar for a histogram.
+struct PerformanceLegendSnapshot final {
+    std::wstring displayType = L"line";
+    std::vector<PerformanceLegendColumnSnapshot> columns;
+    std::vector<PerformanceLegendRowSnapshot> rows;
+};
+
+struct PerformanceValueFieldSnapshot final {
+    std::wstring label;
+    std::wstring value;
+};
+
+// The strip under the graph: Last, Average, Minimum, Maximum and Duration of the selected counter.
+struct PerformanceValueBarSnapshot final {
+    std::vector<PerformanceValueFieldSnapshot> fields;
+};
+
+struct OwnerDrawComboSnapshot final {
+    std::wstring mode;
+    std::vector<OwnerDrawComboItemSnapshot> items;
+    // A dropdown-list selection field gets ODS_COMBOBOXEDIT, including itemID
+    // UINT(-1) when empty. Editable combos keep the native text editor instead.
+    std::optional<ImageListEntry> selectionFace;
+};
+
 struct ToolbarItemSnapshot final {
     ToolbarItemKind kind = ToolbarItemKind::PushButton;
     uint32_t commandId = 0;
@@ -123,16 +339,22 @@ struct ToolbarItemSnapshot final {
     uint32_t imageHeight = 0;
     std::wstring imageFormat;
     std::vector<uint8_t> imageData;
+    std::optional<ImageListEntry> hotImage;
+    std::optional<ImageListEntry> disabledImage;
+    std::optional<ImageListEntry> pressedImage;
 };
 
-// One referenced icon from a control's own image list. Item-bearing controls
-// share a bounded compact list and address it by projection index; unused native
-// entries do not travel, and repeated references share the same owned pixels.
-struct ImageListEntry final {
-    uint32_t imageWidth = 0;
-    uint32_t imageHeight = 0;
-    std::wstring imageFormat;
-    std::vector<uint8_t> imageData;
+struct ListViewGroupSnapshot final {
+    int groupId = 0;
+    std::wstring header;
+    std::wstring footer;
+    std::wstring headerAlignment = L"left";
+    std::wstring footerAlignment = L"left";
+    bool collapsible = false;
+    bool collapsed = false;
+    bool hidden = false;
+    RECT headerRect{};
+    RECT footerRect{};
 };
 
 struct ControlNode final {
@@ -187,9 +409,14 @@ struct ControlNode final {
     bool vertical = false;
     bool reversed = false;
     std::vector<std::wstring> items;
+    std::optional<OwnerDrawComboSnapshot> ownerDrawCombo;
     // ListView presentation mode. Report remains the default for old snapshots;
     // icon/list modes carry item labels and geometry without synthetic columns.
     std::wstring listViewMode = L"report";
+    bool groupViewEnabled = false;
+    // Native display order; row membership keeps the canonical item sequence.
+    std::vector<ListViewGroupSnapshot> listViewGroups;
+    std::vector<int> itemGroupIds;
     // TCM_GETITEMRECT / non-report LVM_GETITEMRECT results in client-local physical
     // pixels. List items may lie outside the current viewport after scrolling.
     std::vector<RECT> itemRects;
@@ -200,6 +427,11 @@ struct ControlNode final {
     // True only when stable item IDs and the native accessible default action
     // both exist. Older peers and controls without that capability expose false.
     bool itemActivationSupported = false;
+    // The projection may open an item (double-click, Enter) with the openItem action: the
+    // item is selected and its control is sent Enter. Offered for MMC result lists that have
+    // no stable-identity activation contract (virtual lists) and for MMC result trees
+    // (Device Manager's devices); never for the MMC scope tree, where a double-click only expands.
+    bool itemDefaultActivation = false;
     std::vector<std::wstring> columns;
     std::vector<int> columnWidths;
     // Report ListView only: the display order of the columns as a permutation of
@@ -207,6 +439,12 @@ struct ControlNode final {
     // order, so nothing on the wire changes meaning when the user reorders them.
     std::vector<int> columnOrder;
     std::vector<std::vector<std::wstring>> rows;
+    // A large virtual report list carries a window of its rows: `items` and `rows`
+    // hold the rows from itemWindowStart on, and itemCount is the list's full length.
+    // Zero means the node carries every row.  Every index on the wire (selection,
+    // focus, actions) stays absolute.
+    size_t itemCount = 0;
+    size_t itemWindowStart = 0;
     bool columnHeadersVisible = false;
     bool checkBoxes = false;
     std::vector<int> checkedIndices;
@@ -242,8 +480,18 @@ struct ControlNode final {
     // container paints itself.
     std::vector<PaneSplitSnapshot> splits;
     std::vector<ChromeRegionSnapshot> chromeRegions;
+    // Scrolling containers only, with clientRect set to the scrolled viewport.
+    std::vector<ScrollBarSnapshot> scrollBars;
     // Accessible islands only: the HWND-less elements the host window exposes.
     std::vector<AccessibleIslandItemSnapshot> islandItems;
+    std::optional<NativeDocumentSnapshot> document;
+    std::optional<DiskViewSnapshot> diskView;
+    // Rich text only: the paragraphs a read-only rich edit control shows, in their formats.
+    std::vector<RichParagraphSnapshot> richParagraphs;
+    // Performance Monitor's chart, legend and value strip (each on its own kind).
+    std::optional<PerformanceGraphSnapshot> performanceGraph;
+    std::optional<PerformanceLegendSnapshot> performanceLegend;
+    std::optional<PerformanceValueBarSnapshot> performanceValueBar;
     std::wstring adapterId;
     std::wstring pageId;
     std::wstring semanticKey;
@@ -256,8 +504,16 @@ struct ControlNode final {
 
 // Report capture mirrors each first cell into items; every ListView view uses
 // this one canonical item sequence for selection, checks, editing and actions.
+// A windowed virtual list counts every row, carried or not.
 inline size_t ListViewItemCount(const ControlNode& node) noexcept {
-    return node.items.size();
+    return node.itemCount != 0 ? node.itemCount : node.items.size();
+}
+
+// The label of the item at an absolute index, when the node carries that row.
+inline const std::wstring* ListViewItemLabel(const ControlNode& node, int index) noexcept {
+    if (index < 0 || static_cast<size_t>(index) < node.itemWindowStart) return nullptr;
+    const size_t local = static_cast<size_t>(index) - node.itemWindowStart;
+    return local < node.items.size() ? &node.items[local] : nullptr;
 }
 
 enum class MenuItemKind {
@@ -331,11 +587,19 @@ struct ActionRequest final {
     // generation across the source-thread hop, including a failed recapture.
     uint64_t expectedMenuBindingGeneration = 0;
     std::wstring action;
+    std::wstring nativeDocumentId;
+    std::wstring nativeDocumentItemKey;
+    std::wstring nativeDocumentActionIdentity;
+    uint32_t diskItemId = 0;
     std::wstring text;
     int integerValue = 0;
     std::vector<int> integerValues;
     int itemIndex = -1;
     bool booleanValue = false;
+    // setScroll: booleanValue names the vertical bar, and integerValue is either a
+    // target position or (when this is set) a signed count of line steps.
+    bool scrollByLines = false;
+    int groupId = 0;
     int selectionStart = 0;
     int selectionLength = 0;
     uint32_t menuCommandId = 0;

@@ -18,6 +18,264 @@
     { "$ref": "#/$defs/shutdown" }
   ],
   "$defs": {
+    "diskItemId": { "type": "string", "pattern": "^[1-9][0-9]{0,9}$", "maxLength": 10 },
+    "diskView": {
+      "type": "object",
+      "required": ["name", "clientRect", "scrollRect", "scrollMinimum", "scrollMaximum", "scrollPosition", "scrollPage", "items"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "clientRect": { "$ref": "#/$defs/rect" },
+        "scrollRect": { "$ref": "#/$defs/rect" },
+        "scrollMinimum": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "scrollMaximum": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "scrollPosition": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "scrollPage": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "items": {
+          "type": "array", "minItems": 1, "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["itemId", "diskId", "kind", "rect", "name", "value", "enabled", "selected", "focused"],
+            "properties": {
+              "itemId": { "$ref": "#/$defs/diskItemId" }, "diskId": { "$ref": "#/$defs/diskItemId" },
+              "kind": { "enum": ["disk", "partition"] }, "rect": { "$ref": "#/$defs/rect" },
+              "name": { "type": "string", "minLength": 1, "maxLength": 65536 },
+              "value": { "type": "string", "minLength": 1, "maxLength": 65536 },
+              "enabled": { "type": "boolean" }, "selected": { "type": "boolean" }, "focused": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "richText": {
+      "$comment": "Minor 35: a read-only rich edit control as paragraphs of runs, each run one character format. Sizes and indents are points; color is 0xRRGGBB or -1 for the control's automatic colour.",
+      "type": "object",
+      "required": ["paragraphs"],
+      "properties": {
+        "paragraphs": {
+          "type": "array", "maxItems": 512,
+          "items": {
+            "type": "object",
+            "required": ["alignment", "bullet", "leftIndent", "firstLineIndent", "spaceBefore", "spaceAfter", "runs"],
+            "properties": {
+              "alignment": { "enum": ["left", "center", "right", "justify"] },
+              "bullet": { "type": "boolean" },
+              "leftIndent": { "type": "number", "minimum": -2000, "maximum": 2000 },
+              "firstLineIndent": { "type": "number", "minimum": -2000, "maximum": 2000 },
+              "spaceBefore": { "type": "number", "minimum": 0, "maximum": 2000 },
+              "spaceAfter": { "type": "number", "minimum": 0, "maximum": 2000 },
+              "runs": {
+                "type": "array", "maxItems": 128,
+                "items": {
+                  "type": "object",
+                  "required": ["text", "bold", "italic", "underline", "strike", "size", "color"],
+                  "properties": {
+                    "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+                    "bold": { "type": "boolean" },
+                    "italic": { "type": "boolean" },
+                    "underline": { "type": "boolean" },
+                    "strike": { "type": "boolean" },
+                    "size": { "type": "number", "minimum": 1, "maximum": 400 },
+                    "color": { "type": "integer", "minimum": -1, "maximum": 16777215 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "performanceGraph": {
+      "$comment": "Minor 36: Performance Monitor's graph as read from the System Monitor control. series[].values holds one entry per graph slot in drawing order (null where the counter had no sample); barSlot is the slot of the newest sample of a wrapping chart (-1 for a scrolling one). Times are milliseconds since the Unix epoch and colours are 0xRRGGBB.",
+      "type": "object",
+      "required": ["displayType", "minimum", "maximum", "sampleCount", "intervalMs", "scroll", "barSlot", "wrapped", "startTimeMs", "endTimeMs", "showVerticalGrid", "showHorizontalGrid", "showScaleLabels", "showTimeLabels", "title", "yAxisLabel", "backColor", "controlColor", "gridColor", "textColor", "barColor", "series"],
+      "properties": {
+        "displayType": { "enum": ["line", "histogram"] },
+        "minimum": { "type": "number", "minimum": -1e15, "maximum": 1e15 },
+        "maximum": { "type": "number", "minimum": -1e15, "maximum": 1e15 },
+        "sampleCount": { "type": "integer", "minimum": 2, "maximum": 2000 },
+        "intervalMs": { "type": "integer", "minimum": 100, "maximum": 3600000 },
+        "scroll": { "type": "boolean" },
+        "barSlot": { "type": "integer", "minimum": -1, "maximum": 1999 },
+        "wrapped": { "type": "boolean" },
+        "startTimeMs": { "type": "integer", "minimum": 0, "maximum": 253402300799999 },
+        "endTimeMs": { "type": "integer", "minimum": 0, "maximum": 253402300799999 },
+        "showVerticalGrid": { "type": "boolean" },
+        "showHorizontalGrid": { "type": "boolean" },
+        "showScaleLabels": { "type": "boolean" },
+        "showTimeLabels": { "type": "boolean" },
+        "title": { "type": "string", "maxLength": 1024 },
+        "yAxisLabel": { "type": "string", "maxLength": 1024 },
+        "backColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "controlColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "gridColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "textColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "barColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+        "series": {
+          "type": "array", "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["name", "color", "width", "style", "scale", "visible", "highlighted", "values"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 1024 },
+              "color": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+              "width": { "type": "integer", "minimum": 1, "maximum": 8 },
+              "style": { "enum": ["solid", "dash", "dot", "dashdot", "dashdotdot"] },
+              "scale": { "type": "number", "minimum": -1e9, "maximum": 1e9 },
+              "visible": { "type": "boolean" },
+              "highlighted": { "type": "boolean" },
+              "values": {
+                "type": "array", "maxItems": 2000,
+                "items": { "oneOf": [{ "type": "null" }, { "type": "number", "minimum": -1e300, "maximum": 1e300 }] }
+              }
+            }
+          }
+        }
+      }
+    },
+    "performanceLegend": {
+      "$comment": "Minor 36: the legend under the graph. Each row's cells follow the Show and Color columns, one per remaining column.",
+      "type": "object",
+      "required": ["displayType", "columns", "rows"],
+      "properties": {
+        "displayType": { "enum": ["line", "histogram"] },
+        "columns": {
+          "type": "array", "minItems": 1, "maxItems": 16,
+          "items": {
+            "type": "object",
+            "required": ["title", "width"],
+            "properties": {
+              "title": { "type": "string", "maxLength": 1024 },
+              "width": { "type": "integer", "minimum": 0, "maximum": 16384 }
+            }
+          }
+        },
+        "rows": {
+          "type": "array", "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["visible", "color", "width", "style", "selected", "cells"],
+            "properties": {
+              "visible": { "type": "boolean" },
+              "color": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+              "width": { "type": "integer", "minimum": 1, "maximum": 8 },
+              "style": { "enum": ["solid", "dash", "dot", "dashdot", "dashdotdot"] },
+              "selected": { "type": "boolean" },
+              "cells": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 1024 } }
+            }
+          }
+        }
+      }
+    },
+    "performanceValueBar": {
+      "$comment": "Minor 36: the value strip under the graph (Last, Average, Minimum, Maximum, Duration), labelled by the control's own strings.",
+      "type": "object",
+      "required": ["fields"],
+      "properties": {
+        "fields": {
+          "type": "array", "minItems": 1, "maxItems": 8,
+          "items": {
+            "type": "object",
+            "required": ["label", "value"],
+            "properties": {
+              "label": { "type": "string", "maxLength": 1024 },
+              "value": { "type": "string", "maxLength": 1024 }
+            }
+          }
+        }
+      }
+    },
+    "nativeDocument": {
+      "type": "object", "required": ["documentId", "regions", "items"],
+      "properties": {
+        "documentId": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "regions": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object", "required": ["key", "kind", "rect", "contentWidth", "contentHeight", "maximumX", "maximumY", "offsetX", "offsetY"],
+            "properties": {
+              "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "kind": { "enum": ["html", "report"] },
+              "rect": { "$ref": "#/$defs/rect" },
+              "contentWidth": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "contentHeight": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "maximumX": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "maximumY": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "offsetX": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "offsetY": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            }
+          }
+        },
+        "items": {
+          "type": "array", "minItems": 1, "maxItems": 256,
+          "items": {
+            "type": "object", "required": ["key", "kind", "rect", "regionIndex", "reportRegionIndex", "name", "actionIdentity", "enabled", "reportRows"],
+            "properties": {
+              "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "kind": { "enum": ["text", "heading", "link", "image", "report"] },
+              "rect": { "$ref": "#/$defs/rect" },
+              "regionIndex": { "type": "integer", "minimum": -1, "maximum": 15 },
+              "reportRegionIndex": { "type": "integer", "minimum": -1, "maximum": 15 },
+              "name": { "type": "string", "maxLength": 4096 },
+              "actionIdentity": { "type": "string", "maxLength": 20 },
+              "enabled": { "type": "boolean" },
+              "image": { "$ref": "#/$defs/toolbarStateImage" },
+              "reportRows": {
+                "type": "array", "maxItems": 256,
+                "items": {
+                  "type": "object", "required": ["path", "value", "available"],
+                  "properties": {
+                    "path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                    "value": { "type": "number" },
+                    "available": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "$comment": "Runtime validates unique DOM keys, scroll containment and exact range extents, action tokens, report ownership, 256 aggregate report rows, 65536 text characters and 1 MiB owned premultiplied images. Native HWND descendants are absorbed only after the complete DOM/COM contract accounts for them."
+    },
+    "ownerDrawComboFace": {
+      "type": "object",
+      "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"],
+      "properties": {
+        "imageWidth": { "type": "integer", "minimum": 1, "maximum": 512 },
+        "imageHeight": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "imageFormat": { "const": "bgra8-premultiplied" },
+        "imageData": { "type": "string", "minLength": 8, "maxLength": 349528, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+      }
+    },
+    "ownerDrawCombo": {
+      "type": "object",
+      "required": ["mode", "items"],
+      "properties": {
+        "mode": { "enum": ["fixed", "variable"] },
+        "items": {
+          "type": "array", "maxItems": 64,
+          "items": {
+            "type": "object", "required": ["normal", "selected"],
+            "properties": {
+              "normal": { "$ref": "#/$defs/ownerDrawComboFace" },
+              "selected": { "$ref": "#/$defs/ownerDrawComboFace" }
+            }
+          }
+        },
+        "selectionFace": { "$ref": "#/$defs/ownerDrawComboFace" }
+      },
+      "$comment": "One face pair per canonical label. Fixed mode has uniform heights; selected and normal dimensions match. All faces together are bounded to 1 MiB decoded BGRA. Native style, lengths, and pixel premultiplication are also checked by both runtime adapters."
+    },
+    "toolbarStateImage": {
+      "type": "object",
+      "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"],
+      "properties": {
+        "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
+        "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
+        "imageFormat": { "const": "bgra8-premultiplied" },
+        "imageData": { "type": "string", "minLength": 8, "maxLength": 49152, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+      },
+      "$comment": "Dimensions must equal the toolbar item's normal image. Normal and state images together retain the 64 * 96 * 96 * 4 decoded-byte toolbar budget."
+    },
     "u64String": {
       "type": "string",
       "pattern": "^(0|[1-9][0-9]{0,19})$",
@@ -25,6 +283,10 @@
     },
     "positiveU64String": {
       "allOf": [{ "$ref": "#/$defs/u64String" }, { "not": { "const": "0" } }]
+    },
+    "nativeListGroupId": {
+      "type": "string", "pattern": "^(0|-?[1-9][0-9]{0,9})$", "maxLength": 11,
+      "description": "Signed 32-bit native group ID in canonical decimal spelling; range and sentinels are validated by both codecs."
     },
     "nativeListItemId": {
       "type": "string",
@@ -95,15 +357,50 @@
     },
     "controlNode": {
       "type": "object",
+      "dependentRequired": {
+        "groupViewEnabled": ["listViewGroups", "itemGroupIds"],
+        "listViewGroups": ["groupViewEnabled", "itemGroupIds"],
+        "itemGroupIds": ["groupViewEnabled", "listViewGroups"],
+        "itemCount": ["itemWindowStart"],
+        "itemWindowStart": ["itemCount"]
+      },
       "required": ["nodeId", "generation", "nativeHwnd", "kind", "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "editable", "items"],
       "allOf": [
+        {
+          "$comment": "Minor 33: a large virtual report ListView carries a window of its rows. items and rows hold the rows from itemWindowStart on; itemCount is the list's length, and every index (selection, focus, actions) stays absolute.",
+          "if": { "required": ["itemCount"] },
+          "then": {
+            "properties": {
+              "kind": { "const": "listView" },
+              "listViewMode": { "const": "report" },
+              "checkBoxes": { "const": false },
+              "groupViewEnabled": { "const": false },
+              "itemNativeIds": { "maxItems": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "groupViewEnabled": { "const": true } }, "required": ["groupViewEnabled"] },
+          "then": { "required": ["itemRects"] },
+          "else": { "properties": { "listViewGroups": { "maxItems": 0 }, "itemGroupIds": { "maxItems": 0 } } }
+        },
+        {
+          "if": { "required": ["ownerDrawCombo"] },
+          "then": {
+            "required": ["style", "nativeHwnd", "selectedIndex"],
+            "properties": { "kind": { "const": "comboBox" }, "items": { "maxItems": 64, "items": { "type": "string", "minLength": 1 } }, "nativeHwnd": { "$ref": "#/$defs/hwndString" } },
+            "if": { "properties": { "editable": { "const": true } }, "required": ["editable"] },
+            "then": { "properties": { "ownerDrawCombo": { "not": { "required": ["selectionFace"] } } } },
+            "else": { "properties": { "ownerDrawCombo": { "required": ["selectionFace"] } } }
+          }
+        },
         {
           "if": { "properties": { "kind": { "const": "progressBar" } }, "required": ["kind"] },
           "then": { "required": ["minimum", "maximum", "position", "indeterminate"] },
           "else": { "not": { "required": ["indeterminate"] } }
         },
         {
-          "if": { "properties": { "kind": { "enum": ["slider", "upDown"] } }, "required": ["kind"] },
+          "if": { "properties": { "kind": { "enum": ["slider", "upDown", "datePicker", "timePicker"] } }, "required": ["kind"] },
           "then": { "required": ["minimum", "maximum", "position", "smallChange", "largeChange"] }
         },
         {
@@ -135,7 +432,8 @@
                 { "required": ["imageList"] },
                 { "required": ["itemImages"] },
                 { "required": ["editableLabels"] },
-                { "required": ["editingIndex"] }
+                { "required": ["editingIndex"] },
+                { "required": ["itemDefaultActivation"] }
               ]
             }
           }
@@ -210,7 +508,12 @@
                 { "required": ["columnOrder"] },
                 { "required": ["listViewMode"] },
                 { "required": ["itemActivationSupported"] },
-                { "required": ["itemNativeIds"] }
+                { "required": ["itemNativeIds"] },
+                { "required": ["groupViewEnabled"] },
+                { "required": ["listViewGroups"] },
+                { "required": ["itemGroupIds"] },
+                { "required": ["itemCount"] },
+                { "required": ["itemWindowStart"] }
               ]
             }
           }
@@ -221,7 +524,11 @@
           "else": {
             "if": { "properties": { "kind": { "const": "listView" }, "listViewMode": { "enum": ["largeIcon", "smallIcon", "list"] } }, "required": ["kind", "listViewMode"] },
             "then": { "required": ["itemRects"], "properties": { "columns": { "maxItems": 0 }, "columnWidths": { "maxItems": 0 }, "columnOrder": { "maxItems": 0 }, "rows": { "maxItems": 0 }, "columnHeadersVisible": { "const": false } } },
-            "else": { "not": { "required": ["itemRects"] } }
+            "else": {
+              "if": { "properties": { "kind": { "const": "listView" }, "groupViewEnabled": { "const": true } }, "required": ["kind", "groupViewEnabled"] },
+              "then": { "required": ["itemRects", "listViewGroups", "itemGroupIds"] },
+              "else": { "not": { "required": ["itemRects"] } }
+            }
           }
         },
         {
@@ -231,11 +538,16 @@
             "not": {
               "anyOf": [
                 { "required": ["active"] },
-                { "required": ["windowState"] },
-                { "required": ["clientRect"] }
+                { "required": ["windowState"] }
               ]
             }
           }
+        },
+        {
+          "$comment": "Minor 32: a scrolling container carries its standard scroll bars and the viewport (clientRect) its scrolled children are clipped to. clientRect otherwise belongs only to an MDI child.",
+          "if": { "required": ["scrollBars"] },
+          "then": { "required": ["clientRect"], "properties": { "kind": { "const": "paneContainer" } } },
+          "else": { "if": { "required": ["clientRect"] }, "then": { "properties": { "kind": { "const": "mdiChild" } } } }
         },
         {
           "if": { "properties": { "kind": { "const": "toolbar" } }, "required": ["kind"] },
@@ -249,6 +561,36 @@
           "else": { "not": { "anyOf": [{ "required": ["splits"] }, { "required": ["chromeRegions"] }] } }
         },
         {
+          "if": { "properties": { "kind": { "const": "nativeDocument" } }, "required": ["kind"] },
+          "then": { "required": ["document"] },
+          "else": { "not": { "required": ["document"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "diskView" } }, "required": ["kind"] },
+          "then": { "required": ["diskView"] },
+          "else": { "not": { "required": ["diskView"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "richText" } }, "required": ["kind"] },
+          "then": { "required": ["richText"] },
+          "else": { "not": { "required": ["richText"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "performanceGraph" } }, "required": ["kind"] },
+          "then": { "required": ["performanceGraph"] },
+          "else": { "not": { "required": ["performanceGraph"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "performanceLegend" } }, "required": ["kind"] },
+          "then": { "required": ["performanceLegend"] },
+          "else": { "not": { "required": ["performanceLegend"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "performanceValueBar" } }, "required": ["kind"] },
+          "then": { "required": ["performanceValueBar"] },
+          "else": { "not": { "required": ["performanceValueBar"] } }
+        },
+        {
           "$comment": "An accessible island's elements own no HWND, so they travel as typed items on the island's own node rather than as virtual nodes.",
           "if": { "properties": { "kind": { "const": "accessibleIsland" } }, "required": ["kind"] },
           "then": { "required": ["islandItems"] },
@@ -260,7 +602,13 @@
         "generation": { "$ref": "#/$defs/u64String" },
         "nativeHwnd": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hwndString" }] },
         "parentNodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
-        "kind": { "enum": ["static", "staticIcon", "staticBitmap", "staticDecoration", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "upDown", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland"] },
+        "kind": { "enum": ["static", "staticIcon", "staticBitmap", "staticDecoration", "separator", "button", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "groupBox", "progressBar", "sysLink", "listView", "treeView", "tabControl", "slider", "upDown", "datePicker", "timePicker", "dialogContainer", "mdiClient", "mdiChild", "statusBar", "toolbar", "paneContainer", "accessibleIsland", "nativeDocument", "diskView", "richText", "performanceGraph", "performanceLegend", "performanceValueBar"] },
+        "document": { "$ref": "#/$defs/nativeDocument" },
+        "diskView": { "$ref": "#/$defs/diskView" },
+        "richText": { "$ref": "#/$defs/richText" },
+        "performanceGraph": { "$ref": "#/$defs/performanceGraph" },
+        "performanceLegend": { "$ref": "#/$defs/performanceLegend" },
+        "performanceValueBar": { "$ref": "#/$defs/performanceValueBar" },
         "controlId": { "type": "integer", "minimum": -2147483648, "maximum": 2147483647 },
         "zIndex": { "type": "integer", "minimum": 0, "maximum": 511 },
         "tabIndex": { "type": "integer", "minimum": -1, "maximum": 511 },
@@ -274,9 +622,11 @@
         "text": { "$ref": "#/$defs/text" },
         "automationName": { "$ref": "#/$defs/text" },
         "checked": { "type": "integer", "minimum": 0, "maximum": 2 },
-        "selectedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
-        "selectedIndices": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 4095 } },
-        "focusedIndex": { "type": "integer", "minimum": -1, "maximum": 4095 },
+        "selectedIndex": { "type": "integer", "minimum": -1, "maximum": 16777215 },
+        "selectedIndices": { "type": "array", "maxItems": 4096, "items": { "type": "integer", "minimum": 0, "maximum": 16777215 } },
+        "focusedIndex": { "type": "integer", "minimum": -1, "maximum": 16777215 },
+        "itemCount": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "itemWindowStart": { "type": "integer", "minimum": 0, "maximum": 16777215 },
         "multiSelect": { "type": "boolean" },
         "selectionStart": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
         "selectionLength": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
@@ -303,7 +653,28 @@
         },
         "itemRects": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/rect" } },
         "listViewMode": { "enum": ["report", "largeIcon", "smallIcon", "list"] },
+        "groupViewEnabled": { "type": "boolean" },
+        "listViewGroups": {
+          "type": "array", "maxItems": 256,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["groupId", "header", "footer", "headerAlignment", "footerAlignment", "collapsible", "collapsed", "hidden", "headerRect", "footerRect"],
+            "properties": {
+              "groupId": { "$ref": "#/$defs/nativeListGroupId", "not": { "enum": ["-1", "-2"] } },
+              "header": { "$ref": "#/$defs/text" }, "footer": { "$ref": "#/$defs/text" },
+              "headerAlignment": { "enum": ["left", "center", "right"] },
+              "footerAlignment": { "enum": ["left", "center", "right"] },
+              "collapsible": { "type": "boolean" }, "collapsed": { "type": "boolean" }, "hidden": { "type": "boolean" },
+              "headerRect": { "$ref": "#/$defs/rect" }, "footerRect": { "$ref": "#/$defs/rect" }
+            }
+          }
+        },
+        "itemGroupIds": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/nativeListGroupId", "not": { "const": "-1" } } },
         "itemActivationSupported": { "type": "boolean" },
+        "itemDefaultActivation": {
+          "type": "boolean",
+          "description": "A ListView or TreeView item may be opened (double-click, Enter) by the openItem action: the item is selected and its control is sent the Enter key."
+        },
         "itemNativeIds": {
           "type": "array", "maxItems": 4096, "uniqueItems": true,
           "description": "Canonical LVM_MAPINDEXTOID identities. Empty means no stable identity contract. Runtime validation requires one per item when activation is supported.",
@@ -311,6 +682,7 @@
         },
         "columns": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } },
         "columnWidths": { "type": "array", "maxItems": 64, "items": { "type": "integer", "minimum": 0, "maximum": 2147483647 } },
+        "ownerDrawCombo": { "$ref": "#/$defs/ownerDrawCombo" },
         "columnOrder": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 63 } },
         "rows": { "type": "array", "maxItems": 4096, "items": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/text" } } },
         "columnHeadersVisible": { "type": "boolean" },
@@ -356,11 +728,11 @@
         "imageHeight": { "type": "integer", "minimum": 1, "maximum": 1024 },
         "imageFormat": { "const": "bgra8-premultiplied" },
         "imageData": { "type": "string", "minLength": 8, "maxLength": 2796204, "pattern": "^[A-Za-z0-9+/]+={0,2}$" },
-        "adapterId": { "enum": ["microsoft.mdsched.directui", "microsoft.recoverydrive.directui", "microsoft.windows.directui.semantic.v1"] },
-        "pageId": { "enum": ["initial", "first", "semantic-v1"] },
+        "adapterId": { "const": "microsoft.windows.directui.semantic.v1" },
+        "pageId": { "const": "semantic-v1" },
         "semanticKey": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:-]+$" },
         "sourceKind": { "enum": ["uiaVirtual", "nativeBacking"] },
-          "presentationVariant": { "enum": ["mainIcon", "instruction", "content", "commandLink", "standard", "wizardTitle", "header", "bitmapDisplay", "bitmapSwitch", "monitorPalette"] },
+        "presentationVariant": { "enum": ["commandLink", "standard", "password", "bitmapDisplay", "bitmapSwitch", "monitorPalette", "mainInstruction", "commandLinkNoIcon", "commandLinkElevated", "elevated", "expandoCollapsed", "expandoExpanded"] },
         "supportedActions": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "setItemText", "setValue", "setExpand", "toolbarCommand", "mdiCommand"] } },
         "helpText": { "$ref": "#/$defs/text" },
         "accessKey": { "$ref": "#/$defs/text" },
@@ -373,6 +745,9 @@
               "if": { "properties": { "kind": { "const": "radioButton" } }, "required": ["kind"] },
               "then": { "required": ["radioGroup", "checked"], "properties": { "dropDown": { "const": false }, "wholeDropDown": { "const": false } } },
               "else": { "not": { "required": ["radioGroup"] } }
+            }, {
+              "if": { "anyOf": [{ "required": ["hotImage"] }, { "required": ["disabledImage"] }, { "required": ["pressedImage"] }] },
+              "then": { "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"], "properties": { "kind": { "enum": ["pushButton", "toggleButton", "radioButton"] } } }
             }],
             "properties": {
               "kind": { "enum": ["pushButton", "toggleButton", "radioButton", "separator"] },
@@ -385,6 +760,9 @@
               "checked": { "type": "boolean" },
               "dropDown": { "type": "boolean" },
               "wholeDropDown": { "type": "boolean" },
+              "hotImage": { "$ref": "#/$defs/toolbarStateImage" },
+              "disabledImage": { "$ref": "#/$defs/toolbarStateImage" },
+              "pressedImage": { "$ref": "#/$defs/toolbarStateImage" },
               "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
               "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
               "imageFormat": { "const": "bgra8-premultiplied" },
@@ -403,6 +781,23 @@
               "thickness": { "type": "integer", "minimum": 1, "maximum": 64 },
               "minimum": { "type": "integer", "minimum": 0, "maximum": 65535 },
               "maximum": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            }
+          }
+        },
+        "scrollBars": {
+          "type": "array", "minItems": 1, "maxItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["vertical", "enabled", "minimum", "maximum", "page", "position", "rect"],
+            "properties": {
+              "vertical": { "type": "boolean" },
+              "enabled": { "type": "boolean" },
+              "minimum": { "type": "integer", "minimum": -65535, "maximum": 65535 },
+              "maximum": { "type": "integer", "minimum": -65535, "maximum": 65535 },
+              "page": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "position": { "type": "integer", "minimum": -65535, "maximum": 65535 },
+              "rect": { "$ref": "#/$defs/rect" }
             }
           }
         },
@@ -447,6 +842,20 @@
         }
       }
     },
+    "directUiNode": {
+      "$comment": "Only capability-derived DirectUI semantics remain. Virtual provider text, separators, bounded host-painted images, and property-sheet buttons have no HWND; every other admitted role is HWND-backed.",
+      "required": ["adapterId", "pageId", "semanticKey", "sourceKind", "presentationVariant", "supportedActions", "helpText", "accessKey"],
+      "properties": {
+        "kind": { "enum": ["static", "separator", "groupBox", "staticIcon", "progressBar", "statusBar", "button", "sysLink", "checkBox", "threeState", "radioButton", "edit", "password", "comboBox", "listBox", "listView", "tabControl", "toolbar"] }
+      },
+      "if": { "properties": { "sourceKind": { "const": "uiaVirtual" } }, "required": ["sourceKind"] },
+      "then": {
+        "properties": { "nativeHwnd": { "type": "null" }, "kind": { "enum": ["static", "separator", "button", "staticIcon"] } },
+        "if": { "properties": { "kind": { "const": "staticIcon" } }, "required": ["kind"] },
+        "then": { "properties": { "presentationVariant": { "const": "standard" } } }
+      },
+      "else": { "properties": { "nativeHwnd": { "$ref": "#/$defs/hwndString" } } }
+    },
     "windowSnapshot": {
       "type": "object",
       "required": ["surfaceId", "surfaceKind", "modal", "canCancel", "icon", "generation", "revision", "nativeHwnd", "title", "dpi", "bounds", "clientBounds", "windowStyle", "windowExStyle", "visible", "enabled", "state", "showInTaskbar", "rtl", "nodes"],
@@ -471,8 +880,8 @@
         "state": { "enum": ["normal", "minimized", "maximized"] },
         "showInTaskbar": { "type": "boolean" },
         "rtl": { "type": "boolean" },
-        "adapterId": { "enum": ["microsoft.mdsched.directui", "microsoft.recoverydrive.directui", "microsoft.windows.directui.semantic.v1"] },
-        "pageId": { "enum": ["initial", "first", "semantic-v1"] },
+        "adapterId": { "const": "microsoft.windows.directui.semantic.v1" },
+        "pageId": { "const": "semantic-v1" },
         "menu": {
           "type": "array",
           "maxItems": 256,
@@ -487,6 +896,46 @@
       },
       "allOf": [
         {
+          "if": { "anyOf": [{ "required": ["adapterId"] }, { "required": ["pageId"] }] },
+          "then": {
+            "required": ["adapterId", "pageId"],
+            "properties": {
+              "surfaceKind": { "const": "window" },
+              "menu": { "maxItems": 0 },
+              "nodes": { "minItems": 1, "items": { "$ref": "#/$defs/directUiNode" } }
+            }
+          },
+          "else": {
+            "$comment": "A translated task dialog presents its main instruction, command links (with their note as helpText), elevation shields and expando button through presentationVariant; no other generic node carries adapter fields.",
+            "if": { "properties": { "surfaceKind": { "const": "taskDialog" } }, "required": ["surfaceKind"] },
+            "then": {
+              "properties": {
+                "nodes": {
+                  "items": {
+                    "not": {
+                      "anyOf": [{ "required": ["adapterId"] }, { "required": ["pageId"] }, { "required": ["semanticKey"] }, { "required": ["sourceKind"] }, { "required": ["supportedActions"] }, { "required": ["accessKey"] }]
+                    },
+                    "properties": {
+                      "presentationVariant": { "enum": ["mainInstruction", "commandLink", "commandLinkNoIcon", "commandLinkElevated", "elevated", "expandoCollapsed", "expandoExpanded"] }
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "nodes": {
+                  "items": {
+                    "not": {
+                      "anyOf": [{ "required": ["adapterId"] }, { "required": ["pageId"] }, { "required": ["semanticKey"] }, { "required": ["sourceKind"] }, { "required": ["presentationVariant"] }, { "required": ["supportedActions"] }, { "required": ["helpText"] }, { "required": ["accessKey"] }]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
           "if": { "properties": { "surfaceKind": { "const": "window" } }, "required": ["surfaceKind"] },
           "else": { "properties": { "popupMenu": { "type": "null" } } }
         },
@@ -497,7 +946,10 @@
             "required": ["surfaceKind"]
           },
           "then": { "properties": { "nodes": { "items": { "properties": { "nativeHwnd": { "type": "null" } } } } } },
-          "else": { "properties": { "nodes": { "items": { "properties": { "nativeHwnd": { "$ref": "#/$defs/hwndString" } } } } } }
+          "else": {
+            "if": { "not": { "required": ["adapterId"] } },
+            "then": { "properties": { "nodes": { "items": { "properties": { "nativeHwnd": { "$ref": "#/$defs/hwndString" } } } } } }
+          }
         }
       ]
     },
@@ -517,13 +969,13 @@
       }
     },
     "popupMenu": {
-      "$comment": "The protocol validator resolves nodeId and itemIndex to an accessibleIsland dropdown. The opener may be disabled while the native popup is tracking. Menu paths and command IDs are scoped independently from window.menu.",
+      "$comment": "The protocol validator resolves nodeId and itemIndex to an accessibleIsland dropdown, a diskView item, or (minor 32) the TreeView or ListView item whose contextMenu request opened it. The opener may be disabled while the native popup is tracking. Menu paths and command IDs are scoped independently from window.menu.",
       "type": "object",
       "required": ["popupId", "nodeId", "itemIndex", "items"],
       "properties": {
         "popupId": { "$ref": "#/$defs/positiveU64String" },
         "nodeId": { "$ref": "#/$defs/positiveU64String" },
-        "itemIndex": { "type": "integer", "minimum": 0, "maximum": 31 },
+        "itemIndex": { "type": "integer", "minimum": 0, "maximum": 4095 },
         "items": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/menuItem" } }
       }
     },
@@ -631,6 +1083,62 @@
           }
         },
         {
+          "$comment": "Minor 32: scroll a scrolling container through the application's own line/page handling, toward a position or by signed line steps.",
+          "if": { "properties": { "action": { "const": "setScroll" } }, "required": ["action"] },
+          "then": {
+            "required": ["nodeId"],
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["vertical"],
+                "oneOf": [{ "required": ["position"] }, { "required": ["lines"] }],
+                "properties": {
+                  "vertical": { "type": "boolean" },
+                  "position": { "type": "integer", "minimum": -65535, "maximum": 65535 },
+                  "lines": { "type": "integer", "minimum": -100, "maximum": 100, "not": { "const": 0 } }
+                }
+              }
+            }
+          }
+        },
+        {
+          "$comment": "contextMenu asks for an item's own menu. Minor 34's openItem selects the item and sends its control Enter (a double-click), where the node offers itemDefaultActivation; both witness the item by label.",
+          "if": { "properties": { "action": { "enum": ["contextMenu", "openItem"] } }, "required": ["action"] },
+          "then": {
+            "required": ["nodeId"],
+            "properties": {
+              "value": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["index", "text"],
+                "properties": {
+                  "index": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+                  "text": { "$ref": "#/$defs/text" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "$comment": "Minor 33: move a windowed virtual ListView's window by scrolling the native list so the row is its top row.",
+          "if": { "properties": { "action": { "const": "setTopIndex" } }, "required": ["action"] },
+          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": 0, "maximum": 16777215 } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "setGroupExpanded" } }, "required": ["action"] },
+          "then": {
+            "required": ["nodeId"],
+            "properties": { "value": {
+              "type": "object", "additionalProperties": false, "required": ["groupId", "expanded"],
+              "properties": {
+                "groupId": { "$ref": "#/$defs/nativeListGroupId", "not": { "enum": ["-1", "-2"] } },
+                "expanded": { "type": "boolean" }
+              }
+            } }
+          }
+        },
+        {
           "if": { "properties": { "action": { "const": "setColumnOrder" } }, "required": ["action"] },
           "then": {
             "properties": {
@@ -644,7 +1152,7 @@
         },
         {
           "if": { "properties": { "action": { "const": "setFocusedIndex" } }, "required": ["action"] },
-          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": -1, "maximum": 4095 } } }
+          "then": { "required": ["nodeId"], "properties": { "value": { "type": "integer", "minimum": -1, "maximum": 16777215 } } }
         },
         {
           "if": { "properties": { "action": { "const": "scrollBy" } }, "required": ["action"] },
@@ -661,6 +1169,47 @@
               }
             }
           }
+        },
+        {
+          "if": { "properties": { "action": { "enum": ["diskSelect", "diskContext"] } }, "required": ["action"] },
+          "then": { "properties": { "value": {
+            "type": "object", "additionalProperties": false, "required": ["itemId"],
+            "properties": { "itemId": { "$ref": "#/$defs/diskItemId" } }
+          } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "diskScroll" } }, "required": ["action"] },
+          "then": { "properties": { "value": {
+            "type": "object", "additionalProperties": false, "required": ["position"],
+            "properties": { "position": { "type": "integer", "minimum": 0, "maximum": 65535 } }
+          } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "htmlInvoke" } }, "required": ["action"] },
+          "then": { "properties": { "value": {
+            "type": "object", "additionalProperties": false,
+            "required": ["index", "documentId", "key", "actionIdentity"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "documentId": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "actionIdentity": { "$ref": "#/$defs/u64String", "not": { "const": "0" } }
+            }
+          } } }
+        },
+        {
+          "if": { "properties": { "action": { "const": "htmlScroll" } }, "required": ["action"] },
+          "then": { "properties": { "value": {
+            "type": "object", "additionalProperties": false,
+            "required": ["index", "documentId", "key", "x", "y"],
+            "properties": {
+              "index": { "type": "integer", "minimum": 0, "maximum": 15 },
+              "documentId": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "key": { "type": "string", "minLength": 1, "maxLength": 4096 },
+              "x": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "y": { "type": "integer", "minimum": 0, "maximum": 65535 }
+            }
+          } } }
         },
         {
           "if": { "properties": { "action": { "const": "islandInvoke" } }, "required": ["action"] },
@@ -702,7 +1251,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "setItemCheck", "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "islandInvoke", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "setItemCheck", "setItemText", "setValue", "setExpand", "setGroupExpanded", "setSplit", "setColumnOrder", "islandInvoke", "htmlInvoke", "htmlScroll", "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

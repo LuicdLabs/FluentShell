@@ -1,13 +1,17 @@
 #pragma once
 
 #include "ControlAdapters.h"
+#include "DateTimePickerValue.h"
 #include "WindowCapture.h"
 #include "PopupMenuState.h"
 
 #include <commctrl.h>
 #include <algorithm>
 #include <atomic>
+#include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +31,11 @@ struct IslandActionRequest final {
     std::wstring name;
     std::wstring action;
     bool dropDown = false;
+    ControlKind kind = ControlKind::AccessibleIsland;
+    std::optional<DiskViewSnapshot> diskView;
+    // A toolbar drop-down only: the command id of the button whose arrow was pressed. `index` is
+    // that button's position in the toolbar and `name` its label.
+    uint32_t commandId = 0;
 };
 
 struct ListViewActivationRequest final {
@@ -56,6 +65,18 @@ struct ActionOutcome final {
     WindowSnapshot snapshot;
     std::wstring error;
 };
+
+// Prefix of the capture error raised when a surface spanning several GUI threads
+// kept changing across both confirmation passes (a snap-in still loading).
+inline constexpr wchar_t kCaptureBarrierUnstable[] =
+    L"native controls changed across their GUI-thread capture barrier";
+
+// Whether a message delivered to `window` can change what capture observes. The
+// WM_USER-range control codes are judged by the receiving window's class, because
+// the families share numbers (a toolbar read can alias a trackbar mutator).
+// A WM_NOTIFY (lParam is its NMHDR) that only queries display data or reports
+// painting/hovering is not a mutation.
+bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam = 0, WPARAM wParam = 0) noexcept;
 
 // Virtual item indices identify only the published ordering. These actions must
 // not run, or automatically replay, after that native snapshot has changed.
@@ -155,6 +176,61 @@ inline bool SetTrackbarPosition(
             reinterpret_cast<LPARAM>(trackbar));
     }
     return current() == position;
+}
+
+// A picker's new value is applied the way the control applies one the user chose: the value
+// itself, then the DTN_DATETIMECHANGE notification the control raises to its parent (a Windows
+// Forms DateTimePicker learns of its new Value from that notification alone; DTM_SETSYSTEMTIME
+// does not send it).  `requested` is the day number of a date picker or the second of the day of
+// a time picker; the other half of the value is left as the control has it.  The native value is
+// the verdict.
+inline bool SetDateTimePickerValue(
+    HWND root, HWND picker, bool timeOfDay, int requested) noexcept {
+    if (!picker) return false;
+    SYSTEMTIME value{};
+    if (SendMessageW(picker, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&value)) != GDT_VALID)
+        return false;
+    SYSTEMTIME target = value;
+    if (timeOfDay) {
+        if (requested < 0 || requested >= kSecondsPerDay) return false;
+        target.wHour = static_cast<WORD>(requested / 3600);
+        target.wMinute = static_cast<WORD>(requested % 3600 / 60);
+        target.wSecond = static_cast<WORD>(requested % 60);
+        target.wMilliseconds = 0;
+    } else {
+        int year = 0;
+        int month = 0;
+        int day = 0;
+        CivilFromDayNumber(requested, year, month, day);
+        target.wYear = static_cast<WORD>(year);
+        target.wMonth = static_cast<WORD>(month);
+        target.wDay = static_cast<WORD>(day);
+        target.wDayOfWeek = DayOfWeekFromDayNumber(requested);
+    }
+    if (std::memcmp(&target, &value, sizeof(SYSTEMTIME)) == 0) return true;
+    if (!SendMessageW(picker, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&target)))
+        return false;
+    // The control keeps a value inside its range and clamps one outside it, so what it holds
+    // now is what the user chose or it is not.
+    SYSTEMTIME applied{};
+    if (SendMessageW(picker, DTM_GETSYSTEMTIME, 0, reinterpret_cast<LPARAM>(&applied)) != GDT_VALID ||
+        (timeOfDay
+            ? applied.wHour != target.wHour || applied.wMinute != target.wMinute ||
+                applied.wSecond != target.wSecond
+            : applied.wYear != target.wYear || applied.wMonth != target.wMonth ||
+                applied.wDay != target.wDay)) {
+        SendMessageW(picker, DTM_SETSYSTEMTIME, GDT_VALID, reinterpret_cast<LPARAM>(&value));
+        return false;
+    }
+    NMDATETIMECHANGE change{};
+    change.nmhdr.hwndFrom = picker;
+    change.nmhdr.idFrom = static_cast<UINT_PTR>(GetDlgCtrlID(picker));
+    change.nmhdr.code = DTN_DATETIMECHANGE;
+    change.dwFlags = GDT_VALID;
+    change.st = applied;
+    const HWND parent = SyntheticNotificationTarget(root, picker);
+    SendMessageW(parent, WM_NOTIFY, change.nmhdr.idFrom, reinterpret_cast<LPARAM>(&change));
+    return true;
 }
 
 // An UpDown step follows the sequence the control itself runs for an arrow click:
@@ -303,7 +379,11 @@ struct DeferredSlot final {
 
 class SourceThreadAgent final : public std::enable_shared_from_this<SourceThreadAgent> {
 public:
-    static std::shared_ptr<SourceThreadAgent> Attach(HWND root, HMODULE module);
+    // transientFailure (optional) reports whether a failed initial capture was a
+    // timing condition worth retrying later: the GUI thread did not answer within the
+    // deadline, or a multi-thread surface kept changing across its capture barrier.
+    static std::shared_ptr<SourceThreadAgent> Attach(
+        HWND root, HMODULE module, bool* transientFailure = nullptr);
     ~SourceThreadAgent();
 
     SourceThreadAgent(const SourceThreadAgent&) = delete;
@@ -470,8 +550,10 @@ public:
     // loop, which would blow every bounded command deadline.  Identity is revalidated
     // inside the deferred handler, so an element that moved is dropped instead of
     // acted on.
+    // `open` queues the item's activation (selection and the Enter key) instead of its
+    // context menu: a TreeView or ListView item only.
     bool PostIslandAction(const ControlNode& node, int index, bool& refused,
-        uint64_t* queuedToken = nullptr) noexcept;
+        uint64_t* queuedToken = nullptr, bool open = false) noexcept;
     void DispatchIslandActionOnSourceThread(uint64_t token) noexcept;
     bool TrackIslandPopupOnSourceThread(HMENU menu, UINT flags, HWND owner, BOOL& result);
     bool CompletePopupOnSourceThread(const ActionRequest& action, std::wstring& error);
@@ -507,10 +589,6 @@ public:
     void PoisonDirectUiUia() noexcept { directUiUiaPoisoned_.store(true); }
     const DirectUiWindowProfile* DirectUiProfile() const noexcept { return directUiProfile_; }
     bool GenericDirectUiCandidate() const noexcept { return genericDirectUiCandidate_; }
-    // Lets an exact-profile surface degrade to the capability-derived lane once the
-    // application navigates past the page its declarative row describes. Returns
-    // false when the process itself is not eligible for generic admission.
-    bool EnableGenericDirectUiCandidate() noexcept;
     void AdoptDirectUiProfile(std::shared_ptr<DirectUiOwnedProfile> profile) noexcept;
 
 private:
@@ -519,6 +597,24 @@ private:
     void UnhookAll() noexcept;
     void RunIslandActionOnSourceThread(const IslandActionRequest& request) noexcept;
     void RunListViewActivationOnSourceThread(const ListViewActivationRequest& request) noexcept;
+    struct RemotePopupState final {
+        std::mutex mutex;
+        PopupMenuState menu;
+        std::optional<PopupMenuDecision> decision;
+        IslandActionRequest request;
+        std::wstring error;
+        // Set once the control's own thread tracked the popup: the root thread must then not
+        // claim a second one for the same request.
+        std::atomic<bool> claimed{false};
+    };
+    bool TrackRemoteIslandPopup(const IslandActionRequest& request,
+        const std::shared_ptr<RemotePopupState>& state,
+        const std::shared_ptr<std::atomic<bool>>& cancelled,
+        HMENU menu, UINT flags, HWND owner, BOOL& result);
+    void RunListViewActivationOnOwner(const ListViewActivationRequest& request,
+        uint64_t cancellation, const std::shared_ptr<std::atomic<bool>>& cancelled) noexcept;
+    bool PostRemoteAction(HWND target, std::function<void(const std::shared_ptr<std::atomic<bool>>&)> work,
+        std::wstring& error);
 
     HWND root_ = nullptr;
     HMODULE module_ = nullptr;
@@ -546,8 +642,11 @@ private:
         HMENU menu = nullptr;
         uint64_t menuFingerprint = 0;
         uint64_t closeSequence = 0;
+        std::optional<NativeDocumentSnapshot> document;
     };
     void RunNativeActionOnSourceThread(const NativeActionRequest& request) noexcept;
+    void RunNativeActionOnOwner(const NativeActionRequest& request, const ControlNode& node,
+        const std::shared_ptr<std::atomic<bool>>& cancelled) noexcept;
     void CancelNativeActionOnSourceThread() noexcept;
     struct MenuActionRequest final {
         HWND toolbar = nullptr;
@@ -572,7 +671,14 @@ private:
     DeferredSlot<ListViewActivationRequest> listViewActivation_;
     DeferredSlot<IslandActionRequest> islandAction_;
     bool nativeActionRunning_ = false;
-    uint64_t listViewActivationCancellation_ = 0;
+    std::atomic<uint64_t> listViewActivationCancellation_{0};
+    std::atomic<unsigned> remoteActions_{0};
+    std::mutex remoteSubmissionMutex_;
+    std::atomic<bool> restoring_{false};
+    std::shared_ptr<std::atomic<bool>> remoteCancellation_;
+    std::shared_ptr<RemotePopupState> remotePopup_;
+    std::atomic<uint64_t> nextPopupId_{1};
+    uint64_t AllocatePopupId() noexcept;
     std::optional<IslandActionRequest> pendingIslandMenu_;
     std::optional<IslandActionRequest> trackedIslandMenu_;
     ULONGLONG pendingIslandDeadline_ = 0;

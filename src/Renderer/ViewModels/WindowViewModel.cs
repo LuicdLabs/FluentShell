@@ -70,12 +70,12 @@ public sealed class WindowViewModel : ObservableObject
                 (incoming.ListViewMode ?? "report") != current.ListViewMode ||
                 incoming.ParentNodeId != current.ParentNodeId ||
                 incoming.ZIndex != current.ZIndex ||
-                (incoming.TabIndex ?? incoming.ZIndex) != current.TabIndex ||
-                incoming.TabStop != current.TabStop ||
+                // Tab stops, tab order and the default button follow the controls' enabled state and
+                // the focus; they are applied to the controls in place (ControlFactory.Create), not
+                // by replacing every control, which would take the keyboard focus from the user.
                 (incoming.ReadOnly ?? false) != current.ReadOnly ||
                 (incoming.Multiline ?? false) != current.Multiline ||
                 incoming.Editable != current.Editable ||
-                (incoming.IsDefault ?? false) != current.IsDefault ||
                 (incoming.GroupStart ?? false) != current.GroupStart ||
                 (incoming.AdapterId ?? string.Empty) != current.AdapterId ||
                 (incoming.PageId ?? string.Empty) != current.PageId ||

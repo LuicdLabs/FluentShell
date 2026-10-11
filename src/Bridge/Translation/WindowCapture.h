@@ -28,6 +28,8 @@ struct CaptureContext final {
     HWND menuBarToolbar = nullptr;
     uint64_t menuBarToolbarGeneration = 0;
     std::vector<MenuBarButton> menuBarButtons;
+    // Buttons whose last read opened no popup; cleared whenever the buttons change.
+    std::vector<bool> menuBarSilentButtons;
     MenuBarRefreshPolicy menuBarRefresh;
 };
 
@@ -59,5 +61,15 @@ bool CaptureMenuHandle(
     bool requireUniqueCommands = true) noexcept;
 
 uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept;
+
+// Diagnostic only: the first observable difference between two captures of the same
+// window (node count, then per node class, geometry, text and state), or empty.
+std::wstring DescribeSnapshotDifference(const WindowSnapshot& before, const WindowSnapshot& after);
+
+// True when `next` differs from the canonical snapshot only in the pixels some container's chrome
+// regions hold: the fingerprints differ and nothing else moved.  The pixel buffers are swapped for
+// the length of the comparison and put back, so both snapshots are unchanged on return.
+bool OnlyChromePixelsChanged(
+    WindowSnapshot& canonical, WindowSnapshot& next, uint64_t canonicalFingerprint) noexcept;
 
 } // namespace FluentShell::Bridge::Translation

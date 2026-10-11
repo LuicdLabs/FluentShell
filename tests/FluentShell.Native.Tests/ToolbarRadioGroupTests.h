@@ -254,7 +254,7 @@ inline void TestNativeGroups(void (*check)(bool, const char*)) {
     CheckWire(node, check);
 }
 
-inline void TestBareGroupRejection(void (*check)(bool, const char*)) {
+inline void TestBareGroupIsPushButton(void (*check)(bool, const char*)) {
     Fixture fixture;
     check(fixture.ready, "bare toolbar GROUP rejection fixture was not created");
     if (!fixture.ready) return;
@@ -264,11 +264,13 @@ inline void TestBareGroupRejection(void (*check)(bool, const char*)) {
     check(SendMessageW(fixture.toolbar, TB_GETBUTTON, 0, reinterpret_cast<LPARAM>(&native)) &&
         (native.fsStyle & (BTNS_CHECK | BTNS_GROUP)) == BTNS_GROUP,
         "bare toolbar GROUP fixture did not retain its native style");
+    // comctl32 reads BTNS_GROUP only with BTNS_CHECK; alone the button is a push button.
     ControlNode node;
     std::wstring error;
-    check(!fixture.Capture(node, error) &&
-        (error.find(L"group") != std::wstring::npos || error.find(L"BTNS_GROUP") != std::wstring::npos),
-        "a toolbar BTNS_GROUP button without BTNS_CHECK was admitted as a radio button");
+    const bool captured = fixture.Capture(node, error);
+    check(captured && node.toolbarItems.size() == 1 &&
+        node.toolbarItems[0].kind == ToolbarItemKind::PushButton,
+        "a toolbar BTNS_GROUP button without BTNS_CHECK was not captured as a push button");
 }
 
 inline bool ReadNativeStates(HWND toolbar, std::vector<BYTE>& states) {
@@ -430,7 +432,7 @@ inline void TestNativeCommandState(void (*check)(bool, const char*)) {
 
 inline void TestToolbarRadioGroups(void (*check)(bool, const char*)) {
     ToolbarRadioGroups::TestNativeGroups(check);
-    ToolbarRadioGroups::TestBareGroupRejection(check);
+    ToolbarRadioGroups::TestBareGroupIsPushButton(check);
     ToolbarRadioGroups::TestNativeCommandState(check);
 }
 

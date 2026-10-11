@@ -1,0 +1,181 @@
+{
+  "messageType": "window.open",
+  "sessionNonce": "00112233445566778899aabbccddeeff",
+  "window": {
+    "surfaceId": "4f17d4bb-b2bf-42b8-a334-2f9ad8d54d42",
+    "surfaceKind": "window",
+    "modal": false,
+    "canCancel": true,
+    "icon": "none",
+    "generation": "1",
+    "revision": "7",
+    "nativeHwnd": "0x00000000000100AA",
+    "ownerHwnd": null,
+    "title": "Native semantic document",
+    "dpi": 144,
+    "bounds": {
+      "x": 100,
+      "y": 80,
+      "width": 780,
+      "height": 480
+    },
+    "clientBounds": {
+      "x": 0,
+      "y": 0,
+      "width": 760,
+      "height": 430
+    },
+    "windowStyle": "0x00000000CF0000",
+    "windowExStyle": "0x00000000000000",
+    "visible": true,
+    "enabled": true,
+    "state": "normal",
+    "showInTaskbar": true,
+    "rtl": false,
+    "nodes": [
+      {
+        "enabled": true,
+        "tabStop": false,
+        "nativeHwnd": "0x31",
+        "visible": true,
+        "rect": {
+          "x": 0,
+          "height": 400,
+          "y": 0,
+          "width": 600
+        },
+        "generation": "1",
+        "dialogCode": 0,
+        "zIndex": 0,
+        "text": "",
+        "controlId": 0,
+        "kind": "nativeDocument",
+        "tabIndex": -1,
+        "document": {
+          "documentId": "document-1",
+          "items": [
+            {
+              "key": "title",
+              "actionIdentity": "",
+              "name": "System overview",
+              "reportRows": [],
+              "enabled": true,
+              "rect": {
+                "x": 8,
+                "height": 24,
+                "y": 8,
+                "width": 320
+              },
+              "reportRegionIndex": -1,
+              "kind": "heading",
+              "regionIndex": -1
+            },
+            {
+              "key": "link",
+              "actionIdentity": "9007199254740993",
+              "name": "Open monitor",
+              "reportRows": [],
+              "enabled": true,
+              "rect": {
+                "x": 8,
+                "height": 24,
+                "y": 38,
+                "width": 200
+              },
+              "reportRegionIndex": -1,
+              "kind": "link",
+              "regionIndex": -1
+            },
+            {
+              "key": "description",
+              "actionIdentity": "",
+              "name": "Current sampled counters",
+              "reportRows": [],
+              "enabled": true,
+              "rect": {
+                "x": 0,
+                "height": 220,
+                "y": 0,
+                "width": 220
+              },
+              "reportRegionIndex": -1,
+              "kind": "text",
+              "regionIndex": 0
+            },
+            {
+              "key": "report",
+              "actionIdentity": "",
+              "name": "",
+              "reportRows": [
+                {
+                  "path": "\\Memory\\Available MBytes",
+                  "available": true,
+                  "value": 8192.25
+                },
+                {
+                  "path": "\\Processor(_Total)\\% Processor Time",
+                  "available": false,
+                  "value": 0
+                }
+              ],
+              "enabled": true,
+              "rect": {
+                "x": 8,
+                "height": 210,
+                "y": 170,
+                "width": 570
+              },
+              "reportRegionIndex": 1,
+              "kind": "report",
+              "regionIndex": -1
+            }
+          ],
+          "regions": [
+            {
+              "key": "details",
+              "contentHeight": 240,
+              "offsetY": 20,
+              "offsetX": 0,
+              "contentWidth": 250,
+              "rect": {
+                "x": 8,
+                "height": 80,
+                "y": 70,
+                "width": 250
+              },
+              "maximumX": 0,
+              "kind": "html",
+              "maximumY": 160
+            },
+            {
+              "key": "report",
+              "contentHeight": 0,
+              "offsetY": 0,
+              "offsetX": 3,
+              "contentWidth": 0,
+              "rect": {
+                "x": 8,
+                "height": 210,
+                "y": 170,
+                "width": 570
+              },
+              "maximumX": 12,
+              "kind": "report",
+              "maximumY": 0
+            }
+          ]
+        },
+        "nodeId": "1",
+        "style": "0x56000000",
+        "editable": false,
+        "selectedIndex": -1,
+        "selectedIndices": [],
+        "columns": [],
+        "columnWidths": [],
+        "rows": [],
+        "items": []
+      }
+    ],
+    "menu": []
+  }
+}

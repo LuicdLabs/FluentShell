@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SourceThreadAgent.h"
+#include "VirtualTaskDialog.h"
 
 #include <commctrl.h>
 
@@ -18,11 +19,6 @@
 #include <vector>
 
 namespace FluentShell::Bridge::Translation {
-
-struct TaskDialogResult final {
-    int button = 0;
-    bool verificationChecked = false;
-};
 
 class RendererSession final : public std::enable_shared_from_this<RendererSession> {
 public:
@@ -42,16 +38,10 @@ public:
         std::wstring_view text,
         std::wstring_view caption,
         UINT type,
-        WORD languageId = 0);
+        WORD languageId = 0,
+        const DialogIconImage* customIcon = nullptr);
 
-    std::optional<TaskDialogResult> ShowTaskDialog(
-        const TASKDIALOGCONFIG& config,
-        const std::vector<std::pair<int, std::wstring>>& buttons,
-        std::wstring_view title,
-        std::wstring_view instruction,
-        std::wstring_view content,
-        std::wstring_view footer,
-        std::wstring_view verification);
+    std::optional<TaskDialogResult> ShowTaskDialog(const TASKDIALOGCONFIG& config);
 
 private:
     struct Surface;
@@ -124,6 +114,7 @@ private:
     void HandleFrame(const Ipc::Frame& frame);
     void HandleReady(const SurfaceReady& ready);
     void HandleAction(const ActionRequest& action);
+    void AdmitAction(const ActionRequest& action, const std::shared_ptr<Surface>& surface);
     // Rejects an action and resynchronizes the renderer with the canonical
     // revision.  Requires `lock` to own surface->mutex and releases it before
     // the frames are sent, because Send can block on pipe backpressure.
@@ -147,6 +138,10 @@ private:
     DiscoveryDecision ClassifyTopLevel(HWND window, bool ownsVisibleTopLevel);
     bool OpenNativeWindow(HWND root);
     bool IsProjectedOwner(HWND owner);
+    // A rebuilt virtual task dialog: keeps the surface identity and the window's
+    // current position, assigns the next revision and patches the renderer.
+    void PublishVirtualDialog(const std::shared_ptr<Surface>& surface, WindowSnapshot snapshot,
+        uint64_t eventId);
     bool OpenSurface(const std::shared_ptr<Surface>& surface, bool cloakNative);
     // Projection gate stages, in the order OpenSurface runs them.  Each logs its
     // own rejection reason and returns false; the caller owns rollback.  All of
@@ -190,7 +185,9 @@ private:
     void ReassertRememberedSplits(ReconcilePass& pass);
     // Refreshes a toolbar menu after commit. A failed recapture must not publish
     // the snapshot taken before the native command bindings changed.
-    const wchar_t* RefreshMenuBarToolbar(ReconcilePass& pass);
+    const wchar_t* RefreshMenuBarToolbar(ReconcilePass& pass, std::wstring& failure);
+    bool HoldThroughTransientRejection(const std::shared_ptr<Surface>& surface,
+        const std::wstring& error) noexcept;
     // Records the split a completed setSplit produced, or forgets it when the
     // container no longer describes one.  Requires surface->mutex.
     static void RememberSplitIntent(
@@ -267,6 +264,41 @@ private:
     std::unordered_set<std::wstring> retiredSurfaceIds_;
     std::deque<std::wstring> retiredSurfaceOrder_;
     std::unordered_set<HWND> discoveryAttempts_;
+    // Windows whose busy GUI thread deferred their attempt (logged once each).
+    // Touched only by the supervisor thread.
+    std::unordered_set<HWND> busyDiscoveryWindows_;
+    // Windows whose attempt failed on a timing condition (a snap-in still loading),
+    // or whose projection a rollback handed back to native (a view the projection
+    // cannot take yet): counts and the tick at which discovery may attempt them
+    // again. Guarded by surfacesMutex_.
+    struct DiscoveryRetry final {
+        unsigned attempts = 0;
+        // When the current run of transient failures began.
+        uint64_t firstTransient = 0;
+        unsigned reprojections = 0;
+        // The pending attempt continues a post-rollback chain: an attempt that does
+        // not end projected schedules the next one with the chain's backoff.
+        bool reprojecting = false;
+        uint64_t due = 0;
+        // Child-window topology when the chain last waited; a change (the user
+        // navigated the native window) brings the next attempt forward.
+        uint64_t topology = 0;
+        uint64_t lastAttempt = 0;
+        // A window never projected whose capture refused its current view waits for
+        // its topology to change instead of a timer; consecutive refusals back off.
+        bool watching = false;
+        unsigned watchFailures = 0;
+        // The refusal showed nothing, so a timed re-attempt cannot flash the proxy.
+        bool timedRetry = false;
+    };
+    std::unordered_map<HWND, DiscoveryRetry> discoveryRetries_;
+    // Roots currently projected and the tick their projection committed. Guarded
+    // by surfacesMutex_.
+    std::unordered_map<HWND, uint64_t> projectedSince_;
+    void ScheduleDiscoveryRetry(HWND window);
+    void ScheduleReprojection(HWND root, std::wstring_view reason) noexcept;
+    void ContinueReprojection(HWND root) noexcept;
+    void WatchTopology(HWND root, bool timed = false) noexcept;
     // Identifies the last enumeration reported to the log, so the census is
     // written when the window set changes instead of once per second.  Touched
     // only by the supervisor thread, which is the only caller of discovery.
@@ -274,6 +306,23 @@ private:
     // Zero means an owned top-level is still visible. A nonzero tick starts the
     // quiet period that must elapse before the native owner is projected again.
     std::unordered_map<HWND, uint64_t> ownerGraphDeferrals_;
+    // Owned windows whose owner is not a projection (yet): they wait without using their
+    // one attempt, because a graph handed back to native is projected again from its
+    // root and the dialogs on it are offered after it. Logged once each. Guarded by
+    // surfacesMutex_.
+    std::unordered_set<HWND> ownedWaiting_;
+    // Modal dialogs the projection tried and could not take, for as long as they are
+    // open: each holds the root it belongs to native, because projecting the root
+    // again would only hand the graph back. Guarded by surfacesMutex_.
+    std::unordered_set<HWND> refusedDialogs_;
+    // Hands every projected owner of a window the projection cannot take back to
+    // native, together, and arranges for the graph to be offered again once that
+    // window is gone: a root waits in ownerGraphDeferrals_, an owned dialog gets
+    // its attempt back for after its own owner has projected.
+    void HandOwnerGraphToNative(const std::vector<std::shared_ptr<Surface>>& owners);
+    // After a root projected: the windows it owns that are not projections are
+    // offered their attempt in the same discovery pass.
+    void ReleaseOwnedWindows(HWND root, const std::vector<HWND>& candidates);
     std::mutex actionMutex_;
     std::condition_variable actionCondition_;
     std::deque<std::pair<ActionRequest, std::shared_ptr<Surface>>> actionQueue_;

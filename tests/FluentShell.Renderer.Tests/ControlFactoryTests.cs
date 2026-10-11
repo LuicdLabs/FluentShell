@@ -19,7 +19,7 @@ public sealed class ControlFactoryTests
             Rect = new PixelRect { Width = 200, Height = 60 }, Visible = true, Enabled = true,
             Text = "Run now", AutomationName = "Run now", PresentationVariant = "commandLink",
             SupportedActions = ["invoke"], HelpText = "Checks memory after restart.", AccessKey = "Alt+R",
-            AdapterId = "microsoft.mdsched.directui", PageId = "initial",
+            AdapterId = ProtocolConstants.GenericDirectUiAdapterId, PageId = ProtocolConstants.GenericDirectUiPageId,
             SemanticKey = "CommandLink.0", SourceKind = "nativeBacking",
         });
 
@@ -30,14 +30,14 @@ public sealed class ControlFactoryTests
     }
 
     [Fact]
-    public void RecoveryDriveCheckboxAndDisabledBackSurviveTheViewModelBoundary()
+    public void SemanticCheckboxAndDisabledBackSurviveTheViewModelBoundary()
     {
         var checkbox = ControlNodeViewModel.FromSnapshot(new ControlNode
         {
             NodeId = "1", Generation = "1", NativeHwnd = "0x2", Kind = "checkBox",
             Rect = new PixelRect { Width = 300, Height = 24 }, Visible = true, Enabled = true,
             Checked = 0, Text = "Back up system files", AutomationName = "Back up system files",
-            AdapterId = "microsoft.recoverydrive.directui", PageId = "first",
+            AdapterId = ProtocolConstants.GenericDirectUiAdapterId, PageId = ProtocolConstants.GenericDirectUiPageId,
             SemanticKey = "backupSystemFiles", SourceKind = "nativeBacking",
             PresentationVariant = "standard", SupportedActions = ["setCheck"],
             HelpText = string.Empty, AccessKey = string.Empty,
@@ -47,7 +47,7 @@ public sealed class ControlFactoryTests
             NodeId = "2", Generation = "1", NativeHwnd = null, Kind = "button",
             Rect = new PixelRect { Width = 80, Height = 32 }, Visible = true, Enabled = false,
             Text = "Back", AutomationName = "Back",
-            AdapterId = "microsoft.recoverydrive.directui", PageId = "first",
+            AdapterId = ProtocolConstants.GenericDirectUiAdapterId, PageId = ProtocolConstants.GenericDirectUiPageId,
             SemanticKey = "backbutton", SourceKind = "uiaVirtual",
             PresentationVariant = "standard", SupportedActions = [],
             HelpText = string.Empty, AccessKey = string.Empty,
@@ -412,7 +412,7 @@ public sealed class ControlFactoryTests
     // variants stretch their pixels to the slot.
     [Theory]
     [InlineData("standard", false)]
-    [InlineData("mainIcon", false)]
+    [InlineData("unknownVariant", false)]
     [InlineData("", false)]
     [InlineData("bitmapDisplay", true)]
     [InlineData("monitorPalette", true)]
@@ -489,7 +489,7 @@ public sealed class ControlFactoryTests
             });
 
         // A generated slot's routes come from that revision's own typed state, so
-        // the factory refuses anything the profile did not advertise even when the
+        // the factory refuses anything the semantic node did not advertise even when the
         // WinUI control is perfectly capable of raising it.
         var checkList = Semantic("listView", "setSelection", "setItemCheck");
         Assert.True(ControlFactory.AllowsAction(checkList, "setSelection"));

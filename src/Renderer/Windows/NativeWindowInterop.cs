@@ -179,3 +179,12 @@ internal static class NativeWindowInterop
         Marshal.StructureToPtr(position, lParam, false);
     }
 }
+
+/// <summary>The system's double-click time: how close two presses must be to be one gesture.</summary>
+internal static class ProjectedDoubleClickTime
+{
+    [DllImport("user32.dll")]
+    private static extern uint GetDoubleClickTime();
+
+    public static long Milliseconds => Math.Clamp(GetDoubleClickTime(), 200u, 5000u);
+}

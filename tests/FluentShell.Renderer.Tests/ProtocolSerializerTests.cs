@@ -568,7 +568,7 @@ public sealed class ProtocolSerializerTests
     [InlineData("[1,1]")]
     [InlineData("[2,1]")]
     [InlineData("[-1]")]
-    [InlineData("[4096]")]
+    [InlineData("[16777216]")]
     [InlineData("[\"1\"]")]
     [InlineData("{}")]
     public void RejectsNonCanonicalSetSelectionAction(string valueJson)
@@ -585,6 +585,28 @@ public sealed class ProtocolSerializerTests
         };
 
         Assert.Throws<ProtocolException>(() => ProtocolSerializer.Deserialize(
+            FrameMessageType.ActionInvoke, ProtocolSerializer.Serialize(action)));
+    }
+
+    // Selection indices are absolute rows, so a windowed virtual list can select past
+    // the per-array cap; each node still bounds them by its own row count.
+    [Theory]
+    [InlineData("[4096]")]
+    [InlineData("[5,9000,16777215]")]
+    public void AdmitsAbsoluteSetSelectionRowsOfAWindowedList(string valueJson)
+    {
+        var action = new ActionInvokeMessage
+        {
+            SessionNonce = TestData.Nonce,
+            SurfaceId = TestData.Snapshot().SurfaceId,
+            NodeId = "10",
+            EventId = "1",
+            ExpectedRevision = "7",
+            Action = "setSelection",
+            Value = JsonDocument.Parse(valueJson).RootElement.Clone(),
+        };
+
+        Assert.IsType<ActionInvokeMessage>(ProtocolSerializer.Deserialize(
             FrameMessageType.ActionInvoke, ProtocolSerializer.Serialize(action)));
     }
 

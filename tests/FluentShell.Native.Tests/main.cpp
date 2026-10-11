@@ -3,28 +3,41 @@
 #include "../../src/Bridge/Translation/ControlAdapters.h"
 #include "../../src/Bridge/Translation/WindowCapture.h"
 #include "../../src/Bridge/Translation/SourceThreadAgent.h"
+#include "../../src/Bridge/Translation/GuiThreadDispatch.h"
 #include "../../src/Bridge/Translation/ListViewActivation.h"
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
+#include "../../src/Bridge/Translation/VirtualTaskDialog.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
 #include "../../src/Bridge/Translation/PopupMenuState.h"
 #include "../../src/Bridge/Translation/PaintedPixel.h"
+#include "../../src/Bridge/Translation/RichText.h"
+#include "../../src/Bridge/Translation/PerformanceChart.h"
 #include "ItemImageCaptureTests.h"
 #include "MmcHtmlDocumentTests.h"
 #include "ListViewModeRegressionTests.h"
 #include "OwnerDataListViewTests.h"
 #include "OwnerDataListViewActionTests.h"
 #include "ToolbarRadioGroupTests.h"
+#include "ToolbarImageVariantTests.h"
+#include "OwnerDrawComboBoxTests.h"
+#include "ListViewGroupTests.h"
+#include "DirectUiVirtualImageTests.h"
+#include "DirectUiDetailEvidenceTests.h"
+#include "NativeDocumentTests.h"
 #include "UiAutomationProjectionTests.h"
 
 #include <winrt/base.h>
 #include <objbase.h>
 #include <oleacc.h>
 #include <commctrl.h>
+#include <crtdbg.h>
+#include <dbghelp.h>
 #include <dwmapi.h>
 #include <prsht.h>
+#include <richedit.h>
 #include <UIAutomation.h>
 
 #include <algorithm>
@@ -98,12 +111,55 @@ void Check(bool condition, const char* message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
+// A crashing test otherwise ends the process with no output at all, because no
+// test prints on success. Print the faulting stack so the failing test is named.
+LONG WINAPI ReportUnhandledException(EXCEPTION_POINTERS* exception) {
+    const HANDLE process = GetCurrentProcess();
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+    SymInitialize(process, nullptr, TRUE);
+    std::cerr << "CRASH: exception 0x" << std::hex
+        << exception->ExceptionRecord->ExceptionCode << std::dec << '\n';
+    CONTEXT context = *exception->ContextRecord;
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME]{};
+    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+    for (int depth = 0; depth < 48 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, process,
+            GetCurrentThread(), &frame, &context, nullptr, SymFunctionTableAccess64,
+            SymGetModuleBase64, nullptr) && frame.AddrPC.Offset != 0; ++depth) {
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+        DWORD64 displacement = 0;
+        IMAGEHLP_LINE64 line{ sizeof(line) };
+        DWORD lineDisplacement = 0;
+        std::cerr << "  #" << depth << ' ';
+        if (SymFromAddr(process, frame.AddrPC.Offset, &displacement, symbol)) std::cerr << symbol->Name;
+        else std::cerr << "0x" << std::hex << frame.AddrPC.Offset << std::dec;
+        if (SymGetLineFromAddr64(process, frame.AddrPC.Offset, &lineDisplacement, &line))
+            std::cerr << " (" << line.FileName << ':' << line.LineNumber << ')';
+        std::cerr << '\n';
+    }
+    std::cerr.flush();
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+#include "GuiThreadDispatchTests.h"
+#include "CrossThreadSurfaceTests.h"
+#include "SnapshotDetailFingerprintTests.h"
 #include "MdiCaptureRegressionTests.h"
 #include "StaticDecorationRegressionTests.h"
 #include "SiblingZOrderCaptureTests.h"
 #include "MmcMessageViewTests.h"
 #include "CaptureVisibilityTests.h"
 #include "UpDownAdapterTests.h"
+#include "DateTimePickerAdapterTests.h"
+#include "ListBoxMultiSelectTests.h"
+#include "PerformanceChartTests.h"
 
 std::string ReadFixture(const wchar_t* name) {
     const auto path = std::filesystem::current_path() / L"tests" / L"ProtocolFixtures" / name;
@@ -200,14 +256,6 @@ Translation::DirectUiWindowEvidence DirectUiWindow(
     return value;
 }
 
-const Translation::DirectUiWindowProfile* TestProfileById(std::wstring_view adapterId) {
-    for (size_t index = 0; index < Translation::kDirectUiProfileCount; ++index) {
-        if (Translation::kDirectUiProfiles[index].adapterId == adapterId)
-            return &Translation::kDirectUiProfiles[index];
-    }
-    return nullptr;
-}
-
 // Builds profile-shaped native evidence. All slots get backing windows for
 // non-virtual slots; virtual slots keep null HWNDs.
 Translation::DirectUiNativeEvidence DirectUiNativeFixture(
@@ -245,11 +293,35 @@ void TestDirectUiEvidenceContracts() {
     Check(!Translation::NormalizeDirectUiEvidenceText(embeddedNull, normalized),
         "ambiguous embedded-NUL DirectUI evidence was accepted");
 
-    // The mutation bracket is profile-independent: it compares root, anchor,
-    // and every backing slot window between A and B.
-    const auto* profile = TestProfileById(L"microsoft.mdsched.directui");
-    Check(profile != nullptr, "MdSched profile is missing from the registry");
-    if (!profile) return;
+    // Capability-derived slots exercise the shared native/UIA contract without
+    // admitting any executable-specific page or trusting its resource IDs.
+    Translation::DirectUiSlot bracketSlots[3];
+    bracketSlots[0].semanticKey = L"semantic.instruction";
+    bracketSlots[0].uiaControlType = UIA_TextControlTypeId;
+    bracketSlots[0].uiaClassName = L"Element";
+    bracketSlots[0].pinUiaPatterns = true;
+    for (size_t index = 1; index < std::size(bracketSlots); ++index) {
+        auto& slot = bracketSlots[index];
+        slot.semanticKey = index == 1 ? L"semantic.next" : L"semantic.cancel";
+        slot.kind = Translation::ControlKind::Button;
+        slot.virtualSource = false;
+        slot.nativeClass = L"Button";
+        slot.uiaControlType = UIA_ButtonControlTypeId;
+        slot.uiaClassName = L"CCPushButton";
+        slot.uiaFocusable = true;
+        slot.uiaActionable = true;
+        slot.pinUiaPatterns = true;
+        slot.uiaPatternMask = Translation::DirectUiPatternInvoke;
+        slot.action = Translation::DirectUiAction::HandoffClick;
+        slot.cancel = index == 2;
+    }
+    Translation::DirectUiWindowProfile bracketProfile;
+    bracketProfile.adapterId = L"microsoft.windows.directui.semantic.v1";
+    bracketProfile.pageId = L"semantic-v1";
+    bracketProfile.rootClass = L"NativeHWNDHost";
+    bracketProfile.slots = bracketSlots;
+    bracketProfile.slotCount = std::size(bracketSlots);
+    const auto* profile = &bracketProfile;
     std::vector<HWND> backing;
     auto before = DirectUiNativeFixture(*profile, backing);
     auto after = before;
@@ -304,14 +376,14 @@ void TestDirectUiEvidenceContracts() {
     // Semantic identity is adapter-scoped, so the same key under two profiles is
     // two different nodes and a RuntimeId never leaks into identity.
     const uint64_t first = Translation::DirectUiSemanticNodeId(
-        profile->adapterId, L"MainInstruction");
+        profile->adapterId, L"semantic.instruction");
     const uint64_t second = Translation::DirectUiSemanticNodeId(
-        profile->adapterId, L"MainInstruction");
+        profile->adapterId, L"semantic.instruction");
     Check(first == second && first != Translation::DirectUiSemanticNodeId(
-        profile->adapterId, L"ContentText"),
+        profile->adapterId, L"semantic.content"),
         "DirectUI semantic identity is not stable and key-scoped");
     Check(first != Translation::DirectUiSemanticNodeId(
-        L"microsoft.recoverydrive.directui", L"MainInstruction"),
+        L"test.other-adapter", L"semantic.instruction"),
         "DirectUI semantic identity is not adapter-scoped");
 
     Check(Translation::IsMicrosoftWindowsSignerName(L"Microsoft Windows") &&
@@ -343,7 +415,6 @@ void TestDirectUiEvidenceContracts() {
     generatedProfile.rootClass = L"NativeHWNDHost";
     generatedProfile.slots = generatedSlots;
     generatedProfile.slotCount = std::size(generatedSlots);
-    generatedProfile.genericSemantic = true;
     Translation::DirectUiNativeEvidence generatedNative;
     generatedNative.root = DirectUiWindow(0x500, 50, 0, WS_VISIBLE | WS_POPUP);
     generatedNative.directUi = DirectUiWindow(0x501, 51, 0);
@@ -436,35 +507,54 @@ void TestDirectUiEvidenceContracts() {
               generatedNative, generatedSnapshot, generatedBindings, error),
         "generated DirectUI refresh accepted a changed semantic identity");
 
-    // The admitted profile set is exactly the two known application pages.
-    Check(Translation::kDirectUiProfileCount == 2 &&
-          TestProfileById(L"microsoft.mdsched.directui") != nullptr &&
-          TestProfileById(L"microsoft.recoverydrive.directui") != nullptr,
-        "DirectUI profile registry does not contain exactly the two admitted pages");
-    const auto* recovery = TestProfileById(L"microsoft.recoverydrive.directui");
-    Check(recovery && recovery->rootClass == L"NativeHWNDHost" &&
-          recovery->fileVersion[3] == 33296,
-        "RecoveryDrive profile identity is not the exact admitted contract");
-    bool foundToggle = false;
-    bool foundDisabledBack = false;
-    bool foundPageText = false;
-    for (size_t index = 0; recovery && index < recovery->slotCount; ++index) {
-        const auto& slot = recovery->slots[index];
-        if (slot.action == Translation::DirectUiAction::ToggleCheck) foundToggle = true;
-        if (slot.semanticKey == L"backbutton" && !slot.project) {}
-        if (slot.semanticKey == L"backbutton" && slot.action == Translation::DirectUiAction::None &&
-            !slot.uiaEnabled)
-            foundDisabledBack = true;
-        if (slot.semanticKey == L"pageText" && slot.project && !slot.virtualSource &&
-            slot.nativeClass == L"Static")
-            foundPageText = true;
+    Translation::DirectUiUiaEvidence uia;
+    uia.rootHwnd = before.root.hwnd;
+    uia.directUiHwnd = before.directUi.hwnd;
+    for (size_t index = 0; index < profile->slotCount; ++index) {
+        const auto& slot = profile->slots[index];
+        Translation::DirectUiSemanticEvidence semantic;
+        semantic.semanticKey = slot.semanticKey;
+        semantic.name = slot.virtualSource ? L"localized instruction" : before.slotWindows[index].text;
+        semantic.className = slot.uiaClassName;
+        semantic.frameworkId = slot.uiaFrameworkId;
+        semantic.controlType = slot.uiaControlType;
+        semantic.enabled = slot.uiaEnabled;
+        semantic.focusable = slot.uiaFocusable;
+        semantic.actionable = slot.uiaActionable;
+        semantic.patternMask = slot.uiaPatternMask;
+        semantic.bounds = slot.virtualSource ? RECT{ 10, 20, 310, 60 } : before.slotWindows[index].bounds;
+        semantic.backingHwnd = slot.virtualSource ? nullptr : before.slotWindows[index].hwnd;
+        uia.semantics.push_back(std::move(semantic));
     }
-    Check(foundToggle, "RecoveryDrive profile does not route the checkbox through native toggle");
-    Check(foundDisabledBack, "RecoveryDrive profile does not declare the back button inert");
-    Check(foundPageText && recovery->directUiOwnsTabOrder &&
-          recovery->census.visibleNotifyWrappers == 3 &&
-          recovery->census.hiddenNotifyWrappers == 2,
-        "RecoveryDrive profile does not pin its observed page text, tab owner, and census");
+    Check(Translation::MatchDirectUiEvidence(*profile, before, uia, error),
+        "capability-derived DirectUI UIA evidence was rejected");
+    auto changedUia = uia;
+    changedUia.semantics[0].controlType = UIA_PaneControlTypeId;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted changed virtual provider role");
+    changedUia = uia;
+    changedUia.semantics[0].patternMask = Translation::DirectUiPatternInvoke;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted new actions on a presentation-only virtual slot");
+    changedUia = uia;
+    changedUia.semantics.push_back(uia.semantics[0]);
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted duplicated virtual semantic identity");
+    changedUia = uia;
+    changedUia.semantics[1].bounds.right += 30;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted native/UIA backing geometry mismatch");
+    changedUia = uia;
+    changedUia.semantics[1].patternMask = Translation::DirectUiPatternNone;
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted removal of a backing control's verified route");
+    changedUia = uia;
+    auto unexpected = uia.semantics[0];
+    unexpected.semanticKey = L"unexpected";
+    changedUia.semantics.push_back(std::move(unexpected));
+    Check(!Translation::MatchDirectUiEvidence(*profile, before, changedUia, error),
+        "DirectUI accepted a semantic outside the sealed capability contract");
+
 }
 
 // The in-place routes are the ones that keep a capability-derived page
@@ -589,7 +679,6 @@ void TestDirectUiInPlaceRoutes() {
     profile.rootClass = L"NativeHWNDHost";
     profile.slots = slots;
     profile.slotCount = std::size(slots);
-    profile.genericSemantic = true;
 
     Translation::DirectUiNativeEvidence before;
     before.root = DirectUiWindow(0x600, 60, 0, WS_VISIBLE | WS_POPUP);
@@ -1450,9 +1539,11 @@ void TestControlAdapterRegistry() {
         { L"Button", BS_AUTO3STATE, true, ControlKind::ThreeState, "3-state Button" },
         { L"Button", BS_AUTORADIOBUTTON, true, ControlKind::RadioButton, "radio Button" },
         { L"Button", BS_GROUPBOX, true, ControlKind::GroupBox, "GroupBox" },
-        { L"Button", BS_GROUPBOX | WS_TABSTOP, false, ControlKind::GroupBox,
+        // A group box never takes the focus: a template's WS_TABSTOP on one (MMC's Customize View)
+        // is dropped from the traversal at capture, not a reason to keep the dialog native.
+        { L"Button", BS_GROUPBOX | WS_TABSTOP, true, ControlKind::GroupBox,
           "tab-stop GroupBox" },
-        { L"Button", BS_OWNERDRAW, false, ControlKind::Button, "owner-draw Button" },
+        { L"Button", BS_OWNERDRAW, true, ControlKind::Button, "owner-draw Button" },
         { L"Button", BS_PUSHBUTTON | BS_ICON, true, ControlKind::Button, "icon Button" },
         { L"Button", BS_PUSHBUTTON | BS_BITMAP, true, ControlKind::Button, "bitmap Button" },
         { L"Button", BS_AUTOCHECKBOX | BS_ICON, false, ControlKind::CheckBox, "icon check Button" },
@@ -1462,7 +1553,11 @@ void TestControlAdapterRegistry() {
         { L"ComboBox", CBS_SIMPLE | CBS_HASSTRINGS, false, ControlKind::ComboBox,
           "simple ComboBox" },
         { L"ListBox", 0, true, ControlKind::ListBox, "ListBox" },
-        { L"ListBox", LBS_EXTENDEDSEL, false, ControlKind::ListBox, "multi-select ListBox" },
+        { L"ListBox", LBS_EXTENDEDSEL, true, ControlKind::ListBox, "extended-selection ListBox" },
+        { L"ListBox", LBS_MULTIPLESEL, true, ControlKind::ListBox, "multiple-selection ListBox" },
+        { L"ListBox", LBS_MULTICOLUMN, false, ControlKind::ListBox, "multi-column ListBox" },
+        { L"ListBox", LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "owner-draw ListBox" },
+        { L"ListBox", LBS_NODATA | LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "virtual ListBox" },
         { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
         { PROGRESS_CLASSW, PBS_MARQUEE, true, ControlKind::ProgressBar, "marquee ProgressBar" },
         { PROGRESS_CLASSW, PBS_VERTICAL, false, ControlKind::ProgressBar, "vertical ProgressBar" },
@@ -1503,6 +1598,32 @@ void TestControlAdapterRegistry() {
             Check(!reason.empty(), adapter.label);
         }
         DestroyWindow(child);
+    }
+
+    // A Static that takes the focus and says nothing is a control its dialog subclassed and paints
+    // (the palettes of the Color chooser): a text label could not carry its pixels or its clicks.
+    {
+        struct StaticFocusCase { DWORD style; const wchar_t* text; bool supported; const char* label; };
+        const StaticFocusCase focusCases[] = {
+            { SS_SIMPLE | WS_TABSTOP, L"", false, "tab-stop Static without text" },
+            { SS_LEFT | WS_TABSTOP, L"", false, "tab-stop left Static without text" },
+            { SS_SIMPLE | WS_TABSTOP, L"Label", true, "tab-stop Static with text" },
+            { SS_SIMPLE, L"", true, "empty Static that is not a tab stop" },
+        };
+        for (const auto& focusCase : focusCases) {
+            HWND child = CreateWindowExW(0, L"Static", focusCase.text, WS_CHILD | focusCase.style,
+                0, 0, 80, 24, root, reinterpret_cast<HMENU>(303), GetModuleHandleW(nullptr), nullptr);
+            Check(child != nullptr, focusCase.label);
+            if (!child) continue;
+            ControlKind kind = ControlKind::Count;
+            std::wstring reason;
+            Check(Translation::ClassifyControl(child, kind, reason) == focusCase.supported,
+                focusCase.label);
+            if (!focusCase.supported) {
+                Check(reason.find(L"custom-drawn") != std::wstring::npos, focusCase.label);
+            }
+            DestroyWindow(child);
+        }
     }
 
     HWND styledList = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT,
@@ -1790,10 +1911,17 @@ void TestStructuredCommonControlCapture() {
     virtualContext.surfaceId = L"22222222-2222-3333-4444-555555555555";
     virtualContext.generation = 1;
     virtualContext.revision = 1;
+    // Without rows a column-less list paints nothing and is carried as an empty list;
+    // a virtual list that claims rows it has no columns to show stays refused.
+    Check(virtualList && Translation::CaptureWindow(
+            virtualWindow, virtualContext, rejected, error),
+        "an empty virtual report ListView without columns was refused");
+    if (virtualList) SendMessageW(virtualList, LVM_SETITEMCOUNT, 3, 0);
+    virtualContext.revision = 2;
     Check(virtualList && !Translation::CaptureWindow(
             virtualWindow, virtualContext, rejected, error) &&
             error.find(L"no native report columns") != std::wstring::npos,
-        "virtual report ListView without columns was accepted by the bounded adapter");
+        "virtual report ListView with rows but no columns was accepted by the bounded adapter");
     DestroyWindow(virtualWindow);
 }
 
@@ -2146,6 +2274,152 @@ void TestAncestorEnabledTabOrderCapture() {
     DestroyWindow(window);
 }
 
+// An owner-draw button of any framework but Windows Forms (Performance Monitor's colour swatch) is a push
+// button whose whole face its owner paints: the face is captured as painted, all background included.
+LRESULT CALLBACK OwnerDrawSwatchParent(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (message == WM_DRAWITEM && lParam) {
+        const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        HBRUSH brush = CreateSolidBrush(RGB(200, 30, 30));
+        FillRect(draw->hDC, &draw->rcItem, brush);
+        DeleteObject(brush);
+        return TRUE;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void TestOwnerDrawButtonFace() {
+    HWND root = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"owner-draw-face",
+        WS_OVERLAPPEDWINDOW, 20, 20, 300, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND swatch = root ? CreateWindowExW(0, L"Button", L"Colour", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        10, 10, 90, 24, root, reinterpret_cast<HMENU>(700), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && swatch, "owner-draw swatch controls were not created");
+    if (!root || !swatch) {
+        if (root) DestroyWindow(root);
+        return;
+    }
+    // A face wider than a button picture may be is the inert picture it shows when no key reaches the
+    // button, and has no contract when one does.
+    HWND wide = CreateWindowExW(0, L"Button", L"Wide", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        10, 44, 150, 24, root, reinterpret_cast<HMENU>(701), GetModuleHandleW(nullptr), nullptr);
+    HWND wideFocusable = CreateWindowExW(0, L"Button", L"Wide focusable", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        10, 78, 150, 24, root, reinterpret_cast<HMENU>(702), GetModuleHandleW(nullptr), nullptr);
+    Check(wide && wideFocusable, "wide owner-draw buttons were not created");
+    if (wide && wideFocusable) {
+        Translation::ControlKind wideKind{};
+        std::wstring wideReason;
+        Check(Translation::ClassifyControl(wide, wideKind, wideReason) &&
+              wideKind == Translation::ControlKind::StaticBitmap,
+            "a wide owner-draw button that no key reaches was not carried as an inert picture");
+        wideReason.clear();
+        Check(!Translation::ClassifyControl(wideFocusable, wideKind, wideReason) && !wideReason.empty(),
+            "a wide owner-draw button that takes focus was admitted");
+        DestroyWindow(wideFocusable);
+    }
+    SetWindowSubclass(root, OwnerDrawSwatchParent, 1, 0);
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    UpdateWindow(root);
+    Translation::CaptureContext context;
+    context.surfaceId = L"77777777-7777-7777-7777-555555555555";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring error;
+    const bool captured = Translation::CaptureWindow(root, context, snapshot, error);
+    if (!captured) std::wcerr << L"owner-draw button capture: " << error << L'\n';
+    Check(captured, "an owner-draw button of a non-WinForms owner was rejected");
+    if (captured) {
+        RECT client{};
+        GetClientRect(swatch, &client);
+        const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [swatch](const Translation::ControlNode& candidate) { return candidate.hwnd == swatch; });
+        Check(node != snapshot.nodes.end() && node->kind == Translation::ControlKind::Button &&
+              node->text == L"Colour" &&
+              node->imageWidth == static_cast<uint32_t>(client.right) &&
+              node->imageHeight == static_cast<uint32_t>(client.bottom) &&
+              node->imageData.size() == static_cast<size_t>(client.right) * client.bottom * 4,
+            "an owner-draw button face was not captured at the control's size");
+        if (node != snapshot.nodes.end() && node->imageData.size() >= 4) {
+            const size_t centre = (static_cast<size_t>(client.bottom / 2) * client.right + client.right / 2) * 4;
+            Check(node->imageData[centre] == 30 && node->imageData[centre + 1] == 30 &&
+                  node->imageData[centre + 2] == 200 && node->imageData[centre + 3] == 255,
+                "an owner-draw button face was keyed out instead of captured as painted");
+        }
+    }
+    DestroyWindow(root);
+}
+
+// The native dialog manager numbers a container's tab stops from its first one -- even when the
+// container's first child is itself a tab stop -- and a child dialog that is no control parent (the pages of
+// an OLE property frame, such as Performance Monitor's chart Properties) is a navigation scope of its own.
+void TestTabOrderScopes() {
+    const auto find = [](const Translation::WindowSnapshot& snapshot, HWND window) {
+        return std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [window](const Translation::ControlNode& node) { return node.hwnd == window; });
+    };
+    HWND startRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"tab-order-start",
+        WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND first = startRoot ? CreateWindowExW(0, L"Edit", L"first", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 10, 120, 24, startRoot, reinterpret_cast<HMENU>(501), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND second = startRoot ? CreateWindowExW(0, L"Edit", L"second", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 44, 120, 24, startRoot, reinterpret_cast<HMENU>(502), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND third = startRoot ? CreateWindowExW(0, L"Button", L"third", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        10, 78, 120, 24, startRoot, reinterpret_cast<HMENU>(503), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(startRoot && first && second && third, "tab-order start controls were not created");
+    if (startRoot && first && second && third) {
+        ShowWindow(startRoot, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"66666666-6666-6666-6666-555555555555";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        Check(Translation::CaptureWindow(startRoot, context, snapshot, error), "tab-order start window was rejected");
+        const auto a = find(snapshot, first), b = find(snapshot, second), c = find(snapshot, third);
+        Check(a != snapshot.nodes.end() && b != snapshot.nodes.end() && c != snapshot.nodes.end() &&
+              a->tabIndex == 0 && b->tabIndex == 1 && c->tabIndex == 2,
+            "a first child that is a tab stop was not numbered first");
+    }
+    if (startRoot) DestroyWindow(startRoot);
+
+    HWND frame = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"property-frame",
+        WS_OVERLAPPEDWINDOW, 20, 20, 400, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND frameButton = frame ? CreateWindowExW(0, L"Button", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        10, 250, 80, 24, frame, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    // No DS_CONTROL and no WS_EX_CONTROLPARENT: the frame's dialog manager never reaches the page's controls.
+    HWND page = frame ? CreateWindowExW(0, L"#32770", L"Page", WS_CHILD | WS_VISIBLE,
+        10, 10, 360, 200, frame, reinterpret_cast<HMENU>(600), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND pageFirst = page ? CreateWindowExW(0, L"Edit", L"one", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 10, 150, 24, page, reinterpret_cast<HMENU>(601), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    HWND pageSecond = page ? CreateWindowExW(0, L"Edit", L"two", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 44, 150, 24, page, reinterpret_cast<HMENU>(602), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(frame && frameButton && page && pageFirst && pageSecond, "property-page tab-order controls were not created");
+    if (frame && frameButton && page && pageFirst && pageSecond) {
+        ShowWindow(frame, SW_SHOWNOACTIVATE);
+        Translation::CaptureContext context;
+        context.surfaceId = L"66666666-6666-6666-6666-666666666666";
+        context.generation = 1;
+        context.revision = 1;
+        Translation::WindowSnapshot snapshot;
+        std::wstring error;
+        const bool captured = Translation::CaptureWindow(frame, context, snapshot, error);
+        if (!captured) std::wcerr << L"property page capture: " << error << L'\n';
+        Check(captured, "a child dialog that is no control parent was rejected");
+        if (captured) {
+            const auto container = find(snapshot, page);
+            const auto one = find(snapshot, pageFirst), two = find(snapshot, pageSecond), ok = find(snapshot, frameButton);
+            Check(container != snapshot.nodes.end() && one != snapshot.nodes.end() && two != snapshot.nodes.end() &&
+                  ok != snapshot.nodes.end() &&
+                  container->kind == Translation::ControlKind::DialogContainer && container->tabIndex == -1,
+                "a child dialog that is no control parent was not captured as a structural container");
+            Check(one != snapshot.nodes.end() && two != snapshot.nodes.end() && ok != snapshot.nodes.end() &&
+                  one->tabIndex >= 0 && two->tabIndex >= 0 && ok->tabIndex >= 0 &&
+                  one->tabIndex + 1 == two->tabIndex && one->tabIndex != ok->tabIndex && two->tabIndex != ok->tabIndex,
+                "the controls of an independent dialog page lost their own tab order");
+        }
+    }
+    if (frame) DestroyWindow(frame);
+}
+
 void TestTabOrderRejectionSpecificity() {
     HWND dialogRoot = CreateWindowExW(WS_EX_CONTROLPARENT, L"Static", L"dialog-container",
         WS_OVERLAPPEDWINDOW, 20, 20, 360, 240, nullptr, nullptr,
@@ -2364,6 +2638,10 @@ public:
     bool duplicateTabSelection = false;
     int selectedTab = 1;
     unsigned drives = 0;
+    // Menu-bar buttons (one-based) that report STATE_SYSTEM_INVISIBLE, as MMC's hidden
+    // Favorites and snap-in placeholders do, and the last one whose default action opens a popup.
+    std::vector<long> hiddenChildren;
+    long popupChildLimit = 2;
     DWORD thread = GetCurrentThreadId();
     TestIslandPopupRuntime* islandRuntime = nullptr;
 
@@ -2435,6 +2713,9 @@ public:
             if (child.lVal == selectedTab || duplicateTabSelection) state->lVal |= STATE_SYSTEM_SELECTED;
             if (!itemEnabled) state->lVal |= STATE_SYSTEM_UNAVAILABLE;
         }
+        if (child.vt == VT_I4 && std::find(hiddenChildren.begin(), hiddenChildren.end(), child.lVal) !=
+                hiddenChildren.end())
+            state->lVal |= STATE_SYSTEM_INVISIBLE;
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE get_accHelp(VARIANT, BSTR*) override { return S_FALSE; }
@@ -2483,7 +2764,7 @@ public:
             PostMessageW(toolbar, kTestMenuFlood, 0, 0);
             return S_OK;
         }
-        if (child.vt == VT_I4 && child.lVal < 3)
+        if (child.vt == VT_I4 && child.lVal <= popupChildLimit)
             PostMessageW(toolbar, kTestMenuPopup, child.lVal, 0);
         return S_OK;
     }
@@ -2689,6 +2970,24 @@ void TestMenuBarToolbarLifecycle() {
         menu[0].items[0].commandId == 77 && menu[0].items[0].itemId == L"0.0" &&
         menu[1].itemId == L"1" && !menu[1].enabled && menu[1].items.empty(),
         "menu-bar capture lost copied commands, system-menu filtering or empty popup state");
+    {
+        // The Window button opens nothing. The read remembers that, and the next
+        // read waits only briefly for it instead of the full popup interval.
+        std::vector<bool> silent;
+        auto started = GetTickCount64();
+        const bool first = Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            600, 4000, cancelled, menu, error, nullptr, &silent);
+        const auto firstElapsed = GetTickCount64() - started;
+        Check(first && silent == std::vector<bool>{ false, false, true },
+            "menu-bar read did not remember the button that opened no popup");
+        started = GetTickCount64();
+        const bool second = Translation::CaptureMenuBarToolbar(root, toolbar, context.menuBarButtons,
+            600, 4000, cancelled, menu, error, nullptr, &silent);
+        const auto secondElapsed = GetTickCount64() - started;
+        Check(second && menu.size() == 2 && !menu[1].enabled && firstElapsed >= 600 &&
+            secondElapsed + 300 < firstElapsed,
+            "a button that opened no popup still cost the full wait on the next read");
+    }
     context.menuBarToolbarMenu = menu;
     Translation::ObserveMenuBarToolbar(root, context);
     Check(!context.menuBarToolbarMenu.empty(), "unchanged toolbar discarded cached menu");
@@ -3104,11 +3403,20 @@ void TestSourceThreadPopupTracking() {
         action.action = L"islandInvoke";
         action.itemIndex = 0;
         Translation::ActionOutcome outcome;
-        if (!agent->Invoke(action, outcome) || !outcome.accepted) return false;
+        if (!agent->Invoke(action, outcome) || !outcome.accepted) {
+            std::wcerr << L"source popup invoke: " << outcome.error << L'\n';
+            return false;
+        }
         snapshot = std::move(outcome.snapshot);
         if (WaitForSingleObject(runtime.tracking, 2000) != WAIT_OBJECT_0 ||
-            WaitForSingleObject(runtime.returned, 0) != WAIT_TIMEOUT) return false;
-        return agent->Capture(snapshot, error) && snapshot.popupMenu.has_value();
+            WaitForSingleObject(runtime.returned, 0) != WAIT_TIMEOUT) {
+            std::wcerr << L"source popup tracking did not start or returned early\n";
+            return false;
+        }
+        const bool captured = agent->Capture(snapshot, error);
+        if (!captured || !snapshot.popupMenu)
+            std::wcerr << L"source popup snapshot: " << error << L'\n';
+        return captured && snapshot.popupMenu.has_value();
     };
     const auto answer = [&](std::optional<std::wstring> itemId) {
         Translation::ActionRequest action;
@@ -3291,6 +3599,8 @@ void CheckVirtualDialogSnapshot(
         if (node.hwnd != nullptr) ok = false;
         if (++seenIds[node.nodeId] > 1) ok = false;
         if (++seenZ[node.zIndex] > 1) ok = false;
+        // The renderer refuses a tab index on a control that is not a tab stop.
+        if (!node.tabStop && node.tabIndex != -1) ok = false;
     }
     Check(ok, label);
 }
@@ -3571,52 +3881,538 @@ void TestPaneContainerCaptureAndSplit() {
     DestroyWindow(root);
 }
 
+// A Windows Forms dialog shown without an owner is parented to the desktop and disables the
+// thread's other top-level windows instead (Event Viewer's Filter dialog). The desktop is no
+// owner; the disabled window is the one the dialog is modal to.
+void TestUnownedModalDialogOwnerResolution() {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND frame = CreateWindowExW(0, L"Static", L"modal-peer-frame", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40, 40, 320, 220, nullptr, nullptr, instance, nullptr);
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"Static", L"modal-peer-dialog",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 70, 70, 200, 120, GetDesktopWindow(), nullptr, instance, nullptr);
+    HWND plain = CreateWindowExW(0, L"Static", L"modal-peer-plain",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 90, 90, 200, 120, GetDesktopWindow(), nullptr, instance, nullptr);
+    Check(frame && dialog && plain, "unowned modal dialog fixtures were not created");
+    if (!frame || !dialog || !plain) {
+        for (HWND window : { frame, dialog, plain }) if (window) DestroyWindow(window);
+        return;
+    }
+    Check(Translation::EffectiveTopLevelOwner(dialog) == nullptr && !Translation::IsModalOwnedTopLevel(dialog),
+        "a dialog beside an enabled window was given an owner");
+    EnableWindow(frame, FALSE);
+    Check(Translation::EffectiveTopLevelOwner(dialog) == frame && Translation::IsModalOwnedTopLevel(dialog),
+        "an unowned dialog was not modal to the window disabled for it");
+    Check(Translation::EffectiveTopLevelOwner(frame) == nullptr && !Translation::IsModalOwnedTopLevel(frame),
+        "the disabled window was given an owner");
+    Check(Translation::EffectiveTopLevelOwner(plain) == nullptr,
+        "a window with no dialog frame was taken for the dialog of a disabled peer");
+    EnableWindow(frame, TRUE);
+    Check(Translation::EffectiveTopLevelOwner(dialog) == nullptr,
+        "a dialog stayed owned by a window that is enabled again");
+    DestroyWindow(plain);
+    DestroyWindow(dialog);
+    DestroyWindow(frame);
+}
+
+// A group box a dialog template gave WS_TABSTOP is no stop of the traversal: the box is captured, takes
+// neither a tab stop nor a tab index, and the controls around it keep theirs.
+void TestTabStopGroupBoxIsNotATabStop() {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    struct WindowOwner final {
+        HWND window;
+        ~WindowOwner() { if (window) DestroyWindow(window); }
+    } owner{ CreateWindowExW(WS_EX_CONTROLPARENT, L"#32770", L"group-tab",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, 40, 40, 300, 200, nullptr, nullptr, instance, nullptr) };
+    const HWND root = owner.window;
+    const HWND first = root ? CreateWindowExW(0, L"Edit", L"a", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        10, 10, 100, 22, root, reinterpret_cast<HMENU>(61), instance, nullptr) : nullptr;
+    const HWND group = root ? CreateWindowExW(0, L"Button", L"frame", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+        WS_GROUP | BS_GROUPBOX, 10, 40, 200, 100, root, reinterpret_cast<HMENU>(62), instance, nullptr) : nullptr;
+    const HWND second = root ? CreateWindowExW(0, L"Edit", L"b", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        20, 60, 100, 22, root, reinterpret_cast<HMENU>(63), instance, nullptr) : nullptr;
+    Check(root && first && group && second, "tab-stop group box fixture could not create its windows");
+    if (!root || !first || !group || !second) return;
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    Translation::CaptureContext context;
+    context.surfaceId = L"a1a1a1a1-b2b2-c3c3-d4d4-e5e5e5e5e5e5";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    std::wstring reason;
+    const bool captured = Translation::CaptureWindow(root, context, snapshot, reason);
+    if (!captured) std::wcerr << L"tab-stop group box capture: " << reason << L"\n";
+    const auto find = [&snapshot](HWND window) {
+        return std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [window](const auto& candidate) { return candidate.hwnd == window; });
+    };
+    const auto groupNode = find(group);
+    const auto firstNode = find(first);
+    const auto secondNode = find(second);
+    Check(captured && groupNode != snapshot.nodes.end() && groupNode->kind == Translation::ControlKind::GroupBox &&
+        !groupNode->tabStop && groupNode->tabIndex == -1,
+        "a tab-stop group box was captured as a tab stop or refused");
+    Check(captured && firstNode != snapshot.nodes.end() && secondNode != snapshot.nodes.end() &&
+        firstNode->tabStop && secondNode->tabStop && firstNode->tabIndex >= 0 && secondNode->tabIndex >= 0,
+        "the controls around a tab-stop group box lost their tab stops");
+}
+
+// An animation control (the flashlight of Find Certificates) takes no input: it travels as the picture it
+// shows, and one that is a tab stop is refused.
+void TestAnimationControlIsAnInertPicture() {
+    INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_ANIMATE_CLASS };
+    InitCommonControlsEx(&controls);
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    struct WindowOwner final {
+        HWND window;
+        ~WindowOwner() { if (window) DestroyWindow(window); }
+    } owner{ CreateWindowExW(WS_EX_CONTROLPARENT, L"#32770", L"animation",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, 40, 40, 300, 200, nullptr, nullptr, instance, nullptr) };
+    const HWND root = owner.window;
+    const HWND animation = root ? CreateWindowExW(0, ANIMATE_CLASSW, L"", WS_CHILD | WS_VISIBLE | ACS_TRANSPARENT,
+        10, 10, 48, 48, root, reinterpret_cast<HMENU>(71), instance, nullptr) : nullptr;
+    const HWND focusable = root ? CreateWindowExW(0, ANIMATE_CLASSW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        80, 10, 48, 48, root, reinterpret_cast<HMENU>(72), instance, nullptr) : nullptr;
+    Check(root && animation && focusable, "animation fixture could not create its windows");
+    if (!root || !animation || !focusable) return;
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(animation, kind, reason) && kind == Translation::ControlKind::StaticBitmap,
+        "an animation control was not classified as an inert picture");
+    reason.clear();
+    Check(!Translation::ClassifyControl(focusable, kind, reason) && !reason.empty(),
+        "an animation control that is a tab stop was accepted");
+    DestroyWindow(focusable);
+    Translation::CaptureContext context;
+    context.surfaceId = L"b1b1b1b1-c2c2-d3d3-e4e4-f5f5f5f5f5f5";
+    context.generation = 1;
+    context.revision = 1;
+    Translation::WindowSnapshot snapshot;
+    const bool captured = Translation::CaptureWindow(root, context, snapshot, reason);
+    if (!captured) std::wcerr << L"animation capture: " << reason << L"\n";
+    const auto node = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+        [animation](const auto& candidate) { return candidate.hwnd == animation; });
+    Check(captured && node != snapshot.nodes.end() && node->kind == Translation::ControlKind::StaticBitmap &&
+        node->imageWidth > 0 && node->imageHeight > 0 && !node->imageData.empty(),
+        "an animation control's frame was not captured as a picture");
+}
+
+// A dialog opened from a dialog (a Color chooser from a property sheet from a console) is a
+// chain: each window is modal to the one that owns it exactly while that one is disabled.
+// The chain is projected one dialog at a time, so every level has to answer for itself.
+void TestNestedModalDialogChain() {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND frame = CreateWindowExW(0, L"Static", L"chain-frame", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        40, 40, 360, 240, nullptr, nullptr, instance, nullptr);
+    HWND sheet = frame ? CreateWindowExW(WS_EX_DLGMODALFRAME, L"Static", L"chain-sheet",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 70, 70, 260, 160, frame, nullptr, instance, nullptr) : nullptr;
+    HWND chooser = sheet ? CreateWindowExW(WS_EX_DLGMODALFRAME, L"Static", L"chain-chooser",
+        WS_POPUP | WS_CAPTION | WS_VISIBLE, 100, 100, 180, 110, sheet, nullptr, instance, nullptr) : nullptr;
+    Check(frame && sheet && chooser, "nested dialog chain fixtures were not created");
+    if (!frame || !sheet || !chooser) {
+        for (HWND window : { chooser, sheet, frame }) if (window) DestroyWindow(window);
+        return;
+    }
+    Check(Translation::EffectiveTopLevelOwner(chooser) == sheet &&
+          Translation::EffectiveTopLevelOwner(sheet) == frame &&
+          Translation::EffectiveTopLevelOwner(frame) == nullptr,
+        "the dialog chain did not resolve each window to its own owner");
+    // Everything enabled: nothing is modal, whatever the depth.
+    Check(!Translation::IsModalOwnedTopLevel(sheet) && !Translation::IsModalOwnedTopLevel(chooser),
+        "a dialog of an enabled owner was taken for a modal one");
+    // The sheet is open modally over the console.
+    EnableWindow(frame, FALSE);
+    Check(Translation::IsModalOwnedTopLevel(sheet) && !Translation::IsModalOwnedTopLevel(chooser),
+        "the sheet was not modal to the disabled console, or the chooser was modal to the enabled sheet");
+    // The chooser is open modally over the sheet: it is modal although its owner is itself owned.
+    EnableWindow(sheet, FALSE);
+    Check(Translation::IsModalOwnedTopLevel(sheet) && Translation::IsModalOwnedTopLevel(chooser),
+        "a dialog modal to an owned dialog was not taken for a modal one");
+    Check(!Translation::IsModalOwnedTopLevel(frame), "the console of the chain was taken for a dialog");
+    EnableWindow(sheet, TRUE);
+    EnableWindow(frame, TRUE);
+    DestroyWindow(chooser);
+    DestroyWindow(sheet);
+    DestroyWindow(frame);
+}
+
+// A form page of label/field rows has a strip between each label and its field, and every
+// strip has a neighbour on both sides. None of them is a splitter: each is one row tall and
+// stops at the next row (Task Scheduler's task Properties page offered a draggable bar).
+void TestFormRowStripsAreNotSplits() {
+    WNDCLASSEXW containerClass{};
+    containerClass.cbSize = sizeof(containerClass);
+    containerClass.lpfnWndProc = PaneContainerProc;
+    containerClass.hInstance = GetModuleHandleW(nullptr);
+    containerClass.lpszClassName = L"FluentShellTestPaneHost";
+    RegisterClassExW(&containerClass);
+
+    HWND root = CreateWindowExW(0, L"Static", L"form-rows", WS_OVERLAPPEDWINDOW,
+        30, 30, 360, 280, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND container = root ? CreateWindowExW(0, L"FluentShellTestPaneHost", L"",
+        WS_CHILD | WS_VISIBLE, 0, 0, 300, 94, root, reinterpret_cast<HMENU>(700),
+        GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(root && container, "form-row test container was not created");
+    if (!root || !container) {
+        if (root) DestroyWindow(root);
+        return;
+    }
+    // Three rows, 26 px tall (a pane's minimum extent is 24), 8 px between a label and its
+    // field and between rows: every uncovered piece is a thin strip, so the rows tile.
+    for (int row = 0; row < 3; ++row) {
+        const int top = row * 34;
+        CreateWindowExW(0, L"Static", L"label", WS_CHILD | WS_VISIBLE,
+            0, top, 90, 26, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+        CreateWindowExW(0, L"Static", L"field", WS_CHILD | WS_VISIBLE,
+            98, top, 202, 26, container, nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    ShowWindow(root, SW_SHOWNOACTIVATE);
+    UpdateWindow(root);
+
+    Translation::ControlKind kind{};
+    std::wstring reason;
+    Check(Translation::ClassifyControl(container, kind, reason) &&
+          kind == Translation::ControlKind::PaneContainer,
+        "a container of label/field rows was not admitted");
+    Translation::ControlNode node;
+    node.kind = Translation::ControlKind::PaneContainer;
+    reason.clear();
+    Check(Translation::CaptureControlDetail(container, node, reason) && node.splits.empty(),
+        "a strip between a label and its field was offered as a draggable split");
+    if (!node.splits.empty()) std::wcerr << L"form-row splits=" << node.splits.size() << L'\n';
+    DestroyWindow(root);
+}
+
 void TestVirtualDialogSnapshots() {
+    using Translation::DialogTextMeasure;
     std::unordered_map<uint64_t, int> results;
     const auto messageBox = Translation::BuildMessageBoxSnapshot(
-        nullptr, L"The call was answered by the projection.", L"Oracle",
-        MB_YESNOCANCEL | MB_ICONEXCLAMATION, results);
+        nullptr, L"Save & exit?", L"Oracle",
+        MB_YESNOCANCEL | MB_ICONEXCLAMATION | MB_DEFBUTTON2, results);
     Check(messageBox.surfaceKind == Translation::SurfaceKind::MessageBox &&
           messageBox.icon == L"warning" && messageBox.canCancel &&
           messageBox.nodes.size() == 4 && results.size() == 3,
         "MessageBox translation did not describe its buttons");
     CheckVirtualDialogSnapshot(messageBox, "translated MessageBox broke a protocol invariant");
 
-    // Every text block, the verification checkbox, and every button share one
-    // snapshot, which is where duplicate z-indexes came from.
-    TASKDIALOGCONFIG config{};
-    config.cbSize = sizeof(config);
-    config.dwFlags = TDF_VERIFICATION_FLAG_CHECKED | TDF_ALLOW_DIALOG_CANCELLATION;
-    config.pszMainIcon = TD_INFORMATION_ICON;
-    config.nDefaultButton = IDOK;
-    const std::vector<std::pair<int, std::wstring>> buttons{
-        { IDOK, L"OK" }, { IDCANCEL, L"Cancel" }
-    };
-    std::unordered_map<uint64_t, int> dialogResults;
-    std::optional<uint64_t> verificationNode;
-    const auto taskDialog = Translation::BuildTaskDialogSnapshot(
-        config, buttons, L"Oracle", L"Main instruction", L"Body content",
-        L"Footer", L"Do not ask again", dialogResults, verificationNode);
-    Check(taskDialog.surfaceKind == Translation::SurfaceKind::TaskDialog &&
-          taskDialog.icon == L"info" && taskDialog.canCancel &&
-          taskDialog.nodes.size() == 6 && dialogResults.size() == 2 &&
-          verificationNode.has_value(),
-        "TaskDialog translation did not describe its content");
-    CheckVirtualDialogSnapshot(taskDialog, "translated TaskDialog broke a protocol invariant");
+    // The dialog is as large as its text: a short message is a small dialog, its text
+    // beside the icon, and the buttons right-aligned in the band below it.
+    const DialogTextMeasure measure(messageBox.dpi);
+    const RECT& client = messageBox.clientBounds;
+    const auto& text = messageBox.nodes.front();
+    Check(client.right < measure.Px(480) && client.bottom < measure.Px(200),
+        "a short MessageBox was not sized to its text");
+    Check(text.kind == Translation::ControlKind::StaticText && text.text == L"Save && exit?" &&
+          text.rect.left >= measure.Px(20 + 32) && text.rect.right <= client.right,
+        "MessageBox text was not escaped or not placed beside its icon");
+    LONG previousRight = 0;
+    for (size_t index = 1; index < messageBox.nodes.size(); ++index) {
+        const auto& button = messageBox.nodes[index];
+        Check(button.kind == Translation::ControlKind::Button && button.rect.top >= text.rect.bottom &&
+              button.rect.bottom <= client.bottom && button.rect.left >= previousRight &&
+              button.text == Translation::DialogButtonLabel(results.at(button.nodeId)),
+            "MessageBox buttons are not a band of labelled buttons under the text");
+        previousRight = button.rect.right;
+    }
+    Check(client.right - previousRight == measure.Px(20),
+        "MessageBox buttons are not right-aligned at the margin");
+    Check(messageBox.nodes[2].isDefault && !messageBox.nodes[1].isDefault,
+        "MB_DEFBUTTON2 did not make the second button the default");
+    const LONG frameWidth = messageBox.bounds.right - messageBox.bounds.left;
+    Check(frameWidth > client.right, "MessageBox bounds do not include the window frame");
 
-    // An empty text block is skipped rather than projected as a blank node, and the
-    // remaining nodes still form one contiguous, unique z-order.
-    TASKDIALOGCONFIG spare{};
-    spare.cbSize = sizeof(spare);
-    std::unordered_map<uint64_t, int> spareResults;
-    std::optional<uint64_t> spareVerification;
+    std::unordered_map<uint64_t, int> okResults;
+    const auto okBox = Translation::BuildMessageBoxSnapshot(nullptr, L"Done.", L"", MB_OK, okResults);
+    Check(okBox.canCancel && okBox.icon == L"none" && okBox.nodes.front().rect.left == measure.Px(20),
+        "a lone OK message box cannot be dismissed with Escape or reserves icon space");
+
+    // Links: <a href> markup becomes the visible label, reported by its href.
+    const auto parsed = Translation::ParseTaskDialogLinks(
+        L"Visit <a href=\"https://example.test/\">the site</a> or <A HREF='help'>help</A>.");
+    Check(parsed.text == L"Visit the site or help." && parsed.labels.size() == 2 &&
+          parsed.hrefs[0] == L"https://example.test/" && parsed.hrefs[1] == L"help",
+        "task dialog link markup was not parsed");
+
+    // A full task dialog: every element in one snapshot with unique IDs and z-order.
+    Translation::TaskDialogModel model;
+    model.title = L"Oracle";
+    model.instruction = L"Main instruction";
+    model.content = L"Body content with <a href=\"x\">a link</a>.";
+    model.expandedInformation = L"Expanded details";
+    model.footer = L"Footer";
+    model.footerIcon.standard = L"info";
+    model.verification = L"Do not ask again";
+    model.mainIcon.standard = L"warning";
+    model.hyperlinks = true;
+    model.canCancel = true;
+    model.progress = Translation::TaskDialogProgress::Normal;
+    model.progressPosition = 40;
+    model.radios = { { 10, L"&First", true }, { 11, L"&Second", true } };
+    model.selectedRadio = 11;
+    Translation::TaskDialogButtonModel link;
+    link.id = 100;
+    link.text = L"&Continue";
+    link.note = L"Keeps going";
+    link.commandLink = true;
+    model.buttons.push_back(link);
+    model.buttons.push_back({ IDOK, L"OK" });
+    model.buttons.push_back({ IDCANCEL, L"Cancel" });
+    Translation::TaskDialogElements elements;
+    const auto taskDialog = Translation::BuildTaskDialogSnapshot(
+        model, nullptr, nullptr, 96, std::nullopt, elements);
+    CheckVirtualDialogSnapshot(taskDialog, "translated TaskDialog broke a protocol invariant");
+    size_t radios = 0, buttons = 0, texts = 0, verification = 0, expando = 0;
+    for (const auto& [_, element] : elements) {
+        switch (element.kind) {
+        case Translation::TaskDialogElementKind::Radio: ++radios; break;
+        case Translation::TaskDialogElementKind::Button: ++buttons; break;
+        case Translation::TaskDialogElementKind::Text: ++texts; break;
+        case Translation::TaskDialogElementKind::Verification: ++verification; break;
+        case Translation::TaskDialogElementKind::Expando: ++expando; break;
+        }
+    }
+    Check(taskDialog.surfaceKind == Translation::SurfaceKind::TaskDialog && taskDialog.icon == L"warning" &&
+          radios == 2 && buttons == 3 && texts == 1 && verification == 1 && expando == 1,
+        "TaskDialog translation did not describe every element");
+    const auto nodeById = [](const Translation::WindowSnapshot& snapshot, uint64_t id) {
+        return std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [&](const auto& node) { return node.nodeId == id; });
+    };
+    const auto commandLink = std::find_if(taskDialog.nodes.begin(), taskDialog.nodes.end(),
+        [](const auto& node) { return node.presentationVariant == L"commandLink"; });
+    Check(commandLink != taskDialog.nodes.end() && commandLink->helpText == L"Keeps going" &&
+          commandLink->controlId == 100,
+        "a command link lost its note");
+    const auto selected = std::count_if(taskDialog.nodes.begin(), taskDialog.nodes.end(),
+        [](const auto& node) { return node.kind == Translation::ControlKind::RadioButton && node.checked == 1; });
+    Check(selected == 1, "TaskDialog radio selection is not exactly the default radio");
+    Check(nodeById(taskDialog, 4) == taskDialog.nodes.end(), "collapsed expanded information was projected");
+
+    // Expanding keeps every element's identity and grows the dialog downward.
+    model.expanded = true;
+    Translation::TaskDialogElements expandedElements;
+    const auto expanded = Translation::BuildTaskDialogSnapshot(
+        model, nullptr, nullptr, 96, POINT{ 0, 0 }, expandedElements);
+    Check(nodeById(expanded, 4) != expanded.nodes.end() &&
+          expanded.clientBounds.bottom > taskDialog.clientBounds.bottom &&
+          expanded.nodes.size() == taskDialog.nodes.size() + 1,
+        "expanding a TaskDialog did not add its details in place");
+    for (const auto& node : taskDialog.nodes) {
+        Check(nodeById(expanded, node.nodeId) != expanded.nodes.end(),
+            "a TaskDialog rebuild changed an element's node ID");
+    }
+
+    // An empty text block is skipped rather than projected as a blank node.
+    Translation::TaskDialogModel sparse;
+    sparse.instruction = L"Only an instruction";
+    sparse.buttons.push_back({ IDOK, L"OK" });
+    Translation::TaskDialogElements sparseElements;
     const auto minimal = Translation::BuildTaskDialogSnapshot(
-        spare, { { IDOK, L"OK" } }, L"", L"Only an instruction", L"", L"", L"",
-        spareResults, spareVerification);
-    Check(minimal.nodes.size() == 2 && !spareVerification.has_value() &&
-          minimal.title == L"Dialog" && minimal.icon == L"none",
+        sparse, nullptr, nullptr, 96, std::nullopt, sparseElements);
+    Check(minimal.nodes.size() == 2 && minimal.icon == L"none" && !minimal.title.empty(),
         "a sparse TaskDialog was not reduced to its real content");
     CheckVirtualDialogSnapshot(minimal, "sparse TaskDialog broke a protocol invariant");
+}
+
+// The task dialog's callback contract: notifications reach the callback with the
+// host HWND on the calling thread, TDM_* messages change the published dialog, and
+// S_FALSE from TDN_BUTTON_CLICKED keeps it open.
+struct TaskDialogProbe final {
+    std::vector<UINT> notifications;
+    int refusals = 1;
+    HWND host = nullptr;
+    std::wstring href;
+};
+
+HRESULT CALLBACK ProbeTaskDialogCallback(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LONG_PTR data) {
+    auto* probe = reinterpret_cast<TaskDialogProbe*>(data);
+    probe->notifications.push_back(message);
+    probe->host = hwnd;
+    if (message == TDN_DIALOG_CONSTRUCTED) SendMessageW(hwnd, TDM_ENABLE_BUTTON, IDOK, FALSE);
+    if (message == TDN_HYPERLINK_CLICKED && lParam) probe->href = reinterpret_cast<PCWSTR>(lParam);
+    if (message == TDN_BUTTON_CLICKED && wParam == IDCANCEL && probe->refusals > 0) {
+        --probe->refusals;
+        return S_FALSE;
+    }
+    return S_OK;
+}
+
+void PumpTaskDialogHost() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
+}
+
+void TestVirtualTaskDialogCallbacks() {
+    TaskDialogProbe probe;
+    const TASKDIALOG_BUTTON radios[] = { { 20, L"One" }, { 21, L"Two" } };
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_SHOW_PROGRESS_BAR;
+    config.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+    config.pszMainInstruction = L"Probe";
+    config.pszContent = L"See <a href=\"probe-link\">the link</a>.";
+    config.cRadioButtons = 2;
+    config.pRadioButtons = radios;
+    config.pfCallback = ProbeTaskDialogCallback;
+    config.lpCallbackData = reinterpret_cast<LONG_PTR>(&probe);
+    std::wstring reason;
+    auto dialog = Translation::VirtualTaskDialog::Create(config, nullptr, reason);
+    Check(dialog != nullptr, "a callback task dialog was refused");
+    if (!dialog) return;
+    const auto initial = dialog->InitialSnapshot();
+    Check(!initial.nodes.empty(), "the callback task dialog has no content");
+    std::vector<Translation::WindowSnapshot> published;
+    bool completed = false;
+    Translation::VirtualTaskDialog::Sink sink;
+    std::vector<uint64_t> publishedEvents;
+    sink.publish = [&](Translation::WindowSnapshot snapshot, uint64_t eventId) {
+        published.push_back(std::move(snapshot));
+        publishedEvents.push_back(eventId);
+    };
+    sink.complete = [&] { completed = true; };
+    Check(dialog->Start(std::move(sink)), "the task dialog host window was not created");
+    dialog->Announce();
+    Check(probe.notifications.size() >= 2 && probe.notifications[0] == TDN_DIALOG_CONSTRUCTED &&
+          probe.notifications[1] == TDN_CREATED && probe.host == dialog->Host(),
+        "the callback did not see the dialog created on its host window");
+    Check(!published.empty() && std::any_of(published.back().nodes.begin(), published.back().nodes.end(),
+        [](const auto& node) { return node.controlId == IDOK && !node.enabled; }),
+        "TDM_ENABLE_BUTTON from TDN_DIALOG_CONSTRUCTED did not disable the button");
+    if (published.empty()) return;
+
+    // A radio click and a link click arrive as renderer actions.
+    const auto current = published.back();
+    const auto radio = std::find_if(current.nodes.begin(), current.nodes.end(),
+        [](const auto& node) { return node.controlId == 21; });
+    const auto text = std::find_if(current.nodes.begin(), current.nodes.end(),
+        [](const auto& node) { return node.kind == Translation::ControlKind::SysLink; });
+    Check(radio != current.nodes.end() && text != current.nodes.end(), "the probe dialog lost a radio or its link");
+    if (radio == current.nodes.end() || text == current.nodes.end()) return;
+    Translation::ActionRequest select;
+    select.action = L"setCheck";
+    select.nodeId = radio->nodeId;
+    select.integerValue = 1;
+    select.eventId = 7;
+    dialog->PostAction(select);
+    Translation::ActionRequest follow;
+    follow.action = L"invoke";
+    follow.nodeId = text->nodeId;
+    follow.eventId = 9;
+    dialog->PostAction(follow);
+    PumpTaskDialogHost();
+    Check(dialog->Result().radioButton == 21 && probe.href == L"probe-link",
+        "a radio or link action did not reach the callback");
+    // Every accepted action is answered by a patch naming its event, or the renderer keeps
+    // the click pending for good.
+    Check(std::find(publishedEvents.begin(), publishedEvents.end(), 7) != publishedEvents.end() &&
+          std::find(publishedEvents.begin(), publishedEvents.end(), 9) != publishedEvents.end(),
+        "a radio or link action was not answered with a patch naming its event");
+
+    SendMessageW(dialog->Host(), TDM_SET_PROGRESS_BAR_POS, 60, 0);
+    Check(std::any_of(published.back().nodes.begin(), published.back().nodes.end(),
+        [](const auto& node) { return node.kind == Translation::ControlKind::ProgressBar && node.position == 60; }),
+        "TDM_SET_PROGRESS_BAR_POS did not move the progress bar");
+
+    // The first Cancel is refused by the callback, the second closes the dialog.
+    Translation::ActionRequest close;
+    close.action = L"close";
+    dialog->PostAction(close);
+    PumpTaskDialogHost();
+    Check(!completed && !dialog->Completed(), "S_FALSE from TDN_BUTTON_CLICKED did not keep the dialog open");
+    SendMessageW(dialog->Host(), TDM_CLICK_BUTTON, IDCANCEL, 0);
+    Check(completed && dialog->Result().button == IDCANCEL, "TDM_CLICK_BUTTON did not close the dialog");
+    dialog->Finish();
+    Check(probe.notifications.back() == TDN_DESTROYED && dialog->Host() == nullptr,
+        "the task dialog was not destroyed with TDN_DESTROYED");
+}
+
+// A container's painted bands can flicker between two renderings from one capture to the next;
+// reconcile publishes such a change only once two captures agree, which needs to tell "the pixels
+// moved" from "anything else moved".
+void TestChromePixelsOnlyChange() {
+    Translation::WindowSnapshot canonical;
+    canonical.generation = 1;
+    Translation::ControlNode node;
+    node.nodeId = 1;
+    node.generation = 1;
+    node.kind = Translation::ControlKind::PaneContainer;
+    node.rect = { 0, 0, 100, 40 };
+    Translation::ChromeRegionSnapshot band;
+    band.rect = { 0, 0, 4, 2 };
+    band.imageWidth = 4;
+    band.imageHeight = 2;
+    band.imageFormat = L"bgra8-premultiplied";
+    band.imageData.assign(32, 0x10);
+    node.chromeRegions.push_back(band);
+    canonical.nodes.push_back(node);
+    const uint64_t canonicalFingerprint = Translation::SnapshotFingerprint(canonical);
+
+    Translation::WindowSnapshot next = canonical;
+    Check(!Translation::OnlyChromePixelsChanged(canonical, next, canonicalFingerprint),
+        "an unchanged capture was reported as a pixels-only change");
+
+    next.nodes[0].chromeRegions[0].imageData.assign(32, 0x80);
+    Check(Translation::SnapshotFingerprint(next) != canonicalFingerprint,
+        "the fingerprint ignores the pixels of a chrome region");
+    Check(Translation::OnlyChromePixelsChanged(canonical, next, canonicalFingerprint),
+        "a capture that only repainted a chrome region was not recognised");
+    Check(canonical.nodes[0].chromeRegions[0].imageData.front() == 0x10 &&
+          next.nodes[0].chromeRegions[0].imageData.front() == 0x80 &&
+          Translation::SnapshotFingerprint(canonical) == canonicalFingerprint,
+        "the comparison left a snapshot's pixels swapped");
+
+    Translation::WindowSnapshot moved = next;
+    moved.nodes[0].rect = { 0, 0, 120, 40 };
+    Check(!Translation::OnlyChromePixelsChanged(canonical, moved, canonicalFingerprint),
+        "a geometry change was taken for a pixels-only change");
+
+    Translation::WindowSnapshot retitled = next;
+    retitled.title = L"renamed";
+    Check(!Translation::OnlyChromePixelsChanged(canonical, retitled, canonicalFingerprint),
+        "a window change was taken for a pixels-only change");
+
+    Translation::WindowSnapshot resized = next;
+    resized.nodes[0].chromeRegions[0].rect = { 0, 0, 8, 2 };
+    Check(!Translation::OnlyChromePixelsChanged(canonical, resized, canonicalFingerprint),
+        "a chrome region that moved was taken for a pixels-only change");
+}
+
+// A task dialog's own labels come from comctl32 (or English without it), and the application's
+// expando text takes their place -- for both states when it names only one.
+void TestTaskDialogLabels() {
+    for (const int id : { IDOK, IDCANCEL, IDYES, IDNO, IDRETRY, IDCLOSE }) {
+        const std::wstring label = Translation::TaskDialogButtonLabel(id);
+        Check(!label.empty() && label.find(L'%') == std::wstring::npos,
+            "a task dialog common button has no usable label");
+    }
+    const std::wstring collapsed = Translation::TaskDialogExpandoLabel(false);
+    const std::wstring expanded = Translation::TaskDialogExpandoLabel(true);
+    Check(!collapsed.empty() && !expanded.empty() && collapsed != expanded,
+        "the expando button has the same label in both states");
+
+    const auto expandoText = [](bool expand, const wchar_t* collapsedText, const wchar_t* expandedText) {
+        Translation::TaskDialogModel model;
+        model.instruction = L"Instruction";
+        model.expandedInformation = L"Details";
+        model.collapsedControlText = collapsedText;
+        model.expandedControlText = expandedText;
+        model.expanded = expand;
+        model.buttons.push_back({ IDOK, L"OK" });
+        Translation::TaskDialogElements elements;
+        const auto snapshot = Translation::BuildTaskDialogSnapshot(model, nullptr, nullptr, 96, std::nullopt, elements);
+        for (const auto& node : snapshot.nodes) {
+            if (node.presentationVariant == L"expandoCollapsed" || node.presentationVariant == L"expandoExpanded") {
+                return node.text;
+            }
+        }
+        return std::wstring();
+    };
+    Check(expandoText(false, L"", L"") == collapsed && expandoText(true, L"", L"") == expanded,
+        "the default expando labels were not used");
+    Check(expandoText(false, L"More", L"Less") == L"More" && expandoText(true, L"More", L"Less") == L"Less",
+        "the application's expando labels were not used per state");
+    Check(expandoText(false, L"Toggle", L"") == L"Toggle" && expandoText(true, L"Toggle", L"") == L"Toggle",
+        "a lone expando label was not used for both states");
 }
 
 void TestToolbarCaptureBoundary() {
@@ -4297,10 +5093,22 @@ void TestMdiFrameCaptureAndCommands() {
 #include "ListViewActivationTests.h"
 #include "NativeListViewDoubleClickTests.h"
 #include "ListViewActivationFallbackTests.h"
+#include "ItemContextMenuTests.h"
+#include "WinFormsOwnerDrawTests.h"
+#include "ScrollingContainerTests.h"
+#include "EventViewerSurfaceTests.h"
 
 } // namespace
 
 int wmain() {
+#ifdef _DEBUG
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
+    SetUnhandledExceptionFilter(ReportUnhandledException);
+    // Snapshot serialization uses WinRT JSON, so the apartment must exist before
+    // the first test that serializes a frame.
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     // Capture always runs inside a per-monitor-aware scope, so every rectangle it
     // reads is in physical pixels.  A DPI-unaware test process would have its own
     // windows virtualized by DWM, leaving window rectangles and the geometry a
@@ -4309,9 +5117,23 @@ int wmain() {
     // declare the same awareness so their fixtures live in one space.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     TestVisibleUiaBoundsClipping();
+    TestGuiThreadDispatch();
+    TestCrossThreadSurface();
+    TestSnapshotDetailFingerprint();
+    FluentShell::Tests::TestDirectUiVirtualImages(Check);
+    FluentShell::Tests::TestDirectUiDetailEvidence(Check);
+    FluentShell::Tests::TestNativeDocumentAdmission(Check);
+    FluentShell::Tests::TestOwnerDrawComboBoxes(Check);
+    {
+        ListActivationCommonControls groups(ICC_LISTVIEW_CLASSES);
+        Check(static_cast<bool>(groups), "grouped ListView common-controls v6 context failed");
+        if (groups) {
+            FluentShell::Tests::TestListViewGroups(Check);
+            FluentShell::Tests::TestListViewGroupsWithoutText(Check);
+        }
+    }
     TestDirectUiEvidenceContracts();
     TestDirectUiInPlaceRoutes();
-    winrt::init_apartment(winrt::apartment_type::multi_threaded);
     INITCOMMONCONTROLSEX controls{ sizeof(controls),
         ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_PROGRESS_CLASS };
     Check(InitCommonControlsEx(&controls) != FALSE,
@@ -4333,6 +5155,8 @@ int wmain() {
     TestStaticIconCaptureBoundary();
     TestStaticDecorationCaptureAndRejection();
     TestAncestorEnabledTabOrderCapture();
+    TestOwnerDrawButtonFace();
+    TestTabOrderScopes();
     TestTabOrderRejectionSpecificity();
     TestStructuredCommonControlCapture();
     TestListViewCheckNotificationSemantics();
@@ -4352,10 +5176,30 @@ int wmain() {
     TestPopupMenuState();
     TestSourceThreadPopupTracking();
     TestPopupActionProtocol();
+    TestItemContextMenuProtocol();
+    TestItemContextMenuTracking();
+    TestWinFormsOwnerDrawControls();
+    TestWindowsFormsSpinButtons();
+    TestScrollingContainer();
+    TestSurfaceFilledContainers();
+    TestReadOnlyRichEditAdapter();
+    TestObscuredHostIsNotCaptured();
+    TestListViewHeaderPlacementFlag();
+    TestVirtualListWindow();
+    TestEmptyReportListWithoutColumns();
+    TestMmcBusyShieldIdentity();
     TestMenuActionValidationAndSerialization();
     TestToolbarCaptureBoundary();
     TestVirtualDialogSnapshots();
+    TestVirtualTaskDialogCallbacks();
+    TestChromePixelsOnlyChange();
+    TestTaskDialogLabels();
     TestPaneContainerCaptureAndSplit();
+    TestFormRowStripsAreNotSplits();
+    TestUnownedModalDialogOwnerResolution();
+    TestNestedModalDialogChain();
+    TestTabStopGroupBoxIsNotATabStop();
+    TestAnimationControlIsAnInertPicture();
     TestOverlappingSiblingZOrderCapture();
     TestAccessibleIslandBoundary();
     TestAccessiblePageTabs();
@@ -4365,14 +5209,28 @@ int wmain() {
     TestFullyClippedChildIsNotCaptured();
     TestStaticBitmapCapture();
     TestUpDownAdapter();
+    TestDateTimePickerDayNumbers();
+    TestDateTimePickerAdapter();
     TestWizardSheetTabStripIsNotCaptured();
     TestIconButtonCapture();
+    TestMultiSelectListBox();
+    TestPerformanceChartLayout();
+    TestPerformanceChartText();
+    TestPerformanceChartSerialization();
+    TestPerformanceChartActions();
     FluentShell::Tests::TestUiAutomationProjectionScope(Check);
     FluentShell::Tests::TestMmcHtmlDocumentAdmission(Check);
     FluentShell::Tests::TestListViewModes(Check);
     FluentShell::Tests::TestOwnerDataListViews(Check);
     FluentShell::Tests::TestOwnerDataListViewActions(Check);
     FluentShell::Tests::TestToolbarRadioGroups(Check);
+    {
+        // Pressed toolbar images are a v6 contract; keep other fixtures on the
+        // legacy common-controls path they are intended to exercise.
+        ListActivationCommonControls toolbarControls(ICC_BAR_CLASSES);
+        Check(static_cast<bool>(toolbarControls), "toolbar v6 activation failed");
+        if (toolbarControls) FluentShell::Tests::TestToolbarImageVariants(Check);
+    }
     if (g_failures != 0) {
         std::cerr << g_failures << " native protocol test(s) failed.\n";
         return 1;

@@ -67,6 +67,11 @@ std::wstring AccessibleChildName(HWND window, int childIndex) noexcept;
 
 bool IsAccessibleIslandClass(std::wstring_view className) noexcept;
 
+// The real ScrollBar window a DirectUI scroll viewer hosts (directly, or inside its
+// CtrlNotifySink). It is chrome of the island, not content: the projection scrolls
+// the island's elements itself.
+bool IsDirectUiScrollChrome(HWND window) noexcept;
+
 // True when the window's class was registered by `moduleName` loaded from System32.
 // A class name an application can reuse proves nothing; the registering module of a
 // Windows-owned class does.

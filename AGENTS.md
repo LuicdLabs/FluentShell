@@ -23,7 +23,7 @@ Everything is x64-only; `Debug` and `Release` are the only configurations.
 
 ```powershell
 .\build.ps1 -Configuration Release      # nuget + dotnet restore, build solution, publish renderer, verify payload layout
-.\build.ps1 -Configuration Debug -CoreOnly   # skip the renderer publish; native projects only
+.\build.ps1 -Configuration Debug -CoreOnly   # skip renderer restore/publish; native projects only
 .\build.ps1 -RestoreOnly                # restore and stop
 .\test.ps1  -Configuration Release      # C# tests, native tests, then the production gates
 ```
@@ -44,7 +44,7 @@ MSBuild lives under the VS install; resolve it with
 `MSBuild\Current\Bin\amd64\MSBuild.exe`.
 
 ```powershell
-# Native only (Bridge pulls in Core + detours)
+# Native only (Bridge pulls in detours)
 & $msbuild src\FluentShell.Bridge.vcxproj /m /p:Configuration=Debug /p:Platform=x64 /v:m
 
 # C# tests
@@ -277,7 +277,7 @@ isolated in `NativeWindowInterop.cs`/`WindowMessages`.
 ### Injection safety
 
 `FluentShell.Injector.exe inject <absolute-image-path> [--pid <pid>] [--sha256 <hex>]` is the only
-production entry point (plus the one-shot `l0` DWM diagnostic). The target is resolved through a file
+production entry point. The target is resolved through a file
 handle; the path read from the selected process must match that canonical path; `--pid` is mandatory
 when several processes share the image; injector and target integrity levels must match. Shell,
 security, XAML hosts, the renderer, and FluentShell's own tools are hard-denied in
@@ -309,8 +309,6 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
 
 - The native projects restore only CppWinRT (`src/packages.config`); WinUI and the Windows App SDK
   belong to the renderer's own `PackageReference`s and never to native code.
-- `src/Renderer.Dwm` is the cross-process DWM attribute layer behind the `l0` diagnostic; it is not
-  part of the translation path.
 - Source files are CRLF and carry localized comments/diagnostics; `Directory.Build.props` forces
   `/utf-8` so MSVC's character sets stay deterministic across locales.
 - `ProgressBar` state changes and other native mutations are only observed for the messages listed in

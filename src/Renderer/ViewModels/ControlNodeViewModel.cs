@@ -17,7 +17,11 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _multiSelect;
     private bool _columnHeadersVisible;
     private string _listViewMode = "report";
+    private bool _groupViewEnabled;
+    private IReadOnlyList<ListViewGroupSnapshot> _listViewGroups = [];
+    private IReadOnlyList<string> _itemGroupIds = [];
     private bool _itemActivationSupported;
+    private bool _itemDefaultActivation;
     private bool _checkBoxes;
     private int _selectionStart;
     private int _selectionLength;
@@ -30,6 +34,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _reversed;
     private bool _indeterminate;
     private bool _editable;
+    private OwnerDrawComboSnapshot? _ownerDrawCombo;
     private bool _active;
     private string _windowState = "normal";
     private PixelRect _clientRect = new();
@@ -44,6 +49,11 @@ public sealed class ControlNodeViewModel : ObservableObject
     private ulong _exStyle;
     private readonly Dictionary<string, string> _pendingEventIds = new(StringComparer.Ordinal);
 
+    // Where the last projected context request on this node happened, in DIPs
+    // relative to the node's own element. Renderer-only: the native popup that
+    // answers it is placed here, because the native menu has no projected anchor.
+    internal (double X, double Y)? ContextMenuAnchor { get; set; }
+
     public string NodeId { get; private set; } = "0";
     public string Generation { get; private set; } = "0";
     public string? NativeHwnd { get; private set; } = "0x0";
@@ -51,12 +61,19 @@ public sealed class ControlNodeViewModel : ObservableObject
     public string Kind { get; private set; } = string.Empty;
     public int ControlId { get; private set; }
     public int ZIndex { get; private set; }
-    public int TabIndex { get; private set; }
-    public bool TabStop { get; private set; }
+    // A native dialog's tab order is the order of its controls that are effective tab stops, so it
+    // changes whenever one is enabled or disabled (typing a character into Find enables "Find
+    // Next"). These two are applied to the existing controls: replacing every control for them
+    // destroyed the keyboard focus the user was typing with.
+    private int _tabIndex;
+    private bool _tabStop;
+    public int TabIndex { get => _tabIndex; private set => SetProperty(ref _tabIndex, value); }
+    public bool TabStop { get => _tabStop; private set => SetProperty(ref _tabStop, value); }
     public uint DialogCode { get; private set; }
     public bool ReadOnly { get; private set; }
     public bool Multiline { get; private set; }
     public bool Editable { get => _editable; private set => SetProperty(ref _editable, value); }
+    public OwnerDrawComboSnapshot? OwnerDrawCombo { get => _ownerDrawCombo; private set => SetProperty(ref _ownerDrawCombo, value); }
     public bool IsDefault { get; private set; }
     public bool GroupStart { get; private set; }
     // Native window style bits, already validated as canonical hex on admission.
@@ -78,7 +95,12 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool MultiSelect { get => _multiSelect; private set => SetProperty(ref _multiSelect, value); }
     public bool ColumnHeadersVisible { get => _columnHeadersVisible; private set => SetProperty(ref _columnHeadersVisible, value); }
     public string ListViewMode { get => _listViewMode; private set => SetProperty(ref _listViewMode, value); }
+    public bool GroupViewEnabled { get => _groupViewEnabled; private set => SetProperty(ref _groupViewEnabled, value); }
+    public IReadOnlyList<ListViewGroupSnapshot> ListViewGroups => _listViewGroups;
+    public IReadOnlyList<string> ItemGroupIds => _itemGroupIds;
     public bool ItemActivationSupported { get => _itemActivationSupported; private set => SetProperty(ref _itemActivationSupported, value); }
+    // A double-click (or Enter) opens the item: its control is sent the Enter key (openItem).
+    public bool ItemDefaultActivation { get => _itemDefaultActivation; private set => SetProperty(ref _itemDefaultActivation, value); }
     public bool CheckBoxes { get => _checkBoxes; private set => SetProperty(ref _checkBoxes, value); }
     public int SelectionStart { get => _selectionStart; private set => SetProperty(ref _selectionStart, value); }
     public int SelectionLength { get => _selectionLength; private set => SetProperty(ref _selectionLength, value); }
@@ -117,6 +139,19 @@ public sealed class ControlNodeViewModel : ObservableObject
     public ObservableCollection<ToolbarItemSnapshot> ToolbarItems { get; } = [];
     public ObservableCollection<PaneSplit> Splits { get; } = [];
     public ObservableCollection<ChromeRegion> ChromeRegions { get; } = [];
+    public ObservableCollection<ScrollBarSnapshot> ScrollBars { get; } = [];
+    private NativeDocumentSnapshot? _document;
+    public NativeDocumentSnapshot? Document { get => _document; private set => SetProperty(ref _document, value); }
+    private DiskViewSnapshot? _diskView;
+    public DiskViewSnapshot? DiskView { get => _diskView; private set => SetProperty(ref _diskView, value); }
+    private RichTextSnapshot? _richText;
+    public RichTextSnapshot? RichText { get => _richText; private set => SetProperty(ref _richText, value); }
+    private PerformanceGraphSnapshot? _performanceGraph;
+    public PerformanceGraphSnapshot? PerformanceGraph { get => _performanceGraph; private set => SetProperty(ref _performanceGraph, value); }
+    private PerformanceLegendSnapshot? _performanceLegend;
+    public PerformanceLegendSnapshot? PerformanceLegend { get => _performanceLegend; private set => SetProperty(ref _performanceLegend, value); }
+    private PerformanceValueBarSnapshot? _performanceValueBar;
+    public PerformanceValueBarSnapshot? PerformanceValueBar { get => _performanceValueBar; private set => SetProperty(ref _performanceValueBar, value); }
     public ObservableCollection<AccessibleIslandItem> IslandItems { get; } = [];
     public string AdapterId { get; private set; } = string.Empty;
     public string PageId { get; private set; } = string.Empty;
@@ -191,6 +226,11 @@ public sealed class ControlNodeViewModel : ObservableObject
         Vertical = node.Vertical;
         Reversed = node.Reversed;
         Indeterminate = node.Indeterminate ?? false;
+        // The window travels with the rows it describes, so it is in place before any
+        // row or label notification rebuilds a list from it.
+        var windowMoved = ItemCount != (node.ItemCount ?? 0) || ItemWindowStart != (node.ItemWindowStart ?? 0);
+        ItemCount = node.ItemCount ?? 0;
+        ItemWindowStart = node.ItemWindowStart ?? 0;
         ReplaceItems(node.Items);
         ReplaceTreeState(node.ItemDepths ?? [], node.ItemExpanded ?? [], node.ItemHasChildren ?? []);
         ReplaceItemImagery(
@@ -199,19 +239,35 @@ public sealed class ControlNodeViewModel : ObservableObject
         EditableLabels = node.EditableLabels ?? false;
         EditingIndex = node.EditingIndex ?? -1;
         ReplaceItemRects(node.ItemRects ?? []);
+        OwnerDrawCombo = node.OwnerDrawCombo;
         ListViewMode = node.ListViewMode ?? "report";
+        // Publish this coupled group state together before any notification.
+        var groupsChanged = !_listViewGroups.SequenceEqual(node.ListViewGroups ?? []) ||
+            !_itemGroupIds.SequenceEqual(node.ItemGroupIds ?? []) || _groupViewEnabled != (node.GroupViewEnabled ?? false);
+        _groupViewEnabled = node.GroupViewEnabled ?? false;
+        _listViewGroups = node.ListViewGroups?.ToArray() ?? [];
+        _itemGroupIds = node.ItemGroupIds?.ToArray() ?? [];
+        if (groupsChanged) RaisePropertyChanged(nameof(ListViewGroups));
         ItemActivationSupported = node.ItemActivationSupported ?? false;
+        ItemDefaultActivation = node.ItemDefaultActivation ?? false;
         ReplaceItemNativeIds(node.ItemNativeIds ?? []);
         ReplaceSelectedIndices(node.SelectedIndices);
         ReplaceCheckedIndices(node.CheckedIndices ?? []);
         ReplaceColumns(node.Columns);
         ReplaceColumnWidths(node.ColumnWidths);
         ReplaceColumnOrder(node.ColumnOrder ?? []);
-        ReplaceRows(node.Rows);
+        ReplaceRows(node.Rows, windowMoved);
         var toolbarChanged = ReplaceToolbarItems(node.ToolbarItems ?? []);
         ReplaceSplits(node.Splits ?? []);
         ReplaceChromeRegions(node.ChromeRegions ?? []);
+        ReplaceScrollBars(node.ScrollBars ?? []);
         ReplaceIslandItems(node.IslandItems ?? []);
+        Document = node.Document;
+        DiskView = node.DiskView;
+        RichText = node.RichText;
+        PerformanceGraph = node.PerformanceGraph;
+        PerformanceLegend = node.PerformanceLegend;
+        PerformanceValueBar = node.PerformanceValueBar;
         ApplyImageState(
             node.ImageWidth ?? 0,
             node.ImageHeight ?? 0,
@@ -273,6 +329,10 @@ public sealed class ControlNodeViewModel : ObservableObject
         // A refused split leaves the canonical geometry in place, and the projected
         // splitter follows it back.
         else if (property == "splits") RaisePropertyChanged(nameof(Splits));
+        else if (property == "scrollBars") RaisePropertyChanged(nameof(ScrollBars));
+        else if (property == "document") RaisePropertyChanged(nameof(Document));
+        else if (property == "diskView") RaisePropertyChanged(nameof(DiskView));
+        else if (property == "richText") RaisePropertyChanged(nameof(RichText));
         PendingActionsChanged?.Invoke();
     }
 
@@ -305,6 +365,7 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "columnHeadersVisible": ColumnHeadersVisible = value.GetBoolean(); break;
             case "listViewMode": ListViewMode = value.GetString() ?? "report"; break;
             case "itemActivationSupported": ItemActivationSupported = value.GetBoolean(); break;
+            case "itemDefaultActivation": ItemDefaultActivation = value.GetBoolean(); break;
             case "itemNativeIds":
                 throw new ProtocolException(
                     "ListView identities are republished with their rows in a full snapshot, not as a field patch.");
@@ -444,15 +505,25 @@ public sealed class ControlNodeViewModel : ObservableObject
         RaisePropertyChanged(nameof(ColumnWidths));
     }
 
-    private void ReplaceRows(IEnumerable<IEnumerable<string>> rows)
+    private void ReplaceRows(IEnumerable<IEnumerable<string>> rows, bool windowMoved = false)
     {
         var copies = rows.Select(row => (IReadOnlyList<string>)row.ToArray()).ToArray();
-        if (Rows.Count == copies.Length && Rows.Zip(copies).All(pair =>
+        if (!windowMoved && Rows.Count == copies.Length && Rows.Zip(copies).All(pair =>
                 pair.First.SequenceEqual(pair.Second, StringComparer.Ordinal))) return;
         Rows.Clear();
         foreach (var row in copies) Rows.Add(row);
         RaisePropertyChanged(nameof(Rows));
     }
+
+    // Minor 33: a windowed virtual report list carries the rows from ItemWindowStart
+    // on, and ItemCount is the list's full length (0 when every row is carried).  Both
+    // are published with the rows they describe: a moved window always rebuilds them.
+    public int ItemCount { get; private set; }
+    public int ItemWindowStart { get; private set; }
+    public bool IsWindowedList => ItemCount > 0;
+
+    // The full number of rows a ListView index can name.
+    public int ListRowCount => ItemCount > 0 ? ItemCount : Rows.Count;
 
     private bool ReplaceToolbarItems(IEnumerable<ToolbarItemSnapshot> items)
     {
@@ -469,6 +540,14 @@ public sealed class ControlNodeViewModel : ObservableObject
         Splits.Clear();
         foreach (var split in splits) Splits.Add(split);
         RaisePropertyChanged(nameof(Splits));
+    }
+
+    private void ReplaceScrollBars(IEnumerable<ScrollBarSnapshot> bars)
+    {
+        if (ScrollBars.SequenceEqual(bars)) return;
+        ScrollBars.Clear();
+        foreach (var bar in bars) ScrollBars.Add(bar);
+        RaisePropertyChanged(nameof(ScrollBars));
     }
 
     private void ReplaceChromeRegions(IEnumerable<ChromeRegion> regions)

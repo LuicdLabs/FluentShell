@@ -60,12 +60,36 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // Minor 28 adds the staticBitmap kind (SS_BITMAP pictures under the large-bitmap cap)
 // and the upDown kind (msctls_updown32 stepped through setValue); a BS_ICON/BS_BITMAP
 // push button may carry its picture in the image fields.
-inline constexpr uint16_t kProtocolMinor = 28;
+// Minor 29 retires exact application pages in favor of capability-derived DirectUI
+// semantics and adds owned toolbar hot, disabled, and pressed image variants.
+// Minor 30 adds native documents, owner-draw ComboBox faces, and ListView groups.
+// Minor 31 adds the native Disk Management MSAA table and its semantic actions.
+// Minor 32 adds the contextMenu action for TreeView and ListView items.
+// Minor 33 carries a large virtual report ListView as a window of rows (itemCount,
+// itemWindowStart) with absolute indices, and adds setTopIndex to move that window.
+// Minor 34 lets a ListView or TreeView offer itemDefaultActivation and adds the openItem
+// action: a double-click selects the item and sends its control the Enter key.
+// Minor 35 adds the richText kind: a read-only rich edit control carried as paragraphs of
+// formatted runs (bold, italic, underline, strike-through, size in points, colour).
+// Minor 36 adds Performance Monitor's chart as three kinds read from the System Monitor control:
+// performanceGraph (scale, grid, counters and their recorded samples), performanceLegend (one
+// row per counter) and performanceValueBar (Last, Average, Minimum, Maximum, Duration).
+// Minor 37 adds the datePicker and timePicker kinds (SysDateTimePick32): the value is the
+// position of a range, as for a slider -- a date's day number (days since 0001-01-01), a
+// time's second of the day -- and setValue changes it.
+// Minor 38 completes the translated dialogs: a task dialog's nodes may carry presentation
+// variants (mainInstruction, commandLink*, elevated, expando*) and a command link's note as
+// helpText, and a task dialog's text is a sysLink with one label per link, named by index
+// through activateItem.
+inline constexpr uint16_t kProtocolMinor = 38;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;
 inline constexpr size_t kMaxNodes = 512;
 inline constexpr size_t kMaxListItems = 4096;
+// A windowed virtual ListView may count this many rows; its window and every other
+// per-row array stay under kMaxListItems.
+inline constexpr size_t kMaxVirtualListItems = 16777216;
 inline constexpr size_t kMaxTabItems = 128;
 // itemDepths carries the nesting level of a projected TreeView item, so the
 // deepest admissible level is one less than the level count.
@@ -91,6 +115,10 @@ inline constexpr size_t kMaxMenuItemPathChars = 64;
 // window with more than a handful of independently sized panes is not a frame the
 // projection can describe, so the cap is deliberately small.
 inline constexpr size_t kMaxPaneSplits = 8;
+// A scrolling container has at most its two standard window scroll bars, and one
+// setScroll request moves at most this many application line steps.
+inline constexpr size_t kMaxScrollBars = 2;
+inline constexpr int kMaxScrollLines = 100;
 // Split positions are client coordinates, bounded by the same limit the protocol
 // already applies to window and control geometry.
 inline constexpr int kMaxCoordinate = 65535;

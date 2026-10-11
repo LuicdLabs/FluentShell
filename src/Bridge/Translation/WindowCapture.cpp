@@ -1,4 +1,7 @@
 #include "WindowCapture.h"
+#include "CaptureTrace.h"
+#include "GuiThreadDispatch.h"
+#include "NativeDocument.h"
 
 #include "../../Common/FluentShell.h"
 #include "ControlAdapters.h"
@@ -6,6 +9,8 @@
 
 #include <commctrl.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <unordered_set>
 #include <utility>
@@ -159,6 +164,16 @@ bool IsDialogControlParent(HWND child) noexcept {
         (exStyle & WS_EX_CONTROLPARENT) != 0;
 }
 
+// A child dialog that is not part of its parent's dialog-manager walk -- no DS_CONTROL, no
+// WS_EX_CONTROLPARENT, as with the pages of an OLE property frame -- runs its own IsDialogMessage loop:
+// Tab cycles inside it, and its controls are unreachable from the parent's walk.
+bool IsIndependentDialogPage(HWND window) noexcept {
+    wchar_t classBuffer[kMaxClassNameChars]{};
+    return FluentShell::EqualsIgnoreCase(ClassNameOf(window, classBuffer), L"#32770") &&
+        (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)) & WS_CHILD) != 0 &&
+        !IsDialogControlParent(window);
+}
+
 bool IsMdiChildWindow(HWND window) noexcept {
     return (static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)) &
         WS_EX_MDICHILD) != 0;
@@ -172,7 +187,7 @@ bool IsMdiNavigationContainer(HWND window) noexcept {
 
 HWND NativeTabScope(HWND root, HWND child) noexcept {
     for (HWND parent = GetParent(child); parent && parent != root; parent = GetParent(parent)) {
-        if (IsMdiChildWindow(parent)) return parent;
+        if (IsMdiChildWindow(parent) || IsIndependentDialogPage(parent)) return parent;
     }
     return root;
 }
@@ -184,24 +199,28 @@ bool CaptureNativeTabOrder(
     std::wstring& reason) {
     std::unordered_map<HWND, HWND> candidates;
     for (const HWND child : handles) {
-        if (IsCompositeImplementationChild(child) || IsMdiNavigationContainer(child)) continue;
-        const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
-        if (!IsDialogControlParent(child) && IsWindowVisible(child) &&
-            IsEffectivelyEnabled(root, child) &&
-            (style & WS_TABSTOP) != 0) {
-            candidates.emplace(child, NativeTabScope(root, child));
-        }
+        auto candidate = std::make_shared<HWND>(nullptr);
+        if (!DispatchToWindowThread(child, [root, child, candidate] {
+                if (IsCompositeImplementationChild(child) || IsMdiNavigationContainer(child)) return;
+                const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
+                if (!IsDialogControlParent(child) && !IsIndependentDialogPage(child) && IsWindowVisible(child) &&
+                    IsEffectivelyEnabled(root, child) && (style & WS_TABSTOP) != 0)
+                    *candidate = NativeTabScope(root, child);
+            }, reason)) return false;
+        if (*candidate) candidates.emplace(child, *candidate);
     }
     if (candidates.empty()) return true;
 
     // Dialog-manager traversal is per container: an MDI child frame runs its own
     // IsDialogMessage loop, so the controls inside it are not reachable from the
-    // frame's walk. Each control belongs to its nearest MDI child, or the root
-    // when it has none. Even a control-parent style that exposes an MDI subtree
-    // to the root's walk must not assign that subtree the root's tab order.
+    // frame's walk, and neither are the controls of a child dialog that is no
+    // control parent (an OLE property page). Each control belongs to its nearest
+    // such container, or the root when it has none. Even a control-parent style
+    // that exposes an MDI subtree to the root's walk must not assign that
+    // subtree the root's tab order.
     std::vector<HWND> containers{ root };
     for (const HWND child : handles) {
-        if (IsMdiChildWindow(child) && IsWindowVisible(child)) {
+        if ((IsMdiChildWindow(child) || IsIndependentDialogPage(child)) && IsWindowVisible(child)) {
             containers.push_back(child);
         }
     }
@@ -217,9 +236,16 @@ bool CaptureNativeTabOrder(
         // WS_TABSTOP that this walk omits is not an effective dialog tab stop; keep
         // its style as evidence, but do not invent an order from HWND enumeration.
         std::unordered_set<HWND> visited;
-        HWND current = *seed;
+        // A null start answers the container's first tab stop, so the order begins where the native one
+        // does even when the container's first child is itself a tab stop (a walk begun at that child
+        // would number it last).
+        HWND current = nullptr;
         for (size_t attempt = 0; attempt <= handles.size() + candidates.size(); ++attempt) {
-            const HWND next = GetNextDlgTabItem(container, current, FALSE);
+            auto nextValue = std::make_shared<HWND>(nullptr);
+            if (!DispatchToWindowThread(container, [container, current, nextValue] {
+                    *nextValue = GetNextDlgTabItem(container, current, FALSE);
+                }, reason)) return false;
+            const HWND next = *nextValue;
             if (!next) break;
             if (!IsChild(container, next)) {
                 reason = L"native dialog manager returned a tab stop outside its container";
@@ -380,7 +406,7 @@ bool CaptureMenuLevel(
                     false, item.enabled, mdiFrame, state, item.items, reason) ||
                 item.items.empty()) return false;
         } else {
-            if (topLevel || item.text.empty() || info.wID == 0 || info.wID >= 0xf000) {
+            if (topLevel || item.text.empty() || info.wID == 0 || IsSystemCommandId(info.wID)) {
                 wchar_t evidence[192]{};
                 swprintf_s(evidence,
                     L"menu command '%.32s' id=%u cannot use standard WM_COMMAND semantics",
@@ -410,6 +436,9 @@ struct ChildCaptureScope final {
     // The kind of every node already captured, so a child can be checked against the
     // parent that will own it in the projection.
     const std::unordered_map<HWND, ControlKind>* visibleNodeKinds = nullptr;
+    // The next tab index after the dialog manager's walk, for a Windows Forms tab stop
+    // the walk does not reach (WinForms moves focus with Tab itself).
+    int* nextExtraTabIndex = nullptr;
     int zIndex = 0;
 };
 
@@ -427,11 +456,17 @@ bool CaptureTopLevelFacets(
     // Escape cancels a dialog because the dialog manager maps it to IDCANCEL; an
     // ordinary top-level window receives the keystroke and normally ignores it.
     // Reporting cancel semantics for every window would make Escape close
-    // applications that never close on Escape.
+    // applications that never close on Escape.  A Windows Forms dialog (Event Viewer's
+    // filter, Task Scheduler's task properties) is cancelled by Escape through its
+    // CancelButton, which no window evidence names; it is a dialog when it is modal or
+    // has the dialog frame (WS_EX_DLGMODALFRAME: FormBorderStyle.FixedDialog), and the
+    // dialog it nearly always is closes the same way the form's own close button does.
     {
         wchar_t rootClass[kMaxClassNameChars]{};
         GetClassNameW(root, rootClass, static_cast<int>(std::size(rootClass)));
-        next.canCancel = FluentShell::EqualsIgnoreCase(rootClass, L"#32770");
+        const bool dialogFrame = (static_cast<DWORD>(GetWindowLongPtrW(root, GWL_EXSTYLE)) & WS_EX_DLGMODALFRAME) != 0;
+        next.canCancel = FluentShell::EqualsIgnoreCase(rootClass, L"#32770") ||
+            ((next.modal || dialogFrame) && std::wstring_view(rootClass).starts_with(L"WindowsForms10."));
     }
     next.generation = context.generation;
     next.revision = context.revision;
@@ -534,15 +569,19 @@ bool CaptureCommonNodeFacets(
     node.enabled = IsEffectivelyEnabled(scope.root, child);
     const bool nativeTabStop = (node.style & WS_TABSTOP) != 0;
     node.tabStop = nativeTabStop &&
-        (!node.enabled || scope.tabIndexes->contains(child));
+        (!node.enabled || scope.tabIndexes->contains(child) || IsWindowsFormsControl(child));
     if (const auto tab = scope.tabIndexes->find(child); tab != scope.tabIndexes->end()) {
         node.tabIndex = tab->second;
+    } else if (node.tabStop && node.enabled && scope.nextExtraTabIndex) {
+        // Windows Forms traversal follows the walk's controls, in capture order.
+        node.tabIndex = (*scope.nextExtraTabIndex)++;
     }
     node.dialogCode = static_cast<uint32_t>(SendMessageW(child, WM_GETDLGCODE, 0, 0));
     // A multiline Edit legitimately wants all keys; anything else asking for raw
     // key routing implements private keyboard behavior we cannot project.
     const bool standardTextKeyboard =
-        (node.kind == ControlKind::Edit || node.kind == ControlKind::Password) &&
+        (node.kind == ControlKind::Edit || node.kind == ControlKind::Password ||
+         node.kind == ControlKind::RichText) &&
         (static_cast<DWORD>(node.style) & ES_MULTILINE) != 0;
     if ((node.dialogCode & (DLGC_WANTALLKEYS | DLGC_WANTMESSAGE)) != 0 &&
         !standardTextKeyboard) {
@@ -563,9 +602,11 @@ bool CaptureCommonNodeFacets(
     // turn into a disabled dialog tab stop. Keep the raw style for caption
     // commands, and keep both structural MDI kinds outside dialog traversal.
     // A progress bar takes no keyboard input; a WS_TABSTOP a dialog template gave it
-    // would only make Tab land on nothing.
+    // would only make Tab land on nothing.  An inert painted surface is the same: a
+    // focusable header strip that publishes no action has nothing for focus to act on.
     if (node.kind == ControlKind::DialogContainer || node.kind == ControlKind::ProgressBar ||
-        node.kind == ControlKind::MdiClient || node.kind == ControlKind::MdiChild) {
+        node.kind == ControlKind::MdiClient || node.kind == ControlKind::MdiChild ||
+        node.kind == ControlKind::StaticBitmap || node.kind == ControlKind::GroupBox) {
         node.tabStop = false;
         node.tabIndex = -1;
     }
@@ -592,6 +633,16 @@ bool CaptureCommonNodeFacets(
     return true;
 }
 
+void TraceCaptureStage(HWND child, const wchar_t* stage) noexcept {
+    if (!CaptureTraceEnabled()) return;
+    try {
+        wchar_t className[64]{};
+        GetClassNameW(child, className, static_cast<int>(std::size(className)));
+        CaptureTrace(std::wstring(stage) + L" hwnd=" + Ipc::HwndToString(child) + L" class=" + className);
+    } catch (...) {
+    }
+}
+
 // Classify, identify, common facets, adapter-specific state.  Every stage
 // rejects with its own reason and the caller appends the HWND evidence once.
 bool CaptureChildNode(
@@ -602,14 +653,48 @@ bool CaptureChildNode(
     std::wstring& reason) {
     DWORD childProcess = 0;
     const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
-    if (childProcess != GetCurrentProcessId() || childThread != scope.rootThread) {
-        reason = L"foreign-process or foreign-thread child HWND";
+    if (childProcess != GetCurrentProcessId()) {
+        reason = L"foreign-process child HWND";
         return false;
     }
-    return ClassifyControl(child, node.kind, reason) &&
-        AssignNodeIdentity(child, context, node, reason) &&
-        CaptureCommonNodeFacets(child, scope, node, reason) &&
-        CaptureControlDetail(child, node, reason);
+    if (childThread != GetCurrentThreadId()) {
+        struct RemoteCapture final {
+            CaptureContext context;
+            ChildCaptureScope scope;
+            std::unordered_map<HWND, int> tabs;
+            std::unordered_map<HWND, uint64_t> ids;
+            std::unordered_map<HWND, ControlKind> kinds;
+            ControlNode node;
+            std::wstring error;
+            bool success = false;
+        };
+        auto work = std::make_shared<RemoteCapture>();
+        work->context = context;
+        work->scope = scope;
+        work->tabs = *scope.tabIndexes;
+        work->ids = *scope.visibleNodeIds;
+        work->kinds = *scope.visibleNodeKinds;
+        work->scope.tabIndexes = &work->tabs;
+        work->scope.visibleNodeIds = &work->ids;
+        work->scope.visibleNodeKinds = &work->kinds;
+        if (!DispatchToWindowThread(child, [child, work] {
+                work->success = CaptureChildNode(child, work->context, work->scope, work->node, work->error);
+            }, reason)) return false;
+        if (!work->success) { reason = std::move(work->error); return false; }
+        context.nodeIds = std::move(work->context.nodeIds);
+        context.nextNodeId = work->context.nextNodeId;
+        context.nextNodeGeneration = work->context.nextNodeGeneration;
+        node = std::move(work->node);
+        return true;
+    }
+    TraceCaptureStage(child, L"classify");
+    if (!ClassifyControl(child, node.kind, reason)) return false;
+    TraceCaptureStage(child, L"identity");
+    if (!AssignNodeIdentity(child, context, node, reason)) return false;
+    TraceCaptureStage(child, L"facets");
+    if (!CaptureCommonNodeFacets(child, scope, node, reason)) return false;
+    TraceCaptureStage(child, L"detail");
+    return CaptureControlDetail(child, node, reason);
 }
 
 // A WS_VISIBLE child draws nothing when its ancestors' client areas clip it away
@@ -672,6 +757,29 @@ bool CapturedChild(HWND root, HWND child) noexcept {
         DrawsInsideRoot(root, child) && !IsHiddenTabStrip(child);
 }
 
+// The outermost window between `child` and `root` that a sibling above covers but for
+// its edges, or null.
+HWND OutermostObscuredHost(HWND root, HWND child) noexcept {
+    HWND host = nullptr;
+    for (HWND current = child; current && current != root; current = GetParent(current)) {
+        if (ObscuredBySiblingAbove(current)) host = current;
+    }
+    return host;
+}
+
+bool ProbeChildOnOwner(HWND root, HWND child, bool& kept, ControlKind& kind, std::wstring& reason) {
+    struct Probe final { bool kept = false; bool valid = true; ControlKind kind{}; std::wstring error; };
+    auto probe = std::make_shared<Probe>();
+    if (!DispatchToWindowThread(child, [root, child, probe] {
+            probe->kept = CapturedChild(root, child);
+            if (probe->kept) probe->valid = ClassifyControl(child, probe->kind, probe->error);
+        }, reason)) return false;
+    kept = probe->kept;
+    kind = probe->kind;
+    reason = std::move(probe->error);
+    return probe->valid;
+}
+
 bool CaptureChildNodes(
     HWND root,
     CaptureContext& context,
@@ -691,18 +799,45 @@ bool CaptureChildNodes(
     const DWORD rootThread = GetWindowThreadProcessId(root, nullptr);
     std::wstring firstRejection;
     size_t rejections = 0;
+    std::unordered_set<HWND> keptChildren;
+    std::unordered_set<HWND> droppedHosts;
+    std::vector<HWND> nativeDocuments;
     for (const HWND child : enumeration.handles) {
-        if (!CapturedChild(root, child)) continue;
         DWORD childProcess = 0;
         const DWORD childThread = GetWindowThreadProcessId(child, &childProcess);
-        if (childProcess != GetCurrentProcessId() || childThread != rootThread) {
-            reason = L"foreign-process or foreign-thread child HWND";
+        if (!childThread || childProcess != GetCurrentProcessId()) {
+            reason = L"destroyed or foreign-process child HWND";
             AppendWindowEvidence(child, reason);
             return false;
         }
         ControlKind kind{};
         std::wstring childReason;
-        if (ClassifyControl(child, kind, childReason)) continue;
+        bool kept = false;
+        bool documentChild = false;
+        for (const HWND document : nativeDocuments) {
+            if (!IsChild(document, child)) continue;
+            auto owned = std::make_shared<bool>(false);
+            if (!DispatchToWindowThread(document, [document, child, owned] {
+                    *owned = NativeDocumentOwnsDescendant(document, child);
+                }, childReason)) { reason = std::move(childReason); return false; }
+            if (*owned) { documentChild = true; break; }
+        }
+        if (documentChild) continue;
+        if (ProbeChildOnOwner(root, child, kept, kind, childReason)) {
+            if (kept) {
+                keptChildren.insert(child);
+                if (kind == ControlKind::NativeDocument) nativeDocuments.push_back(child);
+            }
+            continue;
+        }
+        // What the capture cannot project inside a host a sibling covers but for its
+        // edges is never on screen; the whole host is left out instead of the window.
+        // A covered host whose content is supported keeps its nodes, since a covered
+        // control is still reachable from the keyboard.
+        if (const HWND host = OutermostObscuredHost(root, child)) {
+            droppedHosts.insert(host);
+            continue;
+        }
         AppendWindowEvidence(child, childReason);
         if (rejections++ < 8) {
             try {
@@ -715,6 +850,13 @@ bool CaptureChildNodes(
         reason = std::move(firstRejection);
         return false;
     }
+    if (!droppedHosts.empty()) {
+        std::erase_if(keptChildren, [&](HWND child) {
+            return std::any_of(droppedHosts.begin(), droppedHosts.end(), [child](HWND host) {
+                return child == host || IsChild(host, child);
+            });
+        });
+    }
     std::unordered_map<HWND, int> tabIndexes;
     if (!CaptureNativeTabOrder(root, enumeration.handles, tabIndexes, reason)) return false;
 
@@ -726,8 +868,10 @@ bool CaptureChildNodes(
     scope.tabIndexes = &tabIndexes;
     scope.visibleNodeIds = &visibleNodeIds;
     scope.visibleNodeKinds = &visibleNodeKinds;
+    int nextExtraTabIndex = static_cast<int>(tabIndexes.size());
+    scope.nextExtraTabIndex = &nextExtraTabIndex;
     for (const HWND child : enumeration.handles) {
-        if (!CapturedChild(root, child)) continue;
+        if (!keptChildren.contains(child)) continue;
         // The menu-bar toolbar is projected as the surface's menu, so it must not also
         // appear as a control: one native menu bar becomes one projected menu bar.
         if (child == context.menuBarToolbar && !context.menuBarToolbarMenu.empty()) continue;
@@ -801,8 +945,31 @@ void ObserveMenuBarToolbar(HWND root, CaptureContext& context) noexcept {
         ControlNode identity;
         std::wstring reason;
         std::vector<MenuBarButton> buttons;
-        if (toolbar && (!AssignNodeIdentity(toolbar, context, identity, reason) ||
-                !ReadMenuBarButtons(toolbar, buttons))) toolbar = nullptr;
+        if (toolbar) {
+            struct Observation final {
+                CaptureContext context;
+                ControlNode identity;
+                std::vector<MenuBarButton> buttons;
+                bool success = false;
+            };
+            auto observed = std::make_shared<Observation>();
+            observed->context = context;
+            if (!DispatchToWindowThread(toolbar, [toolbar, observed] {
+                    std::wstring error;
+                    observed->success = AssignNodeIdentity(toolbar, observed->context,
+                        observed->identity, error) && ReadMenuBarButtons(toolbar, observed->buttons);
+                }, reason)) toolbar = nullptr;
+            else {
+                context.nodeIds = std::move(observed->context.nodeIds);
+                context.nextNodeId = observed->context.nextNodeId;
+                context.nextNodeGeneration = observed->context.nextNodeGeneration;
+                if (!observed->success) toolbar = nullptr;
+                else {
+                    identity = std::move(observed->identity);
+                    buttons = std::move(observed->buttons);
+                }
+            }
+        }
         if (!toolbar) {
             identity.generation = 0;
             buttons.clear();
@@ -815,6 +982,7 @@ void ObserveMenuBarToolbar(HWND root, CaptureContext& context) noexcept {
         context.menuBarButtons = std::move(buttons);
         context.menuBarToolbarMenu.clear();
         context.menuBarToolbarCommands.clear();
+        context.menuBarSilentButtons.clear();
         context.menuBarRefresh.Invalidate(GetTickCount64());
     } catch (...) {
         context.menuBarToolbar = nullptr;
@@ -869,8 +1037,73 @@ bool CaptureWindow(
     }
 }
 
+std::wstring DescribeSnapshotDifference(const WindowSnapshot& before, const WindowSnapshot& after) {
+    if (before.nodes.size() != after.nodes.size())
+        return L"node count " + std::to_wstring(before.nodes.size()) + L" -> " +
+            std::to_wstring(after.nodes.size());
+    const auto rectText = [](const RECT& rect) {
+        return std::to_wstring(rect.left) + L"," + std::to_wstring(rect.top) + L"," +
+            std::to_wstring(rect.right) + L"," + std::to_wstring(rect.bottom);
+    };
+    for (size_t index = 0; index < before.nodes.size(); ++index) {
+        const auto& a = before.nodes[index];
+        const auto& b = after.nodes[index];
+        std::wstring field;
+        if (a.hwnd != b.hwnd || a.kind != b.kind) field = L"identity";
+        else if (!EqualRect(&a.rect, &b.rect)) field = L"rect " + rectText(a.rect) + L" -> " + rectText(b.rect);
+        else if (a.text != b.text) field = L"text";
+        else if (a.visible != b.visible || a.enabled != b.enabled) field = L"visibility/enabled";
+        else if (a.checked != b.checked || a.selectedIndex != b.selectedIndex ||
+                 a.focusedIndex != b.focusedIndex || a.position != b.position) field = L"state";
+        else if (a.items != b.items || a.itemRects.size() != b.itemRects.size()) field = L"items";
+        else if (a.chromeRegions.size() != b.chromeRegions.size()) field = L"chrome region count";
+        else {
+            for (size_t region = 0; region < a.chromeRegions.size() && field.empty(); ++region) {
+                const auto& before = a.chromeRegions[region].imageData;
+                const auto& after = b.chromeRegions[region].imageData;
+                if (before == after) continue;
+                // How much moved: a few levels on a few bytes is render noise, a whole glyph is
+                // an animation.
+                size_t differing = 0;
+                int largest = 0;
+                const size_t common = (std::min)(before.size(), after.size());
+                for (size_t byte = 0; byte < common; ++byte) {
+                    const int delta = std::abs(static_cast<int>(before[byte]) - static_cast<int>(after[byte]));
+                    if (delta != 0) ++differing;
+                    largest = (std::max)(largest, delta);
+                }
+                field = L"chrome pixels " + rectText(a.chromeRegions[region].rect) + L" (" +
+                    std::to_wstring(differing) + L" of " + std::to_wstring(common) +
+                    L" bytes differ, largest step " + std::to_wstring(largest) + L")";
+            }
+            for (size_t bar = 0; bar < a.scrollBars.size() && bar < b.scrollBars.size() && field.empty(); ++bar)
+                if (a.scrollBars[bar].position != b.scrollBars[bar].position ||
+                    a.scrollBars[bar].maximum != b.scrollBars[bar].maximum)
+                    field = L"scroll bar";
+            if (field.empty() && a.imageData != b.imageData) field = L"image pixels";
+        }
+        if (!field.empty()) {
+            wchar_t className[64]{};
+            GetClassNameW(a.hwnd, className, 64);
+            return L"node " + std::to_wstring(index) + L" (" + className + L") " + field;
+        }
+    }
+    return {};
+}
+
 uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
     uint64_t hash = 1469598103934665603ull;
+    const auto hashImage = [&](const ImageListEntry& image) {
+        HashBytes(hash, image.imageWidth);
+        HashBytes(hash, image.imageHeight);
+        HashString(hash, image.imageFormat);
+        HashBytes(hash, image.imageData.size());
+        if (!image.imageData.empty()) HashRange(hash, image.imageData.data(), image.imageData.size());
+    };
+    const auto hashOptionalImage = [&](const std::optional<ImageListEntry>& image) {
+        HashBytes(hash, image.has_value());
+        if (image) hashImage(*image);
+    };
     HashBytes(hash, snapshot.nativeHwnd);
     HashBytes(hash, snapshot.ownerHwnd);
     HashBytes(hash, snapshot.generation);
@@ -958,11 +1191,72 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.items.size());
         for (const auto& item : node.items) HashString(hash, item);
         HashString(hash, node.listViewMode);
+        HashBytes(hash, node.groupViewEnabled);
+        HashBytes(hash, node.listViewGroups.size());
+        for (const auto& group : node.listViewGroups) {
+            HashBytes(hash, group.groupId);
+            HashString(hash, group.header);
+            HashString(hash, group.footer);
+            HashString(hash, group.headerAlignment);
+            HashString(hash, group.footerAlignment);
+            HashBytes(hash, group.collapsible);
+            HashBytes(hash, group.collapsed);
+            HashBytes(hash, group.hidden);
+            HashBytes(hash, group.headerRect);
+            HashBytes(hash, group.footerRect);
+        }
+        HashBytes(hash, node.itemGroupIds.size());
+        for (const int groupId : node.itemGroupIds) HashBytes(hash, groupId);
+        HashBytes(hash, node.ownerDrawCombo.has_value());
+        if (node.ownerDrawCombo) {
+            HashString(hash, node.ownerDrawCombo->mode);
+            HashBytes(hash, node.ownerDrawCombo->items.size());
+            for (const auto& item : node.ownerDrawCombo->items) {
+                hashImage(item.normal);
+                hashImage(item.selected);
+            }
+            hashOptionalImage(node.ownerDrawCombo->selectionFace);
+        }
+        HashBytes(hash, node.document.has_value());
+        if (node.document) {
+            HashString(hash, node.document->documentId);
+            HashBytes(hash, node.document->regions.size());
+            for (const auto& region : node.document->regions) {
+                HashString(hash, region.key);
+                HashString(hash, region.kind);
+                HashBytes(hash, region.rect);
+                HashBytes(hash, region.contentWidth);
+                HashBytes(hash, region.contentHeight);
+                HashBytes(hash, region.maximumX);
+                HashBytes(hash, region.maximumY);
+                HashBytes(hash, region.offsetX);
+                HashBytes(hash, region.offsetY);
+            }
+            HashBytes(hash, node.document->items.size());
+            for (const auto& item : node.document->items) {
+                HashString(hash, item.key);
+                HashString(hash, item.kind);
+                HashBytes(hash, item.rect);
+                HashBytes(hash, item.regionIndex);
+                HashBytes(hash, item.reportRegionIndex);
+                HashString(hash, item.name);
+                HashString(hash, item.actionIdentity);
+                HashBytes(hash, item.enabled);
+                hashOptionalImage(item.image);
+                HashBytes(hash, item.reportRows.size());
+                for (const auto& row : item.reportRows) {
+                    HashString(hash, row.path);
+                    HashBytes(hash, row.value);
+                    HashBytes(hash, row.available);
+                }
+            }
+        }
         HashBytes(hash, node.itemRects.size());
         for (const auto& rect : node.itemRects) HashBytes(hash, rect);
         HashBytes(hash, node.itemNativeIds.size());
         for (const uint32_t nativeId : node.itemNativeIds) HashBytes(hash, nativeId);
         HashBytes(hash, node.itemActivationSupported);
+        HashBytes(hash, node.itemDefaultActivation);
         HashBytes(hash, node.columns.size());
         for (const auto& column : node.columns) HashString(hash, column);
         HashBytes(hash, node.columnWidths.size());
@@ -974,6 +1268,8 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, row.size());
             for (const auto& cell : row) HashString(hash, cell);
         }
+        HashBytes(hash, node.itemCount);
+        HashBytes(hash, node.itemWindowStart);
         HashBytes(hash, node.columnHeadersVisible);
         HashBytes(hash, node.checkBoxes);
         HashBytes(hash, node.checkedIndices.size());
@@ -1027,6 +1323,10 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, item.checked);
             HashBytes(hash, item.dropDown);
             HashBytes(hash, item.wholeDropDown);
+            HashBytes(hash, item.paintedFace);
+            hashOptionalImage(item.hotImage);
+            hashOptionalImage(item.disabledImage);
+            hashOptionalImage(item.pressedImage);
             HashBytes(hash, item.imageWidth);
             HashBytes(hash, item.imageHeight);
             HashString(hash, item.imageFormat);
@@ -1042,6 +1342,17 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, split.minimum);
             HashBytes(hash, split.maximum);
         }
+        HashBytes(hash, node.scrollBars.size());
+        for (const auto& bar : node.scrollBars) {
+            HashBytes(hash, bar.vertical);
+            HashBytes(hash, bar.enabled);
+            HashBytes(hash, bar.minimum);
+            HashBytes(hash, bar.maximum);
+            HashBytes(hash, bar.page);
+            HashBytes(hash, bar.position);
+            HashBytes(hash, bar.rect);
+        }
+        if (!node.scrollBars.empty()) HashBytes(hash, node.clientRect);
         // The chrome pixels are part of the fingerprint, so a container that repaints
         // its own band reaches the renderer as a patch instead of going stale.
         HashBytes(hash, node.chromeRegions.size());
@@ -1071,6 +1382,93 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             if (!item.imageData.empty())
                 HashRange(hash, item.imageData.data(), item.imageData.size());
         }
+        HashBytes(hash, node.richParagraphs.size());
+        for (const auto& paragraph : node.richParagraphs) {
+            HashString(hash, paragraph.alignment);
+            HashBytes(hash, paragraph.bullet);
+            HashBytes(hash, paragraph.leftIndent);
+            HashBytes(hash, paragraph.firstLineIndent);
+            HashBytes(hash, paragraph.spaceBefore);
+            HashBytes(hash, paragraph.spaceAfter);
+            HashBytes(hash, paragraph.runs.size());
+            for (const auto& run : paragraph.runs) {
+                HashString(hash, run.text);
+                HashBytes(hash, run.bold);
+                HashBytes(hash, run.italic);
+                HashBytes(hash, run.underline);
+                HashBytes(hash, run.strike);
+                HashBytes(hash, run.size);
+                HashBytes(hash, run.color);
+            }
+        }
+        HashBytes(hash, node.performanceGraph.has_value());
+        if (node.performanceGraph) {
+            const auto& graph = *node.performanceGraph;
+            HashString(hash, graph.displayType);
+            HashBytes(hash, graph.minimum);
+            HashBytes(hash, graph.maximum);
+            HashBytes(hash, graph.sampleCount);
+            HashBytes(hash, graph.intervalMs);
+            HashBytes(hash, graph.scroll);
+            HashBytes(hash, graph.barSlot);
+            HashBytes(hash, graph.wrapped);
+            HashBytes(hash, graph.startTimeMs);
+            HashBytes(hash, graph.endTimeMs);
+            HashBytes(hash, graph.showVerticalGrid);
+            HashBytes(hash, graph.showHorizontalGrid);
+            HashBytes(hash, graph.showScaleLabels);
+            HashBytes(hash, graph.showTimeLabels);
+            HashString(hash, graph.title);
+            HashString(hash, graph.yAxisLabel);
+            HashBytes(hash, graph.backColor);
+            HashBytes(hash, graph.controlColor);
+            HashBytes(hash, graph.gridColor);
+            HashBytes(hash, graph.textColor);
+            HashBytes(hash, graph.barColor);
+            HashBytes(hash, graph.series.size());
+            for (const auto& series : graph.series) {
+                HashString(hash, series.name);
+                HashBytes(hash, series.color);
+                HashBytes(hash, series.width);
+                HashString(hash, series.style);
+                HashBytes(hash, series.scale);
+                HashBytes(hash, series.visible);
+                HashBytes(hash, series.highlighted);
+                HashBytes(hash, series.values.size());
+                for (const auto& value : series.values) {
+                    HashBytes(hash, value.has_value());
+                    if (value) HashBytes(hash, *value);
+                }
+            }
+        }
+        HashBytes(hash, node.performanceLegend.has_value());
+        if (node.performanceLegend) {
+            const auto& legend = *node.performanceLegend;
+            HashString(hash, legend.displayType);
+            HashBytes(hash, legend.columns.size());
+            for (const auto& column : legend.columns) {
+                HashString(hash, column.title);
+                HashBytes(hash, column.width);
+            }
+            HashBytes(hash, legend.rows.size());
+            for (const auto& row : legend.rows) {
+                HashBytes(hash, row.visible);
+                HashBytes(hash, row.color);
+                HashBytes(hash, row.width);
+                HashString(hash, row.style);
+                HashBytes(hash, row.selected);
+                HashBytes(hash, row.cells.size());
+                for (const auto& cell : row.cells) HashString(hash, cell);
+            }
+        }
+        HashBytes(hash, node.performanceValueBar.has_value());
+        if (node.performanceValueBar) {
+            HashBytes(hash, node.performanceValueBar->fields.size());
+            for (const auto& field : node.performanceValueBar->fields) {
+                HashString(hash, field.label);
+                HashString(hash, field.value);
+            }
+        }
         HashString(hash, node.pageId);
         HashString(hash, node.semanticKey);
         HashString(hash, node.sourceKind);
@@ -1081,6 +1479,36 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashString(hash, node.accessKey);
     }
     return hash;
+}
+
+// True when `next` differs from the canonical snapshot only in the pixels some container's chrome
+// regions hold (so the fingerprints differ and nothing else moved).  The pixel buffers are swapped
+// for the length of the comparison, never copied.
+bool OnlyChromePixelsChanged(WindowSnapshot& canonical, WindowSnapshot& next,
+    uint64_t canonicalFingerprint) noexcept {
+    if (canonical.nodes.size() != next.nodes.size()) return false;
+    struct Swap final { std::vector<uint8_t>* canonical; std::vector<uint8_t>* next; };
+    std::vector<Swap> swaps;
+    try {
+        for (size_t index = 0; index < canonical.nodes.size(); ++index) {
+            auto& before = canonical.nodes[index].chromeRegions;
+            auto& after = next.nodes[index].chromeRegions;
+            if (before.size() != after.size()) return false;
+            for (size_t region = 0; region < before.size(); ++region) {
+                if (before[region].imageData != after[region].imageData)
+                    swaps.push_back({ &before[region].imageData, &after[region].imageData });
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    if (swaps.empty()) return false;
+    for (const auto& pair : swaps) pair.canonical->swap(*pair.next);
+    // `next` now carries the canonical pixels: it fingerprints like the canonical snapshot exactly
+    // when the pixels were all that differed.
+    const bool onlyPixels = SnapshotFingerprint(next) == canonicalFingerprint;
+    for (const auto& pair : swaps) pair.canonical->swap(*pair.next);
+    return onlyPixels;
 }
 
 } // namespace FluentShell::Bridge::Translation

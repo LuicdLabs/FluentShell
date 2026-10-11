@@ -37,6 +37,12 @@ public sealed record ToolbarItemSnapshot
     public int? ImageHeight { get; init; }
     public string? ImageFormat { get; init; }
     public string? ImageData { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ImageListEntry? HotImage { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ImageListEntry? DisabledImage { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ImageListEntry? PressedImage { get; init; }
 }
 
 public sealed record ImageListEntry
@@ -45,6 +51,20 @@ public sealed record ImageListEntry
     public int ImageHeight { get; init; }
     public string ImageFormat { get; init; } = string.Empty;
     public string ImageData { get; init; } = string.Empty;
+}
+
+public sealed record OwnerDrawComboItem
+{
+    public ImageListEntry Normal { get; init; } = new();
+    public ImageListEntry Selected { get; init; } = new();
+}
+
+public sealed record OwnerDrawComboSnapshot
+{
+    public string Mode { get; init; } = string.Empty;
+    public List<OwnerDrawComboItem> Items { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ImageListEntry? SelectionFace { get; init; }
 }
 
 // One splitter between two panes of a container.  `position` is the gap's leading
@@ -56,6 +76,33 @@ public sealed record PaneSplit
     public int Thickness { get; init; }
     public int Minimum { get; init; }
     public int Maximum { get; init; }
+}
+
+// A standard window scroll bar of a container whose application scrolls its child
+// windows. `rect` is in the container's own window-relative coordinates; the
+// range follows SCROLLINFO, so the last reachable position is maximum - page + 1.
+public sealed record ScrollBarSnapshot
+{
+    public bool Vertical { get; init; }
+    public bool Enabled { get; init; }
+    public int Minimum { get; init; }
+    public int Maximum { get; init; }
+    public int Page { get; init; }
+    public int Position { get; init; }
+    public PixelRect Rect { get; init; }
+}
+
+// setScroll: exactly one of a target position or a signed count of line steps.
+public sealed record SetScrollActionValue
+{
+    [JsonPropertyName("vertical")]
+    public bool Vertical { get; init; }
+    [JsonPropertyName("position")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Position { get; init; }
+    [JsonPropertyName("lines")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Lines { get; init; }
 }
 
 // One band a container paints itself, reproduced from the pixels the native window
@@ -140,11 +187,22 @@ public sealed record ControlNode
     public bool Reversed { get; init; }
     public List<string> Items { get; init; } = [];
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public OwnerDrawComboSnapshot? OwnerDrawCombo { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<PixelRect>? ItemRects { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? ListViewMode { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? GroupViewEnabled { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ListViewGroupSnapshot>? ListViewGroups { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? ItemGroupIds { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ItemActivationSupported { get; init; }
+    // Minor 34: a ListView or TreeView item may be opened (openItem: the control is sent Enter).
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ItemDefaultActivation { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<string>? ItemNativeIds { get; init; }
     public List<string> Columns { get; init; } = [];
@@ -152,6 +210,12 @@ public sealed record ControlNode
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<int>? ColumnOrder { get; init; }
     public List<List<string>> Rows { get; init; } = [];
+    // Minor 33: a large virtual report list carries the rows from ItemWindowStart on;
+    // ItemCount is the list's length and every index stays absolute.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ItemCount { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? ItemWindowStart { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ColumnHeadersVisible { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -193,7 +257,21 @@ public sealed record ControlNode
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<ChromeRegion>? ChromeRegions { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ScrollBarSnapshot>? ScrollBars { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<AccessibleIslandItem>? IslandItems { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public NativeDocumentSnapshot? Document { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public DiskViewSnapshot? DiskView { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public RichTextSnapshot? RichText { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PerformanceGraphSnapshot? PerformanceGraph { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PerformanceLegendSnapshot? PerformanceLegend { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PerformanceValueBarSnapshot? PerformanceValueBar { get; init; }
     public string? AdapterId { get; init; }
     public string? PageId { get; init; }
     public string? SemanticKey { get; init; }
@@ -202,6 +280,28 @@ public sealed record ControlNode
     public List<string>? SupportedActions { get; init; }
     public string? HelpText { get; init; }
     public string? AccessKey { get; init; }
+}
+
+public sealed record ListViewGroupSnapshot
+{
+    public string GroupId { get; init; } = "0";
+    public string Header { get; init; } = string.Empty;
+    public string Footer { get; init; } = string.Empty;
+    public string HeaderAlignment { get; init; } = "left";
+    public string FooterAlignment { get; init; } = "left";
+    public bool Collapsible { get; init; }
+    public bool Collapsed { get; init; }
+    public bool Hidden { get; init; }
+    public PixelRect HeaderRect { get; init; } = new();
+    public PixelRect FooterRect { get; init; } = new();
+}
+
+public sealed record ListViewGroupExpandActionValue
+{
+    [JsonPropertyName("groupId")]
+    public string GroupId { get; init; } = "0";
+    [JsonPropertyName("expanded")]
+    public bool Expanded { get; init; }
 }
 
 public sealed record ListViewCheckActionValue
