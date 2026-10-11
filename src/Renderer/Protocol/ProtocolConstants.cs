@@ -69,7 +69,11 @@ public static class ProtocolConstants
     // Minor 37 adds the datePicker and timePicker kinds (SysDateTimePick32): the value is the
     // position of a range, as for a slider -- a date's day number (days since 0001-01-01), a
     // time's second of the day -- and setValue changes it.
-    public const ushort Minor = 37;
+    // Minor 38 completes the translated dialogs: a task dialog's nodes may carry
+    // presentation variants (mainInstruction, commandLink*, elevated, expando*) and a
+    // command link's note as helpText, and its text is a sysLink with one label per
+    // link, named by index through activateItem.
+    public const ushort Minor = 38;
     // Minor 32 also lets a container carry its scroll bars; one setScroll moves at
     // most this many application line steps.
     public const int MaxScrollLines = 100;

@@ -76,6 +76,7 @@
     <ClCompile Include="Bridge\Translation\MmcHtmlDocument.cpp" />
     <ClCompile Include="Bridge\Translation\MenuBarCapture.cpp" />
     <ClCompile Include="Bridge\Translation\DialogSnapshots.cpp" />
+    <ClCompile Include="Bridge\Translation\VirtualTaskDialog.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />
     <ClCompile Include="Bridge\Translation\DirectUiEngine.cpp" />
     <ClCompile Include="Bridge\Translation\RendererSession.cpp" />
@@ -98,6 +99,7 @@
     <ClInclude Include="Bridge\Translation\MmcHtmlDocument.h" />
     <ClInclude Include="Bridge\Translation\MenuBarCapture.h" />
     <ClInclude Include="Bridge\Translation\DialogSnapshots.h" />
+    <ClInclude Include="Bridge\Translation\VirtualTaskDialog.h" />
     <ClInclude Include="Bridge\Translation\DialogTranslator.h" />
     <ClInclude Include="Bridge\Translation\DirectUiEngine.h" />
     <ClInclude Include="Bridge\Translation\RendererSession.h" />

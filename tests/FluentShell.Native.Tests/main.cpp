@@ -8,6 +8,7 @@
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
+#include "../../src/Bridge/Translation/VirtualTaskDialog.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
 #include "../../src/Bridge/Translation/PopupMenuState.h"
@@ -3598,6 +3599,8 @@ void CheckVirtualDialogSnapshot(
         if (node.hwnd != nullptr) ok = false;
         if (++seenIds[node.nodeId] > 1) ok = false;
         if (++seenZ[node.zIndex] > 1) ok = false;
+        // The renderer refuses a tab index on a control that is not a tab stop.
+        if (!node.tabStop && node.tabIndex != -1) ok = false;
     }
     Check(ok, label);
 }
@@ -4081,51 +4084,335 @@ void TestFormRowStripsAreNotSplits() {
 }
 
 void TestVirtualDialogSnapshots() {
+    using Translation::DialogTextMeasure;
     std::unordered_map<uint64_t, int> results;
     const auto messageBox = Translation::BuildMessageBoxSnapshot(
-        nullptr, L"The call was answered by the projection.", L"Oracle",
-        MB_YESNOCANCEL | MB_ICONEXCLAMATION, results);
+        nullptr, L"Save & exit?", L"Oracle",
+        MB_YESNOCANCEL | MB_ICONEXCLAMATION | MB_DEFBUTTON2, results);
     Check(messageBox.surfaceKind == Translation::SurfaceKind::MessageBox &&
           messageBox.icon == L"warning" && messageBox.canCancel &&
           messageBox.nodes.size() == 4 && results.size() == 3,
         "MessageBox translation did not describe its buttons");
     CheckVirtualDialogSnapshot(messageBox, "translated MessageBox broke a protocol invariant");
 
-    // Every text block, the verification checkbox, and every button share one
-    // snapshot, which is where duplicate z-indexes came from.
-    TASKDIALOGCONFIG config{};
-    config.cbSize = sizeof(config);
-    config.dwFlags = TDF_VERIFICATION_FLAG_CHECKED | TDF_ALLOW_DIALOG_CANCELLATION;
-    config.pszMainIcon = TD_INFORMATION_ICON;
-    config.nDefaultButton = IDOK;
-    const std::vector<std::pair<int, std::wstring>> buttons{
-        { IDOK, L"OK" }, { IDCANCEL, L"Cancel" }
-    };
-    std::unordered_map<uint64_t, int> dialogResults;
-    std::optional<uint64_t> verificationNode;
-    const auto taskDialog = Translation::BuildTaskDialogSnapshot(
-        config, buttons, L"Oracle", L"Main instruction", L"Body content",
-        L"Footer", L"Do not ask again", dialogResults, verificationNode);
-    Check(taskDialog.surfaceKind == Translation::SurfaceKind::TaskDialog &&
-          taskDialog.icon == L"info" && taskDialog.canCancel &&
-          taskDialog.nodes.size() == 6 && dialogResults.size() == 2 &&
-          verificationNode.has_value(),
-        "TaskDialog translation did not describe its content");
-    CheckVirtualDialogSnapshot(taskDialog, "translated TaskDialog broke a protocol invariant");
+    // The dialog is as large as its text: a short message is a small dialog, its text
+    // beside the icon, and the buttons right-aligned in the band below it.
+    const DialogTextMeasure measure(messageBox.dpi);
+    const RECT& client = messageBox.clientBounds;
+    const auto& text = messageBox.nodes.front();
+    Check(client.right < measure.Px(480) && client.bottom < measure.Px(200),
+        "a short MessageBox was not sized to its text");
+    Check(text.kind == Translation::ControlKind::StaticText && text.text == L"Save && exit?" &&
+          text.rect.left >= measure.Px(20 + 32) && text.rect.right <= client.right,
+        "MessageBox text was not escaped or not placed beside its icon");
+    LONG previousRight = 0;
+    for (size_t index = 1; index < messageBox.nodes.size(); ++index) {
+        const auto& button = messageBox.nodes[index];
+        Check(button.kind == Translation::ControlKind::Button && button.rect.top >= text.rect.bottom &&
+              button.rect.bottom <= client.bottom && button.rect.left >= previousRight &&
+              button.text == Translation::DialogButtonLabel(results.at(button.nodeId)),
+            "MessageBox buttons are not a band of labelled buttons under the text");
+        previousRight = button.rect.right;
+    }
+    Check(client.right - previousRight == measure.Px(20),
+        "MessageBox buttons are not right-aligned at the margin");
+    Check(messageBox.nodes[2].isDefault && !messageBox.nodes[1].isDefault,
+        "MB_DEFBUTTON2 did not make the second button the default");
+    const LONG frameWidth = messageBox.bounds.right - messageBox.bounds.left;
+    Check(frameWidth > client.right, "MessageBox bounds do not include the window frame");
 
-    // An empty text block is skipped rather than projected as a blank node, and the
-    // remaining nodes still form one contiguous, unique z-order.
-    TASKDIALOGCONFIG spare{};
-    spare.cbSize = sizeof(spare);
-    std::unordered_map<uint64_t, int> spareResults;
-    std::optional<uint64_t> spareVerification;
+    std::unordered_map<uint64_t, int> okResults;
+    const auto okBox = Translation::BuildMessageBoxSnapshot(nullptr, L"Done.", L"", MB_OK, okResults);
+    Check(okBox.canCancel && okBox.icon == L"none" && okBox.nodes.front().rect.left == measure.Px(20),
+        "a lone OK message box cannot be dismissed with Escape or reserves icon space");
+
+    // Links: <a href> markup becomes the visible label, reported by its href.
+    const auto parsed = Translation::ParseTaskDialogLinks(
+        L"Visit <a href=\"https://example.test/\">the site</a> or <A HREF='help'>help</A>.");
+    Check(parsed.text == L"Visit the site or help." && parsed.labels.size() == 2 &&
+          parsed.hrefs[0] == L"https://example.test/" && parsed.hrefs[1] == L"help",
+        "task dialog link markup was not parsed");
+
+    // A full task dialog: every element in one snapshot with unique IDs and z-order.
+    Translation::TaskDialogModel model;
+    model.title = L"Oracle";
+    model.instruction = L"Main instruction";
+    model.content = L"Body content with <a href=\"x\">a link</a>.";
+    model.expandedInformation = L"Expanded details";
+    model.footer = L"Footer";
+    model.footerIcon.standard = L"info";
+    model.verification = L"Do not ask again";
+    model.mainIcon.standard = L"warning";
+    model.hyperlinks = true;
+    model.canCancel = true;
+    model.progress = Translation::TaskDialogProgress::Normal;
+    model.progressPosition = 40;
+    model.radios = { { 10, L"&First", true }, { 11, L"&Second", true } };
+    model.selectedRadio = 11;
+    Translation::TaskDialogButtonModel link;
+    link.id = 100;
+    link.text = L"&Continue";
+    link.note = L"Keeps going";
+    link.commandLink = true;
+    model.buttons.push_back(link);
+    model.buttons.push_back({ IDOK, L"OK" });
+    model.buttons.push_back({ IDCANCEL, L"Cancel" });
+    Translation::TaskDialogElements elements;
+    const auto taskDialog = Translation::BuildTaskDialogSnapshot(
+        model, nullptr, nullptr, 96, std::nullopt, elements);
+    CheckVirtualDialogSnapshot(taskDialog, "translated TaskDialog broke a protocol invariant");
+    size_t radios = 0, buttons = 0, texts = 0, verification = 0, expando = 0;
+    for (const auto& [_, element] : elements) {
+        switch (element.kind) {
+        case Translation::TaskDialogElementKind::Radio: ++radios; break;
+        case Translation::TaskDialogElementKind::Button: ++buttons; break;
+        case Translation::TaskDialogElementKind::Text: ++texts; break;
+        case Translation::TaskDialogElementKind::Verification: ++verification; break;
+        case Translation::TaskDialogElementKind::Expando: ++expando; break;
+        }
+    }
+    Check(taskDialog.surfaceKind == Translation::SurfaceKind::TaskDialog && taskDialog.icon == L"warning" &&
+          radios == 2 && buttons == 3 && texts == 1 && verification == 1 && expando == 1,
+        "TaskDialog translation did not describe every element");
+    const auto nodeById = [](const Translation::WindowSnapshot& snapshot, uint64_t id) {
+        return std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(),
+            [&](const auto& node) { return node.nodeId == id; });
+    };
+    const auto commandLink = std::find_if(taskDialog.nodes.begin(), taskDialog.nodes.end(),
+        [](const auto& node) { return node.presentationVariant == L"commandLink"; });
+    Check(commandLink != taskDialog.nodes.end() && commandLink->helpText == L"Keeps going" &&
+          commandLink->controlId == 100,
+        "a command link lost its note");
+    const auto selected = std::count_if(taskDialog.nodes.begin(), taskDialog.nodes.end(),
+        [](const auto& node) { return node.kind == Translation::ControlKind::RadioButton && node.checked == 1; });
+    Check(selected == 1, "TaskDialog radio selection is not exactly the default radio");
+    Check(nodeById(taskDialog, 4) == taskDialog.nodes.end(), "collapsed expanded information was projected");
+
+    // Expanding keeps every element's identity and grows the dialog downward.
+    model.expanded = true;
+    Translation::TaskDialogElements expandedElements;
+    const auto expanded = Translation::BuildTaskDialogSnapshot(
+        model, nullptr, nullptr, 96, POINT{ 0, 0 }, expandedElements);
+    Check(nodeById(expanded, 4) != expanded.nodes.end() &&
+          expanded.clientBounds.bottom > taskDialog.clientBounds.bottom &&
+          expanded.nodes.size() == taskDialog.nodes.size() + 1,
+        "expanding a TaskDialog did not add its details in place");
+    for (const auto& node : taskDialog.nodes) {
+        Check(nodeById(expanded, node.nodeId) != expanded.nodes.end(),
+            "a TaskDialog rebuild changed an element's node ID");
+    }
+
+    // An empty text block is skipped rather than projected as a blank node.
+    Translation::TaskDialogModel sparse;
+    sparse.instruction = L"Only an instruction";
+    sparse.buttons.push_back({ IDOK, L"OK" });
+    Translation::TaskDialogElements sparseElements;
     const auto minimal = Translation::BuildTaskDialogSnapshot(
-        spare, { { IDOK, L"OK" } }, L"", L"Only an instruction", L"", L"", L"",
-        spareResults, spareVerification);
-    Check(minimal.nodes.size() == 2 && !spareVerification.has_value() &&
-          minimal.title == L"Dialog" && minimal.icon == L"none",
+        sparse, nullptr, nullptr, 96, std::nullopt, sparseElements);
+    Check(minimal.nodes.size() == 2 && minimal.icon == L"none" && !minimal.title.empty(),
         "a sparse TaskDialog was not reduced to its real content");
     CheckVirtualDialogSnapshot(minimal, "sparse TaskDialog broke a protocol invariant");
+}
+
+// The task dialog's callback contract: notifications reach the callback with the
+// host HWND on the calling thread, TDM_* messages change the published dialog, and
+// S_FALSE from TDN_BUTTON_CLICKED keeps it open.
+struct TaskDialogProbe final {
+    std::vector<UINT> notifications;
+    int refusals = 1;
+    HWND host = nullptr;
+    std::wstring href;
+};
+
+HRESULT CALLBACK ProbeTaskDialogCallback(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LONG_PTR data) {
+    auto* probe = reinterpret_cast<TaskDialogProbe*>(data);
+    probe->notifications.push_back(message);
+    probe->host = hwnd;
+    if (message == TDN_DIALOG_CONSTRUCTED) SendMessageW(hwnd, TDM_ENABLE_BUTTON, IDOK, FALSE);
+    if (message == TDN_HYPERLINK_CLICKED && lParam) probe->href = reinterpret_cast<PCWSTR>(lParam);
+    if (message == TDN_BUTTON_CLICKED && wParam == IDCANCEL && probe->refusals > 0) {
+        --probe->refusals;
+        return S_FALSE;
+    }
+    return S_OK;
+}
+
+void PumpTaskDialogHost() {
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
+}
+
+void TestVirtualTaskDialogCallbacks() {
+    TaskDialogProbe probe;
+    const TASKDIALOG_BUTTON radios[] = { { 20, L"One" }, { 21, L"Two" } };
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_SHOW_PROGRESS_BAR;
+    config.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+    config.pszMainInstruction = L"Probe";
+    config.pszContent = L"See <a href=\"probe-link\">the link</a>.";
+    config.cRadioButtons = 2;
+    config.pRadioButtons = radios;
+    config.pfCallback = ProbeTaskDialogCallback;
+    config.lpCallbackData = reinterpret_cast<LONG_PTR>(&probe);
+    std::wstring reason;
+    auto dialog = Translation::VirtualTaskDialog::Create(config, nullptr, reason);
+    Check(dialog != nullptr, "a callback task dialog was refused");
+    if (!dialog) return;
+    const auto initial = dialog->InitialSnapshot();
+    Check(!initial.nodes.empty(), "the callback task dialog has no content");
+    std::vector<Translation::WindowSnapshot> published;
+    bool completed = false;
+    Translation::VirtualTaskDialog::Sink sink;
+    std::vector<uint64_t> publishedEvents;
+    sink.publish = [&](Translation::WindowSnapshot snapshot, uint64_t eventId) {
+        published.push_back(std::move(snapshot));
+        publishedEvents.push_back(eventId);
+    };
+    sink.complete = [&] { completed = true; };
+    Check(dialog->Start(std::move(sink)), "the task dialog host window was not created");
+    dialog->Announce();
+    Check(probe.notifications.size() >= 2 && probe.notifications[0] == TDN_DIALOG_CONSTRUCTED &&
+          probe.notifications[1] == TDN_CREATED && probe.host == dialog->Host(),
+        "the callback did not see the dialog created on its host window");
+    Check(!published.empty() && std::any_of(published.back().nodes.begin(), published.back().nodes.end(),
+        [](const auto& node) { return node.controlId == IDOK && !node.enabled; }),
+        "TDM_ENABLE_BUTTON from TDN_DIALOG_CONSTRUCTED did not disable the button");
+    if (published.empty()) return;
+
+    // A radio click and a link click arrive as renderer actions.
+    const auto current = published.back();
+    const auto radio = std::find_if(current.nodes.begin(), current.nodes.end(),
+        [](const auto& node) { return node.controlId == 21; });
+    const auto text = std::find_if(current.nodes.begin(), current.nodes.end(),
+        [](const auto& node) { return node.kind == Translation::ControlKind::SysLink; });
+    Check(radio != current.nodes.end() && text != current.nodes.end(), "the probe dialog lost a radio or its link");
+    if (radio == current.nodes.end() || text == current.nodes.end()) return;
+    Translation::ActionRequest select;
+    select.action = L"setCheck";
+    select.nodeId = radio->nodeId;
+    select.integerValue = 1;
+    select.eventId = 7;
+    dialog->PostAction(select);
+    Translation::ActionRequest follow;
+    follow.action = L"invoke";
+    follow.nodeId = text->nodeId;
+    follow.eventId = 9;
+    dialog->PostAction(follow);
+    PumpTaskDialogHost();
+    Check(dialog->Result().radioButton == 21 && probe.href == L"probe-link",
+        "a radio or link action did not reach the callback");
+    // Every accepted action is answered by a patch naming its event, or the renderer keeps
+    // the click pending for good.
+    Check(std::find(publishedEvents.begin(), publishedEvents.end(), 7) != publishedEvents.end() &&
+          std::find(publishedEvents.begin(), publishedEvents.end(), 9) != publishedEvents.end(),
+        "a radio or link action was not answered with a patch naming its event");
+
+    SendMessageW(dialog->Host(), TDM_SET_PROGRESS_BAR_POS, 60, 0);
+    Check(std::any_of(published.back().nodes.begin(), published.back().nodes.end(),
+        [](const auto& node) { return node.kind == Translation::ControlKind::ProgressBar && node.position == 60; }),
+        "TDM_SET_PROGRESS_BAR_POS did not move the progress bar");
+
+    // The first Cancel is refused by the callback, the second closes the dialog.
+    Translation::ActionRequest close;
+    close.action = L"close";
+    dialog->PostAction(close);
+    PumpTaskDialogHost();
+    Check(!completed && !dialog->Completed(), "S_FALSE from TDN_BUTTON_CLICKED did not keep the dialog open");
+    SendMessageW(dialog->Host(), TDM_CLICK_BUTTON, IDCANCEL, 0);
+    Check(completed && dialog->Result().button == IDCANCEL, "TDM_CLICK_BUTTON did not close the dialog");
+    dialog->Finish();
+    Check(probe.notifications.back() == TDN_DESTROYED && dialog->Host() == nullptr,
+        "the task dialog was not destroyed with TDN_DESTROYED");
+}
+
+// A container's painted bands can flicker between two renderings from one capture to the next;
+// reconcile publishes such a change only once two captures agree, which needs to tell "the pixels
+// moved" from "anything else moved".
+void TestChromePixelsOnlyChange() {
+    Translation::WindowSnapshot canonical;
+    canonical.generation = 1;
+    Translation::ControlNode node;
+    node.nodeId = 1;
+    node.generation = 1;
+    node.kind = Translation::ControlKind::PaneContainer;
+    node.rect = { 0, 0, 100, 40 };
+    Translation::ChromeRegionSnapshot band;
+    band.rect = { 0, 0, 4, 2 };
+    band.imageWidth = 4;
+    band.imageHeight = 2;
+    band.imageFormat = L"bgra8-premultiplied";
+    band.imageData.assign(32, 0x10);
+    node.chromeRegions.push_back(band);
+    canonical.nodes.push_back(node);
+    const uint64_t canonicalFingerprint = Translation::SnapshotFingerprint(canonical);
+
+    Translation::WindowSnapshot next = canonical;
+    Check(!Translation::OnlyChromePixelsChanged(canonical, next, canonicalFingerprint),
+        "an unchanged capture was reported as a pixels-only change");
+
+    next.nodes[0].chromeRegions[0].imageData.assign(32, 0x80);
+    Check(Translation::SnapshotFingerprint(next) != canonicalFingerprint,
+        "the fingerprint ignores the pixels of a chrome region");
+    Check(Translation::OnlyChromePixelsChanged(canonical, next, canonicalFingerprint),
+        "a capture that only repainted a chrome region was not recognised");
+    Check(canonical.nodes[0].chromeRegions[0].imageData.front() == 0x10 &&
+          next.nodes[0].chromeRegions[0].imageData.front() == 0x80 &&
+          Translation::SnapshotFingerprint(canonical) == canonicalFingerprint,
+        "the comparison left a snapshot's pixels swapped");
+
+    Translation::WindowSnapshot moved = next;
+    moved.nodes[0].rect = { 0, 0, 120, 40 };
+    Check(!Translation::OnlyChromePixelsChanged(canonical, moved, canonicalFingerprint),
+        "a geometry change was taken for a pixels-only change");
+
+    Translation::WindowSnapshot retitled = next;
+    retitled.title = L"renamed";
+    Check(!Translation::OnlyChromePixelsChanged(canonical, retitled, canonicalFingerprint),
+        "a window change was taken for a pixels-only change");
+
+    Translation::WindowSnapshot resized = next;
+    resized.nodes[0].chromeRegions[0].rect = { 0, 0, 8, 2 };
+    Check(!Translation::OnlyChromePixelsChanged(canonical, resized, canonicalFingerprint),
+        "a chrome region that moved was taken for a pixels-only change");
+}
+
+// A task dialog's own labels come from comctl32 (or English without it), and the application's
+// expando text takes their place -- for both states when it names only one.
+void TestTaskDialogLabels() {
+    for (const int id : { IDOK, IDCANCEL, IDYES, IDNO, IDRETRY, IDCLOSE }) {
+        const std::wstring label = Translation::TaskDialogButtonLabel(id);
+        Check(!label.empty() && label.find(L'%') == std::wstring::npos,
+            "a task dialog common button has no usable label");
+    }
+    const std::wstring collapsed = Translation::TaskDialogExpandoLabel(false);
+    const std::wstring expanded = Translation::TaskDialogExpandoLabel(true);
+    Check(!collapsed.empty() && !expanded.empty() && collapsed != expanded,
+        "the expando button has the same label in both states");
+
+    const auto expandoText = [](bool expand, const wchar_t* collapsedText, const wchar_t* expandedText) {
+        Translation::TaskDialogModel model;
+        model.instruction = L"Instruction";
+        model.expandedInformation = L"Details";
+        model.collapsedControlText = collapsedText;
+        model.expandedControlText = expandedText;
+        model.expanded = expand;
+        model.buttons.push_back({ IDOK, L"OK" });
+        Translation::TaskDialogElements elements;
+        const auto snapshot = Translation::BuildTaskDialogSnapshot(model, nullptr, nullptr, 96, std::nullopt, elements);
+        for (const auto& node : snapshot.nodes) {
+            if (node.presentationVariant == L"expandoCollapsed" || node.presentationVariant == L"expandoExpanded") {
+                return node.text;
+            }
+        }
+        return std::wstring();
+    };
+    Check(expandoText(false, L"", L"") == collapsed && expandoText(true, L"", L"") == expanded,
+        "the default expando labels were not used");
+    Check(expandoText(false, L"More", L"Less") == L"More" && expandoText(true, L"More", L"Less") == L"Less",
+        "the application's expando labels were not used per state");
+    Check(expandoText(false, L"Toggle", L"") == L"Toggle" && expandoText(true, L"Toggle", L"") == L"Toggle",
+        "a lone expando label was not used for both states");
 }
 
 void TestToolbarCaptureBoundary() {
@@ -4904,6 +5191,9 @@ int wmain() {
     TestMenuActionValidationAndSerialization();
     TestToolbarCaptureBoundary();
     TestVirtualDialogSnapshots();
+    TestVirtualTaskDialogCallbacks();
+    TestChromePixelsOnlyChange();
+    TestTaskDialogLabels();
     TestPaneContainerCaptureAndSplit();
     TestFormRowStripsAreNotSplits();
     TestUnownedModalDialogOwnerResolution();

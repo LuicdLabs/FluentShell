@@ -19,6 +19,8 @@ enum ControlId : int {
     IdMessageBox = 1001,
     IdTaskDialog = 1002,
     IdSaveConfirm = 1003,
+    IdRichTaskDialog = 1004,
+    IdInfoMessage = 1005,
     IdEdit = 1101,
     IdCheck = 1102,
     IdCombo = 1103,
@@ -116,6 +118,137 @@ void ShowTaskDialog() {
     const HRESULT hr = TaskDialogIndirect(&config, &button, nullptr, &verification);
     if (FAILED(hr)) button = static_cast<int>(hr);
     ReportResult(L"TaskDialog", button, verification);
+}
+
+// The MessageBox Device Manager raises for a device without driver files: OK only, no
+// icon, one line of text.  The projection sizes the dialog to that line.
+void ShowInfoMessage() {
+    const int result = MessageBoxW(gMain,
+        L"\x6B64\x88DD\x7F6E\x4E0D\x9700\x8981\x9A45\x52D5\x7A0B\x5F0F\x6A94\x6848\xFF0C"
+        L"\x6216\x672A\x70BA\x6B64\x88DD\x7F6E\x8F09\x5165\x4EFB\x4F55\x9A45\x52D5\x7A0B\x5F0F\x3002",
+        L"\x57FA\x672C\x7CFB\x7D71\x88DD\x7F6E", MB_OK);
+    ReportResult(L"InfoMessage", result);
+}
+
+// The rich task dialog exercises what a callback-driven dialog does: radio buttons,
+// command links, hyperlinks, a timer-driven progress bar, expandable details, a
+// footer, a nested MessageBox raised from the callback, and navigation to a second
+// page.  Every notification is logged so the projection can be compared with the
+// native dialog.
+constexpr int kRichNested = 301;
+constexpr int kRichNavigate = 302;
+constexpr int kRichFinish = 303;
+constexpr int kRichDisableRadio = 402;
+TASKDIALOGCONFIG gRichPage2{};
+
+HRESULT CALLBACK RichTaskDialogCallback(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, LONG_PTR) {
+    wchar_t text[512]{};
+    switch (message) {
+    case TDN_CREATED:
+        AppendLog(L"RichTaskDialog TDN_CREATED");
+        SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_RANGE, 0, MAKELPARAM(0, 100));
+        break;
+    case TDN_NAVIGATED:
+        AppendLog(L"RichTaskDialog TDN_NAVIGATED");
+        break;
+    case TDN_TIMER:
+        SendMessageW(hwnd, TDM_SET_PROGRESS_BAR_POS, (std::min<WPARAM>)(100, wParam / 100), 0);
+        break;
+    case TDN_HYPERLINK_CLICKED:
+        swprintf_s(text, L"RichTaskDialog TDN_HYPERLINK_CLICKED %s",
+            lParam ? reinterpret_cast<PCWSTR>(lParam) : L"(null)");
+        AppendLog(text);
+        break;
+    case TDN_RADIO_BUTTON_CLICKED:
+        swprintf_s(text, L"RichTaskDialog TDN_RADIO_BUTTON_CLICKED %d", static_cast<int>(wParam));
+        AppendLog(text);
+        SendMessageW(hwnd, TDM_ENABLE_BUTTON, kRichFinish, wParam != kRichDisableRadio);
+        break;
+    case TDN_VERIFICATION_CLICKED:
+        swprintf_s(text, L"RichTaskDialog TDN_VERIFICATION_CLICKED %d", static_cast<int>(wParam));
+        AppendLog(text);
+        break;
+    case TDN_EXPANDO_BUTTON_CLICKED:
+        swprintf_s(text, L"RichTaskDialog TDN_EXPANDO_BUTTON_CLICKED %d", static_cast<int>(wParam));
+        AppendLog(text);
+        break;
+    case TDN_BUTTON_CLICKED:
+        swprintf_s(text, L"RichTaskDialog TDN_BUTTON_CLICKED %d", static_cast<int>(wParam));
+        AppendLog(text);
+        if (wParam == kRichNested) {
+            const int nested = MessageBoxW(hwnd, L"This message box was raised from the task dialog's callback.",
+                L"Nested", MB_OKCANCEL | MB_ICONINFORMATION);
+            swprintf_s(text, L"RichTaskDialog nested MessageBox result %d", nested);
+            AppendLog(text);
+            return S_FALSE;
+        }
+        if (wParam == kRichNavigate) {
+            SendMessageW(hwnd, TDM_NAVIGATE_PAGE, 0, reinterpret_cast<LPARAM>(&gRichPage2));
+            return S_FALSE;
+        }
+        break;
+    case TDN_DESTROYED:
+        AppendLog(L"RichTaskDialog TDN_DESTROYED");
+        break;
+    default:
+        break;
+    }
+    return S_OK;
+}
+
+void ShowRichTaskDialog() {
+    static const TASKDIALOG_BUTTON buttons[] = {
+        { kRichNested, L"Show a nested message\nThe callback opens a MessageBox owned by this dialog." },
+        { kRichNavigate, L"Go to the second page\nTDM_NAVIGATE_PAGE replaces the content in place." },
+        { kRichFinish, L"Finish\nCloses the dialog with this command's ID." },
+    };
+    static const TASKDIALOG_BUTTON radios[] = {
+        { 401, L"Keep &Finish enabled" },
+        { kRichDisableRadio, L"&Disable Finish (TDM_ENABLE_BUTTON)" },
+    };
+    gRichPage2 = {};
+    gRichPage2.cbSize = sizeof(gRichPage2);
+    gRichPage2.hwndParent = gMain;
+    gRichPage2.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SHOW_MARQUEE_PROGRESS_BAR |
+        TDF_POSITION_RELATIVE_TO_WINDOW;
+    gRichPage2.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
+    gRichPage2.pszWindowTitle = L"Rich TaskDialog";
+    gRichPage2.pszMainIcon = TD_INFORMATION_ICON;
+    gRichPage2.pszMainInstruction = L"Second page";
+    gRichPage2.pszContent = L"The dialog navigated here. The marquee keeps running until you close it.";
+    gRichPage2.pfCallback = RichTaskDialogCallback;
+
+    TASKDIALOGCONFIG config{sizeof(config)};
+    config.hwndParent = gMain;
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_USE_COMMAND_LINKS | TDF_ENABLE_HYPERLINKS |
+        TDF_SHOW_PROGRESS_BAR | TDF_CALLBACK_TIMER | TDF_POSITION_RELATIVE_TO_WINDOW;
+    config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    config.pButtons = buttons;
+    config.cButtons = static_cast<UINT>(std::size(buttons));
+    config.nDefaultButton = kRichFinish;
+    config.pRadioButtons = radios;
+    config.cRadioButtons = static_cast<UINT>(std::size(radios));
+    config.nDefaultRadioButton = 401;
+    config.pszWindowTitle = L"Rich TaskDialog";
+    config.pszMainIcon = TD_SHIELD_ICON;
+    config.pszMainInstruction = L"Choose what the task dialog should do next";
+    config.pszContent = L"Read the <a href=\"https://learn.microsoft.com/windows/win32/controls/task-dialogs-overview\">task dialog overview</a> "
+        L"or the <a href=\"tdm\">TDM messages</a>. The progress bar is driven by TDN_TIMER.";
+    config.pszExpandedInformation = L"Expanded information: these lines appear when the expando button is pressed.";
+    config.pszFooter = L"Footer with an <a href=\"footer\">inline link</a>.";
+    config.pszFooterIcon = TD_INFORMATION_ICON;
+    config.pszVerificationText = L"&Remember my choice";
+    config.pfCallback = RichTaskDialogCallback;
+    int button = 0;
+    int radio = 0;
+    BOOL verification = FALSE;
+    const HRESULT hr = TaskDialogIndirect(&config, &button, &radio, &verification);
+    if (FAILED(hr)) button = static_cast<int>(hr);
+    wchar_t text[256]{};
+    swprintf_s(text, L"RichTaskDialog result: button=%d, radio=%d, verification=%s",
+        button, radio, verification ? L"true" : L"false");
+    SetWindowTextW(gResult, text);
+    AppendLog(text);
 }
 
 void ShowSaveConfirm() {
@@ -439,6 +572,12 @@ LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam
         case IdSaveConfirm:
             if (HIWORD(wParam) == BN_CLICKED) ShowSaveConfirm();
             break;
+        case IdRichTaskDialog:
+            if (HIWORD(wParam) == BN_CLICKED) ShowRichTaskDialog();
+            break;
+        case IdInfoMessage:
+            if (HIWORD(wParam) == BN_CLICKED) ShowInfoMessage();
+            break;
         case IdCreateUnsupported:
             if (HIWORD(wParam) == BN_CLICKED && !IsWindow(gUnsupported)) {
                 gUnsupported = CreateWindowExW(WS_EX_CLIENTEDGE, kUnsupportedClass, L"",
@@ -661,6 +800,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int show)
     HMENU toolsMenu = CreatePopupMenu();
     AppendMenuW(fileMenu, MF_STRING, IdMessageBox, L"&MessageBox\tCtrl+M");
     AppendMenuW(fileMenu, MF_STRING, IdTaskDialog, L"&TaskDialog\tCtrl+T");
+    AppendMenuW(fileMenu, MF_STRING, IdRichTaskDialog, L"&Rich TaskDialog");
+    AppendMenuW(fileMenu, MF_STRING, IdInfoMessage, L"&Information message");
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, IdMenuResetProgress, L"&Reset progress");
     AppendMenuW(fileMenu, MF_POPUP,

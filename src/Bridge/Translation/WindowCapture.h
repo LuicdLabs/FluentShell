@@ -66,4 +66,10 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept;
 // window (node count, then per node class, geometry, text and state), or empty.
 std::wstring DescribeSnapshotDifference(const WindowSnapshot& before, const WindowSnapshot& after);
 
+// True when `next` differs from the canonical snapshot only in the pixels some container's chrome
+// regions hold: the fingerprints differ and nothing else moved.  The pixel buffers are swapped for
+// the length of the comparison and put back, so both snapshots are unchanged on return.
+bool OnlyChromePixelsChanged(
+    WindowSnapshot& canonical, WindowSnapshot& next, uint64_t canonicalFingerprint) noexcept;
+
 } // namespace FluentShell::Bridge::Translation

@@ -243,6 +243,36 @@ native.
   that, because nothing built a dialog snapshot outside the live hook path.
 - Admission failures now name the offending node and field instead of only the rule.
 
+### Translated Dialogs Completed (protocol minor 38, 2026-10-10)
+
+The lane used to lay every MessageBox out at a fixed 540x300 with English labels, and
+virtualized only a static TaskDialog subset (anything with a callback, radio buttons,
+command links, hyperlinks, a progress bar or expandable details went native, where its
+DirectUI content handed the owner graph back to native).
+
+- Layout: dialogs are sized to their text, measured with DirectWrite (Segoe UI and the
+  system fallback, the font XAML draws; GDI's font linking measured CJK too narrow and
+  clipped it), with native-like margins, the icon beside the text, and the buttons
+  right-aligned in a shaded command band. Bounds include the proxy's frame.
+- Labels: user32's own (`MB_GetString`): `確定`, `是(&Y)`. A lone OK closes on Escape.
+- `MessageBoxIndirectW` is hooked (resource text, `MB_USERICON` as a picture node), and
+  `TaskDialog` alongside `TaskDialogIndirect` (in the comctl32 that exports it).
+- TaskDialog: every `TASKDIALOGCONFIG` feature (custom and common buttons, command links
+  with notes and shields, radio buttons, verification, expandable information in the
+  content or footer area, footer and footer icon, application icons, hyperlinks,
+  normal and marquee progress, `cxWidth`, positioning) and the callback contract
+  (`TDN_*` on the caller's thread with a real HWND; `TDM_*` including navigation,
+  progress, element text, enable/elevation state and icon updates; `S_FALSE` vetoes).
+- Protocol minor 38: a task dialog's nodes carry presentation variants
+  (`mainInstruction`, `commandLink*`, `elevated`, `expando*`) and a command link's note
+  as `helpText`; its text is a `sysLink` with one label per link, named by index through
+  `activateItem`. A window surface still admits a single-link SysLink only.
+- Evidence: `TestVirtualDialogSnapshots` and `TestVirtualTaskDialogCallbacks` (native),
+  `TaskDialogProtocolTests` (renderer), and LegacyDialogHost's "Rich TaskDialog" and
+  "Information message" commands driven live, including a MessageBox raised from the
+  task dialog's callback and a navigation; Device Manager's "no driver files" message
+  box over a device's Properties.
+
 ### Tranche J: Accessible Islands And The Full Toolbar Surface
 
 Some private container classes host their content as objects that own no HWND at

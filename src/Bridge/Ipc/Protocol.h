@@ -77,7 +77,11 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // Minor 37 adds the datePicker and timePicker kinds (SysDateTimePick32): the value is the
 // position of a range, as for a slider -- a date's day number (days since 0001-01-01), a
 // time's second of the day -- and setValue changes it.
-inline constexpr uint16_t kProtocolMinor = 37;
+// Minor 38 completes the translated dialogs: a task dialog's nodes may carry presentation
+// variants (mainInstruction, commandLink*, elevated, expando*) and a command link's note as
+// helpText, and a task dialog's text is a sysLink with one label per link, named by index
+// through activateItem.
+inline constexpr uint16_t kProtocolMinor = 38;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

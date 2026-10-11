@@ -26,6 +26,45 @@ internal readonly record struct NodeActionReplay(
     object? Value,
     int RetryCount);
 
+/// <summary>
+/// A menu-bar command the Bridge refused as <c>stale</c>, as the user saw its item: where
+/// it sits in the menu, its command and its label.  A menu has no node to look up again,
+/// so the item itself is the identity the replay is checked against.
+/// </summary>
+internal readonly record struct MenuActionReplay(
+    string ItemId,
+    int CommandId,
+    string Text,
+    int RetryCount);
+
+internal static class MenuActionReplayPolicy
+{
+    /// <summary>
+    /// The item a refused menu click may be re-sent for, or null.  A reconcile that lands
+    /// between the click and its admission only moves the revision; the user still chose
+    /// that item.  The click is therefore kept when the menu that replaced the one the
+    /// user saw still has the same enabled command, under the same path, with the same
+    /// label -- the Bridge then validates it against that menu like any other.  A menu
+    /// that was rebuilt around a different item is a different request, and the user's
+    /// native state stays the truth.
+    /// </summary>
+    public static MenuItemViewModel? Resolve(IEnumerable<MenuItemViewModel> menu, MenuActionReplay replay)
+    {
+        foreach (var item in menu)
+        {
+            if (item.ItemId == replay.ItemId)
+            {
+                return item.Kind == "command" && item.Enabled && item.CommandId == replay.CommandId &&
+                    item.Text == replay.Text
+                    ? item
+                    : null;
+            }
+            if (Resolve(item.Items, replay) is { } nested) return nested;
+        }
+        return null;
+    }
+}
+
 internal static class NodeActionReplayPolicy
 {
     /// <summary>

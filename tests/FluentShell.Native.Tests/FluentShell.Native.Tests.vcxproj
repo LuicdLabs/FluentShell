@@ -69,6 +69,7 @@
     <ClCompile Include="..\..\src\Bridge\Translation\MmcHtmlDocument.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\MenuBarCapture.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\DialogSnapshots.cpp" />
+    <ClCompile Include="..\..\src\Bridge\Translation\VirtualTaskDialog.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\DirectUiEngine.cpp" />
     <ClCompile Include="..\..\src\Bridge\Translation\SourceThreadAgent.cpp" />
   </ItemGroup>

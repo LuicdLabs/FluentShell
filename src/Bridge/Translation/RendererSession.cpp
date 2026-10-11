@@ -3,6 +3,7 @@
 #include "../../Common/FluentShell.h"
 #include "../../Common/ProcessPolicy.h"
 #include "../Ipc/FrameCodec.h"
+#include "CaptureTrace.h"
 #include "DialogSnapshots.h"
 #include "MenuBarCapture.h"
 #include "UiAutomationValidator.h"
@@ -209,6 +210,11 @@ struct RendererSession::Surface final {
     WindowSnapshot snapshot;
     SurfaceReady ready;
     uint64_t fingerprint = 0;
+    // The fingerprint of a capture whose only difference from the canonical snapshot was the
+    // pixels a container painted, waiting for the next capture to show the same thing.  Zero when
+    // no such change is pending.  See PublishReconciledSnapshot.
+    uint64_t chromeCandidate = 0;
+    uint64_t chromePublishedAt = 0;
     bool readyReceived = false;
     bool virtualDialog = false;
     bool verificationChecked = false;
@@ -231,6 +237,10 @@ struct RendererSession::Surface final {
     std::unordered_map<uint64_t, int> buttonResults;
     std::optional<int> cancelResult;
     std::optional<int> dialogResult;
+    // A translated task dialog, and the hidden window its callback addresses.  A
+    // dialog the application opens from a callback names that window as its owner.
+    std::shared_ptr<VirtualTaskDialog> taskDialog;
+    HWND dialogHost = nullptr;
     bool directUiAdapter = false;
     const DirectUiWindowProfile* directUiProfile = nullptr;
     std::shared_ptr<DirectUiOwnedProfile> directUiOwnedProfile;
@@ -721,6 +731,94 @@ std::wstring DescribeRect(const RECT& rect) {
         std::to_wstring(rect.bottom - rect.top);
 }
 
+bool SameMenu(const std::vector<MenuItemSnapshot>& a, const std::vector<MenuItemSnapshot>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t index = 0; index < a.size(); ++index) {
+        if (a[index].itemId != b[index].itemId || a[index].kind != b[index].kind ||
+            a[index].text != b[index].text || a[index].commandId != b[index].commandId ||
+            a[index].enabled != b[index].enabled || a[index].checked != b[index].checked ||
+            a[index].radio != b[index].radio || a[index].isDefault != b[index].isDefault ||
+            !SameMenu(a[index].items, b[index].items)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Writes a premultiplied BGRA image as a 32-bit BMP, so the pixels of a chrome region that keeps
+// changing can be looked at: the first few differences of a process only.
+void DumpChromeBitmap(const std::wstring& name, const ChromeRegionSnapshot& region) {
+    if (region.imageWidth == 0 || region.imageHeight == 0 ||
+        region.imageData.size() != static_cast<size_t>(region.imageWidth) * region.imageHeight * 4) {
+        return;
+    }
+    wchar_t temp[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temp)) return;
+    HANDLE file = CreateFileW((std::wstring(temp) + name).c_str(), GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    BITMAPFILEHEADER header{};
+    BITMAPINFOHEADER info{};
+    info.biSize = sizeof(info);
+    info.biWidth = static_cast<LONG>(region.imageWidth);
+    info.biHeight = -static_cast<LONG>(region.imageHeight);
+    info.biPlanes = 1;
+    info.biBitCount = 32;
+    info.biCompression = BI_RGB;
+    info.biSizeImage = static_cast<DWORD>(region.imageData.size());
+    header.bfType = 0x4d42;
+    header.bfOffBits = sizeof(header) + sizeof(info);
+    header.bfSize = header.bfOffBits + info.biSizeImage;
+    DWORD written = 0;
+    WriteFile(file, &header, sizeof(header), &written, nullptr);
+    WriteFile(file, &info, sizeof(info), &written, nullptr);
+    WriteFile(file, region.imageData.data(), info.biSizeImage, &written, nullptr);
+    CloseHandle(file);
+}
+
+void DumpChromeDifference(const WindowSnapshot& before, const WindowSnapshot& after) {
+    static int dumps = 0;
+    if (dumps >= 6 || before.nodes.size() != after.nodes.size()) return;
+    for (size_t index = 0; index < before.nodes.size(); ++index) {
+        const auto& a = before.nodes[index].chromeRegions;
+        const auto& b = after.nodes[index].chromeRegions;
+        if (a.size() != b.size()) continue;
+        for (size_t region = 0; region < a.size(); ++region) {
+            if (a[region].imageData == b[region].imageData) continue;
+            const std::wstring stem = L"FluentShell.chrome-" + std::to_wstring(dumps);
+            DumpChromeBitmap(stem + L"-before.bmp", a[region]);
+            DumpChromeBitmap(stem + L"-after.bmp", b[region]);
+            ++dumps;
+            return;
+        }
+    }
+}
+
+// The least time between two publications of a surface whose only change is painted pixels.
+constexpr uint64_t kChromePublishIntervalMs = 3000;
+
+
+// What reconcile found different between two captures of one surface, for
+// FLUENTSHELL_DIAG_RECONCILE: the window's own fields first, then its menu, then the first
+// node that differs (DescribeSnapshotDifference).
+std::wstring DescribeReconcileChange(const WindowSnapshot& before, const WindowSnapshot& after) {
+    if (!EqualRect(&before.bounds, &after.bounds))
+        return L"bounds " + DescribeRect(before.bounds) + L" -> " + DescribeRect(after.bounds);
+    if (!EqualRect(&before.clientBounds, &after.clientBounds))
+        return L"client bounds " + DescribeRect(before.clientBounds) + L" -> " + DescribeRect(after.clientBounds);
+    if (before.title != after.title) return L"title";
+    if (before.state != after.state || before.visible != after.visible || before.enabled != after.enabled)
+        return L"state/visible/enabled";
+    if (before.windowStyle != after.windowStyle || before.windowExStyle != after.windowExStyle)
+        return L"window style";
+    if (before.dpi != after.dpi) return L"dpi";
+    if (before.menuBindingGeneration != after.menuBindingGeneration) return L"menu binding generation";
+    if (!SameMenu(before.menu, after.menu)) return L"menu items";
+    if (before.popupMenu.has_value() != after.popupMenu.has_value()) return L"popup menu";
+    const std::wstring node = DescribeSnapshotDifference(before, after);
+    return node.empty() ? L"node detail the describer does not itemise" : node;
+}
+
 void LogReadyMismatch(const SurfaceReady& ready, const WindowSnapshot& expected) {
     FluentShell::Log(L"surface.ready values: uia=" + std::to_wstring(ready.uiaReady) +
         L" revision=" + std::to_wstring(ready.revision) +
@@ -740,9 +838,10 @@ bool RendererSession::ResolveOwnerProxy(ProjectionAttempt& attempt) {
         std::scoped_lock surfacesLock(surfacesMutex_);
         for (const auto& [_, candidate] : surfaces_) {
             std::scoped_lock candidateLock(candidate->mutex);
-            if (!candidate->virtualDialog && candidate->agent &&
-                candidate->agent->Root() == surface->snapshot.ownerHwnd &&
-                candidate->state == SurfaceState::Projected) {
+            const bool ownsDialogs = candidate->virtualDialog
+                ? candidate->dialogHost != nullptr && candidate->dialogHost == surface->snapshot.ownerHwnd
+                : candidate->agent && candidate->agent->Root() == surface->snapshot.ownerHwnd;
+            if (ownsDialogs && candidate->state == SurfaceState::Projected) {
                 attempt.expectedOwnerProxy = candidate->ready.proxyHwnd;
                 break;
             }
@@ -1794,8 +1893,10 @@ bool RendererSession::IsProjectedOwner(HWND owner) {
     }
     for (const auto& surface : surfaces) {
         std::scoped_lock lock(surface->mutex);
-        if (!surface->virtualDialog && surface->agent &&
-            surface->agent->Root() == owner && surface->state == SurfaceState::Projected) {
+        if (surface->state != SurfaceState::Projected) continue;
+        // A translated task dialog owns what its callback opens over it.
+        if (surface->virtualDialog ? surface->dialogHost == owner
+                                   : surface->agent && surface->agent->Root() == owner) {
             return true;
         }
     }
@@ -1823,7 +1924,29 @@ void RendererSession::ApplyVirtualDialogAction(
     std::wstring_view status = L"rejected";
     bool completesDialog = false;
     bool patchRenderer = false;
-    if (action.action == L"invoke" && action.nodeId) {
+    uint64_t baseRevision = action.expectedRevision;
+    if (action.action == L"move") {
+        // The dialog moves where the user dragged it; its size is the dialog's own.
+        baseRevision = surface->snapshot.revision;
+        auto& bounds = surface->snapshot.bounds;
+        const LONG width = bounds.right - bounds.left;
+        const LONG height = bounds.bottom - bounds.top;
+        bounds = { action.rect.left, action.rect.top,
+            action.rect.left + width, action.rect.top + height };
+        ++surface->snapshot.revision;
+        status = L"accepted";
+        patchRenderer = true;
+    } else if (surface->taskDialog) {
+        // The task dialog answers on the thread that called TaskDialogIndirect,
+        // where its callback runs; the result and any rebuilt dialog follow there.
+        if (action.action == L"close" && !surface->snapshot.canCancel) {
+            status = L"closeRejected";
+        } else if (action.action == L"close" || action.action == L"invoke" ||
+                   action.action == L"setCheck" || action.action == L"activateItem") {
+            surface->taskDialog->PostAction(action);
+            status = L"accepted";
+        }
+    } else if (action.action == L"invoke" && action.nodeId) {
         // Only a button the synthesized dialog actually published can complete it.
         const auto button = surface->buttonResults.find(*action.nodeId);
         if (button != surface->buttonResults.end()) {
@@ -1852,7 +1975,7 @@ void RendererSession::ApplyVirtualDialogAction(
     }
     const uint64_t revision = surface->snapshot.revision;
     auto patch = SerializeWindowPatch(
-        nonce_, action.expectedRevision, surface->snapshot, action.eventId);
+        nonce_, baseRevision, surface->snapshot, action.eventId);
     lock.unlock();
     Send(Ipc::MessageType::ActionResult, revision,
         SerializeActionResult(nonce_, action, status, revision));
@@ -1860,6 +1983,33 @@ void RendererSession::ApplyVirtualDialogAction(
         Send(Ipc::MessageType::WindowPatch, revision, std::move(patch));
     }
     if (completesDialog) SetEvent(surface->resultEvent);
+}
+
+void RendererSession::PublishVirtualDialog(
+    const std::shared_ptr<Surface>& surface,
+    WindowSnapshot snapshot,
+    uint64_t eventId) {
+    std::unique_lock lock(surface->mutex);
+    if (surface->state != SurfaceState::Projected) return;
+    const auto& current = surface->snapshot;
+    const uint64_t baseRevision = current.revision;
+    // The window stays where it is; a grown or shrunk dialog keeps its top-left.
+    const LONG width = snapshot.bounds.right - snapshot.bounds.left;
+    const LONG height = snapshot.bounds.bottom - snapshot.bounds.top;
+    snapshot.bounds = { current.bounds.left, current.bounds.top,
+        current.bounds.left + width, current.bounds.top + height };
+    snapshot.surfaceId = current.surfaceId;
+    snapshot.nativeHwnd = current.nativeHwnd;
+    snapshot.generation = current.generation;
+    snapshot.ownerHwnd = current.ownerHwnd;
+    snapshot.showInTaskbar = current.showInTaskbar;
+    snapshot.revision = baseRevision + 1;
+    surface->snapshot = std::move(snapshot);
+    surface->fingerprint = SnapshotFingerprint(surface->snapshot);
+    auto patch = SerializeWindowPatch(nonce_, baseRevision, surface->snapshot, eventId);
+    const uint64_t revision = surface->snapshot.revision;
+    lock.unlock();
+    Send(Ipc::MessageType::WindowPatch, revision, std::move(patch));
 }
 
 void RendererSession::HandleAction(const ActionRequest& action) {
@@ -3256,7 +3406,45 @@ const wchar_t* RendererSession::PublishReconciledSnapshot(ReconcilePass& pass) {
             surface->directUiBindings = pass.directUiBindings;
         }
         changed = fingerprint != surface->fingerprint;
+        // A container's painted bands can flicker between two renderings from one capture to the
+        // next (a console's MDI buttons did, every ~0.45 s), and every flicker would republish the
+        // whole surface: a new revision each time, and a click that lands between a capture and its
+        // publication is refused as stale.  Pixels alone are therefore published only once two
+        // captures in a row show the same new picture; a surface that changed in any other way is
+        // published at once, with the pixels it was captured with.
+        if (changed && !pass.directUiAdapter &&
+            OnlyChromePixelsChanged(surface->snapshot, pass.next, surface->fingerprint)) {
+            // ...and at most once per kChromePublishIntervalMs: the picture can hold still for a
+            // capture or two before it flips again.
+            const uint64_t now = GetTickCount64();
+            if (surface->chromeCandidate == fingerprint &&
+                now - surface->chromePublishedAt >= kChromePublishIntervalMs) {
+                surface->chromeCandidate = 0;
+                surface->chromePublishedAt = now;
+            } else {
+                surface->chromeCandidate = fingerprint;
+                changed = false;
+                if (ReconcileTraceEnabled()) {
+                    try {
+                        FluentShell::Log(L"reconcile held a pixels-only change of " + surface->snapshot.title +
+                            L" until a second capture agrees");
+                    } catch (...) {
+                    }
+                }
+            }
+        } else {
+            surface->chromeCandidate = 0;
+        }
         if (changed) {
+            if (ReconcileTraceEnabled()) {
+                try {
+                    FluentShell::Log(L"reconcile republished " + surface->snapshot.title + L" rev " +
+                        std::to_wstring(pass.baseRevision) + L": " +
+                        DescribeReconcileChange(surface->snapshot, pass.next));
+                    DumpChromeDifference(surface->snapshot, pass.next);
+                } catch (...) {
+                }
+            }
             surface->snapshot = std::move(pass.next);
             surface->fingerprint = fingerprint;
             payload = SerializeWindowPatch(nonce_, pass.baseRevision, surface->snapshot);
@@ -3727,7 +3915,8 @@ std::optional<int> RendererSession::ShowMessageBox(
     std::wstring_view text,
     std::wstring_view caption,
     UINT type,
-    WORD) {
+    WORD,
+    const DialogIconImage* customIcon) {
     owner = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
     if (!IsReady() || !IsProjectedOwner(owner) ||
         (type & (MB_SERVICE_NOTIFICATION | MB_DEFAULT_DESKTOP_ONLY | MB_HELP)) != 0) {
@@ -3735,9 +3924,12 @@ std::optional<int> RendererSession::ShowMessageBox(
     }
     auto surface = std::make_shared<Surface>();
     surface->virtualDialog = true;
-    surface->snapshot = BuildMessageBoxSnapshot(owner, text, caption, type, surface->buttonResults);
+    surface->snapshot = BuildMessageBoxSnapshot(owner, text, caption, type, surface->buttonResults, customIcon);
     surface->fingerprint = SnapshotFingerprint(surface->snapshot);
-    if (surface->snapshot.canCancel) surface->cancelResult = IDCANCEL;
+    // Escape and the close button answer IDCANCEL, or IDOK for a lone OK button.
+    if (surface->snapshot.canCancel) {
+        surface->cancelResult = (type & MB_TYPEMASK) == MB_OK ? IDOK : IDCANCEL;
+    }
     {
         std::scoped_lock lock(surfacesMutex_);
         surfaces_.emplace(surface->snapshot.surfaceId, surface);
@@ -3752,24 +3944,42 @@ std::optional<int> RendererSession::ShowMessageBox(
     return WaitForDialogResult(surface, owner, ownerWasEnabled);
 }
 
-std::optional<TaskDialogResult> RendererSession::ShowTaskDialog(
-    const TASKDIALOGCONFIG& config,
-    const std::vector<std::pair<int, std::wstring>>& buttons,
-    std::wstring_view title,
-    std::wstring_view instruction,
-    std::wstring_view content,
-    std::wstring_view footer,
-    std::wstring_view verification) {
+std::optional<TaskDialogResult> RendererSession::ShowTaskDialog(const TASKDIALOGCONFIG& config) {
     const HWND owner = config.hwndParent ? GetAncestor(config.hwndParent, GA_ROOT) : nullptr;
-    if (!IsReady() || !IsProjectedOwner(owner) || buttons.empty()) return std::nullopt;
+    if (!IsReady() || !IsProjectedOwner(owner)) return std::nullopt;
+    std::wstring reason;
+    std::shared_ptr<VirtualTaskDialog> dialog = VirtualTaskDialog::Create(config, owner, reason);
+    if (!dialog) {
+        FluentShell::Log(L"Task dialog stays native: " + reason);
+        return std::nullopt;
+    }
     auto surface = std::make_shared<Surface>();
     surface->virtualDialog = true;
-    surface->snapshot = BuildTaskDialogSnapshot(config, buttons, title, instruction,
-        content, footer, verification, surface->buttonResults, surface->verificationNode);
+    surface->taskDialog = dialog;
+    std::weak_ptr<Surface> weak = surface;
+    VirtualTaskDialog::Sink sink;
+    sink.publish = [this, weak](WindowSnapshot snapshot, uint64_t eventId) {
+        if (const auto target = weak.lock()) PublishVirtualDialog(target, std::move(snapshot), eventId);
+    };
+    sink.complete = [weak, dialog = dialog.get()] {
+        const auto target = weak.lock();
+        if (!target) return;
+        {
+            std::scoped_lock lock(target->mutex);
+            target->dialogResult = dialog->Result().button;
+        }
+        SetEvent(target->resultEvent);
+    };
+    // The host exists before the projection opens: it is the window the surface
+    // stands for, so a dialog the callback opens over it finds its owner proxy.
+    if (!dialog->Start(std::move(sink))) {
+        dialog->Finish();
+        return std::nullopt;
+    }
+    surface->snapshot = dialog->InitialSnapshot();
     surface->snapshot.ownerHwnd = owner;
+    surface->dialogHost = dialog->Host();
     surface->fingerprint = SnapshotFingerprint(surface->snapshot);
-    surface->verificationChecked = (config.dwFlags & TDF_VERIFICATION_FLAG_CHECKED) != 0;
-    if (surface->snapshot.canCancel) surface->cancelResult = IDCANCEL;
     {
         std::scoped_lock lock(surfacesMutex_);
         surfaces_.emplace(surface->snapshot.surfaceId, surface);
@@ -3779,11 +3989,21 @@ std::optional<TaskDialogResult> RendererSession::ShowTaskDialog(
     if (!OpenSurface(surface, false)) {
         RestoreSurface(surface, L"restore");
         if (owner && IsWindow(owner)) EnableWindow(owner, ownerWasEnabled ? TRUE : FALSE);
+        dialog->Finish();
         return std::nullopt;
     }
+    // The callback sees the dialog only once it is on screen; a TDM_* message it
+    // sends from TDN_DIALOG_CONSTRUCTED patches the projection that is already up.
+    dialog->Announce();
+    // A dialog closed from its own TDN_CREATED has already signalled the result.
     const auto button = WaitForDialogResult(surface, owner, ownerWasEnabled);
-    if (!button) return std::nullopt;
-    return TaskDialogResult{ *button, surface->verificationChecked };
+    {
+        std::scoped_lock lock(surface->mutex);
+        surface->dialogHost = nullptr;
+    }
+    dialog->Finish();
+    if (!button || !dialog->Completed()) return std::nullopt;
+    return dialog->Result();
 }
 
 } // namespace FluentShell::Bridge::Translation

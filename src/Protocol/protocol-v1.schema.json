@@ -732,7 +732,7 @@
         "pageId": { "const": "semantic-v1" },
         "semanticKey": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:-]+$" },
         "sourceKind": { "enum": ["uiaVirtual", "nativeBacking"] },
-        "presentationVariant": { "enum": ["commandLink", "standard", "password", "bitmapDisplay", "bitmapSwitch", "monitorPalette"] },
+        "presentationVariant": { "enum": ["commandLink", "standard", "password", "bitmapDisplay", "bitmapSwitch", "monitorPalette", "mainInstruction", "commandLinkNoIcon", "commandLinkElevated", "elevated", "expandoCollapsed", "expandoExpanded"] },
         "supportedActions": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "setItemText", "setValue", "setExpand", "toolbarCommand", "mdiCommand"] } },
         "helpText": { "$ref": "#/$defs/text" },
         "accessKey": { "$ref": "#/$defs/text" },
@@ -906,11 +906,29 @@
             }
           },
           "else": {
-            "properties": {
-              "nodes": {
-                "items": {
-                  "not": {
-                    "anyOf": [{ "required": ["adapterId"] }, { "required": ["pageId"] }, { "required": ["semanticKey"] }, { "required": ["sourceKind"] }, { "required": ["presentationVariant"] }, { "required": ["supportedActions"] }, { "required": ["helpText"] }, { "required": ["accessKey"] }]
+            "$comment": "A translated task dialog presents its main instruction, command links (with their note as helpText), elevation shields and expando button through presentationVariant; no other generic node carries adapter fields.",
+            "if": { "properties": { "surfaceKind": { "const": "taskDialog" } }, "required": ["surfaceKind"] },
+            "then": {
+              "properties": {
+                "nodes": {
+                  "items": {
+                    "not": {
+                      "anyOf": [{ "required": ["adapterId"] }, { "required": ["pageId"] }, { "required": ["semanticKey"] }, { "required": ["sourceKind"] }, { "required": ["supportedActions"] }, { "required": ["accessKey"] }]
+                    },
+                    "properties": {
+                      "presentationVariant": { "enum": ["mainInstruction", "commandLink", "commandLinkNoIcon", "commandLinkElevated", "elevated", "expandoCollapsed", "expandoExpanded"] }
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "nodes": {
+                  "items": {
+                    "not": {
+                      "anyOf": [{ "required": ["adapterId"] }, { "required": ["pageId"] }, { "required": ["semanticKey"] }, { "required": ["sourceKind"] }, { "required": ["presentationVariant"] }, { "required": ["supportedActions"] }, { "required": ["helpText"] }, { "required": ["accessKey"] }]
+                    }
                   }
                 }
               }

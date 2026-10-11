@@ -668,6 +668,13 @@ JsonObject NodeToJson(const ControlNode& node) {
         result.Insert(L"supportedActions", actions);
         result.Insert(L"helpText", JsonValue::CreateStringValue(node.helpText));
         result.Insert(L"accessKey", JsonValue::CreateStringValue(node.accessKey));
+    } else {
+        // A translated task dialog's presentation: its main instruction, command
+        // links (with their note) and elevation shields.
+        if (!node.presentationVariant.empty())
+            result.Insert(L"presentationVariant", JsonValue::CreateStringValue(node.presentationVariant));
+        if (!node.helpText.empty())
+            result.Insert(L"helpText", JsonValue::CreateStringValue(node.helpText));
     }
     return result;
 }
@@ -1958,6 +1965,13 @@ bool ValidateActionForSnapshot(
         return true;
     }
     if (action.action == L"activateItem") {
+        // A task dialog's text names its links by index.
+        if (node.kind == ControlKind::SysLink && snapshot.surfaceKind == SurfaceKind::TaskDialog) {
+            if (action.itemIndex >= 0 && static_cast<size_t>(action.itemIndex) < node.items.size())
+                return true;
+            error = L"activateItem names no link of the text";
+            return false;
+        }
         if (node.kind != ControlKind::ListView || !node.itemActivationSupported ||
             node.itemNativeIds.size() != ListViewItemCount(node) ||
             action.itemIndex < 0 ||

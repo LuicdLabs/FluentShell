@@ -110,6 +110,10 @@ before the next build (a live renderer locks `clrjit.dll`):
 - `FLUENTSHELL_DIAG_CAPTURE=1` in the target's environment makes capture log every stage it is about to
   run (`capture classify/identity/facets/detail`, ListView groups and rows), so a control whose capture
   never returns is named by the last line of the Bridge log. Off by default (about a hundred lines a pass).
+- `FLUENTSHELL_DIAG_RECONCILE=1` makes every reconcile republish (and every pixels-only change it holds
+  back) log what moved -- the window field, menu, or first differing node, with the size of a chrome
+  pixel change -- and dumps the first changing chrome regions to `%TEMP%\FluentShell.chrome-N-before/after.bmp`.
+  A console that republishes while idle shows up here.
 
 A target process that dies during a projection attempt did not necessarily hang: look in the Application
 event log first (`Get-WinEvent -FilterHashtable @{LogName='Application'}`, providers Application Error and
@@ -194,6 +198,13 @@ Bridge's `RestoreAll` restores in that order).
 - The supervisor loop (`RunSupervisor`) ticks every 250 ms: discovery every 1 s, reconcile every
   tick. A quiet surface is fully recaptured only every 4th tick (`kQuietReconcileTicks`); the
   dirty flag is set by subclass procs for the messages in `RelevantMessage`.
+- A capture whose only change is the pixels of a container's chrome regions
+  (`OnlyChromePixelsChanged`) is published only once two consecutive captures agree on it and at least
+  3 s have passed since the last such publication. MMC paints its menu-bar MDI buttons (the strip right
+  of the menu toolbar) so that DWM's copy of the cloaked window showed them present and absent from one
+  capture to the next; every flip republished the whole surface about once a second, and a click that
+  landed between a capture and its publication was refused as stale. Anything else that changed is
+  published at once.
 
 ### Protocol boundary
 
@@ -207,7 +218,10 @@ by both sides' tests. A 32-byte little-endian `FLSH` frame header wraps a JSON p
 - Property actions carry an expected revision and are rejected `stale` on mismatch. Request-semantic
   actions — `invoke`, `close`, `move`, `resize` (`IsRequestSemanticAction`) — are rebased onto the
   current revision instead, because the pointer, not a snapshot, decides whether a drag still
-  applies.
+  applies. A menu-bar `menuCommand` stays revision-gated (the Bridge also checks the menu binding),
+  but a click that lost a race with a reconcile is not lost: the renderer keeps the clicked item
+  (path, command, label) and re-sends a `stale` refusal once, when the resync patch still carries
+  that same enabled command (`MenuActionReplayPolicy`).
 - A protocol violation naming one surface faults only that surface
   (`WindowRegistry.SurfaceScopeOf` → non-fatal `error` frame → Bridge rolls that window back).
   A session-scoped violation faults the session.
@@ -264,8 +278,22 @@ process-name injection, system-wide discovery, or watch mode.
 
 `dllmain.cpp` starts `BridgeWorker` from `DLL_PROCESS_ATTACH`: pin the module, refuse denied
 targets and processes that already host XAML, start the `RendererSession`, install the
-MessageBox/TaskDialog Detours hooks, then run the supervisor. Exports: `FluentShell_Start`,
-`FluentShell_IsRendererReady`, `FluentShell_Ping`.
+MessageBox/MessageBoxEx/MessageBoxIndirect/TaskDialog/TaskDialogIndirect Detours hooks, then run the
+supervisor. Exports: `FluentShell_Start`, `FluentShell_IsRendererReady`, `FluentShell_Ping`.
+
+### Translated dialogs
+
+A MessageBox or TaskDialog whose owner is a projection is answered by the Bridge as a virtual
+surface (no native dialog is created); anything it cannot honour stays native. The layout is the
+dialog's own (`DialogSnapshots.cpp`): text is measured with DirectWrite in Segoe UI with the system
+fallback -- what XAML draws, CJK included -- and the dialog is sized to it, with the buttons
+(user32's localized labels, `MB_GetString`) right-aligned in a command band the renderer shades
+from the band's first row. A task dialog runs in `VirtualTaskDialog`: a hidden host window on the
+caller's thread is the HWND its callback gets, every `TDN_*` notification runs on that thread, and
+`TDM_*` messages (from the callback or any thread) and renderer actions (posted by the action worker)
+rebuild the dialog and patch the projection. The host is the surface's `nativeHwnd`, so a MessageBox
+the callback opens over it is owned by the task dialog's proxy. The hook depth guard counts only
+native calls: a dialog opened from a translated dialog's callback is translated too.
 
 ## Hard Invariants
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SourceThreadAgent.h"
+#include "VirtualTaskDialog.h"
 
 #include <commctrl.h>
 
@@ -18,11 +19,6 @@
 #include <vector>
 
 namespace FluentShell::Bridge::Translation {
-
-struct TaskDialogResult final {
-    int button = 0;
-    bool verificationChecked = false;
-};
 
 class RendererSession final : public std::enable_shared_from_this<RendererSession> {
 public:
@@ -42,16 +38,10 @@ public:
         std::wstring_view text,
         std::wstring_view caption,
         UINT type,
-        WORD languageId = 0);
+        WORD languageId = 0,
+        const DialogIconImage* customIcon = nullptr);
 
-    std::optional<TaskDialogResult> ShowTaskDialog(
-        const TASKDIALOGCONFIG& config,
-        const std::vector<std::pair<int, std::wstring>>& buttons,
-        std::wstring_view title,
-        std::wstring_view instruction,
-        std::wstring_view content,
-        std::wstring_view footer,
-        std::wstring_view verification);
+    std::optional<TaskDialogResult> ShowTaskDialog(const TASKDIALOGCONFIG& config);
 
 private:
     struct Surface;
@@ -148,6 +138,10 @@ private:
     DiscoveryDecision ClassifyTopLevel(HWND window, bool ownsVisibleTopLevel);
     bool OpenNativeWindow(HWND root);
     bool IsProjectedOwner(HWND owner);
+    // A rebuilt virtual task dialog: keeps the surface identity and the window's
+    // current position, assigns the next revision and patches the renderer.
+    void PublishVirtualDialog(const std::shared_ptr<Surface>& surface, WindowSnapshot snapshot,
+        uint64_t eventId);
     bool OpenSurface(const std::shared_ptr<Surface>& surface, bool cloakNative);
     // Projection gate stages, in the order OpenSurface runs them.  Each logs its
     // own rejection reason and returns false; the caller owns rollback.  All of

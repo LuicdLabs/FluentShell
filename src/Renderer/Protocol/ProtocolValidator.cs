@@ -435,6 +435,10 @@ internal static class ProtocolValidator
                 !nodeIds.Add(node.NodeId) || !zIndexes.Add(node.ZIndex))
                 throw new ProtocolException("Control node IDs and generations must be unique and nonzero.");
             ValidateNode(node);
+            // A native SysLink is projected with its one link; only a translated task
+            // dialog's text carries several.
+            if (node.Kind == "sysLink" && node.Items.Count != 1 && snapshot.SurfaceKind != "taskDialog")
+                throw new ProtocolException("Only a task dialog's text carries more than one link.");
             if (node.ParentNodeId is not null)
             {
                 // A projected container graph is only ever a dialog navigation
@@ -604,6 +608,18 @@ internal static class ProtocolValidator
         extraRules?.Invoke(node);
     }
 
+    // The presentation variants a translated task dialog may give its nodes.
+    private static readonly Dictionary<string, string[]> TaskDialogVariants =
+        new(StringComparer.Ordinal)
+        {
+            ["static"] = ["mainInstruction"],
+            ["button"] =
+            [
+                "commandLink", "commandLinkNoIcon", "commandLinkElevated", "elevated",
+                "expandoCollapsed", "expandoExpanded",
+            ],
+        };
+
     private static void ValidateApplicationAdapter(WindowSnapshot snapshot)
     {
         if (snapshot.AdapterId is null && snapshot.PageId is null)
@@ -619,14 +635,21 @@ internal static class ProtocolValidator
             // carries its own evidence.
             foreach (var node in snapshot.Nodes)
             {
+                // A task dialog's own presentation: its main instruction, command
+                // links with their note, elevation shields and the expando button.
+                var taskDialogPresentation = snapshot.SurfaceKind == "taskDialog" &&
+                    (node.PresentationVariant is null ||
+                     TaskDialogVariants.TryGetValue(node.Kind, out var variants) &&
+                     variants.Contains(node.PresentationVariant, StringComparer.Ordinal)) &&
+                    (node.HelpText is null || node.PresentationVariant?.StartsWith("commandLink", StringComparison.Ordinal) == true);
                 var offending =
                     node.AdapterId is not null ? "adapterId" :
                     node.PageId is not null ? "pageId" :
                     node.SemanticKey is not null ? "semanticKey" :
                     node.SourceKind is not null ? "sourceKind" :
-                    node.PresentationVariant is not null ? "presentationVariant" :
+                    node.PresentationVariant is not null && !taskDialogPresentation ? "presentationVariant" :
                     node.SupportedActions is not null ? "supportedActions" :
-                    node.HelpText is not null ? "helpText" :
+                    node.HelpText is not null && !taskDialogPresentation ? "helpText" :
                     node.AccessKey is not null ? "accessKey" :
                     virtualSurface
                         ? node.NativeHwnd is not null
@@ -1249,12 +1272,44 @@ internal static class ProtocolValidator
 
     private static void ValidateSysLink(ControlNode node)
     {
-        if (node.Items.Count != 1 || string.IsNullOrEmpty(node.Items[0]) || node.Text is null)
-            throw new ProtocolException("SysLink requires exactly one nonempty link label.");
-        var label = node.Items[0];
-        var first = node.Text.IndexOf(label, StringComparison.Ordinal);
-        if (first < 0 || node.Text.IndexOf(label, first + label.Length, StringComparison.Ordinal) >= 0)
-            throw new ProtocolException("SysLink label must occur exactly once in text.");
+        if (node.Items.Count == 0 || node.Items.Count > MaxSysLinkLabels ||
+            node.Items.Any(string.IsNullOrEmpty) || node.Text is null)
+            throw new ProtocolException("SysLink requires nonempty link labels.");
+        if (!TryLocateSysLinkLabels(node.Text, node.Items, out _))
+            throw new ProtocolException(node.Items.Count == 1
+                ? "SysLink label must occur exactly once in text."
+                : "SysLink labels must occur in text in order.");
+    }
+
+    // A translated task dialog's text carries every link its markup declares.
+    private const int MaxSysLinkLabels = 32;
+
+    // Where each link label starts in a SysLink's text.  A single label must occur
+    // exactly once (a native SysLink's one link); several are found left to right,
+    // each after the previous one, the way the task dialog's markup ordered them.
+    internal static bool TryLocateSysLinkLabels(string text, IReadOnlyList<string> labels, out int[] starts)
+    {
+        starts = new int[labels.Count];
+        if (labels.Count == 0) return false;
+        if (labels.Count == 1)
+        {
+            var label = labels[0];
+            if (string.IsNullOrEmpty(label)) return false;
+            var first = text.IndexOf(label, StringComparison.Ordinal);
+            if (first < 0 || text.IndexOf(label, first + label.Length, StringComparison.Ordinal) >= 0) return false;
+            starts[0] = first;
+            return true;
+        }
+        var cursor = 0;
+        for (var index = 0; index < labels.Count; index++)
+        {
+            if (string.IsNullOrEmpty(labels[index])) return false;
+            var at = text.IndexOf(labels[index], cursor, StringComparison.Ordinal);
+            if (at < 0) return false;
+            starts[index] = at;
+            cursor = at + labels[index].Length;
+        }
+        return true;
     }
 
     internal static int ParseListViewGroupId(string? id, bool allowUngrouped)

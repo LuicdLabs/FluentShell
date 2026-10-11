@@ -8,10 +8,13 @@
 #include "../../third_party/detours/src/detours.h"
 
 #include <commctrl.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 
+#include <algorithm>
 #include <atomic>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,24 +26,40 @@ namespace {
 
 using MessageBoxW_t = int(WINAPI*)(HWND, LPCWSTR, LPCWSTR, UINT);
 using MessageBoxExW_t = int(WINAPI*)(HWND, LPCWSTR, LPCWSTR, UINT, WORD);
+using MessageBoxIndirectW_t = int(WINAPI*)(const MSGBOXPARAMSW*);
 using TaskDialogIndirect_t = HRESULT(WINAPI*)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+using TaskDialog_t = HRESULT(WINAPI*)(HWND, HINSTANCE, PCWSTR, PCWSTR, PCWSTR,
+    TASKDIALOG_COMMON_BUTTON_FLAGS, PCWSTR, int*);
 using TrackPopupMenu_t = BOOL(WINAPI*)(HMENU, UINT, int, int, int, HWND, const RECT*);
 using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
 
 MessageBoxW_t TrueMessageBoxW = nullptr;
 MessageBoxExW_t TrueMessageBoxExW = nullptr;
+MessageBoxIndirectW_t TrueMessageBoxIndirectW = nullptr;
 TaskDialogIndirect_t TrueTaskDialogIndirect = nullptr;
+TaskDialog_t TrueTaskDialog = nullptr;
 TrackPopupMenu_t TrueTrackPopupMenu = nullptr;
 TrackPopupMenuEx_t TrueTrackPopupMenuEx = nullptr;
 std::atomic<bool> g_hooksInstalled{ false };
 std::atomic<bool> g_workerRunning{ false };
 HMODULE g_self = nullptr;
+// Depth of native dialog calls on this thread.  A native API entered from a hook
+// (MessageBoxW calls MessageBoxExW, a native TaskDialog runs a modal loop) must
+// not be translated again from inside itself, but a dialog the application opens
+// from a translated dialog's callback -- while the Bridge pumps the caller's
+// messages -- is translated like any other, so only the native calls count.
 thread_local int g_hookDepth = 0;
 
 struct HookDepthGuard final {
     HookDepthGuard() noexcept { ++g_hookDepth; }
     ~HookDepthGuard() { --g_hookDepth; }
 };
+
+template <typename Function, typename... Arguments>
+auto CallNative(Function function, Arguments... arguments) {
+    HookDepthGuard depth;
+    return function(arguments...);
+}
 
 bool UpdateAllDetourThreads(std::vector<HANDLE>& handles) {
     if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) return false;
@@ -83,17 +102,17 @@ int WINAPI HookMessageBoxW(
     LPCWSTR caption,
     UINT type) {
     if (!TrueMessageBoxW) return 0;
-    if (g_hookDepth != 0) return TrueMessageBoxW(owner, text, caption, type);
-    HookDepthGuard depth;
-    try {
-        const auto translated = FluentShell::Bridge::Translation::TranslateMessageBox(
-            FluentShell::Bridge::Translation::ActiveRendererSession(),
-            owner, text, caption, type);
-        if (translated) return *translated;
-    } catch (...) {
-        FluentShell::Log(L"MessageBox translation threw; using native API");
+    if (g_hookDepth == 0) {
+        try {
+            const auto translated = FluentShell::Bridge::Translation::TranslateMessageBox(
+                FluentShell::Bridge::Translation::ActiveRendererSession(),
+                owner, text, caption, type);
+            if (translated) return *translated;
+        } catch (...) {
+            FluentShell::Log(L"MessageBox translation threw; using native API");
+        }
     }
-    return TrueMessageBoxW(owner, text, caption, type);
+    return CallNative(TrueMessageBoxW, owner, text, caption, type);
 }
 
 int WINAPI HookMessageBoxExW(
@@ -103,21 +122,57 @@ int WINAPI HookMessageBoxExW(
     UINT type,
     WORD languageId) {
     if (!TrueMessageBoxExW) {
-        return TrueMessageBoxW ? TrueMessageBoxW(owner, text, caption, type) : 0;
+        return TrueMessageBoxW ? CallNative(TrueMessageBoxW, owner, text, caption, type) : 0;
     }
-    if (g_hookDepth != 0) {
-        return TrueMessageBoxExW(owner, text, caption, type, languageId);
+    if (g_hookDepth == 0) {
+        try {
+            const auto translated = FluentShell::Bridge::Translation::TranslateMessageBox(
+                FluentShell::Bridge::Translation::ActiveRendererSession(),
+                owner, text, caption, type, languageId);
+            if (translated) return *translated;
+        } catch (...) {
+            FluentShell::Log(L"MessageBoxEx translation threw; using native API");
+        }
     }
-    HookDepthGuard depth;
+    return CallNative(TrueMessageBoxExW, owner, text, caption, type, languageId);
+}
+
+int WINAPI HookMessageBoxIndirectW(const MSGBOXPARAMSW* params) {
+    if (!TrueMessageBoxIndirectW) return 0;
+    if (g_hookDepth == 0) {
+        try {
+            const auto translated = FluentShell::Bridge::Translation::TranslateMessageBoxIndirect(
+                FluentShell::Bridge::Translation::ActiveRendererSession(), params);
+            if (translated) return *translated;
+        } catch (...) {
+            FluentShell::Log(L"MessageBoxIndirect translation threw; using native API");
+        }
+    }
+    return CallNative(TrueMessageBoxIndirectW, params);
+}
+
+// Answers a TaskDialogIndirect call with the projection, or returns false to let
+// the native dialog run.
+bool TranslateTaskDialogCall(
+    const TASKDIALOGCONFIG* config,
+    int* button,
+    int* radioButton,
+    BOOL* verificationChecked) {
+    if (g_hookDepth != 0) return false;
     try {
-        const auto translated = FluentShell::Bridge::Translation::TranslateMessageBox(
-            FluentShell::Bridge::Translation::ActiveRendererSession(),
-            owner, text, caption, type, languageId);
-        if (translated) return *translated;
+        const auto translated = FluentShell::Bridge::Translation::TranslateTaskDialog(
+            FluentShell::Bridge::Translation::ActiveRendererSession(), config);
+        if (!translated) return false;
+        if (button) *button = translated->button;
+        if (radioButton) *radioButton = translated->radioButton;
+        if (verificationChecked) {
+            *verificationChecked = translated->verificationChecked ? TRUE : FALSE;
+        }
+        return true;
     } catch (...) {
-        FluentShell::Log(L"MessageBoxEx translation threw; using native API");
+        FluentShell::Log(L"TaskDialog translation threw; using native API");
+        return false;
     }
-    return TrueMessageBoxExW(owner, text, caption, type, languageId);
 }
 
 HRESULT WINAPI HookTaskDialogIndirect(
@@ -126,25 +181,35 @@ HRESULT WINAPI HookTaskDialogIndirect(
     int* radioButton,
     BOOL* verificationChecked) {
     if (!TrueTaskDialogIndirect) return E_FAIL;
-    if (g_hookDepth != 0) {
-        return TrueTaskDialogIndirect(config, button, radioButton, verificationChecked);
-    }
-    HookDepthGuard depth;
-    try {
-        const auto translated = FluentShell::Bridge::Translation::TranslateTaskDialog(
-            FluentShell::Bridge::Translation::ActiveRendererSession(), config);
-        if (translated) {
-            if (button) *button = translated->button;
-            if (radioButton) *radioButton = 0;
-            if (verificationChecked) {
-                *verificationChecked = translated->verificationChecked ? TRUE : FALSE;
-            }
-            return S_OK;
-        }
-    } catch (...) {
-        FluentShell::Log(L"TaskDialog translation threw; using native API");
-    }
-    return TrueTaskDialogIndirect(config, button, radioButton, verificationChecked);
+    if (TranslateTaskDialogCall(config, button, radioButton, verificationChecked)) return S_OK;
+    return CallNative(TrueTaskDialogIndirect, config, button, radioButton, verificationChecked);
+}
+
+// TaskDialog is TaskDialogIndirect with a fixed configuration; comctl32 calls its
+// own implementation directly, so it is hooked on its own.
+HRESULT WINAPI HookTaskDialog(
+    HWND owner,
+    HINSTANCE instance,
+    PCWSTR title,
+    PCWSTR instruction,
+    PCWSTR content,
+    TASKDIALOG_COMMON_BUTTON_FLAGS buttons,
+    PCWSTR icon,
+    int* button) {
+    if (!TrueTaskDialog) return E_FAIL;
+    TASKDIALOGCONFIG config{};
+    config.cbSize = sizeof(config);
+    config.hwndParent = owner;
+    config.hInstance = instance;
+    config.dwCommonButtons = buttons;
+    config.pszWindowTitle = title;
+    config.pszMainInstruction = instruction;
+    config.pszContent = content;
+    config.pszMainIcon = icon;
+    // TaskDialog lets Escape close a dialog that has no Cancel button.
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    if (TranslateTaskDialogCall(&config, button, nullptr, nullptr)) return S_OK;
+    return CallNative(TrueTaskDialog, owner, instance, title, instruction, content, buttons, icon, button);
 }
 
 // A menu-bar toolbar opens its popup from the click itself, so the projection performs
@@ -191,10 +256,29 @@ BOOL WINAPI HookTrackPopupMenuEx(
     return TrueTrackPopupMenuEx(menu, flags, x, y, owner, params);
 }
 
+// The comctl32 that exports TaskDialogIndirect: version 6, which a process loads
+// side by side with version 5 when its manifest asks for it.  LoadLibrary from the
+// Bridge thread resolves through the process default activation context.
+HMODULE TaskDialogModule() noexcept {
+    HMODULE modules[1024]{};
+    DWORD needed = 0;
+    if (EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+        const DWORD count = (std::min)(needed / static_cast<DWORD>(sizeof(HMODULE)),
+            static_cast<DWORD>(std::size(modules)));
+        for (DWORD index = 0; index < count; ++index) {
+            wchar_t name[MAX_PATH]{};
+            if (!GetModuleBaseNameW(GetCurrentProcess(), modules[index], name, MAX_PATH) ||
+                _wcsicmp(name, L"comctl32.dll") != 0) continue;
+            if (GetProcAddress(modules[index], "TaskDialogIndirect")) return modules[index];
+        }
+    }
+    return LoadLibraryW(L"comctl32.dll");
+}
+
 bool InstallHooks() {
     if (g_hooksInstalled.exchange(true)) return true;
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    HMODULE comctl = LoadLibraryW(L"comctl32.dll");
+    HMODULE comctl = TaskDialogModule();
     if (!user32) {
         g_hooksInstalled = false;
         return false;
@@ -203,6 +287,8 @@ bool InstallHooks() {
         GetProcAddress(user32, "MessageBoxW"));
     TrueMessageBoxExW = reinterpret_cast<MessageBoxExW_t>(
         GetProcAddress(user32, "MessageBoxExW"));
+    TrueMessageBoxIndirectW = reinterpret_cast<MessageBoxIndirectW_t>(
+        GetProcAddress(user32, "MessageBoxIndirectW"));
     TrueTrackPopupMenu = reinterpret_cast<TrackPopupMenu_t>(
         GetProcAddress(user32, "TrackPopupMenu"));
     TrueTrackPopupMenuEx = reinterpret_cast<TrackPopupMenuEx_t>(
@@ -210,6 +296,8 @@ bool InstallHooks() {
     if (comctl) {
         TrueTaskDialogIndirect = reinterpret_cast<TaskDialogIndirect_t>(
             GetProcAddress(comctl, "TaskDialogIndirect"));
+        TrueTaskDialog = reinterpret_cast<TaskDialog_t>(
+            GetProcAddress(comctl, "TaskDialog"));
     }
 
     std::vector<HANDLE> detourThreads;
@@ -234,8 +322,12 @@ bool InstallHooks() {
         reinterpret_cast<PVOID>(HookMessageBoxW), L"MessageBoxW");
     attach(reinterpret_cast<PVOID*>(&TrueMessageBoxExW),
         reinterpret_cast<PVOID>(HookMessageBoxExW), L"MessageBoxExW");
+    attach(reinterpret_cast<PVOID*>(&TrueMessageBoxIndirectW),
+        reinterpret_cast<PVOID>(HookMessageBoxIndirectW), L"MessageBoxIndirectW");
     attach(reinterpret_cast<PVOID*>(&TrueTaskDialogIndirect),
         reinterpret_cast<PVOID>(HookTaskDialogIndirect), L"TaskDialogIndirect");
+    attach(reinterpret_cast<PVOID*>(&TrueTaskDialog),
+        reinterpret_cast<PVOID>(HookTaskDialog), L"TaskDialog");
     attach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenu),
         reinterpret_cast<PVOID>(HookTrackPopupMenu), L"TrackPopupMenu");
     attach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenuEx),
@@ -269,6 +361,12 @@ void UninstallHooks() noexcept {
         }
         if (TrueTaskDialogIndirect) {
             DetourDetach(reinterpret_cast<PVOID*>(&TrueTaskDialogIndirect), HookTaskDialogIndirect);
+        }
+        if (TrueTaskDialog) {
+            DetourDetach(reinterpret_cast<PVOID*>(&TrueTaskDialog), HookTaskDialog);
+        }
+        if (TrueMessageBoxIndirectW) {
+            DetourDetach(reinterpret_cast<PVOID*>(&TrueMessageBoxIndirectW), HookMessageBoxIndirectW);
         }
         if (TrueTrackPopupMenu) {
             DetourDetach(reinterpret_cast<PVOID*>(&TrueTrackPopupMenu), HookTrackPopupMenu);

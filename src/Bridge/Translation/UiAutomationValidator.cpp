@@ -529,6 +529,8 @@ bool LacksRangeValuePattern(
         FAILED(result) ? result : E_UNEXPECTED);
 }
 
+// One hyperlink per link label, in the order the text names them: a native SysLink
+// carries one, a translated task dialog's text as many as its markup declares.
 bool ValidateSysLinkDescendant(
     IUIAutomation* automation,
     IUIAutomationElement* root,
@@ -536,8 +538,9 @@ bool ValidateSysLinkDescendant(
     DWORD rendererProcessId,
     ValidationProgress& progress,
     std::wstring& error) noexcept {
-    if (!automation || !root || node.items.size() != 1 || node.items.front().empty())
-        return Fail(error, L"SysLink snapshot has no unique link label");
+    if (!automation || !root || node.items.empty() ||
+        std::any_of(node.items.begin(), node.items.end(), [](const auto& label) { return label.empty(); }))
+        return Fail(error, L"SysLink snapshot has no link label");
     VARIANT value{};
     VariantInit(&value);
     value.vt = VT_I4;
@@ -554,25 +557,28 @@ bool ValidateSysLinkDescendant(
     int length = 0;
     if (FAILED(findResult) || !matches || FAILED(matches->get_Length(&length)))
         return FailHr(error, L"SysLink hyperlink enumeration failed", findResult);
-    if (length != 1)
-        return Fail(error, L"SysLink projection does not contain exactly one hyperlink");
-    ComPtr<IUIAutomationElement> link;
-    if (FAILED(matches->GetElement(0, &link)) || !link)
-        return Fail(error, L"SysLink hyperlink is unavailable");
-    ElementInfo info;
-    if (!ReadElementInfo(link.Get(), info, error)) return false;
-    if (info.processId != static_cast<int>(rendererProcessId) ||
-        info.framework != L"XAML" || info.controlType != UIA_HyperlinkControlTypeId || !info.isControl)
-        return Fail(error, L"SysLink hyperlink role or process is incorrect");
-    if (info.name != DisplayText(node.items.front()))
-        return Fail(error, L"SysLink hyperlink name does not match its link label");
-    if (info.isEnabled != (node.enabled ? TRUE : FALSE))
-        return Fail(error, std::wstring(L"SysLink hyperlink enabled state does not match native state: native=") +
-            (node.enabled ? L"enabled" : L"disabled"));
-    if (info.isKeyboardFocusable != (node.tabStop && node.enabled ? TRUE : FALSE))
-        return Fail(error, std::wstring(L"SysLink hyperlink focusability does not match native tab stop: native=") +
-            (node.tabStop ? L"tab stop" : L"no tab stop"));
-    return HasPattern(link.Get(), RequiredPattern::Invoke, progress, node.nodeId, error);
+    if (length != static_cast<int>(node.items.size()))
+        return Fail(error, L"SysLink projection does not contain one hyperlink per link label");
+    for (int index = 0; index < length; ++index) {
+        ComPtr<IUIAutomationElement> link;
+        if (FAILED(matches->GetElement(index, &link)) || !link)
+            return Fail(error, L"SysLink hyperlink is unavailable");
+        ElementInfo info;
+        if (!ReadElementInfo(link.Get(), info, error)) return false;
+        if (info.processId != static_cast<int>(rendererProcessId) ||
+            info.framework != L"XAML" || info.controlType != UIA_HyperlinkControlTypeId || !info.isControl)
+            return Fail(error, L"SysLink hyperlink role or process is incorrect");
+        if (info.name != DisplayText(node.items[static_cast<size_t>(index)]))
+            return Fail(error, L"SysLink hyperlink name does not match its link label");
+        if (info.isEnabled != (node.enabled ? TRUE : FALSE))
+            return Fail(error, std::wstring(L"SysLink hyperlink enabled state does not match native state: native=") +
+                (node.enabled ? L"enabled" : L"disabled"));
+        if (info.isKeyboardFocusable != (node.tabStop && node.enabled ? TRUE : FALSE))
+            return Fail(error, std::wstring(L"SysLink hyperlink focusability does not match native tab stop: native=") +
+                (node.tabStop ? L"tab stop" : L"no tab stop"));
+        if (!HasPattern(link.Get(), RequiredPattern::Invoke, progress, node.nodeId, error)) return false;
+    }
+    return true;
 }
 
 bool ValidateSliderRangeValue(

@@ -26,6 +26,7 @@ internal sealed class ControlFactory
     internal const int DialogIconZIndex = ProtocolConstants.MaxNodes;
     internal const int PaneSplitterZIndex = 1000;
     private const double NativeFontSize = 12;
+    private const double MainInstructionFontSize = 15;
     // The floor for a label fitted into the width the native control committed to.  A
     // menu bar rendered a fraction smaller is readable; one that reads "Favorit" is not.
     private const double MinimumFittedFontSize = 9;
@@ -232,6 +233,13 @@ internal sealed class ControlFactory
         const ulong ssTypeMask = 0x1F, ssCenter = 1, ssRight = 2, ssSimple = 0x0B, ssLeftNoWordWrap = 0x0C;
         const ulong ssNoPrefix = 0x80, ssCenterImage = 0x200, ssEllipsisMask = 0xC000;
         var text = new TextBlock { FontSize = NativeFontSize };
+        // A task dialog's main instruction is its heading (DialogSnapshots.cpp
+        // measures it at the same size and weight).
+        if (viewModel.PresentationVariant == "mainInstruction")
+        {
+            text.FontSize = MainInstructionFontSize;
+            text.FontWeight = new global::Windows.UI.Text.FontWeight { Weight = 600 };
+        }
         void ApplyStyle()
         {
             var type = viewModel.Style & ssTypeMask;
@@ -412,15 +420,16 @@ internal sealed class ControlFactory
             Padding = new Thickness(4, 0, 4, 0),
             HorizontalContentAlignment = HorizontalAlignment.Center,
         };
-        if (viewModel.PresentationVariant == "commandLink")
+        if (viewModel.PresentationVariant is "commandLink" or "commandLinkNoIcon" or "commandLinkElevated")
         {
             var content = new StackPanel { Orientation = Orientation.Vertical };
-            content.Children.Add(new TextBlock
+            var title = new TextBlock
             {
-                Text = Win32Mnemonic.DisplayText(viewModel.Text),
                 FontWeight = new global::Windows.UI.Text.FontWeight { Weight = 600 },
                 TextWrapping = TextWrapping.Wrap,
-            });
+            };
+            Bind(title, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+            content.Children.Add(title);
             if (!string.IsNullOrEmpty(viewModel.HelpText))
             {
                 content.Children.Add(new TextBlock
@@ -430,9 +439,38 @@ internal sealed class ControlFactory
                     TextWrapping = TextWrapping.Wrap,
                 });
             }
-            control.Content = content;
-            control.HorizontalContentAlignment = HorizontalAlignment.Left;
-            control.Padding = new Thickness(10, 4, 10, 4);
+            // A task dialog's command link leads with an arrow, or with the shield
+            // when the command needs elevation; the DirectUI lane's has neither.
+            var glyph = viewModel.PresentationVariant switch
+            {
+                "commandLinkElevated" => "",
+                "commandLinkNoIcon" => null,
+                _ when string.IsNullOrEmpty(viewModel.AdapterId) => "",
+                _ => null,
+            };
+            control.Content = glyph is null ? content : WithLeadingGlyph(content, glyph, 16, VerticalAlignment.Top);
+            control.HorizontalContentAlignment = HorizontalAlignment.Stretch;
+            control.VerticalContentAlignment = VerticalAlignment.Center;
+            control.Padding = new Thickness(10, 6, 10, 6);
+        }
+        else if (viewModel.PresentationVariant is "elevated" or "expandoCollapsed" or "expandoExpanded")
+        {
+            var label = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
+            Bind(label, TextBlock.TextProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+            var glyph = viewModel.PresentationVariant switch
+            {
+                "elevated" => "",
+                "expandoExpanded" => "",
+                _ => "",
+            };
+            control.Content = WithLeadingGlyph(label, glyph, 12, VerticalAlignment.Center);
+            if (viewModel.PresentationVariant != "elevated")
+            {
+                // The expando button is a disclosure toggle, not a command button.
+                control.HorizontalContentAlignment = HorizontalAlignment.Left;
+                control.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+                control.BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            }
         }
         else if (!string.IsNullOrEmpty(viewModel.ImageData))
         {
@@ -463,6 +501,27 @@ internal sealed class ControlFactory
                 _action(viewModel, "invoke", null);
         };
         return control;
+    }
+
+    // A glyph beside a button's content; the glyph is decoration and stays out of
+    // the accessibility tree.
+    private static Grid WithLeadingGlyph(UIElement content, string glyph, double size, VerticalAlignment alignment)
+    {
+        var icon = new FontIcon
+        {
+            Glyph = glyph,
+            FontSize = size,
+            Margin = new Thickness(0, alignment == VerticalAlignment.Top ? 2 : 0, 8, 0),
+            VerticalAlignment = alignment,
+        };
+        AutomationProperties.SetAccessibilityView(icon, AccessibilityView.Raw);
+        var layout = new Grid();
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        layout.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        layout.Children.Add(icon);
+        Grid.SetColumn((FrameworkElement)content, 1);
+        layout.Children.Add(content);
+        return layout;
     }
 
     private CheckBox CreateCheckBox(ControlNodeViewModel viewModel, bool threeState)
@@ -931,23 +990,40 @@ internal sealed class ControlFactory
         };
         void RebuildText()
         {
-            if (viewModel.Items.Count != 1 ||
-                !TrySplitSysLinkText(viewModel.Text, viewModel.Items[0], out var segments)) return;
+            if (!TrySplitSysLinkRuns(viewModel.Text, viewModel.Items, out var runs)) return;
             var paragraph = new Paragraph();
-            if (segments.Prefix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Prefix });
-            var link = new Hyperlink
+            var linkIndex = 0;
+            foreach (var (value, isLink) in runs)
             {
-                IsTabStop = viewModel.TabStop,
-                TabIndex = Math.Max(0, viewModel.TabIndex),
-            };
-            link.Inlines.Add(new Run { Text = segments.Label });
-            AutomationProperties.SetName(link, segments.Label);
-            link.Click += (_, _) =>
-            {
-                if (!_isApplyingCanonical() && AllowsAction(viewModel, "invoke")) _action(viewModel, "invoke", null);
-            };
-            paragraph.Inlines.Add(link);
-            if (segments.Suffix.Length != 0) paragraph.Inlines.Add(new Run { Text = segments.Suffix });
+                if (!isLink)
+                {
+                    paragraph.Inlines.Add(new Run { Text = value });
+                    continue;
+                }
+                var index = linkIndex++;
+                var link = new Hyperlink
+                {
+                    IsTabStop = viewModel.TabStop,
+                    TabIndex = Math.Max(0, viewModel.TabIndex),
+                };
+                link.Inlines.Add(new Run { Text = value });
+                AutomationProperties.SetName(link, value);
+                // A native SysLink has one link and is invoked; a task dialog's text
+                // names which of its links was clicked.
+                link.Click += (_, _) =>
+                {
+                    if (_isApplyingCanonical()) return;
+                    if (viewModel.Items.Count == 1)
+                    {
+                        if (AllowsAction(viewModel, "invoke")) _action(viewModel, "invoke", null);
+                    }
+                    else if (AllowsAction(viewModel, "activateItem"))
+                    {
+                        _action(viewModel, "activateItem", index);
+                    }
+                };
+                paragraph.Inlines.Add(link);
+            }
             text.Blocks.Clear();
             text.Blocks.Add(paragraph);
         }
@@ -2683,6 +2759,23 @@ internal sealed class ControlFactory
         return segments;
     }
 
+    // The text as plain and link runs, in order.
+    private static bool TrySplitSysLinkRuns(string text, IReadOnlyList<string> labels,
+        out List<(string Text, bool IsLink)> runs)
+    {
+        runs = [];
+        if (!ProtocolValidator.TryLocateSysLinkLabels(text, labels, out var starts)) return false;
+        var cursor = 0;
+        for (var index = 0; index < labels.Count; index++)
+        {
+            if (starts[index] > cursor) runs.Add((text[cursor..starts[index]], false));
+            runs.Add((labels[index], true));
+            cursor = starts[index] + labels[index].Length;
+        }
+        if (cursor < text.Length) runs.Add((text[cursor..], false));
+        return true;
+    }
+
     private static bool TrySplitSysLinkText(string text, string label, out SysLinkSegments segments)
     {
         segments = default;
@@ -2806,6 +2899,8 @@ internal sealed class ControlFactory
         "SolidBackgroundFillColorBaseBrush",
         "ControlStrongStrokeColorDefaultBrush",
         "ControlStrokeColorOnAccentSecondaryBrush",
+        "LayerFillColorAltBrush",
+        "DividerStrokeColorDefaultBrush",
     ];
 
     internal static void WarmThemeResources()

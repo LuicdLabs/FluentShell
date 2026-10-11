@@ -39,6 +39,11 @@ public sealed class TranslatedWindow : Window
     // that carries the newer revision second, so the replay has to wait for that patch
     // or it would be refused for exactly the same reason.
     private readonly Dictionary<string, NodeActionReplay> _staleReplays = new(StringComparer.Ordinal);
+    // A menu-bar command has no node: the item as clicked is kept by event id until the
+    // Bridge answers, and a refused one waits like a node action for the patch that
+    // carries the newer revision.
+    private readonly Dictionary<string, MenuActionReplay> _menuClicks = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, MenuActionReplay> _staleMenuReplays = new(StringComparer.Ordinal);
     private readonly TaskCompletionSource _loaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly AppWindow _appWindow;
     private readonly Dictionary<string, FrameworkElement> _controls = new(StringComparer.Ordinal);
@@ -228,6 +233,7 @@ public sealed class TranslatedWindow : Window
         PresenterActionIntent? presenterReplay = null;
         BoundsActionIntent? boundsReplay = null;
         NodeActionReplay? nodeReplay = null;
+        MenuActionReplay? menuReplay = null;
         RendererDiagnostics.Log($"window.patch event={patch.EventId ?? "-"} rev={patch.Revision} stateBefore={ViewModel.State} inFlight={_presenterActions.InFlightEventId ?? "-"}");
         _applyingCanonical = true;
         try
@@ -258,6 +264,11 @@ public sealed class TranslatedWindow : Window
             {
                 nodeReplay = queuedReplay;
             }
+            if (patch.EventId is not null &&
+                _staleMenuReplays.Remove(patch.EventId, out var queuedMenuReplay))
+            {
+                menuReplay = queuedMenuReplay;
+            }
             if (structural) RebuildControls();
             ApplyWindowState(ShouldApplyCanonicalPlacement(
                 _committed, placementChanged, placementActionPatch, LocalPlacementPending));
@@ -270,6 +281,7 @@ public sealed class TranslatedWindow : Window
         if (presenterReplay is { } replay) QueueOrEmitPresenterAction(replay);
         if (boundsReplay is { } boundsIntent) QueueOrEmitBoundsAction(boundsIntent);
         if (nodeReplay is { } nodeIntent) EmitStaleReplay(nodeIntent);
+        if (menuReplay is { } menuIntent) EmitStaleMenuReplay(menuIntent);
         QueuePopupSynchronization();
     }
 
@@ -319,6 +331,18 @@ public sealed class TranslatedWindow : Window
                         pending.RetryCount < NodeActionReplayPolicy.MaxStaleRetries;
                     pending.Node?.RejectPending(pending.Property, result.EventId, willReplay);
                     if (pending.Property == "close") _closePending = false;
+                    // A menu click that lost a race with a reconcile is kept for the patch that
+                    // carries the newer revision (see MenuActionReplayPolicy); any other
+                    // refusal of a menu command is final.
+                    if (result.Status == "stale" && pending.Action == "menuCommand" &&
+                        _menuClicks.Remove(result.EventId, out var staleClick) &&
+                        staleClick.RetryCount < NodeActionReplayPolicy.MaxStaleRetries)
+                    {
+                        _staleMenuReplays[result.EventId] = staleClick with
+                        {
+                            RetryCount = staleClick.RetryCount + 1,
+                        };
+                    }
                     // A revision race is not a refusal of the request: the Bridge only
                     // says the snapshot the request named is no longer current.  An
                     // action that carries the absolute state the user asked for can be
@@ -338,6 +362,8 @@ public sealed class TranslatedWindow : Window
                     pending.Node?.AcceptPending(pending.Property, result.EventId);
                 }
             }
+            // Only a refusal as stale keeps the clicked item (taken above).
+            if (result.Status != "stale") _menuClicks.Remove(result.EventId);
             if (result.Status == "stale")
             {
                 _presenterActions.MarkStale(result.EventId);
@@ -405,6 +431,8 @@ public sealed class TranslatedWindow : Window
             _closePending = false;
             _pending.Clear();
             _staleReplays.Clear();
+            _staleMenuReplays.Clear();
+            _menuClicks.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
@@ -437,6 +465,8 @@ public sealed class TranslatedWindow : Window
             _closePending = false;
             _pending.Clear();
             _staleReplays.Clear();
+            _staleMenuReplays.Clear();
+            _menuClicks.Clear();
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
@@ -522,6 +552,8 @@ public sealed class TranslatedWindow : Window
             IsImeComposing, lifetime, _itemPresses);
         var icon = CreateDialogIcon();
         if (icon is not null) _canvas.Children.Add(icon);
+        var band = CreateDialogContentArea(dpi);
+        if (band is not null) _canvas.Children.Add(band);
         foreach (var node in ViewModel.Nodes)
         {
             var control = factory.Create(node);
@@ -739,13 +771,55 @@ public sealed class TranslatedWindow : Window
             _ => (string.Empty, string.Empty),
         };
         if (glyph.Length == 0) return null;
-        var icon = new FontIcon { Glyph = glyph, FontSize = 32 };
+        // DialogSnapshots.cpp lays the text out beside a 32 DIP icon at the 20 DIP margin.
+        var icon = new FontIcon { Glyph = glyph, FontSize = 32, Width = 32, Height = 32 };
         AutomationProperties.SetName(icon, name);
-        Canvas.SetLeft(icon, 16);
-        Canvas.SetTop(icon, 16);
+        Canvas.SetLeft(icon, DialogMargin);
+        Canvas.SetTop(icon, DialogMargin);
         Canvas.SetZIndex(icon, ControlFactory.DialogIconZIndex);
         return icon;
     }
+
+    private const double DialogMargin = 20;
+    // kDialogBandPaddingDip in DialogSnapshots.h: the band starts this far above its first row.
+    private const double DialogBandPadding = 12;
+
+    // A translated message box or task dialog has a content area over a command band,
+    // as a ContentDialog does: the content is a lighter layer down to the band's top,
+    // which is its first row of buttons (or the verification check box) less the band
+    // padding.  A dialog with no band is all content.
+    private Border? CreateDialogContentArea(double dpi)
+    {
+        if (ViewModel.SurfaceKind is not ("messageBox" or "taskDialog")) return null;
+        double? firstRow = null;
+        foreach (var node in ViewModel.Nodes)
+        {
+            var bandMember = node.Kind == "checkBox" ||
+                node.Kind == "button" && !node.PresentationVariant.StartsWith("commandLink", StringComparison.Ordinal);
+            if (!bandMember) continue;
+            var top = node.Rect.Y * 96.0 / dpi;
+            firstRow = firstRow is { } current ? Math.Min(current, top) : top;
+        }
+        var height = firstRow is { } row ? Math.Max(0, row - DialogBandPadding) : _canvas.Height;
+        var area = new Border
+        {
+            Width = _canvas.Width,
+            Height = height,
+            Background = DialogBrush("LayerFillColorAltBrush", Microsoft.UI.Colors.White),
+            BorderBrush = DialogBrush("DividerStrokeColorDefaultBrush", Microsoft.UI.Colors.LightGray),
+            BorderThickness = new Thickness(0, 0, 0, firstRow is null ? 0 : 1),
+            IsHitTestVisible = false,
+        };
+        AutomationProperties.SetAccessibilityView(area, AccessibilityView.Raw);
+        Canvas.SetZIndex(area, -1);
+        return area;
+    }
+
+    private static Brush DialogBrush(string key, global::Windows.UI.Color fallback) =>
+        Application.Current?.Resources is { } resources &&
+        resources.TryGetValue(key, out var value) && value is Brush brush
+            ? brush
+            : new SolidColorBrush(fallback);
 
     internal static bool ShouldApplyCanonicalBounds(bool committed, string canonicalState) =>
         !committed || canonicalState == "normal";
@@ -907,8 +981,30 @@ public sealed class TranslatedWindow : Window
             _ => action,
         };
 
-    private void EmitMenuAction(MenuItemViewModel item) =>
-        EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId);
+    private void EmitMenuAction(MenuItemViewModel item) => EmitMenuClick(item, 0);
+
+    private void EmitMenuClick(MenuItemViewModel item, int retryCount)
+    {
+        var eventId = EmitAction(null, $"menu:{item.CommandId}", "menuCommand", item.CommandId, retryCount);
+        if (eventId is not null)
+            _menuClicks[eventId] = new MenuActionReplay(item.ItemId, item.CommandId, item.Text, retryCount);
+    }
+
+    // Re-send a menu command the Bridge refused as stale, now that the revision it was
+    // refused against has arrived -- when the user's item is still there as they saw it.
+    private void EmitStaleMenuReplay(MenuActionReplay replay)
+    {
+        var item = MenuActionReplayPolicy.Resolve(ViewModel.Menu, replay);
+        if (item is null)
+        {
+            RendererDiagnostics.Log(
+                $"stale menu replay dropped command={replay.CommandId} item={replay.ItemId}");
+            return;
+        }
+        RendererDiagnostics.Log(
+            $"stale menu replay command={replay.CommandId} retry={replay.RetryCount} rev={ViewModel.Revision}");
+        EmitMenuClick(item, replay.RetryCount);
+    }
 
     private string? EmitAction(ControlNodeViewModel? node, string property, string action, object? value) =>
         EmitAction(node, property, action, value, 0);

@@ -10,6 +10,7 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <unordered_set>
 #include <utility>
@@ -1057,9 +1058,24 @@ std::wstring DescribeSnapshotDifference(const WindowSnapshot& before, const Wind
         else if (a.items != b.items || a.itemRects.size() != b.itemRects.size()) field = L"items";
         else if (a.chromeRegions.size() != b.chromeRegions.size()) field = L"chrome region count";
         else {
-            for (size_t region = 0; region < a.chromeRegions.size() && field.empty(); ++region)
-                if (a.chromeRegions[region].imageData != b.chromeRegions[region].imageData)
-                    field = L"chrome pixels " + rectText(a.chromeRegions[region].rect);
+            for (size_t region = 0; region < a.chromeRegions.size() && field.empty(); ++region) {
+                const auto& before = a.chromeRegions[region].imageData;
+                const auto& after = b.chromeRegions[region].imageData;
+                if (before == after) continue;
+                // How much moved: a few levels on a few bytes is render noise, a whole glyph is
+                // an animation.
+                size_t differing = 0;
+                int largest = 0;
+                const size_t common = (std::min)(before.size(), after.size());
+                for (size_t byte = 0; byte < common; ++byte) {
+                    const int delta = std::abs(static_cast<int>(before[byte]) - static_cast<int>(after[byte]));
+                    if (delta != 0) ++differing;
+                    largest = (std::max)(largest, delta);
+                }
+                field = L"chrome pixels " + rectText(a.chromeRegions[region].rect) + L" (" +
+                    std::to_wstring(differing) + L" of " + std::to_wstring(common) +
+                    L" bytes differ, largest step " + std::to_wstring(largest) + L")";
+            }
             for (size_t bar = 0; bar < a.scrollBars.size() && bar < b.scrollBars.size() && field.empty(); ++bar)
                 if (a.scrollBars[bar].position != b.scrollBars[bar].position ||
                     a.scrollBars[bar].maximum != b.scrollBars[bar].maximum)
@@ -1463,6 +1479,36 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashString(hash, node.accessKey);
     }
     return hash;
+}
+
+// True when `next` differs from the canonical snapshot only in the pixels some container's chrome
+// regions hold (so the fingerprints differ and nothing else moved).  The pixel buffers are swapped
+// for the length of the comparison, never copied.
+bool OnlyChromePixelsChanged(WindowSnapshot& canonical, WindowSnapshot& next,
+    uint64_t canonicalFingerprint) noexcept {
+    if (canonical.nodes.size() != next.nodes.size()) return false;
+    struct Swap final { std::vector<uint8_t>* canonical; std::vector<uint8_t>* next; };
+    std::vector<Swap> swaps;
+    try {
+        for (size_t index = 0; index < canonical.nodes.size(); ++index) {
+            auto& before = canonical.nodes[index].chromeRegions;
+            auto& after = next.nodes[index].chromeRegions;
+            if (before.size() != after.size()) return false;
+            for (size_t region = 0; region < before.size(); ++region) {
+                if (before[region].imageData != after[region].imageData)
+                    swaps.push_back({ &before[region].imageData, &after[region].imageData });
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+    if (swaps.empty()) return false;
+    for (const auto& pair : swaps) pair.canonical->swap(*pair.next);
+    // `next` now carries the canonical pixels: it fingerprints like the canonical snapshot exactly
+    // when the pixels were all that differed.
+    const bool onlyPixels = SnapshotFingerprint(next) == canonicalFingerprint;
+    for (const auto& pair : swaps) pair.canonical->swap(*pair.next);
+    return onlyPixels;
 }
 
 } // namespace FluentShell::Bridge::Translation
