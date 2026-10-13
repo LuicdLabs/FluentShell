@@ -117,6 +117,9 @@ struct AccessibleIslandItemSnapshot final {
     bool enabled = true;
     bool dropDown = false;
     bool selected = false;
+    // A section header that folds the rows under it: open or folded.  Unset for any
+    // other item.
+    std::optional<bool> expanded;
     // Only an "image" item carries pixels: the region the host painted for an element
     // its provider describes as a graphic.
     uint32_t imageWidth = 0;
@@ -335,6 +338,10 @@ struct ToolbarItemSnapshot final {
     // The control draws this button's face itself, so the projection carries the pixels
     // it drew rather than an image-list icon it does not own.
     bool paintedFace = false;
+    // A TBSTYLE_LIST toolbar draws this button's own label beside its icon (mstsc's
+    // "Show Options").  Without it the text is only the button's name: an icon-only button
+    // names itself from its tooltip, which the control never draws on the face.
+    bool labelBeside = false;
     uint32_t imageWidth = 0;
     uint32_t imageHeight = 0;
     std::wstring imageFormat;
@@ -389,6 +396,9 @@ struct ControlNode final {
     bool readOnly = false;
     bool multiline = false;
     bool editable = false;
+    // The grey hint an empty edit box shows (EM_GETCUEBANNER, CB_GETCUEBANNER): mstsc's
+    // "Example: computer.fabrikam.com".  Edit, password, and editable combo boxes only.
+    std::wstring cueBanner;
     bool isDefault = false;
     bool groupStart = false;
     // MDI child frames only: whether this is the MDI client's active child and
@@ -548,6 +558,9 @@ struct WindowSnapshot final {
     SurfaceKind surfaceKind = SurfaceKind::Window;
     bool modal = false;
     bool canCancel = true;
+    // Whether the native title-bar close button (and Alt+F4) does anything.  Escape is
+    // canCancel's: an ordinary window closes from its title bar but ignores Escape.
+    bool canClose = true;
     std::wstring icon = L"none";
     uint64_t generation = 0;
     uint64_t revision = 0;
@@ -565,6 +578,14 @@ struct WindowSnapshot final {
     bool showInTaskbar = true;
     bool rtl = false;
     std::vector<MenuItemSnapshot> menu;
+    // Where the menu bar is when it is a toolbar inside the client area (MMC's), in client
+    // pixels: the projection draws its menu bar there instead of above the client area,
+    // which is where an HMENU's bar is.  Unset for an HMENU or no menu.
+    std::optional<RECT> menuBarRect;
+    // What a dialog paints itself in a full-width band above or below all of its controls
+    // (mstsc's banner: its logo and title), in client pixels.  A band the dialog only fills
+    // with its background is not carried.
+    std::vector<ChromeRegionSnapshot> paintedBands;
     // Bridge-only identity: a refreshed toolbar binding invalidates the revision
     // even when its rendered labels/command IDs happen to remain identical.
     uint64_t menuBindingGeneration = 0;

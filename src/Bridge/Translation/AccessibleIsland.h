@@ -19,6 +19,7 @@
 
 #include <windows.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,9 @@ struct AccessibleIslandItem final {
     // projection draws the same affordance the native element draws.
     bool dropDown = false;
     bool selected = false;
+    // A section header (MMC's Actions pane) whose action folds or unfolds the rows under
+    // it in place: open or folded.  Unset for every other element.
+    std::optional<bool> expanded;
 };
 
 // True when the class is one of the closed set of accessible-island hosts.  Keyed on

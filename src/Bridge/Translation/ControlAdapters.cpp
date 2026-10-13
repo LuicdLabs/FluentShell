@@ -481,6 +481,10 @@ bool ProbeButton(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason
     switch (type) {
     case BS_PUSHBUTTON:
     case BS_DEFPUSHBUTTON:
+    // A command link is a push button that draws its label, a note under it and a
+    // leading arrow (Windows Memory Diagnostic's two choices): the note is read with it.
+    case BS_COMMANDLINK:
+    case BS_DEFCOMMANDLINK:
         kind = ControlKind::Button;
         return true;
     case BS_CHECKBOX:
@@ -517,7 +521,10 @@ bool ProbeEdit(HWND, DWORD style, ControlKind& kind, std::wstring&) {
 // alternate 微軟正黑體 and Calibri), which a plain text box does the same way.  The
 // text object model answers all of it for the whole story without touching the
 // selection; a property that varies across the range reads back as tomUndefined.
-bool ReadRichEditPlainContent(HWND hwnd, std::wstring& reason, bool* formatted = nullptr) {
+// `decorationOnly`: underline and colour may vary too, as they do in an edit box that underlines
+// what it recognised (the object picker's resolved names); nothing else may.
+bool ReadRichEditPlainContent(HWND hwnd, std::wstring& reason, bool* formatted = nullptr,
+    bool decorationOnly = false) {
     if (formatted) *formatted = false;
     IRichEditOle* raw = nullptr;
     if (!SendMessageW(hwnd, EM_GETOLEINTERFACE, 0, reinterpret_cast<LPARAM>(&raw)) || !raw)
@@ -550,9 +557,11 @@ bool ReadRichEditPlainContent(HWND hwnd, std::wstring& reason, bool* formatted =
         FAILED(font->GetBackColor(&background)) || FAILED(font->GetSize(&size)))
         return Reject(reason, L"RichEdit character formats could not be read");
     const auto plain = [](long value) { return value == tomFalse || value == tomNone; };
-    if (!plain(bold) || !plain(italic) || !plain(underline) || !plain(strike) || !plain(hidden) ||
-        !plain(superscript) || !plain(subscript) || foreground == tomUndefined ||
-        background == tomUndefined || size == static_cast<float>(tomUndefined)) {
+    const bool decorated = decorationOnly && (underline == tomUndefined || underline == tomSingle ||
+        foreground == tomUndefined || background == tomUndefined);
+    if (!plain(bold) || !plain(italic) || (!plain(underline) && !decorated) || !plain(strike) || !plain(hidden) ||
+        !plain(superscript) || !plain(subscript) || (foreground == tomUndefined && !decorationOnly) ||
+        (background == tomUndefined && !decorationOnly) || size == static_cast<float>(tomUndefined)) {
         // Formatted, not unreadable: the rich text adapter decides whether it can draw it.
         if (formatted) *formatted = true;
         return Reject(reason, L"RichEdit text mixes character formats, links, or effects");
@@ -573,9 +582,17 @@ bool ReadRichEditPlainContent(HWND hwnd, std::wstring& reason, bool* formatted =
 // the application's formatting.  Windows Forms' RichTextBox showing Event Viewer's
 // event description is this shape.
 bool ProbeRichEdit(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
-    if ((style & ES_READONLY) == 0)
-        return Reject(reason, L"editable RichEdit would lose its formatting through a plain-text edit");
     if ((style & ES_PASSWORD) != 0) return Reject(reason, L"password RichEdit is not supported");
+    if ((style & ES_READONLY) == 0) {
+        // An editable RichEdit is an edit box while its text is plain, or only underlined or
+        // coloured (the object picker underlines the names it resolved); anything else would
+        // lose its formatting through a plain-text edit.
+        std::wstring plainReason;
+        if (!ReadRichEditPlainContent(hwnd, plainReason, nullptr, true))
+            return Reject(reason, L"editable RichEdit would lose its formatting through a plain-text edit");
+        kind = ControlKind::Edit;
+        return true;
+    }
     bool formatted = false;
     if (ReadRichEditPlainContent(hwnd, reason, &formatted)) {
         kind = ControlKind::Edit;
@@ -603,6 +620,18 @@ bool ProbeComboBox(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
         return Reject(reason,
             L"ComboBox is simple or has an unsupported type");
     }
+    kind = ControlKind::ComboBox;
+    return true;
+}
+
+// A ComboBoxEx (mstsc's computer box) is a combo box that stores and draws its items itself:
+// its inner ComboBox is owner-drawn without strings, and typing goes into an Edit of its own.
+// It is a comboBox node read through what the ComboBoxEx answers about its items, and its
+// inner parts are absorbed by it.
+bool ProbeComboBoxEx(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+    const DWORD type = style & 0x0003u;
+    if (type != CBS_DROPDOWNLIST && type != CBS_DROPDOWN)
+        return Reject(reason, L"ComboBoxEx is simple or has an unsupported type");
     kind = ControlKind::ComboBox;
     return true;
 }
@@ -1924,6 +1953,7 @@ bool CaptureAccessibleIslandState(HWND hwnd, ControlNode& node, std::wstring& re
         published.enabled = item.enabled;
         published.dropDown = item.dropDown;
         published.selected = item.selected;
+        published.expanded = item.expanded;
         if (item.kind == AccessibleItemKind::Image) {
             if (!paint) {
                 paint.emplace(hwnd);
@@ -2016,9 +2046,12 @@ constexpr std::array kClassAdapters{
     ClassAdapter{ MSFTEDIT_CLASS, &ProbeRichEdit },
     ClassAdapter{ RICHEDIT_CLASSW, &ProbeRichEdit },
     ClassAdapter{ L"ComboBox", &ProbeComboBox },
+    ClassAdapter{ WC_COMBOBOXEXW, &ProbeComboBoxEx },
     ClassAdapter{ L"ListBox", &ProbeListBox },
     ClassAdapter{ PROGRESS_CLASSW, &ProbeProgressBar },
     ClassAdapter{ WC_LINK, &ProbeSysLink },
+    // The shell's older link control (the object picker's), answering the same LM_ messages.
+    ClassAdapter{ L"Link Window", &ProbeSysLink },
     ClassAdapter{ WC_LISTVIEWW, &ProbeListView },
     ClassAdapter{ WC_TREEVIEWW, &ProbeTreeView },
     ClassAdapter{ WC_TABCONTROLW, &ProbeTabControl },
@@ -3315,18 +3348,31 @@ bool CaptureSysLinkState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         lowered.find(L"<a", close + 4) != std::wstring::npos) {
         return Reject(reason, L"SysLink markup is not a single bounded hyperlink");
     }
-    const std::wstring prefix = markup.substr(0, open);
+    std::wstring prefix = markup.substr(0, open);
     const std::wstring label = markup.substr(openEnd + 1, close - openEnd - 1);
     std::wstring suffix = markup.substr(close + 4);
     while (!suffix.empty() && suffix.back() <= L' ') suffix.pop_back();
-    const auto hasMarkupOrMnemonic = [](std::wstring_view value) {
-        return value.find_first_of(L"<>&") != std::wstring_view::npos;
+    const auto hasMarkup = [](std::wstring_view value) {
+        return value.find_first_of(L"<>") != std::wstring_view::npos;
     };
-    if (hasMarkupOrMnemonic(prefix) || hasMarkupOrMnemonic(label) ||
-        hasMarkupOrMnemonic(suffix)) {
+    if (hasMarkup(prefix) || hasMarkup(label) || hasMarkup(suffix) ||
+        label.find(L'&') != std::wstring::npos) {
         return Reject(reason,
             L"SysLink contains unsupported nested markup or mnemonic text");
     }
+    // The text around the link may name the next control's access key, as a label does (the
+    // object picker's "Enter the object name (&E):"); it is carried as the text it shows.
+    const auto shown = [](const std::wstring& value) {
+        std::wstring result;
+        for (size_t index = 0; index < value.size(); ++index) {
+            if (value[index] == L'&' && index + 1 < value.size()) ++index;
+            else if (value[index] == L'&') continue;
+            result.push_back(value[index]);
+        }
+        return result;
+    };
+    prefix = shown(prefix);
+    suffix = shown(suffix);
     const std::wstring flattened = prefix + label + suffix;
     const size_t labelAt = flattened.find(label);
     if (labelAt != prefix.size() ||
@@ -3352,7 +3398,24 @@ bool IsTinyGlyphButton(HWND hwnd, const std::wstring& text) noexcept {
 // BS_ICON / BS_BITMAP push buttons draw their picture centred instead of their text.
 bool CaptureButtonState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const auto style = static_cast<DWORD>(node.style);
-    node.isDefault = (style & BS_TYPEMASK) == BS_DEFPUSHBUTTON;
+    node.isDefault = (style & BS_TYPEMASK) == BS_DEFPUSHBUTTON ||
+        (style & BS_TYPEMASK) == BS_DEFCOMMANDLINK;
+    if ((style & BS_TYPEMASK) == BS_COMMANDLINK || (style & BS_TYPEMASK) == BS_DEFCOMMANDLINK) {
+        node.presentationVariant = L"commandLink";
+        node.helpText.clear();
+        const auto length = static_cast<DWORD>(SendMessageW(hwnd, BCM_GETNOTELENGTH, 0, 0));
+        if (length > Ipc::kMaxStringChars) return Reject(reason, L"command link note exceeds the protocol cap");
+        if (length != 0) {
+            std::wstring note(static_cast<size_t>(length) + 1, L'\0');
+            DWORD capacity = length + 1;
+            if (!SendMessageW(hwnd, BCM_GETNOTE, reinterpret_cast<WPARAM>(&capacity),
+                    reinterpret_cast<LPARAM>(note.data())))
+                return Reject(reason, L"command link note is unavailable");
+            note.resize(wcsnlen(note.c_str(), note.size()));
+            node.helpText = std::move(note);
+        }
+        return true;
+    }
     if ((style & BS_TYPEMASK) == BS_OWNERDRAW && !IsWindowsFormsWindow(hwnd)) {
         // The owner paints the whole face, so the picture is the face as painted, not a glyph on a
         // background to key out (a colour swatch is all background); the text stays the accessible name.
@@ -3419,6 +3482,17 @@ bool CaptureToggleState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     return true;
 }
 
+// The grey hint an empty edit box shows.  Both messages exist from common controls 6 and
+// answer FALSE when there is none; the hint is bounded like any short label.
+std::wstring ReadCueBanner(HWND hwnd, UINT message) {
+    std::vector<wchar_t> buffer(kMaxTabLabelChars + 1, L'\0');
+    if (!hwnd || !SendMessageW(hwnd, message, reinterpret_cast<WPARAM>(buffer.data()),
+            static_cast<LPARAM>(buffer.size())))
+        return {};
+    buffer.back() = L'\0';
+    return std::wstring(buffer.data(), wcsnlen_s(buffer.data(), buffer.size() - 1));
+}
+
 bool CaptureTextEntryState(HWND hwnd, ControlNode& node, std::wstring&) {
     const auto style = static_cast<DWORD>(node.style);
     node.readOnly = (style & ES_READONLY) != 0;
@@ -3429,6 +3503,7 @@ bool CaptureTextEntryState(HWND hwnd, ControlNode& node, std::wstring&) {
         reinterpret_cast<WPARAM>(&start), reinterpret_cast<LPARAM>(&end));
     node.selectionStart = static_cast<int>(start);
     node.selectionLength = static_cast<int>(end >= start ? end - start : 0);
+    node.cueBanner = node.multiline ? std::wstring() : ReadCueBanner(hwnd, EM_GETCUEBANNER);
     return true;
 }
 
@@ -3440,11 +3515,68 @@ bool CaptureRichTextState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     return ReadRichText(hwnd, node.richParagraphs, reason);
 }
 
+// The items of a ComboBoxEx as it stores them.  Only text items are projected: an item that
+// draws an image (any item does once the control has an image list), is indented, or asks its
+// owner for its text stays native.
+bool CaptureComboBoxExState(HWND hwnd, ControlNode& node, std::wstring& reason) {
+    node.editable = (static_cast<DWORD>(node.style) & 0x0003u) == CBS_DROPDOWN;
+    if (SendMessageW(hwnd, CBEM_GETIMAGELIST, 0, 0))
+        return Reject(reason, L"ComboBoxEx item images are not projected");
+    const LRESULT rawCount = SendMessageW(hwnd, CB_GETCOUNT, 0, 0);
+    if (rawCount < 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxListItems))
+        return Reject(reason, L"invalid or excessive ComboBoxEx item count");
+    node.items.clear();
+    node.items.reserve(static_cast<size_t>(rawCount));
+    size_t totalText = 0;
+    std::vector<wchar_t> buffer(Ipc::kMaxStringChars + 1);
+    for (LRESULT index = 0; index < rawCount; ++index) {
+        std::fill(buffer.begin(), buffer.end(), L'\0');
+        COMBOBOXEXITEMW item{};
+        item.mask = CBEIF_TEXT | CBEIF_INDENT;
+        item.iItem = static_cast<INT_PTR>(index);
+        item.pszText = buffer.data();
+        item.cchTextMax = static_cast<int>(buffer.size());
+        if (!SendMessageW(hwnd, CBEM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item)))
+            return Reject(reason, L"ComboBoxEx item is unavailable");
+        if (item.pszText == LPSTR_TEXTCALLBACKW)
+            return Reject(reason, L"ComboBoxEx callback text is not supported");
+        if (item.iIndent != 0)
+            return Reject(reason, L"indented ComboBoxEx items are not projected");
+        const wchar_t* text = item.pszText ? item.pszText : buffer.data();
+        const size_t length = wcsnlen_s(text, buffer.size());
+        if (length > Ipc::kMaxStringChars || totalText > kMaxStructuredTextChars - length)
+            return Reject(reason, L"ComboBoxEx item text exceeds the text cap");
+        totalText += length;
+        node.items.emplace_back(text, length);
+    }
+    node.selectedIndex = static_cast<int>(SendMessageW(hwnd, CB_GETCURSEL, 0, 0));
+    if (node.selectedIndex < -1 || node.selectedIndex >= static_cast<int>(node.items.size()))
+        return Reject(reason, L"ComboBoxEx selection is outside its items");
+    // What the box shows: the typed text of an editable one, the selected item otherwise.
+    const HWND edit = reinterpret_cast<HWND>(SendMessageW(hwnd, CBEM_GETEDITCONTROL, 0, 0));
+    if (node.editable) {
+        if (!edit || !IsWindow(edit)) return Reject(reason, L"editable ComboBoxEx has no edit box");
+        const int length = GetWindowTextLengthW(edit);
+        if (length < 0 || static_cast<size_t>(length) > Ipc::kMaxStringChars)
+            return Reject(reason, L"ComboBoxEx edit text exceeds the text cap");
+        std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+        text.resize(static_cast<size_t>(GetWindowTextW(edit, text.data(), length + 1)));
+        node.text = std::move(text);
+        node.cueBanner = ReadCueBanner(edit, EM_GETCUEBANNER);
+        if (node.cueBanner.empty()) node.cueBanner = ReadCueBanner(hwnd, CB_GETCUEBANNER);
+    } else {
+        node.text = node.selectedIndex < 0 ? std::wstring() : node.items[static_cast<size_t>(node.selectedIndex)];
+    }
+    return true;
+}
+
 bool CaptureStringListState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const bool combo = node.kind == ControlKind::ComboBox;
+    if (combo && IsComboBoxExWindow(hwnd)) return CaptureComboBoxExState(hwnd, node, reason);
     if (combo && (static_cast<DWORD>(node.style) & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE)))
         return CaptureOwnerDrawComboBox(hwnd, node, reason);
     node.editable = combo && (static_cast<DWORD>(node.style) & 0x0003u) == CBS_DROPDOWN;
+    if (node.editable) node.cueBanner = ReadCueBanner(hwnd, CB_GETCUEBANNER);
     if (!ReadStringItems(hwnd, combo, node.items, reason)) return false;
     if (!combo && (static_cast<DWORD>(node.style) & (LBS_MULTIPLESEL | LBS_EXTENDEDSEL)) != 0) {
         // A multi-select list answers its selection as a list of indices, not as a current item.
@@ -3669,6 +3801,12 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     bool groupHasCheckedItem = false;
     std::vector<TBBUTTON> capturedButtons;
     capturedButtons.reserve(static_cast<size_t>(rawCount));
+    // Whether the control draws a button's label on its face beside the icon: list mode with
+    // text rows, and under TBSTYLE_EX_MIXEDBUTTONS only for the BTNS_SHOWTEXT buttons.
+    const bool listLabels = (static_cast<DWORD>(node.style) & TBSTYLE_LIST) != 0 &&
+        SendMessageW(hwnd, TB_GETTEXTROWS, 0, 0) > 0;
+    const bool mixedButtons = (static_cast<DWORD>(SendMessageW(hwnd, TB_GETEXTENDEDSTYLE, 0, 0)) &
+        TBSTYLE_EX_MIXEDBUTTONS) != 0;
     for (int index = 0; index < rawCount; ++index) {
         TBBUTTON button{};
         if (!SendMessageW(hwnd, TB_GETBUTTON, index, reinterpret_cast<LPARAM>(&button)))
@@ -3698,6 +3836,7 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         }
 
         ToolbarItemSnapshot item;
+        bool ownLabel = false;
         item.enabled = (button.fsState & TBSTATE_ENABLED) != 0;
         item.hidden = (button.fsState & TBSTATE_HIDDEN) != 0;
         item.checked = (button.fsState & TBSTATE_CHECKED) != 0;
@@ -3769,6 +3908,7 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             }
 
             const bool drawsItsOwnLabel = length != 0;
+            ownLabel = drawsItsOwnLabel;
             if (button.iBitmap == I_IMAGECALLBACK) {
                 // The control asks its owner for the image index at draw time, so the
                 // projection asks the same question through the same notification rather
@@ -3882,6 +4022,8 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             previousRight = rect.right;
         }
         item.rect = rect;
+        item.labelBeside = listLabels && ownLabel && !item.paintedFace && !item.imageData.empty() &&
+            (!mixedButtons || (button.fsStyle & BTNS_SHOWTEXT) != 0);
         node.toolbarItems.push_back(std::move(item));
     }
     if (!haveVisibleBand)
@@ -4305,6 +4447,50 @@ constexpr std::array<CaptureFn, kControlKindCount> MakeCaptureTable() {
 constexpr auto kCaptureTable = MakeCaptureTable();
 
 } // namespace
+
+bool IsComboBoxExWindow(HWND hwnd) noexcept {
+    wchar_t className[kMaxClassNameChars]{};
+    return FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, className), WC_COMBOBOXEXW);
+}
+
+bool CaptureDialogPaintedBands(HWND root, std::vector<ChromeRegionSnapshot>& bands, std::wstring& reason) {
+    bands.clear();
+    wchar_t className[kMaxClassNameChars]{};
+    if (!FluentShell::EqualsIgnoreCase(ClassNameOf(root, className), L"#32770")) return true;
+    RECT client{};
+    if (!GetClientRect(root, &client) || client.right <= 0 || client.bottom <= 0) return true;
+    std::vector<RECT> children;
+    CollectVisibleChildRects(root, children);
+    if (children.empty()) return true;
+    LONG top = client.bottom;
+    LONG bottom = client.top;
+    for (const RECT& child : children) {
+        top = std::min(top, child.top);
+        bottom = std::max(bottom, child.bottom);
+    }
+    // Thinner than this is the dialog's margin, not a band; the controls' own edge is theirs.
+    constexpr LONG kMinimumBand = 24;
+    constexpr LONG kClearance = 2;
+    std::vector<RECT> candidates;
+    if (top - kClearance - client.top >= kMinimumBand)
+        candidates.push_back({ client.left, client.top, client.right, top - kClearance });
+    if (client.bottom - (bottom + kClearance) >= kMinimumBand)
+        candidates.push_back({ client.left, bottom + kClearance, client.right, client.bottom });
+    // A band past the chrome caps stays unprojected rather than keeping the dialog native.
+    size_t bytes = 0;
+    std::erase_if(candidates, [&](const RECT& band) {
+        const LONG width = band.right - band.left;
+        const LONG height = band.bottom - band.top;
+        const size_t size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+        if (width > static_cast<LONG>(Ipc::kMaxChromeRegionDimension) ||
+            height > static_cast<LONG>(Ipc::kMaxChromeRegionDimension) ||
+            size > Ipc::kMaxChromeRegionBytes - bytes) return true;
+        bytes += size;
+        return false;
+    });
+    if (candidates.empty()) return true;
+    return CaptureContainerChrome(root, client, candidates, bands, reason);
+}
 
 bool CaptureOwnedIconPixels(
     HICON icon,
@@ -5250,6 +5436,7 @@ bool IsCompositeImplementationChild(HWND hwnd) noexcept {
             std::wstring className;
             bool empty = false;
             bool captionCandidate = false;
+            bool sizeGrip = false;
         };
         auto child = std::make_shared<Child>();
         std::wstring reason;
@@ -5257,12 +5444,16 @@ bool IsCompositeImplementationChild(HWND hwnd) noexcept {
                 child->parent = GetParent(hwnd);
                 wchar_t name[kMaxClassNameChars]{};
                 child->className = ClassNameOf(hwnd, name);
+                child->sizeGrip = FluentShell::EqualsIgnoreCase(child->className, L"ScrollBar") &&
+                    (static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)) & (SBS_SIZEBOX | SBS_SIZEGRIP)) != 0;
                 child->empty = GetWindowTextLengthW(hwnd) == 0;
                 RECT client{};
                 child->captionCandidate = child->empty && !GetWindow(hwnd, GW_CHILD) &&
                     GetClientRect(hwnd, &client) && client.right > 0 && client.bottom > 0 &&
                     client.right <= 144 && client.bottom <= 48;
             }, reason) || !child->parent) return false;
+        // A size grip is the window's resize corner, which the projection's own frame provides.
+        if (child->sizeGrip) return true;
         // The caption cluster's own facts belong to the child; MDI activation
         // belongs to the client, which may live on a third GUI thread.
         if (child->captionCandidate) {
@@ -5301,8 +5492,14 @@ bool IsCompositeImplementationChild(HWND hwnd) noexcept {
             const auto type = ClassNameOf(parent, name);
             if (FluentShell::EqualsIgnoreCase(type, L"ComboBox")) {
                 COMBOBOXINFO info{sizeof(info)};
-                *absorbed = GetComboBoxInfo(parent, &info) &&
-                    (hwnd == info.hwndItem || hwnd == info.hwndList);
+                // A ComboBoxEx's own edit box lives inside its inner combo.
+                const HWND outer = GetParent(parent);
+                *absorbed = (GetComboBoxInfo(parent, &info) &&
+                        (hwnd == info.hwndItem || hwnd == info.hwndList)) ||
+                    (outer && IsComboBoxExWindow(outer) &&
+                        hwnd == reinterpret_cast<HWND>(SendMessageW(outer, CBEM_GETEDITCONTROL, 0, 0)));
+            } else if (FluentShell::EqualsIgnoreCase(type, WC_COMBOBOXEXW)) {
+                *absorbed = hwnd == reinterpret_cast<HWND>(SendMessageW(parent, CBEM_GETCOMBOCONTROL, 0, 0));
             } else if (FluentShell::EqualsIgnoreCase(type, WC_TREEVIEWW)) {
                 *absorbed = hwnd == reinterpret_cast<HWND>(SendMessageW(parent, TVM_GETEDITCONTROL, 0, 0));
             } else if (FluentShell::EqualsIgnoreCase(type, L"MonitorPaletteClass")) {

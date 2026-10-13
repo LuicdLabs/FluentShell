@@ -147,10 +147,27 @@ BOOL CALLBACK CollectChild(HWND hwnd, LPARAM raw) {
     return enumeration.handles.size() <= Ipc::kMaxNodes;
 }
 
+// What the window's own close button does: nothing without a system menu, nothing for a
+// CS_NOCLOSE class, and nothing while the application has greyed SC_CLOSE (which the
+// title bar reports as an unavailable close button, and which DefWindowProc honours by
+// ignoring Alt+F4 too).
+bool CanCloseFromTitleBar(HWND root, uint64_t style) noexcept {
+    if ((style & WS_SYSMENU) == 0) return false;
+    if ((GetClassLongPtrW(root, GCL_STYLE) & CS_NOCLOSE) != 0) return false;
+    TITLEBARINFO titleBar{ sizeof(titleBar) };
+    if (!GetTitleBarInfo(root, &titleBar)) return true;
+    constexpr size_t kCloseButton = 5;
+    return (titleBar.rgstate[kCloseButton] & STATE_SYSTEM_UNAVAILABLE) == 0;
+}
+
+// A control is disabled by itself or by a container below the top-level window.  The
+// top-level window's own enabled state is not the control's: the dialog manager disables
+// an owner while a modal dialog runs, and its controls keep their look (the snapshot's
+// window-level `enabled` carries that state, and the proxy takes no input while it is off).
 bool IsEffectivelyEnabled(HWND root, HWND child) noexcept {
     for (HWND current = child; current; current = GetParent(current)) {
-        if (!IsWindowEnabled(current)) return false;
         if (current == root) return true;
+        if (!IsWindowEnabled(current)) return false;
     }
     return false;
 }
@@ -496,6 +513,7 @@ bool CaptureTopLevelFacets(
     next.showInTaskbar = GetWindow(root, GW_OWNER) == nullptr ||
         (next.windowExStyle & WS_EX_APPWINDOW) != 0;
     next.rtl = (next.windowExStyle & WS_EX_LAYOUTRTL) != 0;
+    next.canClose = CanCloseFromTitleBar(root, next.windowStyle);
     return CaptureTopLevelMenu(root, next.menu, reason);
 }
 
@@ -1023,10 +1041,23 @@ bool CaptureWindow(
             }
             next.menu = context.menuBarToolbarMenu;
             next.menuBindingGeneration = context.menuBarBindingGeneration;
+            RECT bar{};
+            POINT topLeft{};
+            POINT bottomRight{};
+            if (!next.menu.empty() && GetWindowRect(context.menuBarToolbar, &bar)) {
+                topLeft = { bar.left, bar.top };
+                bottomRight = { bar.right, bar.bottom };
+                if (ScreenToClient(root, &topLeft) && ScreenToClient(root, &bottomRight) &&
+                    bottomRight.x > topLeft.x && bottomRight.y > topLeft.y)
+                    next.menuBarRect = RECT{ topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
+            }
         }
         if (!CaptureChildNodes(root, context, next, rejectionReason)) {
             return false;
         }
+        // A dialog's painted bands are presentation: one that cannot be rendered is left out.
+        std::wstring bandReason;
+        if (!CaptureDialogPaintedBands(root, next.paintedBands, bandReason)) next.paintedBands.clear();
         // The snapshot is published only once every stage has accepted, so a
         // rejected capture can never leave a partial tree behind.
         snapshot = std::move(next);
@@ -1115,10 +1146,23 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
     HashBytes(hash, snapshot.windowExStyle);
     HashBytes(hash, snapshot.visible);
     HashBytes(hash, snapshot.enabled);
+    HashBytes(hash, snapshot.canCancel);
+    HashBytes(hash, snapshot.canClose);
     HashString(hash, snapshot.state);
     HashBytes(hash, snapshot.showInTaskbar);
     HashBytes(hash, snapshot.rtl);
     HashBytes(hash, snapshot.menuBindingGeneration);
+    HashBytes(hash, snapshot.menuBarRect.has_value());
+    if (snapshot.menuBarRect) HashBytes(hash, *snapshot.menuBarRect);
+    HashBytes(hash, snapshot.paintedBands.size());
+    for (const auto& band : snapshot.paintedBands) {
+        HashBytes(hash, band.rect);
+        HashBytes(hash, band.imageWidth);
+        HashBytes(hash, band.imageHeight);
+        HashString(hash, band.imageFormat);
+        HashBytes(hash, band.imageData.size());
+        if (!band.imageData.empty()) HashRange(hash, band.imageData.data(), band.imageData.size());
+    }
     HashString(hash, snapshot.adapterId);
     HashString(hash, snapshot.pageId);
     const auto hashMenu = [&](const auto& self,
@@ -1176,6 +1220,7 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         HashBytes(hash, node.readOnly);
         HashBytes(hash, node.multiline);
         HashBytes(hash, node.editable);
+        HashString(hash, node.cueBanner);
         HashBytes(hash, node.isDefault);
         HashBytes(hash, node.groupStart);
         HashBytes(hash, node.active);
@@ -1324,6 +1369,7 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, item.dropDown);
             HashBytes(hash, item.wholeDropDown);
             HashBytes(hash, item.paintedFace);
+            HashBytes(hash, item.labelBeside);
             hashOptionalImage(item.hotImage);
             hashOptionalImage(item.disabledImage);
             hashOptionalImage(item.pressedImage);
@@ -1375,6 +1421,8 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             HashBytes(hash, item.enabled);
             HashBytes(hash, item.dropDown);
             HashBytes(hash, item.selected);
+            HashBytes(hash, item.expanded.has_value());
+            HashBytes(hash, item.expanded.value_or(false));
             HashBytes(hash, item.imageWidth);
             HashBytes(hash, item.imageHeight);
             HashString(hash, item.imageFormat);
@@ -1486,10 +1534,17 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
 // for the length of the comparison, never copied.
 bool OnlyChromePixelsChanged(WindowSnapshot& canonical, WindowSnapshot& next,
     uint64_t canonicalFingerprint) noexcept {
-    if (canonical.nodes.size() != next.nodes.size()) return false;
+    if (canonical.nodes.size() != next.nodes.size() ||
+        canonical.paintedBands.size() != next.paintedBands.size()) return false;
     struct Swap final { std::vector<uint8_t>* canonical; std::vector<uint8_t>* next; };
     std::vector<Swap> swaps;
     try {
+        // A dialog's own painted bands are chrome of the same kind.
+        for (size_t band = 0; band < canonical.paintedBands.size(); ++band) {
+            auto& before = canonical.paintedBands[band].imageData;
+            auto& after = next.paintedBands[band].imageData;
+            if (before != after) swaps.push_back({ &before, &after });
+        }
         for (size_t index = 0; index < canonical.nodes.size(); ++index) {
             auto& before = canonical.nodes[index].chromeRegions;
             auto& after = next.nodes[index].chromeRegions;

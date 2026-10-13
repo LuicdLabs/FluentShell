@@ -245,6 +245,9 @@ private:
     HANDLE rendererProcess_ = nullptr;
     HANDLE rendererThread_ = nullptr;
     HANDLE shutdownEvent_ = nullptr;
+    // Set by the thread hooks when a top-level window is shown or activated (see
+    // SetTopLevelShownEvent); wakes the supervisor for discovery.
+    HANDLE discoveryWake_ = nullptr;
     DWORD rendererProcessId_ = 0;
     uint64_t rendererCreated_ = 0;
     std::wstring pipeName_;

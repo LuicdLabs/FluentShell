@@ -43,6 +43,10 @@ public sealed record ToolbarItemSnapshot
     public ImageListEntry? DisabledImage { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ImageListEntry? PressedImage { get; init; }
+    // Minor 40: a TBSTYLE_LIST toolbar draws this button's own label beside its icon.
+    // Otherwise the text only names the button (an icon-only button's tooltip).
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? LabelBeside { get; init; }
 }
 
 public sealed record ImageListEntry
@@ -129,6 +133,9 @@ public sealed record AccessibleIslandItem
     public bool Enabled { get; init; }
     public bool DropDown { get; init; }
     public bool Selected { get; init; }
+    // A section header that shows or hides the rows under it (MMC's Actions pane): true
+    // while the section is open, false while it is folded, absent on any other item.
+    public bool? Expanded { get; init; }
     // Only an "image" item carries pixels: the region its host painted for an element
     // the provider describes as a graphic.
     public int? ImageWidth { get; init; }
@@ -168,6 +175,9 @@ public sealed record ControlNode
     public bool? ReadOnly { get; init; }
     public bool? Multiline { get; init; }
     public bool Editable { get; init; }
+    // Minor 40: the grey hint an empty edit box shows (edit, password, editable comboBox).
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CueBanner { get; init; }
     public bool? IsDefault { get; init; }
     public bool? GroupStart { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -398,6 +408,10 @@ public sealed record WindowSnapshot
     public string SurfaceKind { get; init; } = "window";
     public bool Modal { get; init; }
     public bool CanCancel { get; init; }
+    // Whether the title-bar close button (Alt+F4, SC_CLOSE) does anything.  Escape is
+    // CanCancel's: an ordinary window closes from its title bar but ignores Escape.
+    // Absent from a Bridge older than minor 39, where the close button followed CanCancel.
+    public bool? CanClose { get; init; }
     public string Icon { get; init; } = "none";
     public string Generation { get; init; } = "0";
     public string Revision { get; init; } = "0";
@@ -415,6 +429,14 @@ public sealed record WindowSnapshot
     public bool ShowInTaskbar { get; init; }
     public bool Rtl { get; init; }
     public List<MenuItemSnapshot> Menu { get; init; } = [];
+    // Minor 39: a menu bar that is a toolbar inside the client area (MMC's), in client
+    // pixels.  Absent for an HMENU, whose bar is above the client area.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PixelRect? MenuBarRect { get; init; }
+    // Minor 40: what a dialog paints itself in a full-width band above or below all of its
+    // controls (mstsc's banner), in client pixels.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<ChromeRegion>? PaintedBands { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public PopupMenuSnapshot? PopupMenu { get; init; }
     public List<ControlNode> Nodes { get; init; } = [];

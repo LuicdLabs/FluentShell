@@ -156,7 +156,7 @@ internal static class ProtocolValidator
         new(StringComparer.Ordinal)
         {
             "invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck",
-            "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "setGroupExpanded",
+            "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "setGroupExpanded", "focus",
             "islandInvoke", "htmlInvoke", "htmlScroll", "activateItem", "setFocusedIndex", "scrollBy",
             "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex",
             "toolbarCommand", "toolbarDropDown", "mdiCommand",
@@ -166,7 +166,7 @@ internal static class ProtocolValidator
     private static readonly HashSet<string> NullValueActions =
         new(StringComparer.Ordinal)
         {
-            "activate", "invoke", "minimize", "maximize", "restore", "close",
+            "activate", "invoke", "minimize", "maximize", "restore", "close", "focus",
         };
 
     private static void ValidateActionInvoke(ActionInvokeMessage action)
@@ -419,6 +419,37 @@ internal static class ProtocolValidator
         ParseHex64(snapshot.WindowStyle, "windowStyle");
         ParseHex64(snapshot.WindowExStyle, "windowExStyle");
         ValidateMenu(snapshot.Menu);
+        // A client-area menu bar (minor 39) is a place for the menu inside the client area.
+        if (snapshot.MenuBarRect is { } bar)
+        {
+            ValidateRect(bar, "menuBarRect");
+            if (snapshot.Menu.Count == 0 || bar.Width <= 0 || bar.Height <= 0 ||
+                bar.X < 0 || bar.Y < 0 ||
+                (long)bar.X + bar.Width > snapshot.ClientBounds.Width ||
+                (long)bar.Y + bar.Height > snapshot.ClientBounds.Height)
+                throw new ProtocolException("A client-area menu bar must hold a menu inside the client area.");
+        }
+        // A dialog's painted bands (minor 40): at most one above and one below its controls,
+        // each the pixels of exactly its rectangle inside the client area.
+        if (snapshot.PaintedBands is { } bands)
+        {
+            if (bands.Count is 0 or > 2)
+                throw new ProtocolException("A window carries one or two painted bands, or none.");
+            var bandBytes = 0;
+            foreach (var band in bands)
+            {
+                if (band is null) throw new ProtocolException("A painted band is null.");
+                ValidateRect(band.Rect, "paintedBand.rect");
+                if (band.Rect.Width != band.ImageWidth || band.Rect.Height != band.ImageHeight ||
+                    band.Rect.X < 0 || band.Rect.Y < 0 ||
+                    (long)band.Rect.X + band.Rect.Width > snapshot.ClientBounds.Width ||
+                    (long)band.Rect.Y + band.Rect.Height > snapshot.ClientBounds.Height)
+                    throw new ProtocolException("A painted band must be the pixels of a rectangle inside the client area.");
+                bandBytes = checked(bandBytes + ValidateChromeRegionPixels(band));
+                if (bandBytes > ProtocolConstants.MaxChromeRegionBytes)
+                    throw new ProtocolException("Painted bands exceed the protocol pixel cap.");
+            }
+        }
         ValidateApplicationAdapter(snapshot);
 
         // Node IDs and focus order are cross-node invariants, so they are tracked
@@ -586,6 +617,13 @@ internal static class ProtocolValidator
         if (node.Kind != "treeView" && node.ItemSelectedImages is not null)
             throw new ProtocolException(
                 "Only TreeView nodes can carry selected-state item images.");
+        // An empty hint is no hint, and only a box the user types into shows one.
+        if (node.CueBanner is { } cueBanner &&
+            (cueBanner.Length is 0 or > ProtocolConstants.MaxStringChars ||
+             node.Kind is not ("edit" or "password" or "comboBox") ||
+             (node.Kind == "comboBox" && !node.Editable)))
+            throw new ProtocolException(
+                "Only edit, password, and editable comboBox nodes carry a nonempty cueBanner.");
         if (node.Kind != "treeView" &&
             (node.StateImageList is not null || node.ItemStateImages is not null))
             throw new ProtocolException("Only TreeView nodes can carry state images.");
@@ -642,6 +680,10 @@ internal static class ProtocolValidator
                      TaskDialogVariants.TryGetValue(node.Kind, out var variants) &&
                      variants.Contains(node.PresentationVariant, StringComparer.Ordinal)) &&
                     (node.HelpText is null || node.PresentationVariant?.StartsWith("commandLink", StringComparison.Ordinal) == true);
+                // A native BS_COMMANDLINK button (minor 39): its label, and its note as helpText.
+                var commandLinkButton = !virtualSurface && node.Kind == "button" &&
+                    node.PresentationVariant == "commandLink";
+                taskDialogPresentation |= commandLinkButton;
                 var offending =
                     node.AdapterId is not null ? "adapterId" :
                     node.PageId is not null ? "pageId" :
@@ -707,9 +749,10 @@ internal static class ProtocolValidator
                 NamedVariants: ["bitmapDisplay", "monitorPalette"], VirtualAllowed: true),
             ["progressBar"] = new(["standard"], NamedVariants: ["standard"]),
             ["statusBar"] = new(["standard"]),
-            ["button"] = new(["standard", "commandLink"],
-                NamedVariants: ["standard", "commandLink"],
-                FocusVariants: ["standard", "commandLink"], VirtualAllowed: true),
+            // navigationBack (minor 39): an AeroWizard header's Back, drawn as its arrow.
+            ["button"] = new(["standard", "commandLink", "navigationBack"],
+                NamedVariants: ["standard", "commandLink", "navigationBack"],
+                FocusVariants: ["standard", "commandLink", "navigationBack"], VirtualAllowed: true),
             ["sysLink"] = new(["standard"], NamedVariants: ["standard"],
                 FocusVariants: ["standard"]),
             ["checkBox"] = new(["standard"], NamedVariants: ["standard"],
@@ -1014,6 +1057,11 @@ internal static class ProtocolValidator
             if (item.DropDown && !actionable)
                 throw new ProtocolException(
                     "An inert accessible island item cannot open a menu.");
+            // A section header folds the rows under it in place; one that opened a menu
+            // instead would have two meanings for the same click.
+            if (item.Expanded is not null && (item.Kind != "button" || item.DropDown))
+                throw new ProtocolException(
+                    "Only an accessible island button that opens no menu can fold a section.");
             if (item.Selected && !tabs || tabs && item.DropDown)
                 throw new ProtocolException("Accessible island tab metadata is inconsistent.");
             if (tabs && (item.Rect.X < 0 || item.Rect.Y < 0 ||
@@ -1695,11 +1743,14 @@ internal static class ProtocolValidator
         if (node.Style is null || node.ExStyle is null || node.ToolbarItems is null ||
             node.ToolbarItems.Count is <= 0 or > ProtocolConstants.MaxToolbarItems)
             throw new ProtocolException("Toolbar requires style evidence and a bounded item collection.");
-        // The bits the Bridge admits, mirrored here: CCS_TOP, CCS_NORESIZE,
-        // CCS_NODIVIDER, TBSTYLE_TOOLTIPS, TBSTYLE_WRAPABLE, TBSTYLE_FLAT,
-        // TBSTYLE_LIST, and TBSTYLE_TRANSPARENT.  WS_EX_TOOLWINDOW and
-        // WS_EX_NOPARENTNOTIFY change nothing the projection reproduces.
-        const ulong acceptedStyles = 0x9f45;
+        // The bits the Bridge admits (ProbeToolbar), mirrored here: CCS_TOP, CCS_NOMOVEY,
+        // CCS_NORESIZE, CCS_NOPARENTALIGN, CCS_NODIVIDER, TBSTYLE_TOOLTIPS, TBSTYLE_WRAPABLE,
+        // TBSTYLE_ALTDRAG, TBSTYLE_FLAT, TBSTYLE_LIST, and TBSTYLE_TRANSPARENT.  The CCS_*
+        // placement bits only say where the control puts itself when its parent resizes
+        // (mstsc's Options strip is CCS_NOPARENTALIGN); the projection lays it out from its
+        // native rectangle.  WS_EX_TOOLWINDOW and WS_EX_NOPARENTNOTIFY change nothing the
+        // projection reproduces.
+        const ulong acceptedStyles = 0x9f4f;
         const ulong acceptedExStyles = 0x00000080 | 0x00000004;
         if ((ParseHex64(node.Style, "toolbar.style") & 0xffffUL & ~acceptedStyles) != 0 ||
             (ParseHex64(node.ExStyle, "toolbar.exStyle") & ~acceptedExStyles) != 0)
@@ -1730,6 +1781,11 @@ internal static class ProtocolValidator
                 if (item.RadioGroup is not null)
                     throw new ProtocolException("Only toolbar radio buttons can carry radioGroup.");
             }
+            // A label drawn beside the icon needs both: a separator or an icon-less button has
+            // nothing to put it beside.
+            if (item.LabelBeside is { } beside &&
+                (!beside || item.Kind == "separator" || item.ImageData is null || item.Text.Length == 0))
+                throw new ProtocolException("Toolbar labelBeside is only true, on a button with an icon and a label.");
             ValidateRect(item.Rect, "toolbar.item.rect");
             if (item.Hidden)
             {

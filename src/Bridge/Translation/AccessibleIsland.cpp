@@ -178,10 +178,28 @@ bool IsDirectUiScrollChrome(HWND window) noexcept {
 
 namespace {
 
+// The island's client area in screen pixels, which is where an element the provider
+// marks offscreen can only be when it was folded away rather than scrolled away.
+bool IslandVisibleArea(HWND island, RECT& area) noexcept {
+    RECT client{};
+    POINT origin{ 0, 0 };
+    if (!GetClientRect(island, &client) || !ClientToScreen(island, &origin)) return false;
+    area = { origin.x, origin.y, origin.x + client.right, origin.y + client.bottom };
+    return true;
+}
+
+// `visibleArea`, when given, is the island's client area in screen pixels.  An element the
+// provider marks offscreen while its rectangle still lies inside that area is not scrolled
+// out of view -- it was folded away: MMC's Actions pane leaves a collapsed section's rows in
+// the tree, offscreen, stacked under the section header, and drawing them put a second
+// button over the header that took its clicks.  Such elements are skipped, by capture and
+// by invocation alike, so an item index means the same element to both.  An element
+// scrolled outside the area is kept: the projection scrolls the island itself.
 bool CollectElements(
     IAccessible* root,
     std::vector<IslandElement>& elements,
-    std::wstring& reason) {
+    std::wstring& reason,
+    const RECT* visibleArea = nullptr) {
     long childCount = 0;
     if (FAILED(root->get_accChildCount(&childCount)) || childCount <= 0) {
         return Reject(reason, L"island exposes no accessible children");
@@ -221,6 +239,14 @@ bool CollectElements(
             continue;
         }
         if ((state & STATE_SYSTEM_INVISIBLE) != 0) continue;
+        if ((state & STATE_SYSTEM_OFFSCREEN) != 0 && visibleArea) {
+            long left = 0, top = 0, width = 0, height = 0;
+            if (FAILED(target->accLocation(&left, &top, &width, &height, element.id)) ||
+                width <= 0 || height <= 0) continue;
+            const RECT bounds{ left, top, left + width, top + height };
+            RECT overlap{};
+            if (IntersectRect(&overlap, &bounds, visibleArea)) continue;
+        }
         if (element.object) {
             // A DirectUI scroll viewer hosts a real ScrollBar window, which MSAA lists
             // among the elements. It is chrome, not an element: the projection scrolls
@@ -290,6 +316,15 @@ bool ReadItem(
         return Reject(reason, L"island child became invisible during capture");
     }
     item.enabled = (state & STATE_SYSTEM_UNAVAILABLE) == 0;
+    // A drop-down button that reports itself open or folded is a section header: its
+    // action shows or hides the rows under it in place (MMC's Actions pane), and no menu
+    // follows.  Treated as a menu opener, its click held every other action back while the
+    // Bridge waited for a menu that never came.
+    if (role == ROLE_SYSTEM_BUTTONDROPDOWN &&
+        (state & (STATE_SYSTEM_EXPANDED | STATE_SYSTEM_COLLAPSED)) != 0) {
+        item.dropDown = false;
+        item.expanded = (state & STATE_SYSTEM_EXPANDED) != 0;
+    }
     // Disabled MMC commands can omit their default action. Preserve the disabled
     // button, and require the provider's action as soon as it becomes enabled.
     if (item.kind != AccessibleItemKind::Text && item.enabled && item.actionName.empty())
@@ -573,8 +608,12 @@ bool ReadAccessibleIslandItems(
         }
         if (IsPageTabHost(island) != (rootRole == ROLE_SYSTEM_PAGETABLIST))
             return Reject(reason, L"island tab host has an inconsistent root role");
+        RECT visibleArea{};
+        if (!IslandVisibleArea(island, visibleArea)) {
+            return Reject(reason, L"island client area is unavailable");
+        }
         std::vector<IslandElement> elements;
-        if (!CollectElements(root.value, elements, reason)) return false;
+        if (!CollectElements(root.value, elements, reason, &visibleArea)) return false;
         items.reserve(elements.size());
         size_t selectedTabs = 0;
         for (const IslandElement& element : elements) {
@@ -635,8 +674,12 @@ bool InvokeAccessibleIslandItem(
         }
         if (IsPageTabHost(island) != (rootRole == ROLE_SYSTEM_PAGETABLIST))
             return Reject(reason, L"island tab host role changed before invocation");
+        RECT visibleArea{};
+        if (!IslandVisibleArea(island, visibleArea)) {
+            return Reject(reason, L"island client area is unavailable");
+        }
         std::vector<IslandElement> elements;
-        if (!CollectElements(root.value, elements, reason)) return false;
+        if (!CollectElements(root.value, elements, reason, &visibleArea)) return false;
         if (index < 0 || static_cast<size_t>(index) >= elements.size()) {
             return Reject(reason, L"island item index no longer exists");
         }

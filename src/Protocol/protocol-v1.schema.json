@@ -633,6 +633,7 @@
         "readOnly": { "type": "boolean" },
         "multiline": { "type": "boolean" },
         "editable": { "type": "boolean" },
+        "cueBanner": { "$ref": "#/$defs/text", "$comment": "Minor 40: the grey hint an empty edit box shows; edit, password, and editable comboBox nodes only." },
         "isDefault": { "type": "boolean" },
         "groupStart": { "type": "boolean" },
         "active": { "type": "boolean" },
@@ -732,7 +733,7 @@
         "pageId": { "const": "semantic-v1" },
         "semanticKey": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:-]+$" },
         "sourceKind": { "enum": ["uiaVirtual", "nativeBacking"] },
-        "presentationVariant": { "enum": ["commandLink", "standard", "password", "bitmapDisplay", "bitmapSwitch", "monitorPalette", "mainInstruction", "commandLinkNoIcon", "commandLinkElevated", "elevated", "expandoCollapsed", "expandoExpanded"] },
+        "presentationVariant": { "enum": ["commandLink", "standard", "password", "bitmapDisplay", "bitmapSwitch", "monitorPalette", "mainInstruction", "commandLinkNoIcon", "commandLinkElevated", "elevated", "expandoCollapsed", "expandoExpanded", "navigationBack"], "$comment": "navigationBack (minor 39): an AeroWizard header's Back arrow; commandLink also marks a native BS_COMMANDLINK button on a generic window." },
         "supportedActions": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["invoke", "setText", "setCheck", "select", "setSelection", "setItemCheck", "setItemText", "setValue", "setExpand", "toolbarCommand", "mdiCommand"] } },
         "helpText": { "$ref": "#/$defs/text" },
         "accessKey": { "$ref": "#/$defs/text" },
@@ -748,6 +749,9 @@
             }, {
               "if": { "anyOf": [{ "required": ["hotImage"] }, { "required": ["disabledImage"] }, { "required": ["pressedImage"] }] },
               "then": { "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"], "properties": { "kind": { "enum": ["pushButton", "toggleButton", "radioButton"] } } }
+            }, {
+              "if": { "required": ["labelBeside"] },
+              "then": { "required": ["imageWidth", "imageHeight", "imageFormat", "imageData"], "properties": { "kind": { "enum": ["pushButton", "toggleButton", "radioButton"] } } }
             }],
             "properties": {
               "kind": { "enum": ["pushButton", "toggleButton", "radioButton", "separator"] },
@@ -760,6 +764,7 @@
               "checked": { "type": "boolean" },
               "dropDown": { "type": "boolean" },
               "wholeDropDown": { "type": "boolean" },
+              "labelBeside": { "const": true, "$comment": "Minor 40: a TBSTYLE_LIST toolbar draws this button's own label beside its icon; otherwise text only names the button." },
               "hotImage": { "$ref": "#/$defs/toolbarStateImage" },
               "disabledImage": { "$ref": "#/$defs/toolbarStateImage" },
               "pressedImage": { "$ref": "#/$defs/toolbarStateImage" },
@@ -829,6 +834,7 @@
               "enabled": { "type": "boolean" },
               "dropDown": { "type": "boolean" },
               "selected": { "type": "boolean" },
+              "expanded": { "type": "boolean", "$comment": "Minor 39: a section header that folds the rows under it; a button that opens no menu." },
               "imageWidth": { "type": "integer", "minimum": 1, "maximum": 96 },
               "imageHeight": { "type": "integer", "minimum": 1, "maximum": 96 },
               "imageFormat": { "const": "bgra8-premultiplied" },
@@ -864,6 +870,7 @@
         "surfaceKind": { "enum": ["window", "messageBox", "taskDialog"] },
         "modal": { "type": "boolean" },
         "canCancel": { "type": "boolean" },
+        "canClose": { "type": "boolean", "$comment": "Minor 39: the title-bar close button does something. Absent: it follows canCancel." },
         "icon": { "enum": ["none", "warning", "error", "info", "question", "shield"] },
         "generation": { "$ref": "#/$defs/u64String" },
         "revision": { "$ref": "#/$defs/u64String" },
@@ -886,6 +893,22 @@
           "type": "array",
           "maxItems": 256,
           "items": { "$ref": "#/$defs/menuItem" }
+        },
+        "menuBarRect": { "$ref": "#/$defs/rect", "$comment": "Minor 39: a menu bar that is a toolbar inside the client area, in client pixels; absent for an HMENU." },
+        "paintedBands": {
+          "$comment": "Minor 40: what a dialog paints itself in a full-width band above or below all of its controls (mstsc's banner), in client pixels.",
+          "type": "array", "minItems": 1, "maxItems": 2,
+          "items": {
+            "type": "object",
+            "required": ["rect", "imageWidth", "imageHeight", "imageFormat", "imageData"],
+            "properties": {
+              "rect": { "$ref": "#/$defs/rect" },
+              "imageWidth": { "type": "integer", "minimum": 1, "maximum": 1024 },
+              "imageHeight": { "type": "integer", "minimum": 1, "maximum": 1024 },
+              "imageFormat": { "const": "bgra8-premultiplied" },
+              "imageData": { "type": "string", "minLength": 8, "maxLength": 1398104, "pattern": "^[A-Za-z0-9+/]+={0,2}$" }
+            }
+          }
         },
         "popupMenu": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/popupMenu" }] },
         "nodes": {
@@ -1251,7 +1274,7 @@
         "nodeId": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64String" }] },
         "eventId": { "$ref": "#/$defs/u64String" },
         "expectedRevision": { "$ref": "#/$defs/u64String" },
-        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "setItemCheck", "setItemText", "setValue", "setExpand", "setGroupExpanded", "setSplit", "setColumnOrder", "islandInvoke", "htmlInvoke", "htmlScroll", "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
+        "action": { "enum": ["activate", "invoke", "setText", "setCheck", "select", "setSelection", "setFocusedIndex", "focus", "setItemCheck", "setItemText", "setValue", "setExpand", "setGroupExpanded", "setSplit", "setColumnOrder", "islandInvoke", "htmlInvoke", "htmlScroll", "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex", "activateItem", "scrollBy", "toolbarCommand", "menuCommand", "popupCommand", "mdiCommand", "move", "resize", "minimize", "maximize", "restore", "close"] },
         "value": {}
       }
     },

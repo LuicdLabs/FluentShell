@@ -168,6 +168,14 @@ gate. While gated, `TranslatedWindow.ApplyPreInteractiveGate` swallows input and
 Stages after the provisional commit reject through `RejectAfterCommit`, which restores the native
 window first.
 
+The proxy is prepared **without ever being shown** (`TranslatedWindow.PrepareSurfaceAsync`: XAML loads,
+lays out and renders a never-shown window), so the provisional commit is its first show. DWM plays a
+window's open transition only on its first show -- any later hide/show pops in, cloaked or not -- so a
+proxy shown behind its cloak during preparation (the fallback when content does not load hidden within
+750 ms) appears without one. Closing is the mirror: a surface whose native window is gone is only hidden
+(`HideProxyGracefully`, no cloak) and the renderer delays its cloak (`AfterHideTransition`), so DWM's
+close transition plays.
+
 ### The owner graph
 
 A dialog the application runs modally against an owner (the dialog manager disables the owner) is
@@ -196,7 +204,9 @@ Bridge's `RestoreAll` restores in that order).
 - Long-running native work (`WM_CLOSE`, `WM_COMMAND`, `BM_CLICK`) is **posted, not sent**, because
   the handler may enter an application-owned modal loop that would blow the command deadline.
 - The supervisor loop (`RunSupervisor`) ticks every 250 ms: discovery every 1 s, reconcile every
-  tick. A quiet surface is fully recaptured only every 4th tick (`kQuietReconcileTicks`); the
+  tick. A top-level window shown or activated on a hooked GUI thread (`SetTopLevelShownEvent`, set from
+  the `WH_CBT`/`WH_CALLWNDPROCRET` hooks) wakes it into a 600 ms burst of 40 ms discovery passes: a
+  dialog opened over a projection is invisible (its owner's cloak is inherited) until it projects. A quiet surface is fully recaptured only every 4th tick (`kQuietReconcileTicks`); the
   dirty flag is set by subclass procs for the messages in `RelevantMessage`.
 - A capture whose only change is the pixels of a container's chrome regions
   (`OnlyChromePixelsChanged`) is published only once two consecutive captures agree on it and at least
@@ -361,3 +371,58 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
   `setValue` sets `DTM_SETSYSTEMTIME` and then sends the parent `DTN_DATETIMECHANGE`, which is the only way a
   Windows Forms `DateTimePicker` learns its new `Value`. A Windows Forms `GroupBox` owns its controls as child
   windows, so a `groupBox` node is a container.
+- Protocol minor 39: `canClose` (the title-bar X and Alt+F4: `WS_SYSMENU`, no `CS_NOCLOSE`, SC_CLOSE not greyed per
+  `GetTitleBarInfo`) is separate from `canCancel` (Escape). The renderer only sends `close` for `canClose` and greys
+  its own X otherwise; before this, no main window's close button did anything. A control's `enabled` no longer
+  includes the top-level window's: a modal dialog disables the frame (`snapshot.enabled`), not its controls, so the
+  owner proxy is neither greyed out nor rebuilt while a dialog is open.
+- MMC crashed on every close while projected (mmc.exe+0x287C): MFC/MMC subclass their views through an HWND map of
+  their own, and our comctl32 subclass layered over it made their teardown read a freed entry.
+  `DetachControlObservation` removes every control subclass on root `WM_CLOSE`/`WM_DESTROY`, and nothing is
+  re-installed while a close runs (`t_closingRoots`). Never release COM objects from a `thread_local` or static
+  destructor: the MSHTML document cache did so from `LdrShutdownProcess` and faulted Services/Device Manager on
+  exit, so it is now deliberately leaked (`States()` in `NativeDocument.cpp`).
+- MMC's Actions pane (an accessible island): a collapsed section keeps its rows in the MSAA tree, `OFFSCREEN` but
+  inside the client area under the header; capture skips those (an offscreen row outside the area is a scrolled one
+  and is kept). A `ROLE_SYSTEM_BUTTONDROPDOWN` with `EXPANDED`/`COLLAPSED` is a fold toggle (`expanded`), not a
+  menu opener. Drawing the hidden rows put a second button over the header ("the panes fight" after a collapse).
+- The cloaked native window keeps its taskbar button, so the Bridge removes it while projected and restores it on
+  rollback (`TaskbarTabs`, one worker thread). The renderer gives each proxy the native window's icons and a
+  per-application AppUserModelID with relaunch properties (`ProxyIdentity.cs`), so the taskbar shows one button,
+  grouped and named as the application, instead of "FluentShell.Renderer".
+- Dark mode: the title bar follows the app mode (`AppWindowTitleBar.PreferredTheme`), and a container's light
+  painted band (MMC's "動作" strip) is remapped onto the dark range (`ChromeThemeAdaptation`: near-grey pixels,
+  ClearType fringes included, mirror their lightness; strongly coloured pixels are kept; dark bands are untouched).
+- `BS_COMMANDLINK` buttons are `button` nodes with `presentationVariant: commandLink` and the note as `helpText`, on
+  generic windows too. MdSched projects through the DirectUI lane; its DirectUI-hosted Cancel has control ID 0, so
+  the cancel binding also matches the system's localized Cancel label (`IsDirectUiCancelButton`). Never click
+  MdSched's command links in a test: they restart the machine.
+- AeroWizard pages (cttune, rekeywiz, fsquirt): the header's `wizardicon`/`wizardtitle` are accounted for but not
+  drawn (the proxy's title bar shows both), and Back is `presentationVariant: navigationBack` (an arrow). A virtual
+  image reported a few pixels past its host is clipped to what the host paints (at least three quarters inside).
+- Protocol minor 40: the cloaked window's thread focus follows the projection. A menu command acts on the pane that
+  holds the native focus (regedit's Rename and Delete reach the tree's key or the list's values by it), and the
+  cloaked window otherwise kept a focus the user had left, or none. The renderer sends `focus` the first time the user
+  (pointer or keyboard, never a programmatic restore) focuses a list or tree after the focus was elsewhere, and a
+  list's `setSelection`/`setFocusedIndex` or a tree's `select` focuses that control first (`FocusPaneOfUserGesture`).
+- Label renames: regedit vetoes every label session it did not open, so a projected rename it refuses is routed through
+  its own Rename (F2, `PostLabelRename`) and the text goes into the edit box that opens. A session the application
+  opens itself (Edit > Rename, a context menu's Rename) shows as the projected editor on that row (`editingIndex`):
+  `setItemText` answers it through the application's edit box, and the unchanged label cancels it
+  (`ItemLabelEdit.Answer`, `LabelSessionOpenOn`). The menu bar sits where the native one was: the client-area menu
+  toolbar's rectangle (`menuBarRect`) or the HMENU's non-client band, so nothing below it moves.
+- mstsc (minor 40): its computer box is a `ComboBoxEx32` (`ProbeComboBoxEx`): a comboBox node read through the
+  ComboBoxEx's own item store, its inner owner-draw combo and its edit box absorbed; `setText` writes that edit box.
+  Items with images, callback text or indentation keep the window native. An edit box's grey hint is `cueBanner`
+  (`EM_GETCUEBANNER`/`CB_GETCUEBANNER`, shown as `PlaceholderText`; the UIA gate takes it as the name of a box that has
+  none). A `TBSTYLE_LIST` button that draws its own label beside its icon carries `labelBeside` (an icon-only button's
+  text is its tooltip and is never drawn). A dialog's own painting in a full-width band above or below all of its
+  controls (mstsc's banner) travels as `paintedBands` and is adapted to dark mode like container chrome; ClearType edges
+  of coloured text are re-mixed per channel over the dark face (`ChromeThemeAdaptation`). The renderer's toolbar style
+  mask must mirror `ProbeToolbar`'s: it lacked `CCS_NOPARENTALIGN`, which alone kept mstsc native.
+- The object picker (regedit's Connect Network Registry): the shell's older `Link Window` is probed as a SysLink, and
+  the text around a link may carry an access key, carried as the text it shows (`&E` -> `E`). An editable RichEdit is
+  an edit box while its text is plain or only underlined/coloured (the picker underlines resolved names); bold, size
+  or links keep it native. A `ScrollBar` with `SBS_SIZEGRIP`/`SBS_SIZEBOX` is the dialog's resize corner and is
+  absorbed. regedit's Modify Binary Data stays native: its private `HEX` control publishes no text, value or
+  accessible data to read or write.

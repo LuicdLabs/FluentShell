@@ -3,6 +3,7 @@
 #include "SourceThreadAgent.h"
 #include "ControlAdapters.h"
 #include "PaintedPixel.h"
+#include "DialogSnapshots.h"
 #include "../../Common/FluentShell.h"
 #include "../Ipc/Protocol.h"
 
@@ -34,6 +35,37 @@ namespace FluentShell::Bridge::Translation {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+// A button label without its mnemonic: "&Cancel" and "取消(&C)" are both "Cancel"/"取消".
+std::wstring LabelWithoutMnemonic(std::wstring_view label) {
+    std::wstring result;
+    for (size_t index = 0; index < label.size(); ++index) {
+        if (label[index] == L'(' && index + 3 < label.size() &&
+            label[index + 1] == L'&' && label[index + 3] == L')') {
+            index += 3;
+            continue;
+        }
+        if (label[index] != L'&') result.push_back(label[index]);
+    }
+    while (!result.empty() && result.back() == L' ') result.pop_back();
+    return result;
+}
+
+// The page's cancel: the provider names it CancelButton (AeroWizard), or it is the native
+// push button Escape answers -- the dialog's IDCANCEL, or, for a button DirectUI hosts with
+// no control ID (Windows Memory Diagnostic's), the one labelled with the system's own
+// Cancel string.  Close and Escape route to it, as the title bar and dialog manager do.
+bool IsDirectUiCancelButton(
+    const DirectUiSemanticEvidence& semantic, const DirectUiWindowEvidence* backing) {
+    if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"cancelbutton")) return true;
+    if (!backing) return false;
+    const auto type = static_cast<DWORD>(backing->style) & BS_TYPEMASK;
+    if (type != BS_PUSHBUTTON && type != BS_DEFPUSHBUTTON) return false;
+    if (backing->controlId == IDCANCEL) return true;
+    const std::wstring label = LabelWithoutMnemonic(semantic.name);
+    return backing->controlId == 0 && !label.empty() &&
+        label == LabelWithoutMnemonic(DialogButtonLabel(IDCANCEL));
+}
 
 constexpr DWORD kUiaDeadlineMs = 1600;
 constexpr size_t kMaxTextChars = 4096;
@@ -1298,6 +1330,9 @@ bool BuildCompositeSnapshot(
     snapshot.canCancel = std::any_of(
         profile.slots, profile.slots + profile.slotCount,
         [](const DirectUiSlot& slot) { return slot.cancel; });
+    // Close routes to the page's cancel binding, so the close button does exactly what
+    // Escape does.
+    snapshot.canClose = snapshot.canCancel;
     snapshot.icon = L"none";
     snapshot.generation = agent.Generation();
     snapshot.nativeHwnd = native.root.hwnd;
@@ -1623,7 +1658,19 @@ bool BuildGenericSemanticProfile(
         }
 
         bool retain = true;
-        if (nativePane && backing->controlKind == ControlKind::StaticText) {
+        // An AeroWizard's header repeats the window's icon and title beside its Back
+        // arrow.  The proxy's own title bar shows both, so the pair is accounted for in
+        // the contract but not drawn a second time (the icon's crop was also the glass
+        // the header sits on, which paints black).
+        const bool wizardCaption = !hasBacking && propertySheetSurface &&
+            (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"wizardicon") ||
+             FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"wizardtitle")) &&
+            !semantic.focusable && !semantic.actionable;
+        if (wizardCaption) {
+            slot.project = false;
+            slot.kind = ControlKind::StaticText;
+            slot.presentationVariant = L"standard";
+        } else if (nativePane && backing->controlKind == ControlKind::StaticText) {
             if (semantic.name.empty() || semantic.focusable || semantic.actionable ||
                 behavioralPatternMask != DirectUiPatternNone)
                 return Fail(error, L"generic U: native Static Pane exposes unsupported behavior" +
@@ -1641,8 +1688,7 @@ bool BuildGenericSemanticProfile(
                 ((backing->window.style & BS_TYPEMASK) == BS_COMMANDLINK ||
                  (backing->window.style & BS_TYPEMASK) == BS_DEFCOMMANDLINK)
                 ? L"commandLink" : L"standard";
-            slot.cancel = FluentShell::EqualsIgnoreCase(
-                semantic.semanticKey, L"cancelbutton");
+            slot.cancel = IsDirectUiCancelButton(semantic, &backing->window);
             slot.action = DirectUiAction::HandoffClick;
         } else if (nativePane && backing->controlKind == ControlKind::CheckBox) {
             if (semantic.name.empty() || semantic.actionable ||
@@ -1743,14 +1789,17 @@ bool BuildGenericSemanticProfile(
                 ((backing->window.style & BS_TYPEMASK) == BS_COMMANDLINK ||
                  (backing->window.style & BS_TYPEMASK) == BS_DEFCOMMANDLINK)
                 ? L"commandLink" : L"standard";
-            slot.cancel = FluentShell::EqualsIgnoreCase(
-                semantic.semanticKey, L"cancelbutton");
+            slot.cancel = IsDirectUiCancelButton(
+                semantic, nativeButton ? &backing->window : nullptr);
             if (nativeButton) {
                 slot.action = DirectUiAction::HandoffClick;
             } else if (!hasBacking && propertySheetSurface) {
-                if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"backbutton"))
+                if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"backbutton")) {
                     slot.propertySheetButton = PSBTN_BACK;
-                else if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"nextbutton"))
+                    // The wizard draws Back as an arrow in its header, not as a labelled
+                    // button; the label stays the accessible name.
+                    slot.presentationVariant = L"navigationBack";
+                } else if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"nextbutton"))
                     slot.propertySheetButton = PSBTN_NEXT;
                 else if (FluentShell::EqualsIgnoreCase(semantic.semanticKey, L"finishbutton"))
                     slot.propertySheetButton = PSBTN_FINISH;
@@ -1943,13 +1992,16 @@ bool BuildGenericSemanticProfile(
             // A native-backed structural provider may advertise a focus stop
             // solely to delegate focus into its child controls.
             // It has no mutable pattern and is accounted but not projected.
+            // So does a SysLink's own pane: Win32's provider publishes the control as a
+            // focusable pane whose children are the links, which project on their own.
             const bool delegatedStructuralFocus =
                 semantic.controlType == UIA_PaneControlTypeId && semantic.focusable &&
                 !semantic.actionable && behavioralPatternMask == DirectUiPatternNone &&
                 hasBacking &&
-                backing->window.hwnd == native.native.propertySheetPageHwnd &&
-                FluentShell::EqualsIgnoreCase(backing->className, L"#32770") &&
-                !semantic.semanticKey.empty();
+                ((backing->window.hwnd == native.native.propertySheetPageHwnd &&
+                  FluentShell::EqualsIgnoreCase(backing->className, L"#32770") &&
+                  !semantic.semanticKey.empty()) ||
+                 nativeSysLink);
             const bool compositePaletteEntry =
                 semantic.controlType == UIA_PaneControlTypeId &&
                 FluentShell::EqualsIgnoreCase(semantic.className, L"MonitorPaletteEntryClass") &&
@@ -2070,11 +2122,23 @@ bool BuildGenericSemanticProfile(
     for (size_t imageIndex = 0; imageIndex < result->slots.size(); ++imageIndex) {
         const auto& image = result->slots[imageIndex];
         if (!image.virtualSource || !image.captureBitmap) continue;
+        const RECT& imageBounds = admittedSemantics[imageIndex].bounds;
+        const int64_t imageArea = static_cast<int64_t>(imageBounds.right - imageBounds.left) *
+            (imageBounds.bottom - imageBounds.top);
         for (size_t other = 0; other < result->slots.size(); ++other) {
             RECT overlap{};
-            if (other != imageIndex && result->slots[other].project &&
-                IntersectRect(&overlap, &admittedSemantics[imageIndex].bounds,
-                    &admittedSemantics[other].bounds))
+            if (other == imageIndex || !result->slots[other].project ||
+                !IntersectRect(&overlap, &imageBounds, &admittedSemantics[other].bounds))
+                continue;
+            // An AeroWizard's title text box starts a few pixels inside the page icon's
+            // box (its leading padding): inert text drawn over the image's edge takes
+            // nothing from it.  Anything that acts, or covers much of it, does.
+            const auto& neighbour = result->slots[other];
+            const bool inertText = neighbour.kind == ControlKind::StaticText &&
+                neighbour.action == DirectUiAction::None;
+            const int64_t overlapArea = static_cast<int64_t>(overlap.right - overlap.left) *
+                (overlap.bottom - overlap.top);
+            if (!inertText || overlapArea * 2 >= imageArea)
                 return Fail(error, L"generic U: virtual image overlaps another projected semantic");
         }
     }
@@ -2322,12 +2386,19 @@ bool ConfigureDirectUiVirtualImage(
             !host->window.generation ||
             !Inside(host->window.bounds, native.native.directUi.bounds))
             return Fail(error, L"virtual image native host is outside the admitted anchor");
-        RECT crop = semantic.bounds;
-        OffsetRect(&crop, -host->clientOriginScreen.x, -host->clientOriginScreen.y);
-        const int64_t width = static_cast<int64_t>(crop.right) - crop.left;
-        const int64_t height = static_cast<int64_t>(crop.bottom) - crop.top;
+        RECT full = semantic.bounds;
+        OffsetRect(&full, -host->clientOriginScreen.x, -host->clientOriginScreen.y);
+        const int64_t width = static_cast<int64_t>(full.right) - full.left;
+        const int64_t height = static_cast<int64_t>(full.bottom) - full.top;
+        // A provider can report an image a few pixels past its host's client edge (an
+        // AeroWizard's page icon reaches 5 px into the caption): the part the host
+        // paints is the image.  An image mostly outside its host is someone else's.
+        RECT crop{};
         if (width <= 0 || height <= 0 || width > Ipc::kMaxImageDimension ||
-            height > Ipc::kMaxImageDimension || !Inside(crop, host->clientBounds))
+            height > Ipc::kMaxImageDimension ||
+            !IntersectRect(&crop, &full, &host->clientBounds) ||
+            static_cast<int64_t>(crop.right - crop.left) * (crop.bottom - crop.top) * 4 <
+                width * height * 3)
             return Fail(error, L"virtual image crop exceeds its host or owned icon bounds");
         // A virtual image cannot absorb any HWND control that the renderer also
         // projects. The image's own native ancestors are the only overlap allowed.
@@ -2953,10 +3024,17 @@ bool MatchDirectUiEvidence(
             }
             if (slot.captureBitmap) {
                 const auto& image = native.slotWindows[index];
+                // The painted image is the provider's rectangle clipped to its host
+                // (see ConfigureDirectUiVirtualImage).
+                RECT hostScreen = slot.imageHostClientBounds;
+                OffsetRect(&hostScreen, image.bounds.left - slot.imageClientBounds.left,
+                    image.bounds.top - slot.imageClientBounds.top);
+                RECT painted{};
+                IntersectRect(&painted, &semantic->bounds, &hostScreen);
                 if (semantic->imageHostHwnd != slot.imageHostHwnd ||
                     image.hwnd != slot.imageHostHwnd ||
                     image.generation != slot.imageHostGeneration ||
-                    !SameRect(semantic->bounds, image.bounds) ||
+                    !SameRect(painted, image.bounds) ||
                     image.imageWidth != static_cast<uint32_t>(
                         slot.imageClientBounds.right - slot.imageClientBounds.left) ||
                     image.imageHeight != static_cast<uint32_t>(
@@ -3136,6 +3214,7 @@ bool RefreshDirectUiSnapshotFromNative(
 
         snapshot.canCancel = std::any_of(profile.slots, profile.slots + profile.slotCount,
             [](const DirectUiSlot& slot) { return slot.cancel; });
+        snapshot.canClose = snapshot.canCancel;
         snapshot.nativeHwnd = native.root.hwnd;
         snapshot.ownerHwnd = native.effectiveOwnerHwnd;
         snapshot.title = native.title;

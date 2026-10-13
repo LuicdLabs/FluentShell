@@ -101,10 +101,13 @@ void TestMdiCapturePreservesNavigationAcrossModalDisable() {
                 [window](const Translation::ControlNode& node) { return node.hwnd == window; });
             return found == snapshot.nodes.end() ? nullptr : &*found;
         };
+        // A modal dialog disables the frame, not its controls: the window-level `enabled` carries
+        // that, and the controls keep their own state and order (the owner proxy is neither
+        // greyed out nor rebuilt while the dialog is open).
         for (const HWND window : { client, children[0], children[1] }) {
             const auto* node = nodeFor(window);
             Check(node && node->kind == (window == client ? ControlKind::MdiClient : ControlKind::MdiChild) &&
-                  !node->tabStop && node->tabIndex == -1 && node->enabled == enabled,
+                  !node->tabStop && node->tabIndex == -1 && node->enabled,
                 "structural MDI node became a dialog tab stop across modal disable");
             Check(node && node->style == static_cast<uint64_t>(GetWindowLongPtrW(window, GWL_STYLE)) &&
                   node->exStyle == static_cast<uint64_t>(GetWindowLongPtrW(window, GWL_EXSTYLE)),
@@ -114,15 +117,14 @@ void TestMdiCapturePreservesNavigationAcrossModalDisable() {
         for (const HWND edit : { rootEdit, edits[0], edits[1], edits[2], edits[3] }) {
             const auto* node = nodeFor(edit);
             const auto* parent = GetParent(edit) == frame ? nullptr : nodeFor(GetParent(edit));
-            Check(node && node->kind == ControlKind::Edit && node->enabled == enabled && node->tabStop &&
-                  (enabled ? node->tabIndex >= 0 : node->tabIndex == -1),
+            Check(node && node->kind == ControlKind::Edit && node->enabled && node->tabStop &&
+                  node->tabIndex >= 0,
                 "ordinary MDI edit lost native tab-stop semantics across modal disable");
             Check(node && (edit == rootEdit ? !node->parentNodeId :
                   parent && node->parentNodeId == parent->nodeId),
                 "MDI edit lost its native parent scope");
-            if (node && enabled) order.push_back(node->tabIndex);
+            if (node) order.push_back(node->tabIndex);
         }
-        if (!enabled) return;
         std::sort(order.begin(), order.end());
         Check(order == std::vector<int>{ 0, 1, 2, 3, 4 },
             "MDI containers consumed or duplicated a dialog tab-order slot");

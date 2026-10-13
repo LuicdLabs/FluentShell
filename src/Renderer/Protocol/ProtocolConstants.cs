@@ -73,7 +73,14 @@ public static class ProtocolConstants
     // presentation variants (mainInstruction, commandLink*, elevated, expando*) and a
     // command link's note as helpText, and its text is a sysLink with one label per
     // link, named by index through activateItem.
-    public const ushort Minor = 38;
+    // Minor 39 adds canClose to a window (its title-bar close button does something, which an
+    // ordinary window's does although Escape does not) and expanded to an accessible island
+    // item (a section header that folds the rows under it, as in MMC's Actions pane).
+    // Minor 40 adds the focus action: the user put the keyboard focus in a projected list or
+    // tree, and the thread's native focus follows it (menu commands act on the focused pane).
+    // It also adds a toolbar item's labelBeside (a TBSTYLE_LIST button draws its own label
+    // beside its icon) and an edit box's cueBanner (the grey hint it shows while empty).
+    public const ushort Minor = 40;
     // Minor 32 also lets a container carry its scroll bars; one setScroll moves at
     // most this many application line steps.
     public const int MaxScrollLines = 100;

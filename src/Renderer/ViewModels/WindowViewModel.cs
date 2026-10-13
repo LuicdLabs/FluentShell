@@ -17,6 +17,7 @@ public sealed class WindowViewModel : ObservableObject
     public string SurfaceKind { get; private set; } = "window";
     public bool Modal { get; private set; }
     public bool CanCancel { get; private set; }
+    public bool CanClose { get; private set; }
     public string Icon { get; private set; } = "none";
     public string Generation { get; private set; } = "0";
     public ulong Revision { get; private set; }
@@ -42,6 +43,22 @@ public sealed class WindowViewModel : ObservableObject
     public string State { get => _state; private set => SetProperty(ref _state, value); }
     public ObservableCollection<ControlNodeViewModel> Nodes { get; } = [];
     public ObservableCollection<MenuItemViewModel> Menu { get; } = [];
+    // The client-area toolbar the menu bar replaces (MMC), in client pixels; null for an
+    // HMENU's bar above the client area.
+    public PixelRect? MenuBarRect { get; private set; }
+    // What a dialog paints itself above or below all of its controls (mstsc's banner), in
+    // client pixels.  A repaint replaces the pictures without rebuilding the controls.
+    private IReadOnlyList<ChromeRegion> _paintedBands = [];
+    public IReadOnlyList<ChromeRegion> PaintedBands
+    {
+        get => _paintedBands;
+        private set
+        {
+            if (_paintedBands.SequenceEqual(value)) return;
+            _paintedBands = value;
+            RaisePropertyChanged();
+        }
+    }
     // A native tracking menu has its own lifetime. Its appearance must not rebuild
     // the controls or dismiss an open flyout on each ordinary canonical patch.
     public PopupMenuSnapshot? PopupMenu { get; private set; }
@@ -59,6 +76,7 @@ public sealed class WindowViewModel : ObservableObject
             (snapshot.PageId ?? string.Empty) != PageId) return false;
         if (snapshot.Menu.Count != Menu.Count ||
             !Menu.Zip(snapshot.Menu).All(pair => pair.First.HasSameShape(pair.Second))) return false;
+        if (snapshot.MenuBarRect != MenuBarRect) return false;
         if (snapshot.Nodes.Count != Nodes.Count) return false;
         var ordered = snapshot.Nodes.OrderBy(node => node.ZIndex).ToArray();
         for (var index = 0; index < ordered.Length; index++)
@@ -102,6 +120,7 @@ public sealed class WindowViewModel : ObservableObject
         SurfaceKind = snapshot.SurfaceKind;
         Modal = snapshot.Modal;
         CanCancel = snapshot.CanCancel;
+        CanClose = snapshot.CanClose ?? snapshot.CanCancel;
         Icon = snapshot.Icon;
         Generation = snapshot.Generation;
         Revision = ProtocolSerializer.ParseCanonicalUInt64(snapshot.Revision, "revision");
@@ -121,6 +140,8 @@ public sealed class WindowViewModel : ObservableObject
         AdapterId = snapshot.AdapterId ?? string.Empty;
         PageId = snapshot.PageId ?? string.Empty;
         PopupMenu = snapshot.PopupMenu;
+        MenuBarRect = snapshot.MenuBarRect;
+        PaintedBands = snapshot.PaintedBands ?? [];
         var ordered = snapshot.Nodes.OrderBy(node => node.ZIndex).ToArray();
         if (merge)
         {

@@ -63,6 +63,14 @@ bool InsideObscuredHost(HWND root, HWND window) noexcept;
 // it belongs on the deferred native-action path, never inside a bounded command.
 bool IsWindowsFormsLinkLabelWindow(HWND hwnd) noexcept;
 
+// A ComboBoxEx (WC_COMBOBOXEX): a comboBox node whose typed text lives in an edit box of its own.
+bool IsComboBoxExWindow(HWND hwnd) noexcept;
+
+// What a dialog (#32770) paints itself in a full-width band above or below all of its
+// controls, such as mstsc's banner.  A band it only fills with its background is left out;
+// so is one past the chrome pixel caps.  False only when the dialog could not be rendered.
+bool CaptureDialogPaintedBands(HWND root, std::vector<ChromeRegionSnapshot>& bands, std::wstring& reason);
+
 // A window of a Windows Forms class.  Windows Forms moves focus with Tab inside its
 // own containers, so a WS_TABSTOP control there is a tab stop even where the dialog
 // manager's walk from the native root never reaches it (an MMC 3.0 snap-in view).

@@ -155,11 +155,13 @@ public class ProtocolValidatorTests
         };
         ProtocolValidator.ValidateSnapshot(snapshot);
 
-        // Still closed: an owner-draw or multi-row style bit, and half-declared image
-        // metadata, are both refused.
+        // Still closed: a style bit the Bridge refuses (TBSTYLE_CUSTOMERASE, the control erasing
+        // its own background), and half-declared image metadata, are both refused.
+        // CCS_NOPARENTALIGN is admitted on both sides: it only says where the control places
+        // itself (mstsc's Options strip).
         foreach (var broken in new[]
         {
-            toolbar with { Style = "0x5600984D" },
+            toolbar with { Style = "0x5600B84D" },
             toolbar with { ExStyle = "0x100" },
             toolbar with
             {

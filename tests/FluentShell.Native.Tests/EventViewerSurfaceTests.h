@@ -177,10 +177,21 @@ void TestReadOnlyRichEditAdapter() {
     Check(Translation::CaptureControlDetail(description, node, reason) && node.readOnly && node.multiline,
         "a read-only RichEdit lost its read-only multiline shape");
 
+    // An editable RichEdit is an edit box while its text is plain; formatting a plain edit box
+    // would lose keeps it native.
+    reason.clear();
+    Check(Translation::ClassifyControl(editable, kind, reason) && kind == Translation::ControlKind::Edit,
+        "an editable RichEdit with plain text was not admitted as a text box");
+    CHARFORMAT2W editableBold{};
+    editableBold.cbSize = sizeof(editableBold);
+    editableBold.dwMask = CFM_BOLD;
+    editableBold.dwEffects = CFE_BOLD;
+    SendMessageW(editable, EM_SETSEL, 0, 4);
+    SendMessageW(editable, EM_SETCHARFORMAT, SCF_SELECTION, reinterpret_cast<LPARAM>(&editableBold));
     reason.clear();
     Check(!Translation::ClassifyControl(editable, kind, reason) &&
         reason.find(L"editable RichEdit") != std::wstring::npos,
-        "an editable RichEdit was admitted as a plain text box");
+        "an editable RichEdit with bold text was admitted as a plain text box");
 
     // RichEdit binds a CJK run and a Latin run to different fonts by itself; that is
     // not formatting a plain text box loses.

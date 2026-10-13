@@ -54,7 +54,15 @@ struct DocumentState final {
     std::unordered_map<std::wstring, RegionBinding> regions;
     std::vector<HWND> representedWindows;
 };
-thread_local std::unordered_map<std::wstring, DocumentState> states;
+// This thread's documents.  Deliberately never destroyed: their COM objects belong to the
+// thread's apartment and to MSHTML, which are already torn down when a thread_local
+// destructor runs at thread or process exit -- releasing them from LdrShutdownProcess
+// faulted inside MSHTML's renderer and crashed Services and Device Manager on exit.
+// ForgetNativeDocument releases a document while its window is still alive.
+std::unordered_map<std::wstring, DocumentState>& States() {
+    thread_local auto* states = new std::unordered_map<std::wstring, DocumentState>();
+    return *states;
+}
 std::atomic<uint64_t> nextActionToken{1};
 std::atomic<uint64_t> nextDocumentToken{1};
 
@@ -128,7 +136,7 @@ bool DocumentKey(IHTMLDocument2* document, std::wstring& key, ComPtr<IUnknown>& 
     // IHTMLDocument3.uniqueID is an ID generator, not the document's identity.
     // Bind our lifecycle token to canonical IUnknown and retain that COM identity
     // until navigation/destruction retires the host's cached state.
-    for (const auto& [id, state] : states)
+    for (const auto& [id, state] : States())
         if (state.identity == identity) { key = id; return true; }
     key = L"document-" + std::to_wstring(nextDocumentToken.fetch_add(1));
     return true;
@@ -741,10 +749,10 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
         if (!DocumentKey(document, snapshot.documentId, next.identity))
             return Reject(reason, L"native document identity is unavailable");
         next.window = window;
-        const auto previousEntry = states.find(snapshot.documentId);
+        const auto previousEntry = States().find(snapshot.documentId);
         // MSHTML calls can pump messages, including destruction and a nested
         // capture. Own the old bindings instead of retaining a map iterator.
-        const std::optional<DocumentState> previous = previousEntry != states.end() &&
+        const std::optional<DocumentState> previous = previousEntry != States().end() &&
             previousEntry->second.identity == next.identity ?
             std::optional<DocumentState>{previousEntry->second} : std::nullopt;
         Text ready, editing;
@@ -1030,13 +1038,13 @@ bool NativeDocumentDetail::ReadContent(IHTMLDocument2* document, HWND window, co
         // A navigation can replace the document while retaining the host HWND.
         // Remove old bindings before releasing their COM objects (Release may pump).
         std::vector<DocumentState> retired;
-        for (auto entry = states.begin(); entry != states.end();) {
+        for (auto entry = States().begin(); entry != States().end();) {
             if (entry->second.window == window) {
-                auto removed = states.extract(entry++);
+                auto removed = States().extract(entry++);
                 retired.push_back(std::move(removed.mapped()));
             } else ++entry;
         }
-        states.emplace(snapshot.documentId, std::move(next));
+        States().emplace(snapshot.documentId, std::move(next));
         return true;
     } catch (...) { snapshot = {}; return Reject(reason, L"native document capture raised an exception"); }
 }
@@ -1064,8 +1072,8 @@ bool NativeDocumentDetail::InvokeItem(IHTMLDocument2* document, const NativeDocu
         if (item.kind != L"link" || !item.enabled || item.actionIdentity.empty()) return Reject(reason, L"native document item offers no link action");
         std::wstring id; DocumentState current;
         if (!DocumentKey(document, id, current.identity) || id != expected.documentId) return Reject(reason, L"native document identity changed before invocation");
-        const auto old = states.find(id);
-        if (old == states.end() || old->second.identity != current.identity) return Reject(reason, L"native document action binding expired");
+        const auto old = States().find(id);
+        if (old == States().end() || old->second.identity != current.identity) return Reject(reason, L"native document action binding expired");
         const DocumentState previous = old->second;
         ComPtr<IHTMLElementCollection> all; long count = 0;
         if (FAILED(document->get_all(&all)) || !all || FAILED(all->get_length(&count)) || count > kMaxElements) return false;
@@ -1079,8 +1087,8 @@ bool NativeDocumentDetail::InvokeItem(IHTMLDocument2* document, const NativeDocu
                 !ReadAction(element.Get(), key, current, &previous, token, reason) || token != item.actionIdentity)
                 return Reject(reason, L"native document link identity changed before invocation");
             if (GuiThreadOperationCancelled()) return Reject(reason, L"native document invocation was cancelled");
-            const auto live = states.find(id);
-            if (live == states.end() || live->second.identity != current.identity ||
+            const auto live = States().find(id);
+            if (live == States().end() || live->second.identity != current.identity ||
                 !live->second.actions.contains(key) || live->second.actions.at(key).token != token)
                 return Reject(reason, L"native document action binding expired during invocation");
             return SUCCEEDED(element->click()) || Reject(reason, L"native document declined its link action");
@@ -1095,9 +1103,9 @@ bool NativeDocumentDetail::Scroll(IHTMLDocument2* document, const NativeDocument
         std::wstring id; ComPtr<IUnknown> identity;
         if (!DocumentKey(document, id, identity) || id != expected.documentId || index < 0 ||
             static_cast<size_t>(index) >= expected.regions.size()) return Reject(reason, L"native document scroll identity is invalid");
-        const auto found = states.find(id);
+        const auto found = States().find(id);
         const auto& region = expected.regions[index];
-        if (found == states.end() || found->second.identity != identity ||
+        if (found == States().end() || found->second.identity != identity ||
             x < 0 || x > region.maximumX || y < 0 || y > region.maximumY)
             return Reject(reason, L"native document scroll range changed or binding expired");
         const auto bindingEntry = found->second.regions.find(region.key);
@@ -1105,8 +1113,8 @@ bool NativeDocumentDetail::Scroll(IHTMLDocument2* document, const NativeDocument
         const RegionBinding binding = bindingEntry->second;
         const auto ready = [&] {
             if (GuiThreadOperationCancelled()) return false;
-            const auto live = states.find(id);
-            if (live == states.end() || live->second.identity != identity) return false;
+            const auto live = States().find(id);
+            if (live == States().end() || live->second.identity != identity) return false;
             const auto target = live->second.regions.find(region.key);
             return target != live->second.regions.end() && target->second.element == binding.element &&
                 target->second.report == binding.report;
@@ -1157,7 +1165,7 @@ bool ScrollNativeDocument(HWND window, const NativeDocumentSnapshot& expected,
 }
 bool NativeDocumentOwnsDescendant(HWND document, HWND descendant) noexcept {
     if (!OwnThread(document) || !IsChild(document, descendant)) return false;
-    for (const auto& [id, state] : states) if (state.window == document) {
+    for (const auto& [id, state] : States()) if (state.window == document) {
         if (std::find(state.representedWindows.begin(), state.representedWindows.end(), descendant) !=
             state.representedWindows.end()) return true;
     }
@@ -1166,9 +1174,9 @@ bool NativeDocumentOwnsDescendant(HWND document, HWND descendant) noexcept {
 void ForgetNativeDocument(HWND window) noexcept {
     try {
         std::vector<DocumentState> retired;
-        for (auto entry = states.begin(); entry != states.end();) {
+        for (auto entry = States().begin(); entry != States().end();) {
             if (entry->second.window == window) {
-                auto removed = states.extract(entry++);
+                auto removed = States().extract(entry++);
                 retired.push_back(std::move(removed.mapped()));
             } else ++entry;
         }

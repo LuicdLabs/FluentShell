@@ -112,6 +112,12 @@ internal static class NativeWindowInterop
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
 
+    [DllImport("user32.dll")]
+    private static extern nint GetSystemMenu(nint hwnd, [MarshalAs(UnmanagedType.Bool)] bool revert);
+
+    [DllImport("user32.dll")]
+    private static extern int EnableMenuItem(nint menu, uint item, uint flags);
+
     [DllImport("imm32.dll")]
     private static extern nint ImmGetContext(nint hwnd);
 
@@ -134,6 +140,31 @@ internal static class NativeWindowInterop
     {
         var value = cloaked ? 1 : 0;
         return DwmSetWindowAttribute(hwnd, DwmwaCloak, ref value, sizeof(int)) >= 0;
+    }
+
+    /// <summary>
+    /// Enables or greys the title-bar close button, the way a native window whose close
+    /// does nothing (a message box with no Cancel) shows it: through its system menu.
+    /// </summary>
+    public static void SetCloseEnabled(nint hwnd, bool enabled)
+    {
+        const uint ScClose = 0xF060;
+        const uint ByCommand = 0x0000;
+        const uint Grayed = 0x0001;
+        const uint Disabled = 0x0002;
+        var menu = GetSystemMenu(hwnd, false);
+        if (menu != 0) EnableMenuItem(menu, ScClose, ByCommand | (enabled ? 0 : Grayed | Disabled));
+    }
+
+    /// <summary>
+    /// The dark caption Windows draws for a dark-mode window.  Only the fallback for a
+    /// system without AppWindowTitleBar.PreferredTheme.
+    /// </summary>
+    public static void SetDarkCaption(nint hwnd, bool dark)
+    {
+        const int DwmwaUseImmersiveDarkMode = 20;
+        var value = dark ? 1 : 0;
+        DwmSetWindowAttribute(hwnd, DwmwaUseImmersiveDarkMode, ref value, sizeof(int));
     }
 
     /// <summary>Per-window DPI, or 0 when the window cannot report one.</summary>

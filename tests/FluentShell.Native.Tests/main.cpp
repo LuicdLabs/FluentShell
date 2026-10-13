@@ -5097,6 +5097,11 @@ void TestMdiFrameCaptureAndCommands() {
 #include "WinFormsOwnerDrawTests.h"
 #include "ScrollingContainerTests.h"
 #include "EventViewerSurfaceTests.h"
+#include "ActionsPaneIslandTests.h"
+#include "LabelSessionTests.h"
+#include "ComboBoxExTests.h"
+#include "MstscPresentationTests.h"
+#include "ObjectPickerTests.h"
 
 } // namespace
 
@@ -5218,6 +5223,21 @@ int wmain() {
     TestPerformanceChartText();
     TestPerformanceChartSerialization();
     TestPerformanceChartActions();
+    TestActionsPaneSections();
+    TestTitleBarCloseCapture();
+    TestApplicationLabelSessions();
+    TestFocusAction();
+    TestComboBoxExCapture();
+    TestToolbarLabelBeside();
+    TestCueBanners();
+    TestDialogPaintedBands();
+    TestObjectPickerControls();
+    {
+        // A command link is drawn by the common-controls v6 button.
+        ListActivationCommonControls buttonControls(ICC_STANDARD_CLASSES);
+        Check(static_cast<bool>(buttonControls), "button v6 activation failed");
+        if (buttonControls) TestCommandLinkButtons();
+    }
     FluentShell::Tests::TestUiAutomationProjectionScope(Check);
     FluentShell::Tests::TestMmcHtmlDocumentAdmission(Check);
     FluentShell::Tests::TestListViewModes(Check);

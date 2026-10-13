@@ -39,6 +39,39 @@ public sealed class ToolbarImageVariantTests
         Assert.IsType<WindowOpenMessage>(ProtocolSerializer.Deserialize(FrameMessageType.WindowOpen,
             ProtocolSerializer.Serialize(message)));
 
+    private static WindowOpenMessage Styled(string style, string exStyle = "0x84")
+    {
+        var message = Message(Button());
+        return message with
+        {
+            Window = message.Window with
+            {
+                Nodes = [message.Window.Nodes[0] with { Style = style, ExStyle = exStyle }],
+            },
+        };
+    }
+
+    // The renderer admits the style bits the Bridge's ProbeToolbar admits.  The CCS_* placement
+    // bits only say where the control puts itself when its parent resizes: mstsc's Options strip
+    // is CCS_NOPARENTALIGN, and CCS_BOTTOM is CCS_TOP | CCS_NOMOVEY.
+    [Theory]
+    [InlineData("0x5603904D")]
+    [InlineData("0x50000003")]
+    [InlineData("0x50009F4F")]
+    public void BridgeAdmittedToolbarStylesAreAccepted(string style)
+    {
+        Read(Styled(style));
+    }
+
+    [Theory]
+    [InlineData("0x50002000")]
+    [InlineData("0x50000020")]
+    [InlineData("0x50000080")]
+    public void ToolbarStylesTheBridgeRefusesAreRejected(string style)
+    {
+        Assert.Throws<ProtocolException>(() => Read(Styled(style)));
+    }
+
     [Fact]
     public void SharedToolbarFixtureCarriesAllNativeImageStates()
     {

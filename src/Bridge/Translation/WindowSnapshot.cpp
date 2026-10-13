@@ -40,6 +40,21 @@ JsonObject RectToJson(const RECT& rect) {
     return value;
 }
 
+// A container's chrome bands, or a dialog's painted bands: a rectangle and the pixels in it.
+JsonArray ChromeRegionsToJson(const std::vector<ChromeRegionSnapshot>& regions) {
+    JsonArray result;
+    for (const auto& region : regions) {
+        JsonObject value;
+        value.Insert(L"rect", RectToJson(region.rect));
+        value.Insert(L"imageWidth", JsonValue::CreateNumberValue(region.imageWidth));
+        value.Insert(L"imageHeight", JsonValue::CreateNumberValue(region.imageHeight));
+        value.Insert(L"imageFormat", JsonValue::CreateStringValue(region.imageFormat));
+        value.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(region.imageData)));
+        result.Append(value);
+    }
+    return result;
+}
+
 bool JsonInteger(const JsonObject& value, std::wstring_view name, LONG& result) {
     if (!value.HasKey(name)) return false;
     const double number = value.GetNamedNumber(name);
@@ -171,6 +186,7 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"readOnly", JsonValue::CreateBooleanValue(node.readOnly));
     result.Insert(L"multiline", JsonValue::CreateBooleanValue(node.multiline));
     result.Insert(L"editable", JsonValue::CreateBooleanValue(node.editable));
+    if (!node.cueBanner.empty()) result.Insert(L"cueBanner", JsonValue::CreateStringValue(node.cueBanner));
     result.Insert(L"isDefault", JsonValue::CreateBooleanValue(node.isDefault));
     result.Insert(L"groupStart", JsonValue::CreateBooleanValue(node.groupStart));
     if (node.kind == ControlKind::MdiChild) {
@@ -374,6 +390,7 @@ JsonObject NodeToJson(const ControlNode& node) {
                 value.Insert(L"radioGroup", JsonValue::CreateNumberValue(item.radioGroup));
             value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
             value.Insert(L"wholeDropDown", JsonValue::CreateBooleanValue(item.wholeDropDown));
+            if (item.labelBeside) value.Insert(L"labelBeside", JsonValue::CreateBooleanValue(true));
             // The icon fields travel only when the control actually draws one: a
             // text-only button owns no image list entry and no painted face.
             if (!item.imageData.empty()) {
@@ -411,18 +428,7 @@ JsonObject NodeToJson(const ControlNode& node) {
             splits.Append(value);
         }
         result.Insert(L"splits", splits);
-        JsonArray chromeRegions;
-        for (const auto& region : node.chromeRegions) {
-            JsonObject value;
-            value.Insert(L"rect", RectToJson(region.rect));
-            value.Insert(L"imageWidth", JsonValue::CreateNumberValue(region.imageWidth));
-            value.Insert(L"imageHeight", JsonValue::CreateNumberValue(region.imageHeight));
-            value.Insert(L"imageFormat", JsonValue::CreateStringValue(region.imageFormat));
-            value.Insert(L"imageData",
-                JsonValue::CreateStringValue(Base64Encode(region.imageData)));
-            chromeRegions.Append(value);
-        }
-        result.Insert(L"chromeRegions", chromeRegions);
+        result.Insert(L"chromeRegions", ChromeRegionsToJson(node.chromeRegions));
         if (!node.scrollBars.empty()) {
             JsonArray scrollBars;
             for (const auto& bar : node.scrollBars) {
@@ -452,6 +458,7 @@ JsonObject NodeToJson(const ControlNode& node) {
             value.Insert(L"enabled", JsonValue::CreateBooleanValue(item.enabled));
             value.Insert(L"dropDown", JsonValue::CreateBooleanValue(item.dropDown));
             value.Insert(L"selected", JsonValue::CreateBooleanValue(item.selected));
+            if (item.expanded) value.Insert(L"expanded", JsonValue::CreateBooleanValue(*item.expanded));
             if (!item.imageData.empty()) {
                 value.Insert(L"imageWidth", JsonValue::CreateNumberValue(item.imageWidth));
                 value.Insert(L"imageHeight", JsonValue::CreateNumberValue(item.imageHeight));
@@ -701,6 +708,7 @@ JsonObject SnapshotToJson(const WindowSnapshot& snapshot) {
     result.Insert(L"surfaceKind", JsonValue::CreateStringValue(SurfaceKindName(snapshot.surfaceKind)));
     result.Insert(L"modal", JsonValue::CreateBooleanValue(snapshot.modal));
     result.Insert(L"canCancel", JsonValue::CreateBooleanValue(snapshot.canCancel));
+    result.Insert(L"canClose", JsonValue::CreateBooleanValue(snapshot.canClose));
     result.Insert(L"icon", JsonValue::CreateStringValue(snapshot.icon));
     result.Insert(L"generation", JsonValue::CreateStringValue(Ipc::UInt64ToString(snapshot.generation)));
     result.Insert(L"revision", JsonValue::CreateStringValue(Ipc::UInt64ToString(snapshot.revision)));
@@ -728,6 +736,10 @@ JsonObject SnapshotToJson(const WindowSnapshot& snapshot) {
     JsonArray menu;
     for (const auto& item : snapshot.menu) menu.Append(MenuItemToJson(item));
     result.Insert(L"menu", menu);
+    if (snapshot.menuBarRect && !snapshot.menu.empty())
+        result.Insert(L"menuBarRect", RectToJson(*snapshot.menuBarRect));
+    if (!snapshot.paintedBands.empty())
+        result.Insert(L"paintedBands", ChromeRegionsToJson(snapshot.paintedBands));
     if (snapshot.popupMenu) {
         const auto& popup = *snapshot.popupMenu;
         JsonObject value;
@@ -1614,7 +1626,7 @@ bool ParseActionInvoke(
         action.action = root.GetNamedString(L"action");
         static constexpr std::wstring_view kActions[] = {
             L"activate", L"invoke", L"setText", L"setCheck", L"select",
-            L"setSelection", L"setFocusedIndex", L"setItemCheck", L"setItemText", L"activateItem", L"scrollBy", L"setValue", L"setExpand",
+            L"setSelection", L"setFocusedIndex", L"focus", L"setItemCheck", L"setItemText", L"activateItem", L"scrollBy", L"setValue", L"setExpand",
             L"setSplit", L"setColumnOrder", L"setGroupExpanded", L"islandInvoke", L"htmlInvoke", L"htmlScroll",
             L"diskSelect", L"diskContext", L"diskScroll", L"contextMenu", L"openItem", L"setScroll", L"setTopIndex",
             L"menuCommand", L"popupCommand", L"toolbarCommand", L"toolbarDropDown", L"mdiCommand",
@@ -1627,7 +1639,7 @@ bool ParseActionInvoke(
         const bool requiresNode = action.action == L"invoke" || action.action == L"setText" ||
             action.action == L"setCheck" || action.action == L"select" ||
             action.action == L"setSelection" || action.action == L"setFocusedIndex" ||
-            action.action == L"setItemCheck" ||
+            action.action == L"focus" || action.action == L"setItemCheck" ||
             action.action == L"setItemText" || action.action == L"activateItem" ||
             action.action == L"scrollBy" ||
             action.action == L"setValue" || action.action == L"setExpand" ||
@@ -1831,6 +1843,11 @@ bool ValidateActionForSnapshot(
     if (action.action == L"invoke") {
         if (node.kind == ControlKind::Button || node.kind == ControlKind::SysLink) return true;
         error = L"invoke requires a button or SysLink node";
+        return false;
+    }
+    if (action.action == L"focus") {
+        if (node.kind == ControlKind::ListView || node.kind == ControlKind::TreeView) return true;
+        error = L"focus is offered only for ListView and TreeView nodes";
         return false;
     }
     if (action.action == L"setText") {
@@ -2241,7 +2258,9 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
         action == L"diskScroll" ||
         action == L"islandInvoke" || action == L"htmlInvoke" || action == L"htmlScroll" || action == L"popupCommand" ||
         action == L"contextMenu" || action == L"openItem" || action == L"setScroll" || action == L"setTopIndex" ||
-        action == L"mdiCommand";
+        action == L"mdiCommand" ||
+        // Where the user put the focus is not a property a snapshot can make stale.
+        action == L"focus";
 }
 
 } // namespace FluentShell::Bridge::Translation

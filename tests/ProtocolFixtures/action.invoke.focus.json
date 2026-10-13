@@ -1,0 +1,10 @@
+{
+  "messageType": "action.invoke",
+  "sessionNonce": "00112233445566778899aabbccddeeff",
+  "surfaceId": "4f17d4bb-b2bf-42b8-a334-2f9ad8d54d42",
+  "nodeId": "2",
+  "eventId": "31",
+  "expectedRevision": "9",
+  "action": "focus",
+  "value": null
+}

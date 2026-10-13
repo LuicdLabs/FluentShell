@@ -114,6 +114,11 @@ public sealed class TranslatedWindow : Window
         Hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         _renderDpi = ReadWindowDpi();
         _appWindow = AppWindow.GetFromWindowId(Win32Interop.GetWindowIdFromWindow(Hwnd));
+        ApplyCaptionTheme();
+        _root.ActualThemeChanged += (_, _) => ApplyPaintedBands();
+        // A translated message box or task dialog stands for no native window of its own.
+        if (ViewModel.SurfaceKind == "window" && TryParseHwnd(ViewModel.NativeHwnd) is { } native)
+            ProxyIdentity.Apply(Hwnd, native);
         // WinUI requires an owner before an overlapped presenter can be marked
         // modal.  The owner proxy is resolved by WindowRegistry after this
         // window is constructed, so defer IsModal until SetOwner.
@@ -135,6 +140,7 @@ public sealed class TranslatedWindow : Window
             throw new InvalidOperationException("Unable to observe the renderer proxy move/size loop.");
         Closed += (_, _) =>
         {
+            _closed = true;
             _controlLifetime?.Dispose();
             _popupLifetime?.Dispose();
             RendererDiagnostics.Log($"window closed hwnd=0x{(ulong)(nuint)Hwnd:X} surface={ViewModel.SurfaceId}");
@@ -142,6 +148,30 @@ public sealed class TranslatedWindow : Window
         RebuildControls();
         ApplyWindowState();
         RefreshRenderDpi();
+    }
+
+    private static nint? TryParseHwnd(string text) =>
+        text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
+        ulong.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.AllowHexSpecifier,
+            System.Globalization.CultureInfo.InvariantCulture, out var value) && value != 0
+            ? (nint)value
+            : null;
+
+    // The system title bar is drawn light unless the window asks for the app mode: a
+    // dark-mode user saw a white caption over every dark proxy.  The content follows the
+    // same app mode (the renderer sets no RequestedTheme), so the two always agree.
+    private void ApplyCaptionTheme()
+    {
+        try
+        {
+            _appWindow.TitleBar.PreferredTheme = TitleBarTheme.UseDefaultAppMode;
+        }
+        catch (Exception exception)
+        {
+            RendererDiagnostics.Log($"title bar theme unavailable ({exception.Message}); using the DWM caption");
+            NativeWindowInterop.SetDarkCaption(Hwnd,
+                Application.Current?.RequestedTheme == ApplicationTheme.Dark);
+        }
     }
 
     public void SetOwner(nint ownerHwnd)
@@ -174,7 +204,17 @@ public sealed class TranslatedWindow : Window
         _applyingCanonical = true;
         try
         {
-            Activate();
+            // The proxy is prepared without ever being shown.  DWM plays a window's open
+            // transition only on its first show, and a hide/show later never animates, so a
+            // proxy shown behind its cloak here would appear at the cutover with no
+            // transition at all.  XAML loads, lays out and renders the content of a window
+            // that was never shown; only content that does not load in time is shown,
+            // cloaked, to make it load (and that proxy then appears without the transition).
+            if (await Task.WhenAny(_loaded.Task, Task.Delay(HiddenLoadTimeout)) != _loaded.Task)
+            {
+                RendererDiagnostics.Log("proxy content did not load hidden; showing it behind its cloak");
+                Activate();
+            }
             var readiness = await ReadSurfaceReadinessAsync();
             // Keep the HWND materialized for UIA while DWM cloak keeps it out of
             // the user's surface until the Bridge commits the cutover.
@@ -190,12 +230,22 @@ public sealed class TranslatedWindow : Window
     public async Task<(PixelRect Bounds, int NodeCount, bool UiaReady)> ReadSurfaceReadinessAsync()
     {
         var keepHidden = !_committed;
-        if (keepHidden) _appWindow.Show(false);
+        // A proxy whose content has loaded is laid out and rendered without being shown
+        // (see PrepareSurfaceAsync); showing it here would spend its open transition.
+        if (keepHidden && !_loaded.Task.IsCompleted) _appWindow.Show(false);
         try
         {
         await _loaded.Task.WaitAsync(TimeSpan.FromSeconds(2));
         _root.UpdateLayout();
-        await WaitForRenderAsync();
+        try
+        {
+            await WaitForRenderAsync();
+        }
+        catch (TimeoutException) when (!_appWindow.IsVisible)
+        {
+            // Layout above is what readiness reports; a frame is only a courtesy here.
+            RendererDiagnostics.Log("hidden proxy rendered no frame before readiness");
+        }
         _root.UpdateLayout();
         RefreshRenderDpi();
         var bounds = CurrentBounds();
@@ -394,6 +444,8 @@ public sealed class TranslatedWindow : Window
             if (!show || !interactive) HidePopupFlyout();
             if (show)
             {
+                // A proxy prepared hidden is shown for the first time here, which is the show
+                // DWM animates as a window opening.
                 _committed = true;
                 _interactive = interactive;
                 _gateBounds = interactive ? null : ViewModel.Bounds;
@@ -410,7 +462,11 @@ public sealed class TranslatedWindow : Window
                 _interactive = false;
                 _gateBounds = null;
                 _appWindow.Hide();
-                if (!SetCloaked(true)) RendererDiagnostics.Log("proxy cloak failed while hiding surface");
+                AfterHideTransition(() =>
+                {
+                    if (!_committed && !SetCloaked(true))
+                        RendererDiagnostics.Log("proxy cloak failed while hiding surface");
+                });
             }
         }
         finally { _applyingCanonical = false; }
@@ -439,11 +495,16 @@ public sealed class TranslatedWindow : Window
             _appWindow.IsShownInSwitchers = false;
             SetInteractionEnabled(false);
             _appWindow.Hide();
-            if (!SetCloaked(true)) RendererDiagnostics.Log("retired proxy cloak failed after hide");
-            _canvas.Children.Clear();
-            if (_menuBar is not null) _root.Children.Remove(_menuBar);
-            _menuBar = null;
             _controls.Clear();
+            // The content stays until the window has finished closing on screen: emptying
+            // it now would play the close transition over a blank window.
+            AfterHideTransition(() =>
+            {
+                if (!SetCloaked(true)) RendererDiagnostics.Log("retired proxy cloak failed after hide");
+                _canvas.Children.Clear();
+                if (_menuBar is not null) _root.Children.Remove(_menuBar);
+                _menuBar = null;
+            });
         }
         finally
         {
@@ -470,8 +531,9 @@ public sealed class TranslatedWindow : Window
             _placementEventIds.Clear();
             _presenterActions.Reset();
             ResetSizeMove();
+            // Hidden, not cloaked: the window is destroyed next, and DWM plays its close
+            // transition only for a window that is still composited when it goes.
             _appWindow.Hide();
-            if (!SetCloaked(true)) RendererDiagnostics.Log("closing proxy cloak failed after hide");
             _allowClose = true;
             Close();
         }
@@ -534,16 +596,38 @@ public sealed class TranslatedWindow : Window
         _controlLifetime?.Dispose();
         var lifetime = _controlLifetime = new PresentationLifetime();
         _canvas.Children.Clear();
+        _paintedBandImages.Clear();
+        _appliedPaintedBands = null;
         _controls.Clear();
         if (_menuBar is not null) _root.Children.Remove(_menuBar);
         _menuBar = null;
+        var dpi = RenderDpi;
         if (ViewModel.Menu.Count != 0)
         {
             _menuBar = new MenuProjectionFactory(EmitMenuAction, lifetime).Create(ViewModel.Menu);
-            Grid.SetRow(_menuBar, 0);
-            _root.Children.Insert(0, _menuBar);
+            PrepareCompactMenuBar(_menuBar);
+            if (ViewModel.MenuBarRect is { } bar)
+            {
+                // A menu bar that is a toolbar inside the client area (MMC's) is drawn
+                // where that toolbar is: a row added above the client area pushed every
+                // control down by its height and cut the same height off the bottom.
+                var scale = 96.0 / dpi;
+                Canvas.SetLeft(_menuBar, bar.X * scale);
+                Canvas.SetTop(_menuBar, bar.Y * scale);
+                Canvas.SetZIndex(_menuBar, MenuBarZIndex);
+                _menuBar.Width = bar.Width * scale;
+                FitMenuBar(_menuBar, bar.Height * scale);
+                _canvas.Children.Add(_menuBar);
+            }
+            else
+            {
+                // An HMENU's bar is above the client area, so it gets exactly the height the
+                // proxy's client area has beyond the native one (see ApplyMenuBarRow).
+                Grid.SetRow(_menuBar, 0);
+                _root.Children.Insert(0, _menuBar);
+            }
         }
-        var dpi = RenderDpi;
+        ApplyMenuBarRow();
         _canvas.Width = ViewModel.ClientBounds.Width * 96.0 / dpi;
         _canvas.Height = ViewModel.ClientBounds.Height * 96.0 / dpi;
         var factory = new ControlFactory(
@@ -574,8 +658,116 @@ public sealed class TranslatedWindow : Window
                     "Validated control parent is not a projected container.");
             }
         }
+        ApplyPaintedBands();
         RestoreFocus(focus);
         QueuePopupSynchronization();
+    }
+
+    // Below every projected node: what the dialog paints itself under its own controls.
+    private const int PaintedBandZIndex = -100_000;
+    private readonly List<Image> _paintedBandImages = [];
+    private IReadOnlyList<ChromeRegion>? _appliedPaintedBands;
+    private bool _appliedPaintedBandsDark;
+
+    // What a dialog paints itself above or below its controls (mstsc's banner), as the
+    // pictures it painted, adapted to a dark theme the way container chrome is.  Decorative:
+    // the pictures are not in the accessibility tree and take no input.
+    private void ApplyPaintedBands()
+    {
+        var bands = ViewModel.PaintedBands;
+        var dark = _root.ActualTheme == ElementTheme.Dark;
+        var scale = 96.0 / RenderDpi;
+        var changed = !ReferenceEquals(bands, _appliedPaintedBands) || dark != _appliedPaintedBandsDark;
+        while (_paintedBandImages.Count > bands.Count)
+        {
+            var extra = _paintedBandImages[^1];
+            _paintedBandImages.RemoveAt(_paintedBandImages.Count - 1);
+            _canvas.Children.Remove(extra);
+        }
+        for (var index = 0; index < bands.Count; ++index)
+        {
+            if (index == _paintedBandImages.Count)
+            {
+                var created = new Image { Stretch = Stretch.Fill, IsHitTestVisible = false };
+                AutomationProperties.SetAccessibilityView(created, AccessibilityView.Raw);
+                Canvas.SetZIndex(created, PaintedBandZIndex);
+                _paintedBandImages.Add(created);
+                _canvas.Children.Add(created);
+                changed = true;
+            }
+            var band = bands[index];
+            var image = _paintedBandImages[index];
+            if (changed) image.Source = ControlFactory.BitmapForChromeRegion(band, dark);
+            image.Width = Math.Max(0, band.Rect.Width * scale);
+            image.Height = Math.Max(0, band.Rect.Height * scale);
+            Canvas.SetLeft(image, band.Rect.X * scale);
+            Canvas.SetTop(image, band.Rect.Y * scale);
+        }
+        _appliedPaintedBands = bands;
+        _appliedPaintedBandsDark = dark;
+    }
+
+    // Above every projected node, so a client-area menu bar is never under the band its
+    // toolbar was hosted in.
+    private const int MenuBarZIndex = 100_000;
+    // Used only if the proxy's client area somehow has no room beyond the native one.
+    private const double FallbackMenuBarHeight = 20;
+
+    // The row above the client area.  An HMENU's bar takes exactly the height the proxy's
+    // client area has beyond the native client area -- the native menu bar's own height,
+    // a wrapped second line included -- so the canvas below it is the native client area to
+    // the pixel.  WinUI's own 40 px bar pushed the content down by the difference and cut
+    // that much off the bottom of the window.
+    private void ApplyMenuBarRow()
+    {
+        var row = _root.RowDefinitions[0];
+        if (_menuBar is null || ViewModel.MenuBarRect is not null)
+        {
+            row.Height = new GridLength(0);
+            return;
+        }
+        var extra = _appWindow.ClientSize.Height - ViewModel.ClientBounds.Height;
+        var height = extra > 0 ? extra * 96.0 / RenderDpi : FallbackMenuBarHeight;
+        row.Height = new GridLength(height);
+        FitMenuBar(_menuBar, height);
+    }
+
+    private static void FitMenuBar(MenuBar bar, double height)
+    {
+        bar.Height = height;
+        bar.VerticalAlignment = VerticalAlignment.Top;
+    }
+
+    // WinUI's menu bar is laid out for a 40 px row: 32 px items with a 4 px margin and
+    // 14 px text.  A native menu bar is about 20 px, so the items lose their margin and
+    // vertical padding and use the native menu font size.
+    private static void PrepareCompactMenuBar(MenuBar bar)
+    {
+        bar.MinHeight = 0;
+        foreach (var item in bar.Items)
+        {
+            item.Margin = new Thickness(0);
+            item.MinHeight = 0;
+            item.VerticalAlignment = VerticalAlignment.Stretch;
+            item.Loaded += (_, _) =>
+            {
+                if (FindNamed<Button>(item, "ContentButton") is not { } button) return;
+                button.Padding = new Thickness(8, 0, 8, 0);
+                button.MinHeight = 0;
+                button.FontSize = 12;
+            };
+        }
+    }
+
+    private static T? FindNamed<T>(DependencyObject root, string name) where T : FrameworkElement
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); ++index)
+        {
+            var child = VisualTreeHelper.GetChild(root, index);
+            if (child is T match && match.Name == name) return match;
+            if (FindNamed<T>(child, name) is { } nested) return nested;
+        }
+        return null;
     }
 
     private void QueuePopupSynchronization()
@@ -850,10 +1042,12 @@ public sealed class TranslatedWindow : Window
         Title = ViewModel.Title;
         _appWindow.Title = ViewModel.Title;
         _appWindow.IsShownInSwitchers = ViewModel.ShowInTaskbar;
+        NativeWindowInterop.SetCloseEnabled(Hwnd, ViewModel.CanClose);
         _root.FlowDirection = ViewModel.Rtl ? FlowDirection.RightToLeft : FlowDirection.LeftToRight;
         var dpi = RenderDpi;
         _canvas.Width = ViewModel.ClientBounds.Width * 96.0 / dpi;
         _canvas.Height = ViewModel.ClientBounds.Height * 96.0 / dpi;
+        ApplyPaintedBands();
         if (_appWindow.Presenter is OverlappedPresenter presenter)
         {
             presenter.IsResizable = ViewModel.IsResizable;
@@ -877,6 +1071,7 @@ public sealed class TranslatedWindow : Window
                 ViewModel.Bounds.Width, ViewModel.Bounds.Height));
         }
         RefreshRenderDpi();
+        ApplyMenuBarRow();
         ApplyInteractionState();
         if (_committed)
         {
@@ -889,10 +1084,14 @@ public sealed class TranslatedWindow : Window
                 if (!_appWindow.IsVisible) _appWindow.Show(false);
                 if (applyCanonicalPlacement) ApplyPresenterState();
             }
-            else
+            else if (_appWindow.IsVisible)
             {
                 _appWindow.Hide();
-                if (!SetCloaked(true)) RendererDiagnostics.Log("hidden canonical proxy cloak failed after hide");
+                AfterHideTransition(() =>
+                {
+                    if (!ViewModel.Visible && !SetCloaked(true))
+                        RendererDiagnostics.Log("hidden canonical proxy cloak failed after hide");
+                });
             }
         }
     }
@@ -1076,9 +1275,11 @@ public sealed class TranslatedWindow : Window
         RequestClose();
     }
 
+    // The title-bar button and Alt+F4 close any window whose own close button does
+    // something (CanClose); Escape only cancels one that a dialog manager would cancel.
     private void RequestClose()
     {
-        if (!ViewModel.CanCancel || _closePending) return;
+        if (!ViewModel.CanClose || _closePending) return;
         _closePending = true;
         EmitAction(null, "close", "close", null);
     }
@@ -1109,7 +1310,11 @@ public sealed class TranslatedWindow : Window
         }
         else if (args.Key == global::Windows.System.VirtualKey.Escape && ViewModel.CanCancel)
         {
-            RequestClose();
+            if (!_closePending)
+            {
+                _closePending = true;
+                EmitAction(null, "close", "close", null);
+            }
             args.Handled = true;
         }
     }
@@ -1257,6 +1462,34 @@ public sealed class TranslatedWindow : Window
         !interactive && !applyingCanonical;
 
     private const nuint SizeMoveSubclassId = 1;
+
+    // How long a proxy's content may take to load before it is shown, cloaked, to load it.
+    private static readonly TimeSpan HiddenLoadTimeout = TimeSpan.FromMilliseconds(750);
+
+    // How long DWM's close transition runs after ShowWindow(SW_HIDE).  Cloaking the window,
+    // or emptying it, before then cuts the transition short or plays it over a blank frame.
+    private static readonly TimeSpan HideTransition = TimeSpan.FromMilliseconds(400);
+
+    // Runs `action` once the hide transition the window just started has played out, unless
+    // the window has been destroyed by then.
+    private void AfterHideTransition(Action action)
+    {
+        var timer = DispatcherQueue.CreateTimer();
+        timer.Interval = HideTransition;
+        timer.IsRepeating = false;
+        timer.Tick += (sender, _) =>
+        {
+            sender.Stop();
+            _hideTimers.Remove(sender);
+            if (!_closed) action();
+        };
+        // The dispatcher does not keep a timer alive on its own.
+        _hideTimers.Add(timer);
+        timer.Start();
+    }
+
+    private readonly List<Microsoft.UI.Dispatching.DispatcherQueueTimer> _hideTimers = [];
+    private bool _closed;
 
     private bool SetCloaked(bool cloaked) => NativeWindowInterop.SetCloaked(Hwnd, cloaked);
 

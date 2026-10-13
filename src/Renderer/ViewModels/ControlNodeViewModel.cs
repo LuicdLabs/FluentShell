@@ -34,6 +34,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _reversed;
     private bool _indeterminate;
     private bool _editable;
+    private string _cueBanner = string.Empty;
     private OwnerDrawComboSnapshot? _ownerDrawCombo;
     private bool _active;
     private string _windowState = "normal";
@@ -73,6 +74,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     public bool ReadOnly { get; private set; }
     public bool Multiline { get; private set; }
     public bool Editable { get => _editable; private set => SetProperty(ref _editable, value); }
+    // The grey hint an empty edit box shows; empty when the native box has none.
+    public string CueBanner { get => _cueBanner; private set => SetProperty(ref _cueBanner, value); }
     public OwnerDrawComboSnapshot? OwnerDrawCombo { get => _ownerDrawCombo; private set => SetProperty(ref _ownerDrawCombo, value); }
     public bool IsDefault { get; private set; }
     public bool GroupStart { get; private set; }
@@ -213,6 +216,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         ReadOnly = node.ReadOnly ?? false;
         Multiline = node.Multiline ?? false;
         Editable = node.Editable;
+        CueBanner = node.CueBanner ?? string.Empty;
         IsDefault = node.IsDefault ?? false;
         GroupStart = node.GroupStart ?? false;
         Style = ParseStyle(node.Style);
@@ -374,6 +378,7 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "selectionStart": SelectionStart = value.GetInt32(); break;
             case "selectionLength": SelectionLength = value.GetInt32(); break;
             case "editable": Editable = value.GetBoolean(); break;
+            case "cueBanner": CueBanner = value.GetString() ?? string.Empty; break;
             case "minimum": Minimum = value.GetInt32(); break;
             case "maximum": Maximum = value.GetInt32(); break;
             case "position": Position = value.GetInt32(); break;

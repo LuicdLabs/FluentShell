@@ -205,6 +205,19 @@ uses. Every replacement page runs that same capability-derived admission path.
 Only a page it cannot admit within the swap window falls back, and it
 clears the one-shot discovery record on the way out.
 
+2026-10-13 (protocol minor 39): MdSched projects again. Its command links are native
+`BS_COMMANDLINK`/`BS_DEFCOMMANDLINK` buttons, which the Win32 Button adapter now admits
+(`commandLink` with the note), and its Cancel -- hosted by DirectUI with control ID 0 --
+is the cancel binding because it carries the system's localized Cancel label, so the
+title-bar close and Escape cancel it as they do natively. AeroWizard pages (ClearType
+Tuner, the EFS wizard, Bluetooth File Transfer) project with in-place Next/Back: the
+header's `wizardicon`/`wizardtitle` are accounted for but not drawn (the proxy's own
+title bar shows them), Back is drawn as the header's arrow (`navigationBack`), a virtual
+image reported a few pixels past its host is clipped to what the host paints, and inert
+text may overlap less than half of an image. A SysLink's own Win32 pane only delegates
+focus to its links. Display Color Calibration (dccw) still stays native: its link child
+has no HWND of its own to bind to the SysLink.
+
 Previous runtime acceptance covered MdSched, RecoveryDrive first/Please wait/
 Connect USB surfaces including seamless Next and Back page transitions, and the
 first ClearType Text Tuner surface (`cttune.exe`). The 2026-10-04 protocol 29

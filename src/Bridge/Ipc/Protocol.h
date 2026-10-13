@@ -81,7 +81,14 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // variants (mainInstruction, commandLink*, elevated, expando*) and a command link's note as
 // helpText, and a task dialog's text is a sysLink with one label per link, named by index
 // through activateItem.
-inline constexpr uint16_t kProtocolMinor = 38;
+// Minor 39 adds canClose to a window (its title-bar close button does something, which an
+// ordinary window's does although Escape does not) and expanded to an accessible island
+// item (a section header that folds the rows under it, as in MMC's Actions pane).
+// Minor 40 adds the focus action: the user put the keyboard focus in a projected list or
+// tree, and the thread's native focus follows it (menu commands act on the focused pane).
+// It also adds a toolbar item's labelBeside (a TBSTYLE_LIST button draws its own label
+// beside its icon) and an edit box's cueBanner (the grey hint it shows while empty).
+inline constexpr uint16_t kProtocolMinor = 40;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

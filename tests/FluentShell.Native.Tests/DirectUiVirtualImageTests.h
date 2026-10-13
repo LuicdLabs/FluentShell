@@ -94,9 +94,16 @@ inline void CheckContract(void (*check)(bool, const char*)) {
     check(!ConfigureDirectUiVirtualImage(native, semantic, slot, error),
         "virtual image exceeded the owned icon dimension cap");
     semantic = valid;
-    semantic.bounds.left = 90;
+    semantic.bounds.left = 60;
     check(!ConfigureDirectUiVirtualImage(native, semantic, slot, error),
         "virtual image escaped its native host client");
+    // An AeroWizard's page icon reaches a few pixels past its host's client edge:
+    // the part the host paints is the image.
+    semantic = valid;
+    semantic.bounds.top = 95;
+    check(ConfigureDirectUiVirtualImage(native, semantic, slot, error) &&
+        slot.imageClientBounds.top == 0 && slot.imageClientBounds.bottom == 48,
+        "a virtual image a few pixels past its host was refused instead of clipped");
     semantic = valid;
     semantic.imageHostHwnd = reinterpret_cast<HWND>(0x200);
     check(!ConfigureDirectUiVirtualImage(native, semantic, slot, error),

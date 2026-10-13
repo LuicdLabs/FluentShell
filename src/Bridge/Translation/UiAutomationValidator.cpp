@@ -1281,6 +1281,11 @@ bool ValidateOnMta(
         const int expectedType = ExpectedControlType(node);
         if (!expectedType) return Fail(error, L"snapshot contains an unknown UIA control kind");
         const auto expectedName = DisplayText(node.automationName);
+        // XAML names an unlabeled text field after its placeholder, which is the cue banner.
+        const auto nameMatches = [&](const std::wstring& name) {
+            return name == expectedName ||
+                (expectedName.empty() && !node.cueBanner.empty() && name == node.cueBanner);
+        };
         const RECT* parentVisibleBounds = nullptr;
         std::optional<RECT> inheritedClip;
         if (node.parentNodeId) {
@@ -1321,7 +1326,7 @@ bool ValidateOnMta(
             const auto& candidate = elements[index];
             if (used[index] || candidate.processId != static_cast<int>(options.rendererProcessId) ||
             candidate.controlType != expectedType || candidate.framework != L"XAML" ||
-                candidate.automationId != expectedId || candidate.name != expectedName ||
+                candidate.automationId != expectedId || !nameMatches(candidate.name) ||
                 (options.requireVisible && !scrolled && !RectClose(candidate.bounds, expectedBounds) &&
                  !(clippedByParent && RectClose(candidate.bounds, unclippedBounds)))) continue;
             match = index;

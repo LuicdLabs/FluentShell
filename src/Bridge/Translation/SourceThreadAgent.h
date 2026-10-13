@@ -78,6 +78,17 @@ inline constexpr wchar_t kCaptureBarrierUnstable[] =
 // painting/hovering is not a mutation.
 bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam = 0, WPARAM wParam = 0) noexcept;
 
+// An event the thread hooks set when a top-level window on a hooked GUI thread is shown or
+// activated: a dialog the application opens over a projection is invisible (its cloaked
+// owner's cloak is inherited) until discovery projects it, so discovery is woken for it
+// rather than finding it on its next periodic pass.  Null stops the signal.  The event
+// must outlive every hook that could still see it.
+void SetTopLevelShownEvent(HANDLE event) noexcept;
+// The same signal for windows shown by any thread of this process (an in-context
+// EVENT_OBJECT_SHOW hook): threads the agents never hook open dialogs too.
+bool InstallTopLevelShownHook(HMODULE module) noexcept;
+void RemoveTopLevelShownHook() noexcept;
+
 // Virtual item indices identify only the published ordering. These actions must
 // not run, or automatically replay, after that native snapshot has changed.
 bool IsOwnerDataListViewIndexedAction(
@@ -304,13 +315,21 @@ private:
 // item's own text afterwards is the verdict.  The session is opened and closed
 // inside one source-thread command, so the projection never depends on the native
 // control keeping keyboard focus while a user types in the proxy.
-inline bool RenameTreeViewItem(HWND treeView, int index, const std::wstring& text) noexcept {
+// `noEditor` reports that the application declined to open the session at all (its
+// TVN_BEGINLABELEDIT/LVN_BEGINLABELEDIT veto): some applications (regedit) rename only from
+// their own Rename command, and the caller then takes that path instead.
+inline bool RenameTreeViewItem(
+    HWND treeView, int index, const std::wstring& text, bool* noEditor = nullptr) noexcept {
+    if (noEditor) *noEditor = false;
     const HTREEITEM item = ResolveTreeViewItem(treeView, index);
     if (!item) return false;
     ThreadFocusScope focus(treeView);
     const HWND edit = reinterpret_cast<HWND>(SendMessageW(
         treeView, TVM_EDITLABELW, 0, reinterpret_cast<LPARAM>(item)));
-    if (!edit || !IsWindow(edit)) return false;
+    if (!edit || !IsWindow(edit)) {
+        if (noEditor) *noEditor = true;
+        return false;
+    }
     if (!SetWindowTextW(edit, text.c_str())) {
         SendMessageW(treeView, TVM_ENDEDITLABELNOW, TRUE, 0);
         return false;
@@ -327,7 +346,9 @@ inline bool RenameTreeViewItem(HWND treeView, int index, const std::wstring& tex
     return text == buffer.data();
 }
 
-inline bool RenameListViewItem(HWND listView, int index, const std::wstring& text) noexcept {
+inline bool RenameListViewItem(
+    HWND listView, int index, const std::wstring& text, bool* noEditor = nullptr) noexcept {
+    if (noEditor) *noEditor = false;
     if (index < 0) return false;
     // The item has to be the focused one before the control will open its editor,
     // exactly as it is when a user renames it.
@@ -340,7 +361,10 @@ inline bool RenameListViewItem(HWND listView, int index, const std::wstring& tex
     SendMessageW(listView, LVM_ENSUREVISIBLE, static_cast<WPARAM>(index), FALSE);
     const HWND edit = reinterpret_cast<HWND>(SendMessageW(
         listView, LVM_EDITLABELW, static_cast<WPARAM>(index), 0));
-    if (!edit || !IsWindow(edit)) return false;
+    if (!edit || !IsWindow(edit)) {
+        if (noEditor) *noEditor = true;
+        return false;
+    }
     if (!SetWindowTextW(edit, text.c_str())) {
         SendMessageW(listView, LVM_CANCELEDITLABEL, 0, 0);
         return false;
@@ -357,6 +381,94 @@ inline bool RenameListViewItem(HWND listView, int index, const std::wstring& tex
     std::wstring reason;
     return ReadListViewItemText(listView, index, 0, actual, reason) && actual == text;
 }
+
+// Ends an open label session without a rename, as the user's Escape does.  A list has
+// LVM_CANCELEDITLABEL only from common controls 6; before that its edit box answers the
+// Escape key itself.
+inline void CancelOpenLabelEdit(HWND control, bool treeView) noexcept {
+    if (treeView) {
+        SendMessageW(control, TVM_ENDEDITLABELNOW, TRUE, 0);
+        return;
+    }
+    SendMessageW(control, LVM_CANCELEDITLABEL, 0, 0);
+    const HWND edit = reinterpret_cast<HWND>(SendMessageW(control, LVM_GETEDITCONTROL, 0, 0));
+    if (!edit || !IsWindow(edit)) return;
+    SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE, 1);
+    SendMessageW(edit, WM_KEYUP, VK_ESCAPE, 1 | (1ll << 30) | (1ll << 31));
+}
+
+// Finishes a label session the application opened itself (from its own Rename command):
+// the text goes into the control's own edit box, which then commits the way a user's Return
+// does.  Returns false when no session is open.  What the application makes of the text is
+// read back by the next capture: it may rename asynchronously or normalize the name.
+inline bool CommitOpenLabelEdit(HWND control, bool treeView, const std::wstring& text) noexcept {
+    const HWND edit = reinterpret_cast<HWND>(SendMessageW(
+        control, treeView ? TVM_GETEDITCONTROL : LVM_GETEDITCONTROL, 0, 0));
+    if (!edit || !IsWindow(edit)) return false;
+    if (!SetWindowTextW(edit, text.c_str())) {
+        CancelOpenLabelEdit(control, treeView);
+        return false;
+    }
+    if (treeView) {
+        SendMessageW(control, TVM_ENDEDITLABELNOW, FALSE, 0);
+    } else {
+        SendMessageW(edit, WM_KEYDOWN, VK_RETURN, 1);
+        SendMessageW(edit, WM_KEYUP, VK_RETURN, 1 | (1ll << 30) | (1ll << 31));
+    }
+    return true;
+}
+
+// Whether the control has a label session open on that item: the session the application
+// opened itself (its Rename command) is on the focused list row or the tree's caret item.
+inline bool LabelSessionOpenOn(HWND control, bool treeView, int index) noexcept {
+    if (index < 0) return false;
+    const HWND edit = reinterpret_cast<HWND>(SendMessageW(
+        control, treeView ? TVM_GETEDITCONTROL : LVM_GETEDITCONTROL, 0, 0));
+    if (!edit || !IsWindow(edit)) return false;
+    if (!treeView) {
+        return static_cast<int>(SendMessageW(control, LVM_GETNEXTITEM,
+            static_cast<WPARAM>(-1), LVNI_FOCUSED)) == index;
+    }
+    const HTREEITEM item = ResolveTreeViewItem(control, index);
+    return item && reinterpret_cast<HTREEITEM>(
+        SendMessageW(control, TVM_GETNEXTITEM, TVGN_CARET, 0)) == item;
+}
+
+// The item's live label (the first column of a list row).
+inline bool ReadItemLabel(HWND control, bool treeView, int index, std::wstring& label) noexcept {
+    label.clear();
+    if (!treeView) {
+        std::wstring reason;
+        return ReadListViewItemText(control, index, 0, label, reason);
+    }
+    const HTREEITEM item = ResolveTreeViewItem(control, index);
+    if (!item) return false;
+    try {
+        std::vector<wchar_t> buffer(1024, L'\0');
+        TVITEMW read{};
+        read.mask = TVIF_HANDLE | TVIF_TEXT;
+        read.hItem = item;
+        read.pszText = buffer.data();
+        read.cchTextMax = static_cast<int>(buffer.size());
+        if (!SendMessageW(control, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&read))) return false;
+        buffer.back() = L'\0';
+        label = buffer.data();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// A rename the application only allows from its own Rename command, waiting for the session
+// that command opens (see SourceThreadAgent::PostLabelRename).
+struct LabelRenameRequest final {
+    HWND control = nullptr;
+    bool treeView = false;
+    uint64_t nodeId = 0;
+    uint64_t generation = 0;
+    std::wstring text;
+    uint64_t deadline = 0;
+};
 
 // One Bridge-owned action waiting on the source thread's queue.  The posted message
 // carries only `token`; the request stays here, so cancelling releases it even when
@@ -519,6 +631,13 @@ public:
     bool PostListViewActivation(const ControlNode& node, int index,
         bool& refused, std::wstring& error, uint64_t* queuedToken = nullptr) noexcept;
     void DispatchListViewActivationOnSourceThread(uint64_t token) noexcept;
+    // A rename the application refused as a bare label session: its own Rename command is
+    // started the way a user starts it -- F2 to the control, with the control's thread focus,
+    // through the application's message loop and accelerators -- and the session that opens
+    // is finished afterwards.  Source thread only.
+    bool PostLabelRename(const ControlNode& node, HWND control, int index,
+        const std::wstring& text, uint64_t* queuedToken) noexcept;
+    void DispatchLabelRenameOnSourceThread(uint64_t token) noexcept;
     // Only Bridge-issued generic actions enter this queue. Application-posted
     // HWND messages are never intercepted or reordered.
     bool PostNativeAction(const ActionRequest& action, const ControlNode* node,
@@ -670,6 +789,7 @@ private:
     DeferredSlot<MenuActionRequest> menuAction_;
     DeferredSlot<ListViewActivationRequest> listViewActivation_;
     DeferredSlot<IslandActionRequest> islandAction_;
+    DeferredSlot<LabelRenameRequest> labelRename_;
     bool nativeActionRunning_ = false;
     std::atomic<uint64_t> listViewActivationCancellation_{0};
     std::atomic<unsigned> remoteActions_{0};

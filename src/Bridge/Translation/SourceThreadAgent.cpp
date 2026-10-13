@@ -79,6 +79,9 @@ constexpr WPARAM kDeferredIslandAction = 1;
 constexpr WPARAM kDeferredMenuAction = 2;
 constexpr WPARAM kDeferredListViewActivation = 3;
 constexpr WPARAM kDeferredNativeAction = 4;
+constexpr WPARAM kDeferredLabelRename = 5;
+// How long a rename waits for the session the application's own Rename command opens.
+constexpr uint64_t kLabelRenameWaitMs = 1000;
 
 struct Command final {
     explicit Command(std::shared_ptr<std::atomic<bool>> token = {})
@@ -427,6 +430,14 @@ bool UpDownMutator(UINT message) noexcept {
         message == UDM_SETBUDDY;
 }
 
+// A ComboBoxEx stores its items itself; its CB_ messages are the shared ones below WM_USER.
+bool ComboBoxExMutator(UINT message) noexcept {
+    return message == CBEM_INSERTITEMA || message == CBEM_INSERTITEMW ||
+        message == CBEM_SETITEMA || message == CBEM_SETITEMW ||
+        message == CBEM_SETIMAGELIST || message == CBEM_SETEXSTYLE ||
+        message == CBEM_SETEXTENDEDSTYLE;
+}
+
 // ProgressBar state is driven entirely by these messages.  Without them a
 // dirty-gated reconcile would never notice a native progress update.
 bool ProgressMutator(UINT message) noexcept {
@@ -599,6 +610,7 @@ bool RelevantMessageFor(HWND window, UINT message, LPARAM lParam = 0, WPARAM wPa
     if (FluentShell::EqualsIgnoreCase(type, TOOLBARCLASSNAMEW)) return ToolbarMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, TRACKBAR_CLASSW)) return TrackbarMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, UPDOWN_CLASSW)) return UpDownMutator(message);
+    if (FluentShell::EqualsIgnoreCase(type, WC_COMBOBOXEXW)) return ComboBoxExMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, PROGRESS_CLASSW)) return ProgressMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, STATUSCLASSNAMEW)) return StatusBarMutator(message);
     if (FluentShell::EqualsIgnoreCase(type, MSFTEDIT_CLASS) ||
@@ -639,6 +651,11 @@ bool MenuMutationMessage(UINT message, LPARAM lParam) noexcept {
     }
 }
 
+// Roots on this thread whose WM_CLOSE is being handled.  While one is, no control
+// observation is installed on this thread: a capture the close handler's own message loop
+// runs (a "save changes?" prompt) would otherwise put it back just before the windows go.
+thread_local unsigned t_closingRoots = 0;
+
 LRESULT CALLBACK ControlSubclassProc(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR subclassId, DWORD_PTR refData) {
@@ -656,12 +673,38 @@ LRESULT CALLBACK ControlSubclassProc(
     return result;
 }
 
+// Takes the control observation off every window under `root` that this thread owns,
+// before the application starts tearing the window down.  MMC (through MFC) subclasses
+// its views with an HWND map of its own and unwinds it while it closes the frame; with
+// comctl32's subclass layered over its own, that unwinding read a map entry it had
+// already freed and the console crashed on exit (mmc.exe+0x287C).  Without the layer it
+// closes as it does natively.  A close the application vetoes loses nothing: the next
+// capture observes the controls again.
+void DetachControlObservation(HWND root) noexcept {
+    EnumChildWindows(root, [](HWND child, LPARAM) -> BOOL {
+        if (GetWindowThreadProcessId(child, nullptr) == GetCurrentThreadId()) {
+            RemoveWindowSubclass(child, ControlSubclassProc, kControlSubclassId);
+            // Its WM_NCDESTROY no longer reaches the observation that would release the
+            // document read from it, so the document goes now, while its engine is alive.
+            ForgetNativeDocument(child);
+        }
+        return TRUE;
+    }, 0);
+}
+
 LRESULT CALLBACK RootSubclassProc(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam,
     UINT_PTR subclassId, DWORD_PTR refData) {
     const auto owner = AgentForSubclass(reinterpret_cast<SourceThreadAgent*>(refData));
+    // A window can be destroyed without a WM_CLOSE first (EndDialog, an application's
+    // own exit path); WM_DESTROY reaches the root before any of its children.
+    if (message == WM_CLOSE || message == WM_DESTROY) DetachControlObservation(window);
+    if (message == WM_CLOSE) ++t_closingRoots;
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
-    if (message == WM_CLOSE) MarkWindowCloseCompleted(window);
+    if (message == WM_CLOSE) {
+        --t_closingRoots;
+        MarkWindowCloseCompleted(window);
+    }
     if (owner && !CaptureReadInProgress() && RelevantMessageFor(window, message, lParam, wParam))
         owner->MarkDirty(window, message);
     if (message == WM_NCDESTROY && owner) {
@@ -680,6 +723,9 @@ bool InstallChildSubclass(SourceThreadAgent* agent, HWND hwnd) {
             *installed = InstallChildSubclass(owner.get(), hwnd);
         }, error) && *installed;
     }
+    // A root on this thread is inside its close: its controls stay unobserved (see
+    // DetachControlObservation), which a capture reports as success.
+    if (t_closingRoots != 0) return true;
     if (hwnd && IsWindow(hwnd)) {
         wchar_t className[64]{};
         const bool statusBar = GetClassNameW(hwnd, className,
@@ -892,7 +938,16 @@ bool ApplySetText(
         (node.kind == ControlKind::ComboBox && node.editable);
     if (!writableText || node.readOnly) return true;
     if (AbortIfCancelled(command)) return false;
-    command->success = SetWindowTextW(target, command->action.text.c_str()) != FALSE;
+    // A ComboBoxEx keeps the typed text in an edit box of its own.
+    HWND textWindow = target;
+    if (node.kind == ControlKind::ComboBox && IsComboBoxExWindow(target)) {
+        textWindow = reinterpret_cast<HWND>(SendMessageW(target, CBEM_GETEDITCONTROL, 0, 0));
+        if (!textWindow || !IsWindow(textWindow)) {
+            command->error = L"the ComboBoxEx has no edit box";
+            return true;
+        }
+    }
+    command->success = SetWindowTextW(textWindow, command->action.text.c_str()) != FALSE;
     if (!command->success || command->cancelled.load(std::memory_order_acquire)) {
         return true;
     }
@@ -935,6 +990,14 @@ bool ApplySetCheck(
     return true;
 }
 
+// A click that selects in a list or tree focuses that control first.  The application's menu
+// commands act on the pane that holds the thread's focus (regedit renames or deletes a key or
+// a value depending on whether the tree or the list has it), and the cloaked window would
+// otherwise keep a focus the user has long left, or none at all.
+void FocusPaneOfUserGesture(HWND target) noexcept {
+    if (target && GetFocus() != target) SetFocus(target);
+}
+
 bool ApplySelect(
     Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
     if (node.kind == ControlKind::PerformanceLegend) {
@@ -960,6 +1023,7 @@ bool ApplySelect(
         (requested == -1 || static_cast<size_t>(requested) < node.items.size());
     if (!validIndex) return true;
     if (AbortIfCancelled(command)) return false;
+    if (tree) FocusPaneOfUserGesture(target);
 
     if (tab) {
         if (AbortIfCancelled(command)) return false;
@@ -1015,6 +1079,7 @@ bool ApplySetSelection(
     if (node.kind == ControlKind::ListBox) return ApplySetListBoxSelection(command, agent, target, node);
     if (node.kind != ControlKind::ListView) return true;
     if (AbortIfCancelled(command)) return false;
+    FocusPaneOfUserGesture(target);
     const auto& requested = command->action.integerValues;
 
     LVITEMW state{};
@@ -1089,9 +1154,25 @@ bool ApplySetFocusedIndex(
     if (AbortIfCancelled(command)) return false;
     const int index = command->action.itemIndex;
     if (index < -1 || (index >= 0 && static_cast<size_t>(index) >= ListViewItemCount(node))) return true;
+    FocusPaneOfUserGesture(target);
     command->success = SetListViewFocusedIndex(target, index);
     command->refused = !command->success;
     if (!command->success) command->error = L"the list refused the focus change";
+    return true;
+}
+
+// The user put the keyboard focus in a projected list or tree, which natively is the
+// click that focuses that control.  The thread's focus follows, because commands the
+// application runs from its menu act on the pane that holds it (regedit renames or deletes
+// a key or a value depending on whether the tree or the list has it).
+bool ApplyFocus(
+    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    if (node.kind != ControlKind::ListView && node.kind != ControlKind::TreeView) return true;
+    if (AbortIfCancelled(command)) return false;
+    FocusPaneOfUserGesture(target);
+    command->success = GetFocus() == target;
+    command->refused = !command->success;
+    if (!command->success) command->error = L"the control did not take the focus";
     return true;
 }
 
@@ -1310,7 +1391,7 @@ bool ApplyDiskScroll(Command* command, SourceThreadAgent*, HWND target, const Co
 }
 
 bool ApplySetItemText(
-    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
     const bool renamable = (node.kind == ControlKind::TreeView ||
         node.kind == ControlKind::ListView) && node.editableLabels;
     if (!renamable) return true;
@@ -1319,13 +1400,48 @@ bool ApplySetItemText(
         ? node.items.size() : ListViewItemCount(node);
     if (index < 0 || static_cast<size_t>(index) >= itemCount) return true;
     if (AbortIfCancelled(command)) return false;
+    const bool treeView = node.kind == ControlKind::TreeView;
+    std::wstring current;
+    const bool unchanged = ReadItemLabel(target, treeView, index, current) &&
+        current == command->action.text;
+    // The application opened this session itself (its Rename command, from the projected
+    // menu or a context menu), and the projected editor is the answer to it: a new label goes
+    // into the application's own edit box, and the unchanged one cancels the session.
+    if (LabelSessionOpenOn(target, treeView, index)) {
+        if (unchanged) CancelOpenLabelEdit(target, treeView);
+        const bool answered = unchanged ||
+            CommitOpenLabelEdit(target, treeView, command->action.text);
+        if (AbortIfCancelled(command)) return false;
+        command->success = answered;
+        command->refused = !answered;
+        if (!answered) command->error = L"the application's label session closed before the label reached it";
+        return true;
+    }
+    // Outside a session an unchanged label renames nothing.
+    if (unchanged) {
+        command->success = true;
+        command->refused = false;
+        return true;
+    }
     // The rename opens and closes the control's own label session, so the
     // application's veto and its normalization both apply before this reports
     // success.
-    const bool renamed = node.kind == ControlKind::TreeView
-        ? RenameTreeViewItem(target, index, command->action.text)
-        : RenameListViewItem(target, index, command->action.text);
+    bool noEditor = false;
+    const bool renamed = treeView
+        ? RenameTreeViewItem(target, index, command->action.text, &noEditor)
+        : RenameListViewItem(target, index, command->action.text, &noEditor);
     if (AbortIfCancelled(command)) return false;
+    // An application that vetoes every label session it did not open itself (regedit)
+    // renames from its own Rename command, which the user reaches with F2.  The rename is
+    // then queued through that path, and the next capture reports what it settled on.
+    if (!renamed && noEditor && agent &&
+        agent->PostLabelRename(node, target, index, command->action.text,
+            &command->deferredActionToken)) {
+        command->deferredActionKind = kDeferredLabelRename;
+        command->success = true;
+        command->refused = false;
+        return true;
+    }
     command->success = renamed;
     // A label session that ran and left the old text is the application refusing
     // the new one, which is a rejected action rather than a broken projection.
@@ -1433,6 +1549,7 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"select", &ApplySelect },
     NodeActionEntry{ L"setSelection", &ApplySetSelection },
     NodeActionEntry{ L"setFocusedIndex", &ApplySetFocusedIndex },
+    NodeActionEntry{ L"focus", &ApplyFocus },
     NodeActionEntry{ L"scrollBy", &ApplyScrollBy },
     NodeActionEntry{ L"setItemCheck", &ApplySetItemCheck },
     NodeActionEntry{ L"setItemText", &ApplySetItemText },
@@ -2245,6 +2362,13 @@ LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
             return CallNextHookEx(nullptr, code, wParam, lParam);
         }
         if (agent && message->message == agent->MessageId() &&
+            message->wParam == kDeferredLabelRename) {
+            const auto token = static_cast<uint64_t>(message->lParam);
+            message->message = WM_NULL;
+            agent->DispatchLabelRenameOnSourceThread(token);
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        if (agent && message->message == agent->MessageId() &&
             message->wParam == kDeferredMenuAction) {
             const auto token = static_cast<uint64_t>(message->lParam);
             message->message = WM_NULL;
@@ -2292,6 +2416,13 @@ LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
+std::atomic<HANDLE> g_topLevelShownEvent{ nullptr };
+
+void SignalIfTopLevel(HWND window) noexcept {
+    const HANDLE event = g_topLevelShownEvent.load();
+    if (event && window && GetAncestor(window, GA_ROOT) == window) SetEvent(event);
+}
+
 LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
     switch (code) {
     case HCBT_CREATEWND:
@@ -2299,6 +2430,9 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
     case HCBT_MINMAX:
     case HCBT_MOVESIZE:
         MarkCurrentThreadAgentsDirty(reinterpret_cast<HWND>(wParam));
+        break;
+    case HCBT_ACTIVATE:
+        SignalIfTopLevel(reinterpret_cast<HWND>(wParam));
         break;
     default:
         break;
@@ -2316,11 +2450,42 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
         if (observed || message->message == WM_NCDESTROY || message->message == WM_CANCELMODE) {
             MarkCurrentThreadAgentsDirty(message->hwnd, message->message, observed && menuChanged);
         }
+        // A dialog is shown before it is activated, and one shown without activation is
+        // never activated at all.
+        if (message->message == WM_SHOWWINDOW && message->wParam) SignalIfTopLevel(message->hwnd);
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 } // namespace
+
+void SetTopLevelShownEvent(HANDLE event) noexcept { g_topLevelShownEvent.store(event); }
+
+namespace {
+
+// Runs on the thread that showed the window (an in-context hook, limited to this
+// process): a snap-in's own thread opens MMC's property sheets, and no thread hook of
+// ours is installed there.
+void CALLBACK TopLevelShownWinEvent(
+    HWINEVENTHOOK, DWORD, HWND window, LONG object, LONG child, DWORD, DWORD) {
+    if (object == OBJID_WINDOW && child == CHILDID_SELF) SignalIfTopLevel(window);
+}
+
+std::atomic<HWINEVENTHOOK> g_topLevelShownHook{ nullptr };
+
+} // namespace
+
+bool InstallTopLevelShownHook(HMODULE module) noexcept {
+    if (g_topLevelShownHook.load()) return true;
+    const HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, module,
+        TopLevelShownWinEvent, GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
+    g_topLevelShownHook.store(hook);
+    return hook != nullptr;
+}
+
+void RemoveTopLevelShownHook() noexcept {
+    if (const HWINEVENTHOOK hook = g_topLevelShownHook.exchange(nullptr)) UnhookWinEvent(hook);
+}
 
 bool IsNativeMutationMessage(HWND window, UINT message, LPARAM lParam, WPARAM wParam) noexcept {
     return RelevantMessageFor(window, message, lParam, wParam);
@@ -3367,6 +3532,75 @@ bool SourceThreadAgent::PostListViewActivation(const ControlNode& node, int inde
     }
 }
 
+bool SourceThreadAgent::PostLabelRename(const ControlNode& node, HWND control, int index,
+    const std::wstring& text, uint64_t* queuedToken) noexcept {
+    if (queuedToken) *queuedToken = 0;
+    try {
+        if (GetCurrentThreadId() != threadId_ || !control ||
+            GetWindowThreadProcessId(control, nullptr) != threadId_ || labelRename_) return false;
+        const bool treeView = node.kind == ControlKind::TreeView;
+        // The Rename command acts on the item the user has in hand: the control's focused
+        // (and selected) item, in the control that holds the thread's focus.  That focus is
+        // left there, because the application reads it only when it runs the command.
+        if (treeView) {
+            const HTREEITEM item = ResolveTreeViewItem(control, index);
+            if (!item) return false;
+            SendMessageW(control, TVM_SELECTITEM, TVGN_CARET, reinterpret_cast<LPARAM>(item));
+        } else {
+            LVITEMW state{};
+            state.stateMask = LVIS_SELECTED;
+            SendMessageW(control, LVM_SETITEMSTATE, static_cast<WPARAM>(-1),
+                reinterpret_cast<LPARAM>(&state));
+            state.stateMask = LVIS_FOCUSED | LVIS_SELECTED;
+            state.state = LVIS_FOCUSED | LVIS_SELECTED;
+            SendMessageW(control, LVM_SETITEMSTATE, static_cast<WPARAM>(index),
+                reinterpret_cast<LPARAM>(&state));
+            SendMessageW(control, LVM_ENSUREVISIBLE, static_cast<WPARAM>(index), FALSE);
+        }
+        SetFocus(control);
+        const UINT scan = MapVirtualKeyW(VK_F2, MAPVK_VK_TO_VSC);
+        const LPARAM down = 1 | (static_cast<LPARAM>(scan) << 16);
+        if (!PostMessageW(control, WM_KEYDOWN, VK_F2, down) ||
+            !PostMessageW(control, WM_KEYUP, VK_F2, down | (1ll << 30) | (1ll << 31))) return false;
+        LabelRenameRequest request;
+        request.control = control;
+        request.treeView = treeView;
+        request.nodeId = node.nodeId;
+        request.generation = node.generation;
+        request.text = text;
+        request.deadline = GetTickCount64() + kLabelRenameWaitMs;
+        // Queued behind the key, so it runs once the application's loop has turned it into
+        // its Rename command.
+        const uint64_t token = QueueDeferred(labelRename_, kDeferredLabelRename, std::move(request));
+        if (queuedToken) *queuedToken = token;
+        if (token != 0) FluentShell::Log(L"Label rename routed through the application's own Rename (F2)");
+        return token != 0;
+    } catch (...) {
+        return false;
+    }
+}
+
+void SourceThreadAgent::DispatchLabelRenameOnSourceThread(uint64_t token) noexcept {
+    auto request = TakeDeferred(labelRename_, kDeferredLabelRename, token,
+        [](const LabelRenameRequest&) {});
+    if (!request) return;
+    try {
+        const auto identity = captureContext_.nodeIds.find(request->control);
+        if (identity == captureContext_.nodeIds.end() || identity->second.nodeId != request->nodeId ||
+            identity->second.generation != request->generation || !IsWindow(request->control)) return;
+        if (CommitOpenLabelEdit(request->control, request->treeView, request->text)) {
+            MarkDirty();
+            return;
+        }
+        // The application has not opened its session yet: wait for it a little longer, then
+        // leave the label as it is (the next capture republishes it).
+        if (GetTickCount64() < request->deadline &&
+            QueueDeferred(labelRename_, kDeferredLabelRename, std::move(*request)) != 0) return;
+        FluentShell::Log(L"Label rename: the application opened no session for its Rename command");
+        MarkDirty();
+    } catch (...) {}
+}
+
 void SourceThreadAgent::DispatchListViewActivationOnSourceThread(uint64_t token) noexcept {
     auto request = TakeDeferred(listViewActivation_, kDeferredListViewActivation, token,
         [](const ListViewActivationRequest&) {});
@@ -3391,6 +3625,7 @@ void SourceThreadAgent::RearmDeferredActionsOnSourceThread() noexcept {
     rearm(kDeferredIslandAction, islandAction_);
     rearm(kDeferredMenuAction, menuAction_);
     rearm(kDeferredListViewActivation, listViewActivation_);
+    rearm(kDeferredLabelRename, labelRename_);
     rearm(kDeferredNativeAction, nativeAction_);
 }
 
@@ -3400,6 +3635,8 @@ void SourceThreadAgent::CancelDeferredActionOnSourceThread(WPARAM kind, uint64_t
     else if (kind == kDeferredMenuAction && token == menuAction_.token) menuAction_.Reset();
     else if (kind == kDeferredListViewActivation && token == listViewActivation_.token)
         listViewActivation_.Reset();
+    else if (kind == kDeferredLabelRename && token == labelRename_.token)
+        labelRename_.Reset();
     else if (kind == kDeferredNativeAction && token == nativeAction_.token)
         CancelNativeActionOnSourceThread();
 }

@@ -10,15 +10,19 @@
 #include "DirectUiEngine.h"
 
 #include <sddl.h>
+#include <shobjidl_core.h>
 #include <winrt/base.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cwctype>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
@@ -28,6 +32,60 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// The taskbar button of a projected native window.  A cloaked window keeps its button,
+// so a projected application showed twice on the taskbar, and the native button
+// activated a window nobody could see.  The button is removed while the proxy holds the
+// screen and put back when the native window does.  The shell is asked from one worker
+// thread, because ITaskbarList talks to Explorer synchronously and a busy Explorer must
+// not hold a projection or a rollback; the worker applies the latest wish per window.
+class TaskbarTabs final {
+public:
+    static TaskbarTabs& Instance() {
+        // Never destroyed: its worker may still be waiting when the process exits.
+        static auto* instance = new TaskbarTabs();
+        return *instance;
+    }
+
+    void Request(HWND window, bool present) noexcept {
+        try {
+            std::scoped_lock lock(mutex_);
+            wishes_[window] = present;
+            if (!worker_.joinable()) worker_ = std::thread([this] { Run(); });
+            wake_.notify_one();
+        } catch (...) {}
+    }
+
+private:
+    // The worker and its apartment live as long as the process.
+    void Run() noexcept {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        Microsoft::WRL::ComPtr<ITaskbarList> taskbar;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(TaskbarList), nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&taskbar))) && FAILED(taskbar->HrInit())) {
+            taskbar.Reset();
+        }
+        while (true) {
+            std::unordered_map<HWND, bool> wishes;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [this] { return !wishes_.empty(); });
+                wishes.swap(wishes_);
+            }
+            if (!taskbar) continue;
+            for (const auto& [window, present] : wishes) {
+                if (!IsWindow(window)) continue;
+                if (present) taskbar->AddTab(window);
+                else taskbar->DeleteTab(window);
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::unordered_map<HWND, bool> wishes_;
+    std::thread worker_;
+};
+
 constexpr DWORD kHandshakeTimeoutMs = 5000;
 // Renderer heartbeats are gated by a 900 ms dispatcher probe.  Allow the
 // third scheduled probe to complete before declaring three consecutive misses.
@@ -36,6 +94,12 @@ constexpr uint64_t kRendererHeartbeatTimeoutMs = 4250;
 // cannot prove it observes every way native state can change, so a slow poll stays
 // as the backstop instead of trusting the flag alone.
 constexpr unsigned kQuietReconcileTicks = 4;
+constexpr DWORD kReconcileTickMs = 250;
+// Discovery's periodic pass, and the short tick it runs on for a while after a hooked GUI
+// thread showed or activated a top-level window (see RunSupervisor).
+constexpr uint64_t kDiscoveryIntervalMs = 1000;
+constexpr DWORD kDiscoveryBurstTickMs = 40;
+constexpr uint64_t kDiscoveryBurstMs = 600;
 // A source thread inside a modal loop can miss a bounded capture deadline without
 // being broken.  Tolerate a few misses before discarding a working projection.
 constexpr unsigned kMaxCaptureTimeouts = 3;
@@ -165,6 +229,21 @@ bool ClearApplicationCloak(HWND window) noexcept {
     return (reasons & DWM_CLOAKED_APP) == 0;
 }
 
+// A proxy whose native window is already gone (a dialog that closed, a translated dialog
+// that answered) has no second copy to keep off the screen, so it is only hidden: DWM plays
+// a window's close transition for a hide, and a cloak would cut it off.  Falls back to the
+// isolating hide when the window does not go within the bound.
+bool HideProxyGracefully(HWND window) noexcept {
+    if (!window || !IsWindow(window)) return true;
+    ShowWindowAsync(window, SW_HIDE);
+    const uint64_t deadline = GetTickCount64() + 500;
+    do {
+        if (!IsWindow(window) || !IsWindowVisible(window)) return true;
+        Sleep(10);
+    } while (GetTickCount64() < deadline);
+    return false;
+}
+
 bool HideProxyForRestore(HWND window) noexcept {
     if (!window || !IsWindow(window)) return true;
     BOOL cloak = TRUE;
@@ -221,6 +300,9 @@ struct RendererSession::Surface final {
     bool restoreInProgress = false;
     bool restoreRetryScheduled = false;
     bool agentRetained = false;
+    // The native window's taskbar button was taken away while the proxy holds the screen
+    // (see TaskbarTabs); rollback puts it back.
+    bool taskbarTabHidden = false;
     unsigned restoreAttempts = 0;
     uint64_t pendingCloseSequence = 0;
     std::optional<ActionRequest> pendingCloseAction;
@@ -467,6 +549,12 @@ bool RendererSession::Start() {
         return false;
     }
     ready_ = true;
+    // Auto-reset.  Deliberately never closed: a thread hook can still be about to set it
+    // when the session stops, and an event handle is all it costs.
+    discoveryWake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    SetTopLevelShownEvent(discoveryWake_);
+    if (!InstallTopLevelShownHook(bridgeModule_))
+        FluentShell::Log(L"Top-level show events unavailable; discovery keeps its periodic pass");
     actionWorker_ = std::thread([this] { ActionMain(); });
     reader_ = std::thread([this] { ReaderMain(); });
     heartbeatWorker_ = std::thread([this] { HeartbeatMain(); });
@@ -882,7 +970,10 @@ bool RendererSession::PublishAndAwaitReady(ProjectionAttempt& attempt) {
     }
 
     // The proxy must already be at its final geometry while still cloaked, so
-    // the commit below can only change visibility and never move the window.
+    // the commit below can only change visibility and never move the window.  It is
+    // normally not yet shown at all: the renderer prepares it hidden so that the commit
+    // is its first show, the one DWM animates as a window opening.  A proxy whose content
+    // would only load once shown is shown behind its cloak instead.
     RECT actualBounds{};
     DWORD cloakReasons = 0;
     const BOOL boundsRead = GetWindowRect(attempt.ready.proxyHwnd, &actualBounds);
@@ -890,7 +981,7 @@ bool RendererSession::PublishAndAwaitReady(ProjectionAttempt& attempt) {
     const HRESULT cloakRead = DwmGetWindowAttribute(
         attempt.ready.proxyHwnd, DWMWA_CLOAKED, &cloakReasons, sizeof(cloakReasons));
     if (!boundsRead || !RectClose(actualBounds, surface->snapshot.bounds) ||
-        !proxyVisible || FAILED(cloakRead) || (cloakReasons & DWM_CLOAKED_APP) == 0) {
+        FAILED(cloakRead) || (cloakReasons & DWM_CLOAKED_APP) == 0) {
         FluentShell::Log(L"Hidden proxy gate values: rectRead=" +
             std::to_wstring(boundsRead != FALSE) +
             L" visible=" + std::to_wstring(proxyVisible != FALSE) +
@@ -1188,6 +1279,15 @@ bool RendererSession::CommitInteractive(ProjectionAttempt& attempt) {
     if (Send(Ipc::MessageType::SurfaceCommit, snapshot.revision,
             SerializeSurfaceCommit(
                 nonce_, snapshot.surfaceId, snapshot.revision, true, true))) {
+        // The proxy is the window on the taskbar now; the cloaked native window's own
+        // button would only activate something nobody can see.
+        if (attempt.nativeRoot && snapshot.showInTaskbar) {
+            {
+                std::scoped_lock lock(surface->mutex);
+                surface->taskbarTabHidden = true;
+            }
+            TaskbarTabs::Instance().Request(attempt.nativeRoot, false);
+        }
         return true;
     }
     return RejectAfterCommit(attempt, L"surface.interactive commit send failed");
@@ -2101,7 +2201,7 @@ void RendererSession::AdmitAction(const ActionRequest& action, const std::shared
 // are absent: failing to deliver a click or a close is still a broken surface.
 bool IsRecoverableActionFailure(std::wstring_view action) noexcept {
     return action == L"setText" || action == L"setCheck" || action == L"select" ||
-        action == L"setSelection" || action == L"setFocusedIndex" ||
+        action == L"setSelection" || action == L"setFocusedIndex" || action == L"focus" ||
         action == L"setItemCheck" || action == L"setItemText" ||
         action == L"setValue" || action == L"setExpand" || action == L"setGroupExpanded" || action == L"setSplit" ||
         action == L"setColumnOrder" || action == L"scrollBy" || action == L"htmlScroll" ||
@@ -2608,10 +2708,14 @@ void RendererSession::HandleNativeAction(
             FallBackFromDirectUiHandoff(surface, agent, L"restore");
             return;
         }
+        bool restoreTab = false;
         {
             std::scoped_lock terminalLock(surface->mutex);
             surface->state = SurfaceState::Closed;
+            restoreTab = std::exchange(surface->taskbarTabHidden, false);
         }
+        // The native window has the screen again (whatever the click does next).
+        if (restoreTab) TaskbarTabs::Instance().Request(agent->Root(), true);
         if (!agent->Shutdown()) {
             surface->agentRetained = true;
             RetainSourceThreadAgent(agent);
@@ -3484,6 +3588,9 @@ struct RendererSession::RestoreAttempt final {
     DWORD sourceThread = 0;
     uint64_t sourceGeneration = 0;
     bool virtualDialog = false;
+    // The surface is closing because its window is gone (or, for a translated dialog,
+    // has answered): there is no native copy for the proxy to be shown beside.
+    bool nativeGone = false;
 };
 
 namespace {
@@ -3527,6 +3634,7 @@ bool RendererSession::BeginRestore(RestoreAttempt& attempt) {
 // The proxy goes away before native visibility changes.  If DWM cannot establish
 // that isolation, kill the renderer rather than show the user two of the window.
 void RendererSession::IsolateProxyForRestore(const RestoreAttempt& attempt) noexcept {
+    if (attempt.nativeGone && HideProxyGracefully(attempt.proxy)) return;
     if (HideProxyForRestore(attempt.proxy)) return;
     try {
         FluentShell::Log(L"Proxy isolation failed during restore; terminating renderer");
@@ -3543,6 +3651,12 @@ bool RendererSession::RestoreNativeWindow(const RestoreAttempt& attempt) {
 
     std::wstring error;
     bool restored = agent->Restore(error, 2000, shutdownEvent_);
+    bool restoreTab = false;
+    {
+        std::scoped_lock lock(attempt.surface->mutex);
+        restoreTab = std::exchange(attempt.surface->taskbarTabHidden, false);
+    }
+    if (restoreTab) TaskbarTabs::Instance().Request(attempt.nativeRoot, true);
     if (!restored) {
         // The source thread may be stalled.  DWM uncloak is the bounded emergency
         // path that keeps the target usable without it.
@@ -3674,6 +3788,9 @@ void RendererSession::RestoreSurface(
         // has begun.
         std::unique_lock canonicalLock(surface->canonicalMutex);
         if (!BeginRestore(attempt)) return;
+        attempt.nativeGone = reason == L"nativeDestroyed" &&
+            (attempt.virtualDialog || !attempt.agent || attempt.agent->IsDestroyed() ||
+             !IsWindow(attempt.nativeRoot));
         IsolateProxyForRestore(attempt);
         nativeRestored = RestoreNativeWindow(attempt);
         const bool scheduleRetry = PublishRestoredState(attempt, nativeRestored);
@@ -3794,14 +3911,31 @@ void RendererSession::Fail(std::wstring_view reason) noexcept {
 
 void RendererSession::RunSupervisor() {
     uint64_t lastDiscovery = 0;
+    uint64_t lastReconcile = 0;
+    // While a window was just shown, discovery runs on a short tick: the dialog a click
+    // opens stays invisible (it inherits its projected owner's cloak) until it projects,
+    // so every tick of discovery latency is time the user waits for a dialog to appear.
+    // The burst also covers a window whose WM_SHOWWINDOW arrived before it was visible.
+    uint64_t burstUntil = 0;
     while (!stopping_.load() && !failed_.load()) {
         const uint64_t now = GetTickCount64();
-        if (now - lastDiscovery >= 1000) {
+        const bool burst = now < burstUntil;
+        if (now - lastDiscovery >= (burst ? kDiscoveryBurstTickMs : kDiscoveryIntervalMs)) {
             DiscoverTopLevelWindows();
-            lastDiscovery = now;
+            lastDiscovery = GetTickCount64();
         }
-        ReconcileNativeSurfaces();
-        Sleep(250);
+        if (GetTickCount64() - lastReconcile >= kReconcileTickMs) {
+            ReconcileNativeSurfaces();
+            lastReconcile = GetTickCount64();
+        }
+        const DWORD wait = discoveryWake_
+            ? WaitForSingleObject(discoveryWake_, burst ? kDiscoveryBurstTickMs : kReconcileTickMs)
+            : (Sleep(kReconcileTickMs), WAIT_TIMEOUT);
+        if (wait == WAIT_OBJECT_0) {
+            burstUntil = GetTickCount64() + kDiscoveryBurstMs;
+            // Run the first pass now rather than after a full interval.
+            lastDiscovery = 0;
+        }
     }
     RestoreAll(L"restore");
     Stop();
@@ -3810,6 +3944,8 @@ void RendererSession::RunSupervisor() {
 void RendererSession::Stop() noexcept {
     std::scoped_lock stopLock(stopMutex_);
     if (stopping_.exchange(true)) return;
+    RemoveTopLevelShownHook();
+    SetTopLevelShownEvent(nullptr);
     ready_ = false;
     if (shutdownEvent_) SetEvent(shutdownEvent_);
     try { actionCondition_.notify_all(); } catch (...) {}

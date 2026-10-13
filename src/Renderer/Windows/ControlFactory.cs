@@ -30,6 +30,8 @@ internal sealed class ControlFactory
     // The floor for a label fitted into the width the native control committed to.  A
     // menu bar rendered a fraction smaller is readable; one that reads "Favorit" is not.
     private const double MinimumFittedFontSize = 9;
+    // The horizontal padding of a projected toolbar button around its content.
+    private const double ToolbarLabelPadding = 16;
     private static readonly BooleanToVisibilityConverter VisibilityConverter = new();
     private static readonly Win32MnemonicTextConverter MnemonicTextConverter = new();
     private readonly double _scale;
@@ -439,14 +441,13 @@ internal sealed class ControlFactory
                     TextWrapping = TextWrapping.Wrap,
                 });
             }
-            // A task dialog's command link leads with an arrow, or with the shield
-            // when the command needs elevation; the DirectUI lane's has neither.
+            // A command link leads with an arrow, as comctl32 draws one, or with the shield
+            // when the command needs elevation.
             var glyph = viewModel.PresentationVariant switch
             {
                 "commandLinkElevated" => "",
                 "commandLinkNoIcon" => null,
-                _ when string.IsNullOrEmpty(viewModel.AdapterId) => "",
-                _ => null,
+                _ => "",
             };
             control.Content = glyph is null ? content : WithLeadingGlyph(content, glyph, 16, VerticalAlignment.Top);
             control.HorizontalContentAlignment = HorizontalAlignment.Stretch;
@@ -471,6 +472,18 @@ internal sealed class ControlFactory
                 control.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
                 control.BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
             }
+        }
+        else if (viewModel.PresentationVariant == "navigationBack")
+        {
+            // A wizard's Back is the arrow its header draws, not a labelled button; the
+            // label ("上一步(B)") stays the accessible name and becomes the tooltip.
+            var arrow = new FontIcon { Glyph = "", FontSize = 14 };
+            AutomationProperties.SetAccessibilityView(arrow, AccessibilityView.Raw);
+            control.Content = arrow;
+            control.Padding = new Thickness(0);
+            control.Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            control.BorderBrush = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+            ToolTipService.SetToolTip(control, Win32Mnemonic.DisplayText(viewModel.Text));
         }
         else if (!string.IsNullOrEmpty(viewModel.ImageData))
         {
@@ -647,6 +660,7 @@ internal sealed class ControlFactory
             TextWrapping = viewModel.Multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
             IsReadOnly = viewModel.ReadOnly,
         };
+        BindCueBanner(viewModel, text => control.PlaceholderText = text);
         Bind(control, TextBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
         // A retained Value peer can still change a detached control. Remove its
         // two-way source link before that edit can reach the replacement tree.
@@ -780,6 +794,16 @@ internal sealed class ControlFactory
         return control;
     }
 
+    // The grey hint the native box shows while it is empty (its cue banner), kept current.
+    private void BindCueBanner(ControlNodeViewModel viewModel, Action<string> apply)
+    {
+        apply(viewModel.CueBanner);
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName == nameof(viewModel.CueBanner)) apply(viewModel.CueBanner);
+        });
+    }
+
     private PasswordBox CreatePasswordBox(ControlNodeViewModel viewModel)
     {
         var control = new PasswordBox
@@ -789,6 +813,7 @@ internal sealed class ControlFactory
             Padding = new Thickness(4, 0, 4, 0),
             Password = viewModel.DraftText,
         };
+        BindCueBanner(viewModel, text => control.PlaceholderText = text);
         control.PasswordChanged += (_, _) =>
         {
             if (!_lifetime.IsActive) return;
@@ -816,6 +841,7 @@ internal sealed class ControlFactory
             IsEditable = viewModel.Editable,
             Text = viewModel.DraftText,
         };
+        BindCueBanner(viewModel, text => control.PlaceholderText = text);
         control.ApplyNativeFaces(viewModel, _scale);
         Bind(control, ComboBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
         _lifetime.OnDispose(() => control.ClearValue(ComboBox.TextProperty));
@@ -1049,6 +1075,7 @@ internal sealed class ControlFactory
             SelectionMode = SelectionModeFor(viewModel.MultiSelect),
             HorizontalContentAlignment = HorizontalAlignment.Left,
         };
+        ReportFocusEntry(control, viewModel);
         ItemsPanelTemplate? checkedReportPanel = null;
         var positionedPanel = (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
             "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><Canvas/></ItemsPanelTemplate>");
@@ -1072,6 +1099,7 @@ internal sealed class ControlFactory
         FrameworkElement? columnHeader = null;
         var rowHeight = 22.0;
         var windowStart = 0;
+        var endedNativeSession = -1;
         var windowPlaced = false;
         var requestedTop = -1;
         // Rebuilding the items resets a ListView's scroll offset, but the spacers keep
@@ -1325,8 +1353,9 @@ internal sealed class ControlFactory
             var label = viewModel.Items[index];
             var content = new ProjectedItemContent(requested =>
             {
+                var native = EndsNativeSession(index);
                 if (generation != itemPresentationGeneration || _isApplyingCanonical() || !viewModel.EditableLabels || requested.Length == 0 ||
-                    requested == label || !AllowsAction(viewModel, "setItemText")) return;
+                    (requested == label && !native) || !AllowsAction(viewModel, "setItemText")) return;
                 _action(viewModel, "setItemText", new ItemTextActionValue { Index = index, Text = requested });
             }, largeIcon: viewModel.ListViewMode == "largeIcon") { Editable = viewModel.EditableLabels };
             content.Apply(label, icon);
@@ -1441,9 +1470,10 @@ internal sealed class ControlFactory
                 {
                     var item = new ProjectedItemContent(requested =>
                     {
+                        var native = EndsNativeSession(rowIndex);
                         if (generation != itemPresentationGeneration || _isApplyingCanonical() || !viewModel.EditableLabels ||
                             rowIndex < 0 || rowIndex >= viewModel.Rows.Count ||
-                            requested.Length == 0 || requested == cells[0] ||
+                            requested.Length == 0 || (requested == cells[0] && !native) ||
                             !AllowsAction(viewModel, "setItemText")) return;
                         _action(viewModel, "setItemText", new ItemTextActionValue
                         {
@@ -1726,8 +1756,36 @@ internal sealed class ControlFactory
             }
             ApplyCanonicalSelection();
             ApplyCanonicalChecks();
+            ApplyNativeEditSession();
             // The user may have kept scrolling while the window was on its way.
             ScheduleWindowCheck();
+        }
+
+        // A label session the application opened itself (its Rename command, from the menu or
+        // a context menu) is shown as the projected editor on that row; it closes, without
+        // sending anything, when the application ends the session on its own.
+        void ApplyNativeEditSession()
+        {
+            var editing = viewModel.EditingIndex;
+            if (editing != endedNativeSession) endedNativeSession = -1;
+            var local = editing < 0 || editing == endedNativeSession ? -1 : editing - windowStart;
+            for (var index = 0; index < rowContents.Count; ++index)
+                if (index != local && rowContents[index].NativeSession) rowContents[index].AbandonEdit();
+            if (!viewModel.EditableLabels || local < 0 || local >= rowContents.Count ||
+                rowContents[local].IsEditing) return;
+            if (local < control.Items.Count) control.ScrollIntoView(control.Items[local]);
+            rowContents[local].BeginEdit(nativeSession: true);
+        }
+
+        // Whether a row's editor answers the application's own session. Its unchanged label
+        // is then still sent (it ends that session without a rename), and a capture taken
+        // before the answer landed does not open the editor again.
+        bool EndsNativeSession(int local)
+        {
+            var absolute = Absolute(local);
+            if (absolute < 0 || viewModel.EditingIndex != absolute) return false;
+            endedNativeSession = absolute;
+            return true;
         }
 
         control.SelectionChanged += (_, _) =>
@@ -1789,6 +1847,8 @@ internal sealed class ControlFactory
             }
             else if (args.PropertyName == nameof(viewModel.CheckedIndices))
                 ApplyCanonicalChecks();
+            else if (args.PropertyName == nameof(viewModel.EditingIndex))
+                ApplyNativeEditSession();
         });
         // Both pointer presses of a double-click precede DoubleTapped, so they
         // cancel an older gesture without cancelling the new activation. A later
@@ -1975,6 +2035,8 @@ internal sealed class ControlFactory
                 // Set for a text-only button, so the label can be fitted into the width
                 // the native control committed to once that width is known.
                 TextBlock? label = null;
+                // The room an icon beside the label takes from it.
+                var labelInset = 0.0;
                 if (item.Kind == "separator")
                 {
                     element = new SemanticToolbarSeparatorControl();
@@ -1999,6 +2061,28 @@ internal sealed class ControlFactory
                     };
                     var image = face is null ? null : new Image { Source = face, Stretch = Stretch.None };
                     FrameworkElement content = image is not null ? image : label!;
+                    // A list-style toolbar draws the button's own label beside its icon.
+                    if (image is not null && item.LabelBeside == true)
+                    {
+                        label = new TextBlock
+                        {
+                            Text = Win32Mnemonic.DisplayText(item.Text),
+                            FontSize = NativeFontSize,
+                            VerticalAlignment = VerticalAlignment.Center,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            TextWrapping = TextWrapping.NoWrap,
+                        };
+                        var beside = new StackPanel
+                        {
+                            Orientation = Orientation.Horizontal,
+                            Spacing = 4,
+                            VerticalAlignment = VerticalAlignment.Center,
+                        };
+                        beside.Children.Add(image);
+                        beside.Children.Add(label);
+                        content = beside;
+                        labelInset = (item.ImageWidth ?? 0) * _scale + beside.Spacing + ToolbarLabelPadding;
+                    }
                     if (item.DropDown == true)
                     {
                         // The button carries an arrow that asks its owner for a menu, so the
@@ -2121,7 +2205,7 @@ internal sealed class ControlFactory
                 Canvas.SetTop(element, item.Rect.Y * _scale);
                 element.Width = item.Rect.Width * _scale;
                 element.Height = item.Rect.Height * _scale;
-                if (label is not null) FitLabelToWidth(label, element.Width);
+                if (label is not null) FitLabelToWidth(label, element.Width - labelInset);
                 control.AddItem(element);
             }
         }
@@ -2412,6 +2496,7 @@ internal sealed class ControlFactory
     // raises TVN_ITEMEXPANDING.
     private SemanticTreeViewControl CreateTreeView(ControlNodeViewModel viewModel)
     {
+        var endedNativeSession = -1;
         var control = new SemanticTreeViewControl(
             index =>
             {
@@ -2434,9 +2519,12 @@ internal sealed class ControlFactory
             },
             (index, text) =>
             {
+                // The answer to the application's own session (see the list's).
+                var native = index >= 0 && viewModel.EditingIndex == index;
+                if (native) endedNativeSession = index;
                 if (_isApplyingCanonical() || !viewModel.EditableLabels ||
                     index < 0 || index >= viewModel.Items.Count ||
-                    text.Length == 0 || text == viewModel.Items[index] ||
+                    text.Length == 0 || (text == viewModel.Items[index] && !native) ||
                     !AllowsAction(viewModel, "setItemText")) return;
                 _action(viewModel, "setItemText", new ItemTextActionValue
                 {
@@ -2444,6 +2532,8 @@ internal sealed class ControlFactory
                     Text = text,
                 });
             });
+
+        ReportFocusEntry(control, viewModel);
 
         void Rebuild()
         {
@@ -2454,6 +2544,14 @@ internal sealed class ControlFactory
                 ItemIcons(viewModel, viewModel.Items.Count, viewModel.SelectedIndex),
                 StateIcons(viewModel, viewModel.Items.Count),
                 viewModel.SelectedIndex);
+            ApplyNativeEditSession();
+        }
+
+        void ApplyNativeEditSession()
+        {
+            var editing = viewModel.EditingIndex;
+            if (editing != endedNativeSession) endedNativeSession = -1;
+            control.ApplyNativeEditSession(editing == endedNativeSession ? -1 : editing);
         }
         control.Tree.ContextRequested += (_, args) =>
         {
@@ -2522,6 +2620,8 @@ internal sealed class ControlFactory
                     control.ApplyIcons(ItemIcons(
                         viewModel, viewModel.Items.Count, viewModel.SelectedIndex));
             }
+            else if (args.PropertyName == nameof(viewModel.EditingIndex))
+                ApplyNativeEditSession();
         });
         return control;
     }
@@ -2585,8 +2685,16 @@ internal sealed class ControlFactory
     // A container's own painted band, reproduced from the pixels the native window
     // drew.  The projection cannot re-render what it never parsed, so it publishes
     // exactly those pixels rather than approximating the band.
-    internal static WriteableBitmap BitmapForChromeRegion(ChromeRegion region) =>
-        BitmapFromBase64(region.ImageWidth, region.ImageHeight, region.ImageFormat, region.ImageData);
+    // In dark mode a light band is redrawn on the theme's side of the scale (see
+    // ChromeThemeAdaptation): a white header over a dark window read as a hole in it.
+    internal static WriteableBitmap BitmapForChromeRegion(ChromeRegion region, bool dark = false)
+    {
+        if (region.ImageFormat != "bgra8-premultiplied")
+            throw new InvalidOperationException("Validated pixel metadata is unavailable.");
+        var pixels = Convert.FromBase64String(region.ImageData);
+        if (dark) ChromeThemeAdaptation.AdaptToDark(pixels, region.ImageWidth);
+        return BitmapFromPixels(region.ImageWidth, region.ImageHeight, pixels);
+    }
 
     // A trackbar is projected as a stock Slider: integer steps, no invented ticks,
     // and no thumb tooltip, because the adapter captures a position and a range and
@@ -2803,6 +2911,37 @@ internal sealed class ControlFactory
 
     internal static bool ShouldRenderListViewHeader(ControlNodeViewModel viewModel) =>
         viewModel.ListViewMode == "report" && viewModel.ColumnHeadersVisible;
+
+    // The user moving the keyboard focus into a projected list or tree is, natively, the click
+    // (or Tab) that focuses that control.  The Bridge moves the thread's focus there as well,
+    // because the application's menu commands act on the pane that holds it: regedit's Rename
+    // and Delete otherwise reached the tree's key while the user worked in the list of values.
+    // It is sent once per visit: the first focus the user gives the control (the window's own
+    // first focus, or a restore after a rebuild, is programmatic and may already be inside it),
+    // and again only after the focus has left it.
+    private void ReportFocusEntry(UIElement control, ControlNodeViewModel viewModel)
+    {
+        var reported = false;
+        control.GettingFocus += (_, args) =>
+        {
+            if (reported || !_lifetime.IsActive || _isApplyingCanonical() ||
+                args.FocusState is not (FocusState.Pointer or FocusState.Keyboard) ||
+                !AllowsAction(viewModel, "focus")) return;
+            reported = true;
+            _action(viewModel, "focus", null);
+        };
+        control.LosingFocus += (_, args) =>
+        {
+            if (!IsWithin(args.NewFocusedElement, control)) reported = false;
+        };
+    }
+
+    private static bool IsWithin(DependencyObject? element, DependencyObject container)
+    {
+        for (var current = element; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (ReferenceEquals(current, container)) return true;
+        return false;
+    }
 
     private static bool IsListItemEditor(DependencyObject? source, DependencyObject boundary)
     {
@@ -3761,6 +3900,11 @@ internal sealed class ProjectedItemContent : Grid
     public string Text { get; private set; } = string.Empty;
     public bool IsEditing => _editor is not null;
 
+    // The open editor stands for a label session the application opened itself (its own
+    // Rename command), so ending it always answers that session: a new label renames, and
+    // the unchanged one ends the session without a rename.
+    public bool NativeSession { get; private set; }
+
     // Whether the native control admits in-place renaming.  It gates both the F2
     // gesture and the UIA Value pattern, which is how assistive technology renames
     // an item natively.
@@ -3798,9 +3942,14 @@ internal sealed class ProjectedItemContent : Grid
     // Opens the projected editor.  Nothing native happens yet: the native control's
     // own label session runs once, at commit, so a projected edit never depends on
     // the cloaked window keeping keyboard focus while the user types.
-    public void BeginEdit()
+    public void BeginEdit(bool nativeSession = false)
     {
-        if (_editor is not null) return;
+        if (_editor is not null)
+        {
+            NativeSession |= nativeSession;
+            return;
+        }
+        NativeSession = nativeSession;
         _editor = new TextBox
         {
             Text = Text,
@@ -3837,12 +3986,24 @@ internal sealed class ProjectedItemContent : Grid
     {
         if (_editor is not { } editor) return;
         var requested = editor.Text;
+        var native = NativeSession;
+        CloseEditor(editor);
+        if (ItemLabelEdit.Answer(requested, Text, commit, native) is { } label) _commit(label);
+    }
+
+    // The application ended its own session (the label committed or was cancelled natively):
+    // the projected editor closes and sends nothing.
+    public void AbandonEdit()
+    {
+        if (_editor is { } editor) CloseEditor(editor);
+    }
+
+    private void CloseEditor(TextBox editor)
+    {
         _editor = null;
+        NativeSession = false;
         Children.Remove(editor);
         _label.Visibility = Visibility.Visible;
-        // An empty label is how native in-place editing signals a cancel, so it is
-        // never sent as a rename.
-        if (commit && requested.Length != 0 && requested != Text) _commit(requested);
     }
 
     // The UIA rename path: assistive technology sets an item's value rather than
@@ -3855,6 +4016,19 @@ internal sealed class ProjectedItemContent : Grid
 
     protected override AutomationPeer OnCreateAutomationPeer() =>
         new ProjectedItemContentAutomationPeer(this);
+}
+
+internal static class ItemLabelEdit
+{
+    // The label a closing editor sends, or null when it sends nothing.  An empty label is how
+    // native in-place editing signals a cancel, so it is never sent as a rename.  An editor that
+    // answers the application's own session always sends: its unchanged label ends that session
+    // without a rename.
+    public static string? Answer(string requested, string current, bool commit, bool nativeSession)
+    {
+        var renamed = commit && requested.Length != 0 && requested != current;
+        return renamed ? requested : nativeSession ? current : null;
+    }
 }
 
 internal sealed class ProjectedItemContentAutomationPeer(ProjectedItemContent owner) :
@@ -4073,6 +4247,17 @@ internal sealed class SemanticTreeViewControl : ContentControl
         return true;
     }
 
+    // The application's own label session on an item (-1: none): its projected editor opens,
+    // and closes without a rename once the application has ended the session itself.
+    public void ApplyNativeEditSession(int editingIndex)
+    {
+        for (var index = 0; index < _contents.Count; ++index)
+            if (index != editingIndex && _contents[index].NativeSession) _contents[index].AbandonEdit();
+        if (!EditableLabels || editingIndex < 0 || editingIndex >= _contents.Count ||
+            _contents[editingIndex].IsEditing) return;
+        _contents[editingIndex].BeginEdit(nativeSession: true);
+    }
+
     public void ApplyStateIcons(IReadOnlyList<ImageSource?> icons)
     {
         for (var index = 0; index < _contents.Count && index < icons.Count; ++index)
@@ -4251,6 +4436,10 @@ internal sealed class SemanticPaneContainer : Canvas, ISemanticContainer
         // factory has built them.
         SizeChanged += (_, _) => ApplyExtents();
         PointerWheelChanged += OnPointerWheelChanged;
+        ActualThemeChanged += (_, _) =>
+        {
+            if (_chromeRegions is { } regions) ApplyChrome(regions, _chromeScale);
+        };
     }
 
     UIElementCollection ISemanticContainer.Children => _content.Children;
@@ -4402,8 +4591,14 @@ internal sealed class SemanticPaneContainer : Canvas, ISemanticContainer
 
     // The bands the container paints itself.  They sit behind the panes and behind the
     // splitters, which is where the native window drew them.
+    private IReadOnlyList<ChromeRegion>? _chromeRegions;
+    private double _chromeScale = 1;
+
     public void ApplyChrome(IReadOnlyList<ChromeRegion> regions, double scale)
     {
+        _chromeRegions = regions;
+        _chromeScale = scale;
+        var dark = ActualTheme == ElementTheme.Dark;
         while (_chrome.Count > regions.Count)
         {
             var extra = _chrome[^1];
@@ -4421,7 +4616,7 @@ internal sealed class SemanticPaneContainer : Canvas, ISemanticContainer
             }
             var region = regions[index];
             var image = _chrome[index];
-            image.Source = ControlFactory.BitmapForChromeRegion(region);
+            image.Source = ControlFactory.BitmapForChromeRegion(region, dark);
             image.Width = Math.Max(0, region.Rect.Width * scale);
             image.Height = Math.Max(0, region.Rect.Height * scale);
             Canvas.SetLeft(image, region.Rect.X * scale);
@@ -4472,6 +4667,12 @@ internal sealed class SemanticAccessibleIsland : Canvas
         // A Canvas with no Background renders no visual at all, which collapses its UIA
         // bounding rectangle onto the union of its children.
         Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        // The elements keep the native positions from the top-left corner.  A content
+        // shorter than the viewport would otherwise be centred in it (an element with an
+        // explicit height in a stretching slot), which dropped a folded Actions pane's two
+        // section headers to the middle of the pane.
+        _items.HorizontalAlignment = HorizontalAlignment.Left;
+        _items.VerticalAlignment = VerticalAlignment.Top;
         _viewport = new ScrollViewer
         {
             Content = _items,
@@ -4573,10 +4774,13 @@ internal sealed class SemanticAccessibleIsland : Canvas
             TextTrimming = TextTrimming.CharacterEllipsis,
         };
         FrameworkElement content = label;
-        if (item.DropDown)
+        if (item.Expanded is not null) label.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
+        if (item.DropDown || item.Expanded is not null)
         {
             // The element completes by opening a menu of its own, so the projection draws
-            // the same affordance rather than promising an in-place result.
+            // the same affordance rather than promising an in-place result.  A section
+            // header draws the fold it toggles instead: up while its rows show, down while
+            // they are folded, as the native header does.
             var row = new Grid();
             row.ColumnDefinitions.Add(
                 new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -4584,7 +4788,12 @@ internal sealed class SemanticAccessibleIsland : Canvas
             Grid.SetColumn(label, 0);
             var chevron = new FontIcon
             {
-                Glyph = "\uE76C",
+                Glyph = item.Expanded switch
+                {
+                    true => "\uE70E",
+                    false => "\uE70D",
+                    null => "\uE76C",
+                },
                 FontSize = 10,
                 Margin = new Thickness(8, 0, 0, 0),
                 VerticalAlignment = VerticalAlignment.Center,
@@ -4617,6 +4826,8 @@ internal sealed class SemanticAccessibleIsland : Canvas
             MinWidth = 0,
             MinHeight = 0,
         };
+        if (item.Expanded is { } expanded)
+            AutomationProperties.SetItemStatus(button, expanded ? "Expanded" : "Collapsed");
         button.Click += (_, _) => _invoked(index);
         return button;
     }

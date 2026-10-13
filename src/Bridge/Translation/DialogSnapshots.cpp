@@ -434,6 +434,8 @@ WindowSnapshot BuildMessageBoxSnapshot(
     // A lone OK closes on Escape too, as the native message box does.
     snapshot.canCancel = ids.size() == 1 ||
         std::find(ids.begin(), ids.end(), IDCANCEL) != ids.end();
+    // user32 greys the close button of a box it cannot cancel (Yes/No, Abort/Retry/Ignore).
+    snapshot.canClose = snapshot.canCancel;
 
     const DialogTextMeasure measure(dpi);
     const RECT work = WorkAreaFor(owner);
@@ -649,6 +651,7 @@ WindowSnapshot BuildTaskDialogSnapshot(
     }
     InitializeDialogSnapshot(snapshot, SurfaceKind::TaskDialog, owner, model.title, fallbackTitle, dpi);
     snapshot.canCancel = model.canCancel;
+    snapshot.canClose = model.canCancel;
     snapshot.rtl = model.rtl;
     if (model.minimizable) snapshot.windowStyle |= WS_MINIMIZEBOX;
     snapshot.icon = model.mainIcon.image.Empty() ? model.mainIcon.standard : L"none";
