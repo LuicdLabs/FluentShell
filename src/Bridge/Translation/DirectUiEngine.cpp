@@ -263,6 +263,18 @@ bool SameOwnerDrawCombo(const std::optional<OwnerDrawComboSnapshot>& left,
     return true;
 }
 
+bool SameOwnerDrawList(const std::optional<OwnerDrawListSnapshot>& left,
+    const std::optional<OwnerDrawListSnapshot>& right) noexcept {
+    if (left.has_value() != right.has_value()) return false;
+    if (!left) return true;
+    if (left->mode != right->mode || left->items.size() != right->items.size()) return false;
+    for (size_t index = 0; index < left->items.size(); ++index) {
+        if (!SameImageEntry(left->items[index].normal, right->items[index].normal) ||
+            !SameImageEntry(left->items[index].selected, right->items[index].selected)) return false;
+    }
+    return true;
+}
+
 bool SameGroupShape(const ControlNode& left, const ControlNode& right) noexcept {
     if (left.groupViewEnabled != right.groupViewEnabled ||
         left.listViewGroups.size() != right.listViewGroups.size() ||
@@ -969,11 +981,14 @@ bool IsRootNonClientChrome(const DirectUiSemanticEvidence& semantic) {
     if (semantic.controlType == UIA_MenuBarControlTypeId &&
         semantic.semanticKey == L"SystemMenuBar" && !semantic.actionable)
         return true;
+    // A maximized window's caption buttons carry the same names with a "-Restore" suffix
+    // (Display Color Calibration runs maximized: "Minimize-Restore").
+    std::wstring_view caption = semantic.semanticKey;
+    if (caption.ends_with(L"-Restore")) caption.remove_suffix(std::size(L"-Restore") - 1);
     if (semantic.controlType == UIA_ButtonControlTypeId && !semantic.focusable &&
         semantic.actionable &&
-        (semantic.semanticKey == L"Close" || semantic.semanticKey == L"Minimize" ||
-            semantic.semanticKey == L"Maximize" || semantic.semanticKey == L"Restore" ||
-            semantic.semanticKey == L"Help"))
+        (caption == L"Close" || caption == L"Minimize" || caption == L"Maximize" ||
+            caption == L"Restore" || caption == L"Help"))
         return true;
     // System menu items are MenuItems parented under SystemMenuBar and always
     // sit outside the DirectUI host bounds.
@@ -1038,7 +1053,9 @@ bool CaptureUia(
         return Fail(error, L"UIA descendant enumeration failed");
     int count = 0;
     if (FAILED(descendants->get_Length(&count)) || count < 1 || count > kMaxUiaDescendants)
-        return Fail(error, L"UIA descendant count is outside the exact bound");
+        return Fail(error, L"UIA descendant count is outside the exact bound (" + std::to_wstring(count) + L")");
+    // The SysLinks whose link the walk below folded into the control (see there).
+    std::vector<HWND> linkHosts;
     for (int index = 0; index < count; ++index) {
         ComPtr<IUIAutomationElement> element;
         if (FAILED(descendants->GetElement(index, &element)) || !element)
@@ -1076,6 +1093,27 @@ bool CaptureUia(
             if (!semantic.imageHostHwnd)
                 return Fail(error, L"UIA image native ancestry exceeds the bound");
         }
+        // Win32's SysLink provider publishes the control as a pane whose child is its link, an
+        // element with no window of its own (Display Color Calibration's "How do I calibrate my
+        // display?").  The link is the control's semantic: it takes the SysLink as its backing,
+        // and the pane, which stands for the same control, is dropped once the walk is done.
+        if (semantic.controlType == UIA_HyperlinkControlTypeId && !semantic.backingHwnd &&
+            !semantic.offscreen) {
+            ComPtr<IUIAutomationElement> parent;
+            UIA_HWND host = nullptr;
+            int parentPid = 0;
+            wchar_t hostClass[16]{};
+            if (SUCCEEDED(rawWalker->GetParentElement(element.Get(), &parent)) && parent &&
+                SUCCEEDED(parent->get_CurrentNativeWindowHandle(&host)) && host &&
+                SUCCEEDED(parent->get_CurrentProcessId(&parentPid)) &&
+                parentPid == static_cast<int>(processId) &&
+                GetClassNameW(reinterpret_cast<HWND>(host), hostClass,
+                    static_cast<int>(std::size(hostClass))) &&
+                FluentShell::EqualsIgnoreCase(hostClass, L"SysLink")) {
+                semantic.backingHwnd = reinterpret_cast<HWND>(host);
+                linkHosts.push_back(semantic.backingHwnd);
+            }
+        }
         const bool actionable = semantic.actionable || semantic.focusable ||
             semantic.controlType == UIA_ButtonControlTypeId ||
             semantic.controlType == UIA_HyperlinkControlTypeId ||
@@ -1091,6 +1129,10 @@ bool CaptureUia(
             !IsRootNonClientChrome(semantic))
             evidence.semantics.push_back(std::move(semantic));
     }
+    std::erase_if(evidence.semantics, [&](const DirectUiSemanticEvidence& value) {
+        return value.controlType == UIA_PaneControlTypeId &&
+            std::find(linkHosts.begin(), linkHosts.end(), value.backingHwnd) != linkHosts.end();
+    });
     return true;
 }
 
@@ -1257,6 +1299,7 @@ bool ApplyDirectUiDetailToNode(
         node.items = detail.items;
         node.selectedIndex = detail.selectedIndex;
         node.ownerDrawCombo = detail.ownerDrawCombo;
+        node.ownerDrawList = detail.ownerDrawList;
         node.editable = detail.editable;
         node.readOnly = detail.readOnly;
         break;
@@ -1463,7 +1506,8 @@ bool BuildGenericSemanticProfile(
     std::wstring& error) {
     if (uia.semantics.empty() ||
         uia.semantics.size() > static_cast<size_t>(kMaxUiaDescendants))
-        return Fail(error, L"generic U: semantic count is outside the capability bound");
+        return Fail(error, L"generic U: semantic count is outside the capability bound (" +
+            std::to_wstring(uia.semantics.size()) + L")");
     auto result = std::make_shared<DirectUiOwnedProfile>();
     const auto own = [&](std::wstring value) -> std::wstring_view {
         result->strings.push_back(std::move(value));
@@ -2551,6 +2595,8 @@ bool SameDirectUiDetailShape(
         a.columns == b.columns && a.columnWidths == b.columnWidths &&
         a.ownerDrawCombo.has_value() == b.ownerDrawCombo.has_value() &&
         (!a.ownerDrawCombo || a.ownerDrawCombo->mode == b.ownerDrawCombo->mode) &&
+        a.ownerDrawList.has_value() == b.ownerDrawList.has_value() &&
+        (!a.ownerDrawList || a.ownerDrawList->mode == b.ownerDrawList->mode) &&
         SameGroupShape(a, b);
 }
 
@@ -2583,6 +2629,7 @@ bool SameDirectUiDetailContent(
         a.imageWidth == b.imageWidth && a.imageHeight == b.imageHeight &&
         a.imageFormat == b.imageFormat && a.imageData == b.imageData &&
         SameOwnerDrawCombo(a.ownerDrawCombo, b.ownerDrawCombo) &&
+        SameOwnerDrawList(a.ownerDrawList, b.ownerDrawList) &&
         SameGroupContent(a.listViewGroups, b.listViewGroups) &&
         SameToolbarItems(a.toolbarItems, b.toolbarItems);
 }
@@ -3065,7 +3112,11 @@ bool MatchDirectUiEvidence(
         const bool automationIdMatches = slot.uiaAutomationId.empty() ||
             byBacking->semanticKey == slot.uiaAutomationId;
         const bool expectedBacking = backingSeen.insert(backing.hwnd).second;
-        const bool geometryMatches = RectNear(byBacking->bounds, backing.bounds);
+        // A SysLink's semantic is its link (see CaptureUia), which covers the link's text
+        // inside the control rather than the whole window.
+        const bool geometryMatches = slot.kind == ControlKind::SysLink
+            ? Inside(byBacking->bounds, backing.bounds)
+            : RectNear(byBacking->bounds, backing.bounds);
         // Kinds whose window text is content rather than a label: the provider's
         // name comes from an associated static or is absent entirely, so holding
         // the two to each other would reject every legitimate surface.

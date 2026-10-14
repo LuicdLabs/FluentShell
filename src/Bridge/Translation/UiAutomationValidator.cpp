@@ -339,6 +339,21 @@ bool CollectCachedElements(
     return true;
 }
 
+// A name without the invisible marks that only steer layout -- direction and zero-width
+// marks.  Windows puts one after the time it formats (the Date and Time clock names itself
+// with it), and the projected element does not carry it, so names are compared without them.
+std::wstring WithoutInvisibleMarks(std::wstring_view value) {
+    std::wstring result;
+    result.reserve(value.size());
+    for (const wchar_t character : value) {
+        const bool invisible = character == 0x061C || (character >= 0x200B && character <= 0x200F) ||
+            (character >= 0x202A && character <= 0x202E) || (character >= 0x2060 && character <= 0x2064) ||
+            (character >= 0x2066 && character <= 0x2069) || character == 0xFEFF;
+        if (!invisible) result.push_back(character);
+    }
+    return result;
+}
+
 std::wstring DisplayText(std::wstring_view value) {
     std::wstring result;
     result.reserve(value.size());
@@ -389,7 +404,9 @@ int ExpectedControlType(const ControlNode& node) noexcept {
     case ControlKind::StaticIcon:
     case ControlKind::StaticBitmap: return UIA_ImageControlTypeId;
     case ControlKind::Separator: return UIA_SeparatorControlTypeId;
-    case ControlKind::Button: return UIA_ButtonControlTypeId;
+    // A split button is one, natively and projected (its arrow is part of it).
+    case ControlKind::Button:
+        return node.presentationVariant == L"splitButton" ? UIA_SplitButtonControlTypeId : UIA_ButtonControlTypeId;
     case ControlKind::CheckBox:
     case ControlKind::ThreeState: return UIA_CheckBoxControlTypeId;
     case ControlKind::RadioButton: return UIA_RadioButtonControlTypeId;
@@ -632,7 +649,9 @@ bool ValidateListViewSelectionCapability(
     return true;
 }
 
-bool ValidateListViewCheckboxes(
+// A ListView's LVS_EX_CHECKBOXES rows and a TVS_CHECKBOXES tree's items: one check box per
+// realized item, named by its index, in the native state.
+bool ValidateItemCheckboxes(
     IUIAutomation* automation,
     IUIAutomationElement* element,
     const ControlNode& node,
@@ -652,7 +671,9 @@ bool ValidateListViewCheckboxes(
     int length = 0;
     if (FAILED(findResult) || !matches || FAILED(matches->get_Length(&length)))
         return FailHr(error, L"ListView checkbox enumeration failed", findResult);
-    const int rowCount = static_cast<int>(ListViewItemCount(node));
+    // A tree realizes only the items its open branches show, so every item is an upper bound.
+    const int rowCount = static_cast<int>(node.kind == ControlKind::TreeView
+        ? node.items.size() : ListViewItemCount(node));
     const int exposedRows = node.groupViewEnabled
         ? static_cast<int>(std::count_if(node.itemRects.begin(), node.itemRects.end(), [](const RECT& rect) {
             return !IsRectEmpty(&rect);
@@ -1284,6 +1305,7 @@ bool ValidateOnMta(
         // XAML names an unlabeled text field after its placeholder, which is the cue banner.
         const auto nameMatches = [&](const std::wstring& name) {
             return name == expectedName ||
+                WithoutInvisibleMarks(name) == WithoutInvisibleMarks(expectedName) ||
                 (expectedName.empty() && !node.cueBanner.empty() && name == node.cueBanner);
         };
         const RECT* parentVisibleBounds = nullptr;
@@ -1414,8 +1436,8 @@ bool ValidateOnMta(
             !ValidateListViewSelectionCapability(matched.element.Get(), node, error)) return false;
         if ((node.kind == ControlKind::Slider || node.kind == ControlKind::UpDown) &&
             !ValidateSliderRangeValue(matched.element.Get(), node, error)) return false;
-        if (node.kind == ControlKind::ListView &&
-            !ValidateListViewCheckboxes(
+        if ((node.kind == ControlKind::ListView || node.kind == ControlKind::TreeView) &&
+            !ValidateItemCheckboxes(
                 automation.Get(), matched.element.Get(), node, error)) return false;
         if ((node.kind == ControlKind::TabControl || IsAccessibleTabList(node)) &&
             !ValidateTabControlItems(
@@ -1439,14 +1461,35 @@ bool ValidateOnMta(
                 return Fail(error, L"focusable native control has no dialog-manager tab index");
         }
     }
+    // A projected SysLink's links are hyperlinks inside its element with no node identity of their
+    // own; ValidateSysLinkDescendant already held each one to a link label of that node.
+    const auto isSysLinkHyperlink = [&](const ElementInfo& candidate) {
+        if (candidate.controlType != UIA_HyperlinkControlTypeId) return false;
+        return std::any_of(snapshot.nodes.begin(), snapshot.nodes.end(), [&](const ControlNode& node) {
+            if (node.kind != ControlKind::SysLink ||
+                std::none_of(node.items.begin(), node.items.end(),
+                    [&](const std::wstring& label) { return DisplayText(label) == candidate.name; }))
+                return false;
+            const auto hostId = L"FluentShell.Node." + std::to_wstring(node.nodeId) +
+                L"." + std::to_wstring(node.generation);
+            return std::any_of(elements.begin(), elements.end(), [&](const ElementInfo& host) {
+                RECT inside{};
+                return host.automationId == hostId &&
+                    IntersectRect(&inside, &host.bounds, &candidate.bounds) &&
+                    EqualRect(&inside, &candidate.bounds);
+            });
+        });
+    };
     for (const auto& element : elements) {
         if (element.automationId.starts_with(L"FluentShell.Node.") &&
             !expectedAutomationIds.contains(element.automationId))
             return Fail(error, L"proxy UIA tree contains an unexpected FluentShell node");
         if (!snapshot.adapterId.empty() &&
             (element.actionable || element.isKeyboardFocusable) &&
-            !expectedAutomationIds.contains(element.automationId))
-            return Fail(error, L"application-adapter proxy contains an unexpected actionable element");
+            !expectedAutomationIds.contains(element.automationId) && !isSysLinkHyperlink(element))
+            return Fail(error, L"application-adapter proxy contains an unexpected actionable element (type=" +
+                std::to_wstring(element.controlType) + L", name=" + element.name +
+                L", id=" + element.automationId + L")");
     }
 
     const auto findMenuElement = [&](std::wstring_view automationId,

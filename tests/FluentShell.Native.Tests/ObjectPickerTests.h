@@ -27,8 +27,14 @@ void TestObjectPickerControls() {
         { 10, 36, 360, 60 }, 214);
     const HWND grip = child(L"ScrollBar", L"", SBS_SIZEGRIP | SBS_SIZEBOXBOTTOMRIGHTALIGN,
         { 380, 150, 17, 17 }, 207);
-    Check(dialog.window && link && names && grip, "object picker fixture could not create its controls");
-    if (!dialog.window || !link || !names || !grip) return;
+    // A link control with no link in it is a label (Computer Name Changes' explanation).
+    const HWND label = child(WC_LINK, L"Changes might affect access to network resources.", 0,
+        { 10, 100, 360, 20 }, 1017);
+    // A link whose label also occurs earlier in its text (User Profiles) carries where the link starts.
+    const HWND repeated = child(WC_LINK, L"Open user accounts in <A>user accounts</A>.", WS_TABSTOP,
+        { 10, 124, 360, 20 }, 1006);
+    Check(dialog.window && link && names && grip && label && repeated, "object picker fixture could not create its controls");
+    if (!dialog.window || !link || !names || !grip || !label || !repeated) return;
     ShowWindow(dialog.window, SW_SHOWNOACTIVATE);
 
     const auto capture = [&](Translation::WindowSnapshot& snapshot, std::wstring& error) {
@@ -54,6 +60,16 @@ void TestObjectPickerControls() {
           linkNode->text == L"Enter the object name (examples)(E):" &&
           linkNode->items == std::vector<std::wstring>{ L"examples" },
         "the link's surrounding mnemonic text was not carried as the text it shows");
+    const auto* repeatedNode = nodeFor(snapshot, 1006);
+    Check(repeatedNode && repeatedNode->kind == Translation::ControlKind::SysLink &&
+          repeatedNode->text == L"Open user accounts in user accounts." &&
+          repeatedNode->items == std::vector<std::wstring>{ L"user accounts" } &&
+          repeatedNode->linkStarts == std::vector<int>{ 22 } && linkNode && linkNode->linkStarts.empty(),
+        "a link whose label repeats in its text did not carry where the link starts");
+    const auto* labelNode = nodeFor(snapshot, 1017);
+    Check(labelNode && labelNode->kind == Translation::ControlKind::StaticText &&
+          labelNode->text == L"Changes might affect access to network resources.",
+        "a link control with no link was not carried as the label it is");
     const auto* namesNode = nodeFor(snapshot, 214);
     Check(namesNode && namesNode->kind == Translation::ControlKind::Edit && !namesNode->readOnly &&
           namesNode->multiline,

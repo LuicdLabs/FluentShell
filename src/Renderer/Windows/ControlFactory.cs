@@ -75,7 +75,8 @@ internal sealed class ControlFactory
             "timePicker" => CreateTimePicker(viewModel),
             "staticDecoration" => CreateStaticDecoration(viewModel),
             "separator" => new Border { Height = 1, Background = new SolidColorBrush(Microsoft.UI.Colors.Gray) },
-            "button" => CreateButton(viewModel),
+            "button" => viewModel.PresentationVariant == "splitButton"
+                ? CreateSplitButton(viewModel) : CreateButton(viewModel),
             "checkBox" => CreateCheckBox(viewModel, false),
             "threeState" => CreateCheckBox(viewModel, true),
             "radioButton" => viewModel.PresentationVariant == "bitmapSwitch"
@@ -129,6 +130,7 @@ internal sealed class ControlFactory
             });
         }
         ApplyBounds(element, viewModel);
+        if (viewModel.Kind is "listView" or "listBox" or "treeView") ApplyNativeFrame(element, viewModel);
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.TabStop) or nameof(viewModel.TabIndex))
@@ -208,6 +210,48 @@ internal sealed class ControlFactory
         });
         return surface;
     }
+
+    private const ulong WsBorder = 0x00800000, WsExClientEdge = 0x00000200, WsExStaticEdge = 0x00020000;
+
+    // A native list, tree or list box with WS_EX_CLIENTEDGE (or the thinner WS_EX_STATICEDGE, or
+    // WS_BORDER) sits in a sunken box that shows where the list is even while it is empty
+    // (Performance Options' DEP list, the Visual Effects list).  The projection draws that box as a
+    // card: a lifted fill inside a quiet stroke, both from the theme.
+    internal static bool HasNativeFrame(ulong style, ulong exStyle) =>
+        (style & WsBorder) != 0 || (exStyle & (WsExClientEdge | WsExStaticEdge)) != 0;
+
+    private void ApplyNativeFrame(FrameworkElement element, ControlNodeViewModel viewModel)
+    {
+        if ((element is SemanticTreeViewControl tree ? tree.Tree : element as Control) is not { } target) return;
+        var (background, stroke, thickness, corner) =
+            (target.Background, target.BorderBrush, target.BorderThickness, target.CornerRadius);
+        void Apply()
+        {
+            if (!HasNativeFrame(viewModel.Style, viewModel.ExStyle))
+            {
+                (target.Background, target.BorderBrush, target.BorderThickness, target.CornerRadius) =
+                    (background, stroke, thickness, corner);
+                return;
+            }
+            target.Background = ThemeResourceBrush("CardBackgroundFillColorDefaultBrush",
+                global::Windows.UI.Color.FromArgb(0x0D, 0xFF, 0xFF, 0xFF));
+            target.BorderBrush = ThemeResourceBrush("CardStrokeColorDefaultBrush",
+                global::Windows.UI.Color.FromArgb(0x19, 0x80, 0x80, 0x80));
+            target.BorderThickness = new Thickness(1);
+            target.CornerRadius = new CornerRadius(4);
+        }
+        Apply();
+        element.ActualThemeChanged += (_, _) => Apply();
+        _lifetime.Subscribe(viewModel, (_, args) =>
+        {
+            if (args.PropertyName is nameof(viewModel.Style) or nameof(viewModel.ExStyle)) Apply();
+        });
+    }
+
+    private static Brush ThemeResourceBrush(string key, global::Windows.UI.Color fallback) =>
+        Application.Current?.Resources is { } resources &&
+        resources.TryGetValue(key, out var value) && value is Brush brush
+            ? brush : new SolidColorBrush(fallback);
 
     private static Brush StaticDecorationBrush(StaticDecorationTone tone)
     {
@@ -320,9 +364,15 @@ internal sealed class ControlFactory
             if (args.PropertyName == nameof(viewModel.ImageData)) ApplyPixels();
         });
         AutomationProperties.SetAccessibilityView(image, AccessibilityView.Raw);
+        // A transparent face over the whole control gives it bounds of its own: without one XAML
+        // reports the picture's, and an icon centred in a larger Static (Mouse Properties) was
+        // reported where the icon is rather than where the control is.
+        var face = new Grid { Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent) };
+        face.Children.Add(image);
+        AutomationProperties.SetAccessibilityView(face, AccessibilityView.Raw);
         return new SemanticStaticIconControl
         {
-            Content = image,
+            Content = face,
             MinWidth = 0,
             MinHeight = 0,
             Padding = new Thickness(0),
@@ -516,6 +566,53 @@ internal sealed class ControlFactory
         return control;
     }
 
+    // A split button (BS_SPLITBUTTON, the Sound applet's Set Default): its face invokes the
+    // command, and its arrow asks the application for its menu (BCN_DROPDOWN), which comes back
+    // as a native popup anchored under the button.
+    private SplitButton CreateSplitButton(ControlNodeViewModel viewModel)
+    {
+        var control = new SplitButton
+        {
+            FontSize = NativeFontSize,
+            MinWidth = 0,
+            MinHeight = 0,
+            Padding = new Thickness(4, 0, 4, 0),
+        };
+        Bind(control, ContentControl.ContentProperty, nameof(viewModel.Text), BindingMode.OneWay, MnemonicTextConverter);
+        control.Click += (_, _) =>
+        {
+            if (!_isApplyingCanonical() && AllowsAction(viewModel, "invoke")) _action(viewModel, "invoke", null);
+        };
+        // The arrow opens no flyout of its own (the control has none): its click is reported, and
+        // the menu the native owner tracks in answer arrives as the window's popup.
+        Button? arrow = null;
+        void OnArrowClick(object sender, RoutedEventArgs args)
+        {
+            if (!_isApplyingCanonical() && AllowsAction(viewModel, "splitDropDown"))
+                _action(viewModel, "splitDropDown", null);
+        }
+        control.Loaded += (_, _) =>
+        {
+            if (arrow is not null || FindTemplatePart<Button>(control, "SecondaryButton") is not { } part) return;
+            arrow = part;
+            arrow.Click += OnArrowClick;
+        };
+        _lifetime.OnDispose(() => { if (arrow is not null) arrow.Click -= OnArrowClick; });
+        return control;
+    }
+
+    // A named part of a control's template, found by walking its visual tree.
+    internal static T? FindTemplatePart<T>(DependencyObject root, string name) where T : FrameworkElement
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); ++index)
+        {
+            var child = VisualTreeHelper.GetChild(root, index);
+            if (child is T match && match.Name == name) return match;
+            if (FindTemplatePart<T>(child, name) is { } nested) return nested;
+        }
+        return null;
+    }
+
     // A glyph beside a button's content; the glyph is decoration and stays out of
     // the accessibility tree.
     private static Grid WithLeadingGlyph(UIElement content, string glyph, double size, VerticalAlignment alignment)
@@ -651,9 +748,12 @@ internal sealed class ControlFactory
 
     private TextBox CreateTextBox(ControlNodeViewModel viewModel)
     {
+        // MinWidth too: TextBox's style sets 64 px once the control enters the tree, after ApplyBounds
+        // has looked, and a narrower native box (WSH Settings' 44 px timeout) grew past its own edge.
         var control = new TextBox
         {
             FontSize = NativeFontSize,
+            MinWidth = 0,
             MinHeight = 0,
             Padding = new Thickness(4, 0, 4, 0),
             AcceptsReturn = AcceptsReturnFor(viewModel),
@@ -809,6 +909,7 @@ internal sealed class ControlFactory
         var control = new PasswordBox
         {
             FontSize = NativeFontSize,
+            MinWidth = 0,
             MinHeight = 0,
             Padding = new Thickness(4, 0, 4, 0),
             Password = viewModel.DraftText,
@@ -833,6 +934,7 @@ internal sealed class ControlFactory
         var control = new OwnerDrawComboBoxControl
         {
             FontSize = NativeFontSize,
+            MinWidth = 0,
             MinHeight = 0,
             // The default 12,5,0,7 padding leaves a native 21 to 24 px combo 10 px for its 16 px line.
             Padding = new Thickness(8, 0, 0, 0),
@@ -951,14 +1053,15 @@ internal sealed class ControlFactory
         // A multi-select list (LBS_EXTENDEDSEL takes ctrl and shift, LBS_MULTIPLESEL alone toggles each
         // click) is chosen as an index list; any other list has one current item.
         var multiple = viewModel.MultiSelect;
-        var control = new ListBox
-        {
-            FontSize = NativeFontSize,
-            ItemsSource = viewModel.Items,
-            ItemContainerStyle = itemStyle,
-            SelectionMode = !multiple ? SelectionMode.Single
-                : (viewModel.Style & 0x0800) != 0 ? SelectionMode.Extended : SelectionMode.Multiple,
-        };
+        // An owner-draw list (minor 41) shows its rows as the native owner painted them.
+        var ownerDraw = viewModel.OwnerDrawList is not null ? new OwnerDrawListBoxControl() : null;
+        var control = ownerDraw ?? new ListBox();
+        control.FontSize = NativeFontSize;
+        control.ItemContainerStyle = itemStyle;
+        control.SelectionMode = !multiple ? SelectionMode.Single
+            : (viewModel.Style & 0x0800) != 0 ? SelectionMode.Extended : SelectionMode.Multiple;
+        if (ownerDraw is not null) ownerDraw.ApplyNativeFaces(viewModel, _scale);
+        else control.ItemsSource = viewModel.Items;
         var applying = false;
         void ApplySelection()
         {
@@ -972,7 +1075,7 @@ internal sealed class ControlFactory
                 }
                 control.SelectedItems.Clear();
                 foreach (var index in viewModel.SelectedIndices)
-                    if (index >= 0 && index < viewModel.Items.Count) control.SelectedItems.Add(viewModel.Items[index]);
+                    if (index >= 0 && index < control.Items.Count) control.SelectedItems.Add(control.Items[index]);
             }
             finally
             {
@@ -994,6 +1097,13 @@ internal sealed class ControlFactory
         };
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
+            if (ownerDraw is not null && args.PropertyName is nameof(viewModel.OwnerDrawList) or nameof(viewModel.Items))
+            {
+                applying = true;
+                try { ownerDraw.ApplyNativeFaces(viewModel, _scale); }
+                finally { applying = false; }
+                ApplySelection();
+            }
             if (args.PropertyName is nameof(viewModel.SelectedIndex) or nameof(viewModel.SelectedIndices)) ApplySelection();
         });
         return control;
@@ -1016,7 +1126,7 @@ internal sealed class ControlFactory
         };
         void RebuildText()
         {
-            if (!TrySplitSysLinkRuns(viewModel.Text, viewModel.Items, out var runs)) return;
+            if (!TrySplitSysLinkRuns(viewModel.Text, viewModel.Items, out var runs, viewModel.LinkStarts)) return;
             var paragraph = new Paragraph();
             var linkIndex = 0;
             foreach (var (value, isLink) in runs)
@@ -1357,8 +1467,11 @@ internal sealed class ControlFactory
                 if (generation != itemPresentationGeneration || _isApplyingCanonical() || !viewModel.EditableLabels || requested.Length == 0 ||
                     (requested == label && !native) || !AllowsAction(viewModel, "setItemText")) return;
                 _action(viewModel, "setItemText", new ItemTextActionValue { Index = index, Text = requested });
-            }, largeIcon: viewModel.ListViewMode == "largeIcon") { Editable = viewModel.EditableLabels };
+            }, largeIcon: viewModel.ListViewMode == "largeIcon", tile: viewModel.ListViewMode == "tile")
+            { Editable = viewModel.EditableLabels };
             content.Apply(label, icon);
+            if (viewModel.ListViewMode == "tile" && index < viewModel.ItemDetails.Count)
+                content.ApplyDetails(viewModel.ItemDetails[index]);
             rowContents.Add(content);
             FrameworkElement visual = content;
             if (viewModel.CheckBoxes)
@@ -1828,7 +1941,7 @@ internal sealed class ControlFactory
                 nameof(viewModel.ColumnOrder) or
                 nameof(viewModel.Rows) or nameof(viewModel.ColumnHeadersVisible) or
                 nameof(viewModel.CheckBoxes) or nameof(viewModel.ItemImages) or
-                nameof(viewModel.EditableLabels))
+                nameof(viewModel.EditableLabels) or nameof(viewModel.ItemDetails))
             {
                 // One snapshot announces Items, ItemImages and Rows one after another, and a
                 // window of rows is expensive to build, so a windowed list builds once, after
@@ -2531,6 +2644,15 @@ internal sealed class ControlFactory
                     Index = index,
                     Text = text,
                 });
+            },
+            (index, isChecked) =>
+            {
+                // A TVS_CHECKBOXES box: the native tree toggles its item by the Space key, which
+                // also makes that item the selection (the next capture carries both).
+                if (_isApplyingCanonical() || !viewModel.CheckBoxes || index < 0 ||
+                    index >= viewModel.Items.Count || viewModel.CheckedIndices.Contains(index) == isChecked ||
+                    !AllowsAction(viewModel, "setItemCheck")) return;
+                _action(viewModel, "setItemCheck", new ListViewCheckActionValue { Index = index, Checked = isChecked });
             });
 
         ReportFocusEntry(control, viewModel);
@@ -2543,7 +2665,7 @@ internal sealed class ControlFactory
                 viewModel.ItemExpanded, viewModel.ItemHasChildren,
                 ItemIcons(viewModel, viewModel.Items.Count, viewModel.SelectedIndex),
                 StateIcons(viewModel, viewModel.Items.Count),
-                viewModel.SelectedIndex);
+                viewModel.SelectedIndex, ItemChecks(viewModel));
             ApplyNativeEditSession();
         }
 
@@ -2622,8 +2744,21 @@ internal sealed class ControlFactory
             }
             else if (args.PropertyName == nameof(viewModel.EditingIndex))
                 ApplyNativeEditSession();
+            else if (args.PropertyName == nameof(viewModel.CheckedIndices) &&
+                     (ItemChecks(viewModel) is not { } checks || !control.TryApplyChecks(checks)))
+                Rebuild();
+            else if (args.PropertyName == nameof(viewModel.CheckBoxes))
+                Rebuild();
         });
         return control;
+    }
+
+    // One state per item for a check box tree, or null for a tree without boxes.
+    internal static IReadOnlyList<bool>? ItemChecks(ControlNodeViewModel viewModel)
+    {
+        if (!viewModel.CheckBoxes) return null;
+        var checkedItems = viewModel.CheckedIndices.ToHashSet();
+        return Enumerable.Range(0, viewModel.Items.Count).Select(checkedItems.Contains).ToArray();
     }
 
     // One decoded icon per item, or null where the item draws none.  The image list
@@ -2869,10 +3004,17 @@ internal sealed class ControlFactory
 
     // The text as plain and link runs, in order.
     private static bool TrySplitSysLinkRuns(string text, IReadOnlyList<string> labels,
-        out List<(string Text, bool IsLink)> runs)
+        out List<(string Text, bool IsLink)> runs, IReadOnlyList<int>? knownStarts = null)
     {
         runs = [];
-        if (!ProtocolValidator.TryLocateSysLinkLabels(text, labels, out var starts)) return false;
+        // A label that also occurs elsewhere in the text arrives with where its link starts.
+        int[] starts;
+        if (knownStarts is { Count: > 0 })
+        {
+            if (!ProtocolValidator.SysLinkStartsFit(text, labels, knownStarts)) return false;
+            starts = knownStarts.ToArray();
+        }
+        else if (!ProtocolValidator.TryLocateSysLinkLabels(text, labels, out starts)) return false;
         var cursor = 0;
         for (var index = 0; index < labels.Count; index++)
         {
@@ -3864,13 +4006,37 @@ internal sealed class ProjectedItemContent : Grid
     };
     private readonly Action<string> _commit;
     private readonly bool _largeIcon;
+    // A tile's detail lines, under its label (tile view only).
+    private readonly StackPanel? _details;
     private TextBox? _editor;
+    // A TVS_CHECKBOXES tree item's box (tree items only).
+    private CheckBox? _check;
+    private bool _applyingCheck;
 
-    public ProjectedItemContent(Action<string> commit, bool largeIcon = false)
+    public ProjectedItemContent(Action<string> commit, bool largeIcon = false, bool tile = false)
     {
         _commit = commit;
         _largeIcon = largeIcon;
-        if (largeIcon)
+        if (tile)
+        {
+            // A tile: the large icon beside the label, with the detail lines under the label.
+            ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetColumn(_icon, 1);
+            Grid.SetRowSpan(_icon, 2);
+            _icon.VerticalAlignment = VerticalAlignment.Center;
+            Grid.SetColumn(_label, 2);
+            _details = new StackPanel { IsHitTestVisible = false };
+            Grid.SetColumn(_details, 2);
+            Grid.SetRow(_details, 1);
+            AutomationProperties.SetAccessibilityView(_details, AccessibilityView.Raw);
+            Children.Add(_details);
+        }
+        else if (largeIcon)
         {
             RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -3931,12 +4097,66 @@ internal sealed class ProjectedItemContent : Grid
         _state.Margin = icon is null ? new Thickness(0) : new Thickness(0, 0, 4, 0);
     }
 
+    public bool? IsChecked => _check?.IsChecked;
+
+    // A TVS_CHECKBOXES item's box, where the native tree draws it: before the icon.  A click asks
+    // the native tree to toggle the item; the box then shows what the tree reports, which is
+    // the old state again when the application refuses the change.
+    public void ApplyCheck(bool isChecked, int index, Action<bool> requested)
+    {
+        if (_check is null)
+        {
+            var check = new CheckBox
+            {
+                Style = CompactControlStyles.CheckBox,
+                IsTabStop = false,
+                MinWidth = 0,
+                MinHeight = 0,
+                Padding = new Thickness(0),
+                Margin = new Thickness(0, 0, 4, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            AutomationProperties.SetAutomationId(check, "fls-item-check-" + index);
+            RoutedEventHandler changed = (_, _) =>
+            {
+                if (!_applyingCheck) requested(check.IsChecked == true);
+            };
+            check.Checked += changed;
+            check.Unchecked += changed;
+            Children.Add(check);
+            _check = check;
+        }
+        AutomationProperties.SetName(_check, Text);
+        _applyingCheck = true;
+        try { _check.IsChecked = isChecked; }
+        finally { _applyingCheck = false; }
+    }
+
     public void ApplyIcon(ImageSource? icon)
     {
         _icon.Source = icon;
         _icon.Visibility = icon is null ? Visibility.Collapsed : Visibility.Visible;
         _icon.Margin = icon is null ? new Thickness(0)
-            : _largeIcon ? new Thickness(0, 0, 0, 2) : new Thickness(0, 0, 6, 0);
+            : _largeIcon ? new Thickness(0, 0, 0, 2)
+            : _details is not null ? new Thickness(0, 0, 8, 0) : new Thickness(0, 0, 6, 0);
+    }
+
+    // A tile's detail lines, drawn quieter than its label, as the native tile draws them.
+    public void ApplyDetails(IReadOnlyList<string> lines)
+    {
+        if (_details is null) return;
+        _details.Children.Clear();
+        foreach (var line in lines)
+        {
+            _details.Children.Add(new TextBlock
+            {
+                Text = line,
+                FontSize = LabelFontSize,
+                Opacity = 0.7,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                TextWrapping = TextWrapping.NoWrap,
+            });
+        }
     }
 
     // Opens the projected editor.  Nothing native happens yet: the native control's
@@ -4062,6 +4282,7 @@ internal sealed class SemanticTreeViewControl : ContentControl
     private readonly Action<int> _selectionRequested;
     private readonly Action<int, bool> _expansionRequested;
     private readonly Action<int, string> _renameRequested;
+    private readonly Action<int, bool> _checkRequested;
     private readonly TreeView _tree = new()
     {
         SelectionMode = TreeViewSelectionMode.Single,
@@ -4085,11 +4306,13 @@ internal sealed class SemanticTreeViewControl : ContentControl
     public SemanticTreeViewControl(
         Action<int> selectionRequested,
         Action<int, bool> expansionRequested,
-        Action<int, string> renameRequested)
+        Action<int, string> renameRequested,
+        Action<int, bool>? checkRequested = null)
     {
         _selectionRequested = selectionRequested;
         _expansionRequested = expansionRequested;
         _renameRequested = renameRequested;
+        _checkRequested = checkRequested ?? ((_, _) => { });
         Content = _tree;
         Background = null;
         BorderThickness = new Thickness(0);
@@ -4118,6 +4341,16 @@ internal sealed class SemanticTreeViewControl : ContentControl
             args.Handled = true;
             _contents[_selectedIndex].BeginEdit();
         };
+        // Space toggles the selected item's box in a check box tree, as it does natively.  The
+        // tree's own item handles Space too (it selects), so this listens for handled keys.
+        _tree.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler((_, args) =>
+        {
+            if (args.Key != VirtualKey.Space || args.OriginalSource is TextBox) return;
+            if (_selectedIndex < 0 || _selectedIndex >= _contents.Count ||
+                _contents[_selectedIndex].IsChecked is not { } isChecked) return;
+            args.Handled = true;
+            _checkRequested(_selectedIndex, !isChecked);
+        }), true);
     }
 
     public bool EditableLabels { get; set; }
@@ -4154,13 +4387,14 @@ internal sealed class SemanticTreeViewControl : ContentControl
         IReadOnlyList<bool> hasChildren,
         IReadOnlyList<ImageSource?> icons,
         IReadOnlyList<ImageSource?> stateIcons,
-        int selectedIndex)
+        int selectedIndex,
+        IReadOnlyList<bool>? checks = null)
     {
         if (labels.Count != depths.Count || labels.Count != expanded.Count ||
             labels.Count != hasChildren.Count || labels.Count != icons.Count ||
-            labels.Count != stateIcons.Count)
+            labels.Count != stateIcons.Count || (checks is not null && labels.Count != checks.Count))
             throw new ArgumentException(
-                "Tree labels, depths, expansion, child flags, and icons must have matching counts.",
+                "Tree labels, depths, expansion, child flags, icons, and checks must have matching counts.",
                 nameof(depths));
         // Replacing every row resets the scroll offset to the top, so the item under a pointer
         // would change because some property of the tree did (the second press of a double-click
@@ -4188,6 +4422,8 @@ internal sealed class SemanticTreeViewControl : ContentControl
                     Editable = EditableLabels,
                 };
                 content.Apply(labels[index], icons[index], stateIcons[index]);
+                if (checks is not null)
+                    content.ApplyCheck(checks[index], index, isChecked => _checkRequested(position, isChecked));
                 var node = new TreeViewNode { Content = content };
                 if (depth == 0) _tree.RootNodes.Add(node);
                 else ancestors[depth - 1].Children.Add(node);
@@ -4262,6 +4498,19 @@ internal sealed class SemanticTreeViewControl : ContentControl
     {
         for (var index = 0; index < _contents.Count && index < icons.Count; ++index)
             _contents[index].ApplyStateIcon(icons[index]);
+    }
+
+    // The native check states, applied to the boxes in place: a toggle changes nothing else.
+    // False when the items have no boxes to apply them to (the tree must be rebuilt).
+    public bool TryApplyChecks(IReadOnlyList<bool> checks)
+    {
+        if (checks.Count != _contents.Count || _contents.Any(content => content.IsChecked is null)) return false;
+        for (var index = 0; index < _contents.Count; ++index)
+        {
+            var position = index;
+            _contents[index].ApplyCheck(checks[index], index, isChecked => _checkRequested(position, isChecked));
+        }
+        return true;
     }
 
     private void RestoreOffset(ScrollViewer scroll, double target)

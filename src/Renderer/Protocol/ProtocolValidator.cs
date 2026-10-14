@@ -159,14 +159,14 @@ internal static class ProtocolValidator
             "setItemText", "setValue", "setExpand", "setSplit", "setColumnOrder", "setGroupExpanded", "focus",
             "islandInvoke", "htmlInvoke", "htmlScroll", "activateItem", "setFocusedIndex", "scrollBy",
             "diskSelect", "diskContext", "diskScroll", "contextMenu", "openItem", "setScroll", "setTopIndex",
-            "toolbarCommand", "toolbarDropDown", "mdiCommand",
+            "toolbarCommand", "toolbarDropDown", "splitDropDown", "mdiCommand",
         };
 
     // Actions that carry no value at all.
     private static readonly HashSet<string> NullValueActions =
         new(StringComparer.Ordinal)
         {
-            "activate", "invoke", "minimize", "maximize", "restore", "close", "focus",
+            "activate", "invoke", "minimize", "maximize", "restore", "close", "focus", "splitDropDown",
         };
 
     private static void ValidateActionInvoke(ActionInvokeMessage action)
@@ -523,7 +523,7 @@ internal static class ProtocolValidator
             ["edit"] = null,
             ["password"] = null,
             ["groupBox"] = null,
-            ["listBox"] = null,
+            ["listBox"] = ValidateListBox,
             ["comboBox"] = ValidateComboBox,
             ["progressBar"] = ValidateProgress,
             ["sysLink"] = ValidateSysLink,
@@ -584,14 +584,19 @@ internal static class ProtocolValidator
             throw new ProtocolException("Only ComboBox nodes can be editable.");
         if (node.Kind != "comboBox" && node.OwnerDrawCombo is not null)
             throw new ProtocolException("Only ComboBox nodes can carry ownerDrawCombo faces.");
+        if (node.Kind != "listBox" && node.OwnerDrawList is not null)
+            throw new ProtocolException("Only ListBox nodes can carry ownerDrawList faces.");
+        if (node.Kind != "sysLink" && node.LinkStarts is not null)
+            throw new ProtocolException("Only SysLink nodes can carry linkStarts.");
         if (node.Kind is not ("staticIcon" or "staticBitmap" or "radioButton" or "button") &&
             (node.ImageWidth is not null || node.ImageHeight is not null ||
              node.ImageFormat is not null || node.ImageData is not null))
             throw new ProtocolException("Only Static icon, Static bitmap, picture Button, or BitmapSwitch nodes can carry image fields.");
         if (node.Kind != "listView" && node.ColumnHeadersVisible is not null)
             throw new ProtocolException("Only ListView nodes can carry columnHeadersVisible.");
-        if (node.Kind != "listView" && (node.CheckBoxes is not null || node.CheckedIndices is not null))
-            throw new ProtocolException("Only ListView nodes can carry checkbox row state.");
+        if (node.Kind is not ("listView" or "treeView") &&
+            (node.CheckBoxes is not null || node.CheckedIndices is not null))
+            throw new ProtocolException("Only ListView and TreeView nodes can carry checkbox item state.");
         if (node.Kind != "listView" && node.ColumnOrder is not null)
             throw new ProtocolException("Only ListView nodes can carry a column display order.");
         if (node.Kind is not ("tabControl" or "listView") && node.ItemRects is not null)
@@ -681,8 +686,9 @@ internal static class ProtocolValidator
                      variants.Contains(node.PresentationVariant, StringComparer.Ordinal)) &&
                     (node.HelpText is null || node.PresentationVariant?.StartsWith("commandLink", StringComparison.Ordinal) == true);
                 // A native BS_COMMANDLINK button (minor 39): its label, and its note as helpText.
+                // A native BS_SPLITBUTTON (minor 41): a button with an arrow that asks for a menu.
                 var commandLinkButton = !virtualSurface && node.Kind == "button" &&
-                    node.PresentationVariant == "commandLink";
+                    node.PresentationVariant is "commandLink" or "splitButton";
                 taskDialogPresentation |= commandLinkButton;
                 var offending =
                     node.AdapterId is not null ? "adapterId" :
@@ -996,13 +1002,19 @@ internal static class ProtocolValidator
     }
 
     // A BS_ICON / BS_BITMAP push button carries its picture under the icon cap; a
-    // text button carries none.
+    // text button carries none.  A BS_OWNERDRAW button's picture is its whole face (minor 41:
+    // Internet Options' colour buttons paint their label and a swatch), up to 512 by 128.
     private static void ValidateButton(ControlNode node)
     {
         if (node.ImageWidth is null && node.ImageHeight is null &&
             node.ImageFormat is null && node.ImageData is null) return;
-        ValidatePixels("Button picture", node.ImageWidth, node.ImageHeight, node.ImageFormat,
-            node.ImageData, ProtocolConstants.MaxImageDimension, ProtocolConstants.MaxImageBytes);
+        var ownerDraw = node.Style is not null && (ParseHex64(node.Style, "button.style") & 0xFUL) == 0xBUL;
+        if (ownerDraw && node.ImageHeight > ProtocolConstants.MaxOwnerDrawFaceHeight)
+            throw new ProtocolException("Owner-draw button face is taller than its bound.");
+        ValidatePixels("Button picture", node.ImageWidth, node.ImageHeight, node.ImageFormat, node.ImageData,
+            ownerDraw ? ProtocolConstants.MaxOwnerDrawFaceWidth : ProtocolConstants.MaxImageDimension,
+            ownerDraw ? ProtocolConstants.MaxOwnerDrawFaceWidth * ProtocolConstants.MaxOwnerDrawFaceHeight * 4
+                : ProtocolConstants.MaxImageBytes);
     }
 
     private static void ValidateRadioButton(ControlNode node)
@@ -1225,8 +1237,11 @@ internal static class ProtocolValidator
         if (node.Style is null || node.ExStyle is null)
             throw new ProtocolException("Dialog container requires native style evidence.");
         const ulong wsChild = 0x40000000;
+        // WS_CAPTION, WS_THICKFRAME, WS_BORDER, WS_DLGFRAME, WS_HSCROLL, WS_VSCROLL and
+        // DS_MODALFRAME, as the Bridge's ProbeDialogContainer refuses them.  WS_SYSMENU draws
+        // nothing without a caption (the Volume Mixer's columns carry it).
         const ulong unsupportedStyle = 0x00C00000 | 0x00040000 | 0x00800000 |
-            0x00400000 | 0x00100000 | 0x00200000 | 0x00080000 | 0x00000080;
+            0x00400000 | 0x00100000 | 0x00200000 | 0x00000080;
         const ulong unsupportedExStyle = 0x00000001 | 0x00000100 | 0x00000200 |
             0x00020000 | 0x00080000;
         var style = ParseHex64(node.Style, "dialogContainer.style");
@@ -1285,6 +1300,45 @@ internal static class ProtocolValidator
         }
     }
 
+    // Minor 41: an owner-draw ListBox's rows are its owner's faces under the owner-draw combo's size and
+    // pixel bounds; only the rows selected now carry a selected face.
+    private static void ValidateListBox(ControlNode node)
+    {
+        var style = node.Style is null ? 0UL : ParseHex64(node.Style, "listBox.style");
+        var drawStyle = style & 0x30UL;
+        if (node.OwnerDrawList is not { } painted)
+        {
+            if (drawStyle != 0)
+                throw new ProtocolException("Owner-draw ListBox requires its bounded native faces.");
+            return;
+        }
+        if (node.Style is null || drawStyle is not (0x10UL or 0x20UL) ||
+            painted.Mode != (drawStyle == 0x10UL ? "fixed" : "variable"))
+            throw new ProtocolException("Owner-draw ListBox shape does not match its native style.");
+        if (painted.Items is null || painted.Items.Count > 64 || painted.Items.Count != node.Items.Count ||
+            node.Items.Any(string.IsNullOrEmpty))
+            throw new ProtocolException("Owner-draw ListBox labels and faces are inconsistent.");
+        var selected = node.MultiSelect
+            ? node.SelectedIndices.ToHashSet()
+            : node.SelectedIndex is >= 0 and var current ? [current] : new HashSet<int>();
+        var bytes = 0;
+        int? fixedHeight = null;
+        int? rowWidth = null;
+        for (var index = 0; index < painted.Items.Count; ++index)
+        {
+            var item = painted.Items[index];
+            if (item?.Normal is null || (item.Selected is not null) != selected.Contains(index) ||
+                (item.Selected is { } face && (face.ImageWidth != item.Normal.ImageWidth ||
+                    face.ImageHeight != item.Normal.ImageHeight)))
+                throw new ProtocolException("Owner-draw ListBox rows need a face, and a selected face exactly when selected.");
+            rowWidth ??= item.Normal.ImageWidth;
+            fixedHeight ??= item.Normal.ImageHeight;
+            if (item.Normal.ImageWidth != rowWidth || painted.Mode == "fixed" && item.Normal.ImageHeight != fixedHeight)
+                throw new ProtocolException("Owner-draw ListBox row dimensions contradict its draw mode.");
+            AccumulateOwnerDrawComboFace(item.Normal, ref bytes);
+            if (item.Selected is { } selectedFace) AccumulateOwnerDrawComboFace(selectedFace, ref bytes);
+        }
+    }
     private static void AccumulateOwnerDrawComboFace(ImageListEntry image, ref int bytes)
     {
         if (image.ImageWidth is <= 0 or > 512 || image.ImageHeight is <= 0 or > 128 ||
@@ -1323,10 +1377,32 @@ internal static class ProtocolValidator
         if (node.Items.Count == 0 || node.Items.Count > MaxSysLinkLabels ||
             node.Items.Any(string.IsNullOrEmpty) || node.Text is null)
             throw new ProtocolException("SysLink requires nonempty link labels.");
+        // Minor 41: a label that also occurs elsewhere in the text arrives with where its link starts.
+        if (node.LinkStarts is { } starts)
+        {
+            if (!SysLinkStartsFit(node.Text, node.Items, starts))
+                throw new ProtocolException("SysLink linkStarts do not place each label, in order, in its text.");
+            return;
+        }
         if (!TryLocateSysLinkLabels(node.Text, node.Items, out _))
             throw new ProtocolException(node.Items.Count == 1
                 ? "SysLink label must occur exactly once in text."
                 : "SysLink labels must occur in text in order.");
+    }
+
+    // Each label at its start, left to right and without overlap.
+    internal static bool SysLinkStartsFit(string text, IReadOnlyList<string> labels, IReadOnlyList<int> starts)
+    {
+        if (starts.Count != labels.Count || starts.Count == 0) return false;
+        var cursor = 0;
+        for (var index = 0; index < labels.Count; ++index)
+        {
+            var start = starts[index];
+            if (string.IsNullOrEmpty(labels[index]) || start < cursor || start > text.Length - labels[index].Length ||
+                string.CompareOrdinal(text, start, labels[index], 0, labels[index].Length) != 0) return false;
+            cursor = start + labels[index].Length;
+        }
+        return true;
     }
 
     // A translated task dialog's text carries every link its markup declares.
@@ -1422,8 +1498,15 @@ internal static class ProtocolValidator
     private static void ValidateListView(ControlNode node)
     {
         var mode = node.ListViewMode ?? "report";
-        if (mode is not ("report" or "largeIcon" or "smallIcon" or "list"))
+        if (mode is not ("report" or "largeIcon" or "smallIcon" or "list" or "tile"))
             throw new ProtocolException("ListView view mode is unsupported.");
+        // Minor 41: a tile's detail lines, one list per item, only in tile view.
+        if (mode == "tile"
+                ? node.ItemDetails is not { } details || details.Count != node.Items.Count ||
+                  details.Any(lines => lines is null || lines.Count > ProtocolConstants.MaxTileDetailLines ||
+                      lines.Any(line => line is null || line.Length > ProtocolConstants.MaxStringChars))
+                : node.ItemDetails is not null)
+            throw new ProtocolException("ListView itemDetails must give each tile its detail lines, and only in tile view.");
         var report = mode == "report";
         var carried = report ? node.Rows.Count : node.Items.Count;
         // Minor 33: a large virtual report list carries a window of its rows; every
@@ -1602,6 +1685,18 @@ internal static class ProtocolValidator
             throw new ProtocolException("TreeView selected-state item images are missing.");
         if (node.StateImageList is null || node.ItemStateImages is null)
             throw new ProtocolException("TreeView state images are missing.");
+        // Minor 41: a TVS_CHECKBOXES tree says so and lists its checked items; the boxes are drawn
+        // as check boxes, so no item also draws a state glyph.
+        if ((node.CheckBoxes is null) != (node.CheckedIndices is null) || node.CheckBoxes == false)
+            throw new ProtocolException("TreeView check boxes travel as checkBoxes: true with their checkedIndices.");
+        if (node.CheckedIndices is { } checkedItems)
+        {
+            ValidateCanonicalIndices(checkedItems, "checkedIndices");
+            if (checkedItems.Any(index => index >= node.Items.Count))
+                throw new ProtocolException("TreeView checkedIndices contains an index outside its items.");
+            if (node.StateImageList.Count != 0 || node.ItemStateImages.Any(index => index != -1))
+                throw new ProtocolException("A check box TreeView cannot also draw state images.");
+        }
         ValidateItemImagery(node, node.Items.Count);
     }
 
@@ -1745,12 +1840,13 @@ internal static class ProtocolValidator
             throw new ProtocolException("Toolbar requires style evidence and a bounded item collection.");
         // The bits the Bridge admits (ProbeToolbar), mirrored here: CCS_TOP, CCS_NOMOVEY,
         // CCS_NORESIZE, CCS_NOPARENTALIGN, CCS_NODIVIDER, TBSTYLE_TOOLTIPS, TBSTYLE_WRAPABLE,
-        // TBSTYLE_ALTDRAG, TBSTYLE_FLAT, TBSTYLE_LIST, and TBSTYLE_TRANSPARENT.  The CCS_*
-        // placement bits only say where the control puts itself when its parent resizes
-        // (mstsc's Options strip is CCS_NOPARENTALIGN); the projection lays it out from its
-        // native rectangle.  WS_EX_TOOLWINDOW and WS_EX_NOPARENTNOTIFY change nothing the
+        // TBSTYLE_ALTDRAG, TBSTYLE_FLAT, TBSTYLE_LIST, TBSTYLE_CUSTOMERASE and
+        // TBSTYLE_TRANSPARENT.  The CCS_* placement bits only say where the control puts itself
+        // when its parent resizes (mstsc's Options strip is CCS_NOPARENTALIGN); the projection
+        // lays it out from its native rectangle, and draws its own background whoever erases
+        // the native one.  WS_EX_TOOLWINDOW and WS_EX_NOPARENTNOTIFY change nothing the
         // projection reproduces.
-        const ulong acceptedStyles = 0x9f4f;
+        const ulong acceptedStyles = 0xbf4f;
         const ulong acceptedExStyles = 0x00000080 | 0x00000004;
         if ((ParseHex64(node.Style, "toolbar.style") & 0xffffUL & ~acceptedStyles) != 0 ||
             (ParseHex64(node.ExStyle, "toolbar.exStyle") & ~acceptedExStyles) != 0)
@@ -1886,8 +1982,10 @@ internal static class ProtocolValidator
         // A toolbar button's drop-down menu, opened by a toolbarDropDown request.
         var toolbar = node?.Kind == "toolbar" && node.ToolbarItems is not null &&
             popup.ItemIndex < node.ToolbarItems.Count && node.ToolbarItems[popup.ItemIndex].DropDown == true;
-        if (!island && !disk && !item && !toolbar)
-            throw new ProtocolException("Popup menu must anchor to a native semantic dropdown, disk item, tree/list item, or toolbar drop-down.");
+        // A split button's menu, opened by a splitDropDown request (minor 41).
+        var split = node?.Kind == "button" && node.PresentationVariant == "splitButton" && popup.ItemIndex == 0;
+        if (!island && !disk && !item && !toolbar && !split)
+            throw new ProtocolException("Popup menu must anchor to a native semantic dropdown, disk item, tree/list item, toolbar drop-down, or split button.");
         ValidateMenuLevel(popup.Items, new MenuScope(), depth: 1,
             topLevel: false, parentPath: string.Empty);
     }
@@ -2144,8 +2242,8 @@ internal static class ProtocolValidator
                     RequireKind(nativeIds, JsonValueKind.Array, $"{context}.listView.itemNativeIds");
             }
             else if (node.TryGetProperty("columnHeadersVisible", out _) ||
-                     node.TryGetProperty("checkBoxes", out _) ||
-                     node.TryGetProperty("checkedIndices", out _) ||
+                     (kind != "treeView" && (node.TryGetProperty("checkBoxes", out _) ||
+                         node.TryGetProperty("checkedIndices", out _))) ||
                      node.TryGetProperty("itemNativeIds", out _))
             {
                 throw new ProtocolException($"{context}.node carries ListView-only fields for a non-ListView kind.");
@@ -2184,6 +2282,27 @@ internal static class ProtocolValidator
                 if (ownerDrawCombo.TryGetProperty("selectionFace", out var selectionFace))
                     RequireProperties(selectionFace, $"{context}.ownerDrawCombo.selectionFace", RequiredImageProperties);
             }
+            if (node.TryGetProperty("linkStarts", out var linkStarts))
+            {
+                if (kind != "sysLink")
+                    throw new ProtocolException($"{context}.linkStarts belongs only to SysLink.");
+                ValidateCanonicalIndices(linkStarts, $"{context}.linkStarts");
+            }
+            if (node.TryGetProperty("ownerDrawList", out var ownerDrawList))
+            {
+                if (kind != "listBox")
+                    throw new ProtocolException($"{context}.ownerDrawList belongs only to ListBox.");
+                RequireProperties(ownerDrawList, $"{context}.ownerDrawList", ["mode", "items"]);
+                var rows = RequireKind(ownerDrawList.GetProperty("items"), JsonValueKind.Array,
+                    $"{context}.ownerDrawList.items");
+                foreach (var row in rows.EnumerateArray())
+                {
+                    RequireProperties(row, $"{context}.ownerDrawList.item", ["normal"]);
+                    RequireProperties(row.GetProperty("normal"), $"{context}.ownerDrawList.normal", RequiredImageProperties);
+                    if (row.TryGetProperty("selected", out var selectedRow))
+                        RequireProperties(selectedRow, $"{context}.ownerDrawList.selected", RequiredImageProperties);
+                }
+            }
             if (kind is "staticIcon" or "staticBitmap" ||
                 (kind is "radioButton" or "button" && imageFields != 0))
             {
@@ -2220,6 +2339,13 @@ internal static class ProtocolValidator
                     $"{context}.treeView.stateImageList");
                 foreach (var image in stateImages.EnumerateArray())
                     RequireProperties(image, $"{context}.treeView.stateImageList.icon", RequiredImageProperties);
+                if (node.TryGetProperty("checkBoxes", out _) || node.TryGetProperty("checkedIndices", out _))
+                {
+                    RequireProperties(node, $"{context}.treeView.checkBoxes", ["checkBoxes", "checkedIndices"]);
+                    RequireKind(node.GetProperty("checkBoxes"), JsonValueKind.True, $"{context}.treeView.checkBoxes");
+                    RequireKind(node.GetProperty("checkedIndices"), JsonValueKind.Array,
+                        $"{context}.treeView.checkedIndices");
+                }
             }
             else if (node.TryGetProperty("stateImageList", out _))
             {

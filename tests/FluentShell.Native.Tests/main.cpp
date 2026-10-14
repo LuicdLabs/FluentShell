@@ -1556,7 +1556,7 @@ void TestControlAdapterRegistry() {
         { L"ListBox", LBS_EXTENDEDSEL, true, ControlKind::ListBox, "extended-selection ListBox" },
         { L"ListBox", LBS_MULTIPLESEL, true, ControlKind::ListBox, "multiple-selection ListBox" },
         { L"ListBox", LBS_MULTICOLUMN, false, ControlKind::ListBox, "multi-column ListBox" },
-        { L"ListBox", LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "owner-draw ListBox" },
+        { L"ListBox", LBS_OWNERDRAWFIXED, true, ControlKind::ListBox, "owner-draw ListBox" },
         { L"ListBox", LBS_NODATA | LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "virtual ListBox" },
         { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
         { PROGRESS_CLASSW, PBS_MARQUEE, true, ControlKind::ProgressBar, "marquee ProgressBar" },
@@ -1565,9 +1565,10 @@ void TestControlAdapterRegistry() {
         { STATUSCLASSNAMEW, 0, true, ControlKind::StatusBar, "StatusBar" },
         { STATUSCLASSNAMEW, WS_TABSTOP, false, ControlKind::StatusBar, "tab-stop StatusBar" },
         { WC_TREEVIEWW, TVS_HASBUTTONS | TVS_HASLINES, true, ControlKind::TreeView, "TreeView" },
-        { WC_TREEVIEWW, TVS_CHECKBOXES, false, ControlKind::TreeView, "checkbox TreeView" },
+        { WC_TREEVIEWW, TVS_CHECKBOXES, true, ControlKind::TreeView, "checkbox TreeView" },
         { WC_TREEVIEWW, TVS_EDITLABELS, true, ControlKind::TreeView, "label-editing TreeView" },
-        { WC_TREEVIEWW, TVS_SINGLEEXPAND, false, ControlKind::TreeView, "single-expand TreeView" },
+        { WC_TREEVIEWW, TVS_SINGLEEXPAND, true, ControlKind::TreeView, "single-expand TreeView" },
+        { WC_TREEVIEWW, TVS_INFOTIP | TVS_TRACKSELECT, true, ControlKind::TreeView, "info-tip TreeView" },
         { TRACKBAR_CLASSW, TBS_AUTOTICKS, true, ControlKind::Slider, "Trackbar" },
         { TRACKBAR_CLASSW, TBS_VERT | TBS_BOTH, true, ControlKind::Slider, "vertical Trackbar" },
         { TRACKBAR_CLASSW, TBS_ENABLESELRANGE, false, ControlKind::Slider,
@@ -2298,22 +2299,30 @@ void TestOwnerDrawButtonFace() {
         return;
     }
     // A face wider than a button picture may be is the inert picture it shows when no key reaches the
-    // button, and has no contract when one does.
+    // button; one a key reaches is a button whose whole face travels under the owner-draw face bound
+    // (Internet Options' colour buttons), and past that bound it has no contract.
     HWND wide = CreateWindowExW(0, L"Button", L"Wide", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         10, 44, 150, 24, root, reinterpret_cast<HMENU>(701), GetModuleHandleW(nullptr), nullptr);
     HWND wideFocusable = CreateWindowExW(0, L"Button", L"Wide focusable", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         10, 78, 150, 24, root, reinterpret_cast<HMENU>(702), GetModuleHandleW(nullptr), nullptr);
-    Check(wide && wideFocusable, "wide owner-draw buttons were not created");
-    if (wide && wideFocusable) {
+    HWND tooWide = CreateWindowExW(0, L"Button", L"Too wide", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        10, 112, 600, 24, root, reinterpret_cast<HMENU>(703), GetModuleHandleW(nullptr), nullptr);
+    Check(wide && wideFocusable && tooWide, "wide owner-draw buttons were not created");
+    if (wide && wideFocusable && tooWide) {
         Translation::ControlKind wideKind{};
         std::wstring wideReason;
         Check(Translation::ClassifyControl(wide, wideKind, wideReason) &&
               wideKind == Translation::ControlKind::StaticBitmap,
             "a wide owner-draw button that no key reaches was not carried as an inert picture");
         wideReason.clear();
-        Check(!Translation::ClassifyControl(wideFocusable, wideKind, wideReason) && !wideReason.empty(),
-            "a wide owner-draw button that takes focus was admitted");
+        Check(Translation::ClassifyControl(wideFocusable, wideKind, wideReason) &&
+              wideKind == Translation::ControlKind::Button,
+            "a wide owner-draw button that takes focus was not admitted as a button");
+        wideReason.clear();
+        Check(!Translation::ClassifyControl(tooWide, wideKind, wideReason) && !wideReason.empty(),
+            "an owner-draw button wider than the face bound was admitted");
         DestroyWindow(wideFocusable);
+        DestroyWindow(tooWide);
     }
     SetWindowSubclass(root, OwnerDrawSwatchParent, 1, 0);
     ShowWindow(root, SW_SHOWNOACTIVATE);
@@ -4811,10 +4820,10 @@ void TestTreeViewCaptureAndExpansion() {
           kind == Translation::ControlKind::TreeView,
         "an icon-bearing TreeView was rejected");
 
-    SetWindowLongPtrW(tree, GWL_STYLE, treeStyle | TVS_TRACKSELECT);
+    SetWindowLongPtrW(tree, GWL_STYLE, treeStyle | TVS_RTLREADING);
     reason.clear();
     Check(!Translation::ClassifyControl(tree, kind, reason) &&
-          reason.find(L"TVS_TRACKSELECT") != std::wstring::npos &&
+          reason.find(L"TVS_RTLREADING") != std::wstring::npos &&
           reason.find(L"0x") != std::wstring::npos,
         "unsupported TreeView style lacked exact named diagnostics");
     SetWindowLongPtrW(tree, GWL_STYLE, treeStyle);
@@ -5102,6 +5111,11 @@ void TestMdiFrameCaptureAndCommands() {
 #include "ComboBoxExTests.h"
 #include "MstscPresentationTests.h"
 #include "ObjectPickerTests.h"
+#include "PassivePictureTests.h"
+#include "TileListViewTests.h"
+#include "SplitButtonTests.h"
+#include "TreeViewCheckBoxTests.h"
+#include "OwnerDrawListBoxTests.h"
 
 } // namespace
 
@@ -5232,6 +5246,11 @@ int wmain() {
     TestCueBanners();
     TestDialogPaintedBands();
     TestObjectPickerControls();
+    TestPassivePictureControls();
+    TestTileListViewCapture();
+    TestSplitButtons();
+    TestTreeViewCheckBoxes();
+    TestOwnerDrawListBoxes();
     {
         // A command link is drawn by the common-controls v6 button.
         ListActivationCommonControls buttonControls(ICC_STANDARD_CLASSES);

@@ -143,6 +143,32 @@ inline bool SelectTreeViewItem(HWND treeView, int index) noexcept {
     return caret() == item;
 }
 
+inline bool IsTreeViewItemChecked(HWND treeView, HTREEITEM item) noexcept {
+    const auto state = static_cast<UINT>(SendMessageW(treeView, TVM_GETITEMSTATE,
+        reinterpret_cast<WPARAM>(item), TVIS_STATEIMAGEMASK));
+    return (state & TVIS_STATEIMAGEMASK) == INDEXTOSTATEIMAGEMASK(2);
+}
+
+// A TVS_CHECKBOXES tree toggles its caret item's box on the Space key, the one gesture every
+// check-box tree honours: comctl32 raises TVN_KEYDOWN and then TVN_ITEMCHANGING/TVN_ITEMCHANGED
+// for the new state image, and a Windows Forms tree toggles the node in its own key handler
+// (AfterCheck).  A direct TVM_SETITEM would reach only the applications listening for
+// TVN_ITEMCHANGED.  So the item becomes the caret, as a keyboard user's would, and the key
+// arrives as the messages a key press produces.  The state is read back, because the
+// application may refuse the change.
+inline bool SetTreeViewItemCheck(HWND treeView, int index, bool checked) noexcept {
+    const HTREEITEM item = ResolveTreeViewItem(treeView, index);
+    if (!item) return false;
+    if (IsTreeViewItemChecked(treeView, item) == checked) return true;
+    if (!SelectTreeViewItem(treeView, index)) return false;
+    const UINT scan = MapVirtualKeyW(VK_SPACE, MAPVK_VK_TO_VSC);
+    const LPARAM down = 1 | (static_cast<LPARAM>(scan) << 16);
+    SendMessageW(treeView, WM_KEYDOWN, VK_SPACE, down);
+    SendMessageW(treeView, WM_CHAR, L' ', down);
+    SendMessageW(treeView, WM_KEYUP, VK_SPACE, down | (1ll << 30) | (1ll << 31));
+    return IsTreeViewItemChecked(treeView, item) == checked;
+}
+
 // TVM_EXPAND lets the control raise TVN_ITEMEXPANDING/TVN_ITEMEXPANDED, which is
 // what gives a lazily populated tree the chance to insert the children the user
 // just asked for.  The state is read back because an application handler may

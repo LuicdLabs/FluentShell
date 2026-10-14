@@ -64,7 +64,7 @@ public sealed class ToolbarImageVariantTests
     }
 
     [Theory]
-    [InlineData("0x50002000")]
+    [InlineData("0x50004000")]
     [InlineData("0x50000020")]
     [InlineData("0x50000080")]
     public void ToolbarStylesTheBridgeRefusesAreRejected(string style)

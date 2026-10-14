@@ -201,6 +201,8 @@ bool PopupAnchorMatches(const ControlNode& node, const IslandActionRequest& requ
     if (request.kind == ControlKind::Toolbar)
         return index < node.toolbarItems.size() && node.toolbarItems[index].dropDown &&
             node.toolbarItems[index].commandId == request.commandId;
+    if (request.kind == ControlKind::Button)
+        return index == 0 && node.presentationVariant == L"splitButton" && node.text == request.name;
     return index < node.islandItems.size() && node.islandItems[index].dropDown &&
         node.islandItems[index].name == request.name && node.islandItems[index].actionName == request.action;
 }
@@ -211,6 +213,7 @@ bool InvokePopupOwner(const IslandActionRequest& request, std::wstring& reason) 
         return request.diskView && RequestDiskViewContextMenu(request.island, *request.diskView, request.index, reason);
     if (request.kind == ControlKind::Toolbar)
         return RequestToolbarDropDown(request.island, request.index, request.commandId, reason);
+    if (request.kind == ControlKind::Button) return RequestSplitButtonDropDown(request.island, reason);
     if (request.kind == ControlKind::TreeView || request.kind == ControlKind::ListView) {
         // A double-click: the item is selected and its control receives Enter.
         if (request.action == L"openItem")
@@ -1210,6 +1213,18 @@ bool ApplySetItemCheck(
         if (!command->success) command->error = L"the chart did not change whether the counter is shown";
         return true;
     }
+    if (node.kind == ControlKind::TreeView && node.checkBoxes) {
+        const int index = command->action.itemIndex;
+        if (index < 0 || static_cast<size_t>(index) >= node.items.size()) return true;
+        if (AbortIfCancelled(command)) return false;
+        // The box is toggled by the keyboard gesture, which needs the tree's focus as well.
+        FocusPaneOfUserGesture(target);
+        command->success = SetTreeViewItemCheck(target, index, command->action.booleanValue);
+        if (AbortIfCancelled(command)) return false;
+        command->refused = !command->success;
+        if (!command->success) command->error = L"the tree did not change the item's check box";
+        return true;
+    }
     if (node.kind != ControlKind::ListView || !node.checkBoxes) return true;
     const int index = command->action.itemIndex;
     if (index < 0 || static_cast<size_t>(index) >= ListViewItemCount(node)) return true;
@@ -1243,6 +1258,20 @@ bool ApplyToolbarDropDown(
     command->deferredActionKind = kDeferredIslandAction;
     command->success = agent->PostIslandAction(node, static_cast<int>(button - node.toolbarItems.begin()),
         command->refused, &command->deferredActionToken);
+    if (!command->success && command->error.empty()) command->error = command->refused
+        ? L"another native popup action is already pending"
+        : L"the drop-down request could not be queued";
+    return true;
+}
+
+// A split button's arrow: the owner answers BCN_DROPDOWN by tracking its own menu, so the request
+// is queued like a toolbar arrow's, with popup interception armed for the button.
+bool ApplySplitDropDown(
+    Command* command, SourceThreadAgent* agent, HWND, const ControlNode& node) {
+    if (node.kind != ControlKind::Button || node.presentationVariant != L"splitButton" || !agent) return true;
+    if (AbortIfCancelled(command)) return false;
+    command->deferredActionKind = kDeferredIslandAction;
+    command->success = agent->PostIslandAction(node, 0, command->refused, &command->deferredActionToken);
     if (!command->success && command->error.empty()) command->error = command->refused
         ? L"another native popup action is already pending"
         : L"the drop-down request could not be queued";
@@ -1565,6 +1594,7 @@ constexpr std::array kNodeActions{
     NodeActionEntry{ L"openItem", &ApplyOpenItem },
     NodeActionEntry{ L"toolbarCommand", &ApplyToolbarCommand },
     NodeActionEntry{ L"toolbarDropDown", &ApplyToolbarDropDown },
+    NodeActionEntry{ L"splitDropDown", &ApplySplitDropDown },
     NodeActionEntry{ L"mdiCommand", &ApplyMdiCommand },
     NodeActionEntry{ L"setSplit", &ApplySetSplit },
     NodeActionEntry{ L"setScroll", &ApplySetScroll },
@@ -1594,7 +1624,7 @@ bool InvokeOnNode(
     if (!node->visible || !node->enabled) return true;
     const NodeAction apply = FindNodeAction(action.action);
     const bool queued = action.action == L"invoke" || action.action == L"toolbarCommand" ||
-        action.action == L"toolbarDropDown" ||
+        action.action == L"toolbarDropDown" || action.action == L"splitDropDown" ||
         action.action == L"mdiCommand" || action.action == L"activateItem" || action.action == L"islandInvoke" ||
         action.action == L"htmlInvoke" || action.action == L"diskContext" || action.action == L"contextMenu" ||
         action.action == L"openItem";
@@ -2881,6 +2911,7 @@ bool SourceThreadAgent::PostIslandAction(
             ? node.diskView->items.size()
             : node.kind == ControlKind::ListView ? ListViewItemCount(node)
             : node.kind == ControlKind::Toolbar ? node.toolbarItems.size()
+            : node.kind == ControlKind::Button ? size_t{ 1 }
             : itemContext ? node.items.size() : node.islandItems.size();
         // A windowed list's row is addressed by its absolute index and has to be one
         // the snapshot carries, since its label is the request's witness.
@@ -2920,6 +2951,12 @@ bool SourceThreadAgent::PostIslandAction(
             deferred.action = L"toolbarDropDown";
             deferred.dropDown = true;
             deferred.commandId = button.commandId;
+        } else if (node.kind == ControlKind::Button) {
+            // A split button's arrow asks its owner for a menu, as a toolbar arrow does.
+            if (node.presentationVariant != L"splitButton") return false;
+            deferred.name = node.text;
+            deferred.action = L"splitDropDown";
+            deferred.dropDown = true;
         } else {
             const auto& item = node.islandItems[index];
             deferred.name = item.name;

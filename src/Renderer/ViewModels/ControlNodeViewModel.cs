@@ -36,6 +36,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     private bool _editable;
     private string _cueBanner = string.Empty;
     private OwnerDrawComboSnapshot? _ownerDrawCombo;
+    private OwnerDrawListSnapshot? _ownerDrawList;
     private bool _active;
     private string _windowState = "normal";
     private PixelRect _clientRect = new();
@@ -77,6 +78,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     // The grey hint an empty edit box shows; empty when the native box has none.
     public string CueBanner { get => _cueBanner; private set => SetProperty(ref _cueBanner, value); }
     public OwnerDrawComboSnapshot? OwnerDrawCombo { get => _ownerDrawCombo; private set => SetProperty(ref _ownerDrawCombo, value); }
+    public OwnerDrawListSnapshot? OwnerDrawList { get => _ownerDrawList; private set => SetProperty(ref _ownerDrawList, value); }
     public bool IsDefault { get; private set; }
     public bool GroupStart { get; private set; }
     // Native window style bits, already validated as canonical hex on admission.
@@ -121,6 +123,8 @@ public sealed class ControlNodeViewModel : ObservableObject
     public string ImageFormat { get => _imageFormat; private set => SetProperty(ref _imageFormat, value); }
     public string ImageData { get => _imageData; private set => SetProperty(ref _imageData, value); }
     public ObservableCollection<string> Items { get; } = [];
+    // Where each SysLink label starts in Text (minor 41), or empty when each label occurs once.
+    public IReadOnlyList<int> LinkStarts { get; private set; } = [];
     public ObservableCollection<PixelRect> ItemRects { get; } = [];
     public ObservableCollection<int> SelectedIndices { get; } = [];
     public ObservableCollection<int> CheckedIndices { get; } = [];
@@ -235,6 +239,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         var windowMoved = ItemCount != (node.ItemCount ?? 0) || ItemWindowStart != (node.ItemWindowStart ?? 0);
         ItemCount = node.ItemCount ?? 0;
         ItemWindowStart = node.ItemWindowStart ?? 0;
+        LinkStarts = node.LinkStarts?.ToArray() ?? [];
         ReplaceItems(node.Items);
         ReplaceTreeState(node.ItemDepths ?? [], node.ItemExpanded ?? [], node.ItemHasChildren ?? []);
         ReplaceItemImagery(
@@ -244,6 +249,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         EditingIndex = node.EditingIndex ?? -1;
         ReplaceItemRects(node.ItemRects ?? []);
         OwnerDrawCombo = node.OwnerDrawCombo;
+        OwnerDrawList = node.OwnerDrawList;
         ListViewMode = node.ListViewMode ?? "report";
         // Publish this coupled group state together before any notification.
         var groupsChanged = !_listViewGroups.SequenceEqual(node.ListViewGroups ?? []) ||
@@ -261,6 +267,7 @@ public sealed class ControlNodeViewModel : ObservableObject
         ReplaceColumnWidths(node.ColumnWidths);
         ReplaceColumnOrder(node.ColumnOrder ?? []);
         ReplaceRows(node.Rows, windowMoved);
+        ReplaceItemDetails(node.ItemDetails ?? []);
         var toolbarChanged = ReplaceToolbarItems(node.ToolbarItems ?? []);
         ReplaceSplits(node.Splits ?? []);
         ReplaceChromeRegions(node.ChromeRegions ?? []);
@@ -400,12 +407,14 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "windowState": WindowState = value.GetString() ?? "normal"; break;
             case "clientRect": ClientRect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid MDI child client rect patch."); break;
             case "rect": Rect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid node rect patch."); break;
+            case "linkStarts": LinkStarts = value.Deserialize<List<int>>()?.ToArray() ?? []; break;
             case "items": ReplaceItems(value.Deserialize<List<string>>() ?? []); break;
             case "itemRects": ReplaceItemRects(value.Deserialize<List<PixelRect>>() ?? []); break;
             case "columns": ReplaceColumns(value.Deserialize<List<string>>() ?? []); break;
             case "columnWidths": ReplaceColumnWidths(value.Deserialize<List<int>>() ?? []); break;
             case "columnOrder": ReplaceColumnOrder(value.Deserialize<List<int>>() ?? []); break;
             case "rows": ReplaceRows(value.Deserialize<List<List<string>>>() ?? []); break;
+            case "itemDetails": ReplaceItemDetails(value.Deserialize<List<List<string>>>() ?? []); break;
             case "imageWidth": ImageWidth = value.GetInt32(); break;
             case "imageHeight": ImageHeight = value.GetInt32(); break;
             case "imageFormat": ImageFormat = value.GetString() ?? string.Empty; break;
@@ -484,6 +493,18 @@ public sealed class ControlNodeViewModel : ObservableObject
         Columns.Clear();
         foreach (var column in columns) Columns.Add(column);
         RaisePropertyChanged(nameof(Columns));
+    }
+
+    // A tile-view list's detail lines under each item's label (minor 41); empty otherwise.
+    public IReadOnlyList<IReadOnlyList<string>> ItemDetails { get; private set; } = [];
+
+    private void ReplaceItemDetails(IEnumerable<IEnumerable<string>> details)
+    {
+        var copies = details.Select(lines => (IReadOnlyList<string>)lines.ToArray()).ToArray();
+        if (ItemDetails.Count == copies.Length &&
+            ItemDetails.Zip(copies).All(pair => pair.First.SequenceEqual(pair.Second, StringComparer.Ordinal))) return;
+        ItemDetails = copies;
+        RaisePropertyChanged(nameof(ItemDetails));
     }
 
     private void ReplaceItemNativeIds(IEnumerable<string> identities)

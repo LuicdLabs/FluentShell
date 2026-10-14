@@ -40,6 +40,8 @@ namespace FluentShell::Bridge::Translation {
 namespace {
 
 constexpr size_t kMaxListViewColumns = 64;
+// The detail lines a tile shows under its label (a tile view shows a few, LVTILEVIEWINFO.cLines).
+constexpr size_t kMaxTileDetailLines = 8;
 constexpr size_t kMaxStatusBarParts = 64;
 constexpr size_t kMaxStructuredTextChars = 256 * 1024;
 constexpr size_t kMaxTabLabelChars = 4096;
@@ -230,10 +232,19 @@ constexpr int kMaxInertRuleLength = 1024;
 // click changes nothing -- is still only its painted band.
 constexpr int kMaxFocusableStripHeight = 32;
 
-bool IsWindowsFormsInertSurface(HWND hwnd, DWORD style) noexcept {
+// A window the application only paints, projected as the picture it paints: a Windows Forms
+// PictureBox or rule, and in any other class a control that frames nothing, scrolls nothing,
+// takes no keyboard input and offers no action -- the Date and Time clock, the mouse drawn in
+// Mouse Properties, the Volume Mixer's level meter.  An MFC frame or view is a document
+// surface, never one of these.
+bool IsInertPaintedSurface(HWND hwnd, DWORD style) noexcept {
     wchar_t raw[kMaxClassNameChars]{};
     const int length = GetClassNameW(hwnd, raw, static_cast<int>(kMaxClassNameChars));
-    if (length <= 0 || !std::wstring_view(raw, static_cast<size_t>(length)).starts_with(L"WindowsForms10.Window."))
+    if (length <= 0) return false;
+    const std::wstring_view name(raw, static_cast<size_t>(length));
+    if (!name.starts_with(L"WindowsForms10.Window.") &&
+        (name.starts_with(L"Afx") || (style & WS_TABSTOP) != 0 ||
+         SendMessageW(hwnd, WM_GETDLGCODE, 0, 0) != 0))
         return false;
     RECT client{};
     if ((style & (WS_HSCROLL | WS_VSCROLL)) != 0 || GetWindow(hwnd, GW_CHILD) ||
@@ -467,11 +478,18 @@ bool ProbeButton(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason
         // the inert picture it shows; a wider face that takes focus has no contract.
         if (IsWindowsFormsWindow(hwnd)) return Reject(reason, L"unsupported Button draw style");
         RECT client{};
-        const bool fitsButtonPicture = GetClientRect(hwnd, &client) &&
+        const bool measured = GetClientRect(hwnd, &client) != FALSE;
+        const bool fitsButtonPicture = measured &&
             client.right <= static_cast<LONG>(Ipc::kMaxImageDimension) &&
             client.bottom <= static_cast<LONG>(Ipc::kMaxImageDimension);
+        // A wider face a key reaches is still a button (Internet Options' colour buttons, which paint
+        // their label and a swatch): its whole face travels under the owner-draw face bound.
+        const bool fitsOwnerDrawFace = measured &&
+            client.right <= static_cast<LONG>(Ipc::kMaxOwnerDrawFaceWidth) &&
+            client.bottom <= static_cast<LONG>(Ipc::kMaxOwnerDrawFaceHeight);
         if (fitsButtonPicture) kind = ControlKind::Button;
         else if ((style & WS_TABSTOP) == 0) kind = ControlKind::StaticBitmap;
+        else if (fitsOwnerDrawFace) kind = ControlKind::Button;
         else return Reject(reason, L"owner-draw button face exceeds the picture cap");
         return true;
     }
@@ -485,6 +503,8 @@ bool ProbeButton(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason
     // leading arrow (Windows Memory Diagnostic's two choices): the note is read with it.
     case BS_COMMANDLINK:
     case BS_DEFCOMMANDLINK:
+    case BS_SPLITBUTTON:
+    case BS_DEFSPLITBUTTON:
         kind = ControlKind::Button;
         return true;
     case BS_CHECKBOX:
@@ -636,15 +656,24 @@ bool ProbeComboBoxEx(HWND, DWORD style, ControlKind& kind, std::wstring& reason)
     return true;
 }
 
+// The Volume Mixer's frames around its device and application columns: a group box of its own
+// class, which keeps the Button group-box type in its style and its label as its text.
+bool ProbeSpdGroupBox(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if ((style & BS_TYPEMASK) != BS_GROUPBOX)
+        return Reject(reason, L"SPD_GroupBox is not drawn as a group box");
+    kind = ControlKind::GroupBox;
+    return true;
+}
+
 bool ProbeListBox(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
     // A multi-select list (LBS_MULTIPLESEL toggles each click, LBS_EXTENDEDSEL takes ctrl and shift)
-    // carries its selection as an index list; the rest of the unsupported styles change what an item
-    // is, which is not something the projection can carry.
-    constexpr DWORD unsupported = LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE |
-        LBS_NODATA | LBS_MULTICOLUMN | LBS_NOSEL;
+    // carries its selection as an index list, and an owner-draw list its rows as the owner paints
+    // them (CaptureOwnerDrawListBox); the rest of the unsupported styles change what an item is,
+    // which is not something the projection can carry.
+    constexpr DWORD unsupported = LBS_NODATA | LBS_MULTICOLUMN | LBS_NOSEL;
     if ((style & unsupported) != 0) {
         return Reject(reason,
-            L"owner-draw, virtual, or multi-column ListBox");
+            L"virtual, multi-column or unselectable ListBox");
     }
     kind = ControlKind::ListBox;
     return true;
@@ -681,7 +710,17 @@ bool ProbeProgressBar(HWND, DWORD style, ControlKind& kind, std::wstring& reason
     return true;
 }
 
-bool ProbeSysLink(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+bool ProbeSysLink(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    // A link control that holds no link at all is a label (Computer Name Changes' explanation is a
+    // shell Link Window): nothing in it can be activated, and its window text is the text it shows.
+    LITEM first{};
+    first.mask = LIF_ITEMINDEX;
+    first.iLink = 0;
+    if ((style & (0xFFFFu | WS_TABSTOP)) == 0 &&
+        !SendMessageW(hwnd, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&first))) {
+        kind = ControlKind::StaticText;
+        return true;
+    }
     constexpr DWORD unsupported = LWS_IGNORERETURN | LWS_USECUSTOMTEXT |
         LWS_RIGHT | LWS_NOPREFIX;
     if ((style & unsupported) != 0) {
@@ -694,7 +733,12 @@ bool ProbeSysLink(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
 
 bool ReadListViewMode(HWND hwnd, DWORD style, std::wstring& mode, std::wstring& reason) {
     const LRESULT view = SendMessageW(hwnd, LVM_GETVIEW, 0, 0);
-    if (view == LV_VIEW_TILE) return Reject(reason, L"tile ListView is not supported");
+    // A tile is the large icon beside the label and a few detail lines (the Sound applet's
+    // devices); it is carried as a positioned item with those lines.
+    if (view == LV_VIEW_TILE) {
+        mode = L"tile";
+        return true;
+    }
     if (view < LV_VIEW_ICON || view > LV_VIEW_LIST)
         return Reject(reason, L"ListView returned an unknown presentation mode");
     const DWORD legacyView = style & LVS_TYPEMASK;
@@ -795,10 +839,12 @@ bool ProbeToolbar(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reaso
     // places itself when its parent resizes; the projection lays the toolbar out from
     // its native rectangle either way.  TBSTYLE_LIST puts the label beside the icon,
     // which the projected button already does.  TBSTYLE_ALTDRAG only matters to a
-    // customizable (CCS_ADJUSTABLE) toolbar, which stays refused.
+    // customizable (CCS_ADJUSTABLE) toolbar, which stays refused.  TBSTYLE_CUSTOMERASE only
+    // lets the parent paint the strip's background (the Volume Mixer's mute buttons), and the
+    // projection draws its own.
     constexpr DWORD accepted = CCS_TOP | CCS_NOMOVEY | CCS_NODIVIDER | CCS_NORESIZE |
         CCS_NOPARENTALIGN | TBSTYLE_TOOLTIPS | TBSTYLE_WRAPABLE | TBSTYLE_FLAT |
-        TBSTYLE_TRANSPARENT | TBSTYLE_LIST | TBSTYLE_ALTDRAG;
+        TBSTYLE_TRANSPARENT | TBSTYLE_LIST | TBSTYLE_ALTDRAG | TBSTYLE_CUSTOMERASE;
     if ((toolbarStyle & ~accepted) != 0) {
         wchar_t text[128]{};
         swprintf_s(text, L"ToolbarWindow32 has unsupported style bits 0x%04lX (style=0x%08lX)",
@@ -807,10 +853,14 @@ bool ProbeToolbar(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reaso
         return false;
     }
     // TBSTYLE_EX_DRAWDDARROWS only draws the arrow of a BTNS_DROPDOWN button as a separate part
-    // of it, which is how the snapshot already carries such a button; every other extended style
-    // changes what a button looks like or does.
+    // of it, which is how the snapshot already carries such a button; TBSTYLE_EX_DOUBLEBUFFER
+    // only paints the strip off screen first (the Volume Mixer's), and TBSTYLE_EX_MIXEDBUTTONS
+    // only limits drawn labels to BTNS_SHOWTEXT buttons, which labelBeside carries.  Every other
+    // extended style changes what a button looks like or does.
+    constexpr DWORD acceptedExtended = TBSTYLE_EX_DRAWDDARROWS | TBSTYLE_EX_DOUBLEBUFFER |
+        TBSTYLE_EX_MIXEDBUTTONS;
     const auto extended = static_cast<DWORD>(SendMessageW(hwnd, TB_GETEXTENDEDSTYLE, 0, 0));
-    if ((extended & ~static_cast<DWORD>(TBSTYLE_EX_DRAWDDARROWS)) != 0) {
+    if ((extended & ~acceptedExtended) != 0) {
         wchar_t text[112]{};
         swprintf_s(text, L"ToolbarWindow32 has unsupported extended style 0x%08lX", extended);
         reason = text;
@@ -871,19 +921,19 @@ bool ProbeTabControl(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& re
 }
 
 // The bounded TreeView subset: a single-selection tree whose hierarchy,
-// expansion, selection, item icons, overlays, and state images are all readable
-// from the control itself. Checkbox toggles, hover selection, auto-collapse,
-// and callback tooltips each own behavior the projection cannot reproduce, so
-// each keeps the whole window native by name.
+// expansion, selection, item icons, overlays, state images and two-state check
+// boxes are all readable from the control itself. Multi-state check boxes and
+// callback tooltips own behavior the projection cannot reproduce, so each keeps
+// the whole window native by name.
 bool ProbeTreeView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
-    constexpr DWORD unsupportedStyle = TVS_CHECKBOXES |
-        TVS_TRACKSELECT | TVS_SINGLEEXPAND | TVS_INFOTIP | TVS_RTLREADING;
+    // TVS_INFOTIP only asks the owner for a hover tip and TVS_TRACKSELECT only underlines the
+    // item under the pointer; under TVS_SINGLEEXPAND the native tree folds the other branches
+    // itself when one opens, and the next capture carries that.  None changes what an item is.
+    // TVS_CHECKBOXES gives every item the control's own unchecked/checked box, captured as the
+    // tree's checkedIndices and toggled by the Space key the control itself answers.
+    constexpr DWORD unsupportedStyle = TVS_RTLREADING;
     if (const DWORD rejected = style & unsupportedStyle; rejected != 0) {
         static constexpr NamedFlag flags[] = {
-            { TVS_CHECKBOXES, L"TVS_CHECKBOXES" },
-            { TVS_TRACKSELECT, L"TVS_TRACKSELECT" },
-            { TVS_SINGLEEXPAND, L"TVS_SINGLEEXPAND" },
-            { TVS_INFOTIP, L"TVS_INFOTIP" },
             { TVS_RTLREADING, L"TVS_RTLREADING" },
         };
         return RejectFlags(reason, L"TreeView has unsupported style bit(s) ",
@@ -909,8 +959,9 @@ bool ProbeTreeView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reas
         return RejectFlags(reason, L"TreeView has unsupported extended style bit(s) ",
             rejected, extended, flags, std::size(flags));
     }
-    // A state image list is painted beside each item that names one. Checkbox
-    // styles stay refused above: those glyphs are a toggle, not decoration.
+    // A state image list is painted beside each item that names one. The partial,
+    // dimmed and exclusion check box styles stay refused above: their extra glyphs
+    // are states of a toggle, not decoration.
     // The control's built-in tooltip only re-renders a truncated item label the
     // adapter already captures, so its presence is not interrogated.  Application
     // tooltip *content* arrives through TVS_INFOTIP and TVS_EX_RICHTOOLTIP, and
@@ -1043,8 +1094,10 @@ bool ProbeMdiChild(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reas
 bool ProbeDialogContainer(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
     const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
     if ((style & WS_CHILD) == 0) return Reject(reason, L"dialog is not a child window");
+    // WS_SYSMENU draws nothing without a caption (the Volume Mixer's columns carry it); the
+    // caption itself stays refused.
     constexpr DWORD unsupportedStyle = WS_CAPTION | WS_THICKFRAME | WS_BORDER |
-        WS_DLGFRAME | WS_HSCROLL | WS_VSCROLL | WS_SYSMENU | DS_MODALFRAME;
+        WS_DLGFRAME | WS_HSCROLL | WS_VSCROLL | DS_MODALFRAME;
     constexpr DWORD unsupportedExStyle = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE |
         WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_LAYERED;
     if ((style & unsupportedStyle) != 0 || (exStyle & unsupportedExStyle) != 0) {
@@ -1109,6 +1162,9 @@ struct PaneSurface final {
 };
 
 bool IsPlainSurfaceBand(HWND container, const RECT& band) noexcept;
+// One render of the container, every band judged against it: `plain[i]` for `bands[i]`.  All
+// false when the container cannot be rendered.
+void PlainSurfaceBands(HWND container, const std::vector<RECT>& bands, std::vector<bool>& plain) noexcept;
 
 bool CollectPaneSurface(
     HWND container,
@@ -1136,7 +1192,7 @@ bool CollectPaneSurface(
         return Reject(reason, L"container region could not be measured");
     }
     const auto* rects = reinterpret_cast<const RECT*>(data->Buffer);
-    size_t chromeBytes = 0;
+    std::vector<RECT> bands;
     for (DWORD index = 0; index < data->rdh.nCount; ++index) {
         const RECT& gap = rects[index];
         const int width = gap.right - gap.left;
@@ -1146,14 +1202,26 @@ bool CollectPaneSurface(
             surface.gaps.push_back(PaneGap{ gap, height > width });
             continue;
         }
+        bands.push_back(gap);
+    }
+    // A band that is only the surface the projection draws behind every control (the empty room
+    // beside a button row, the cells between an ACL checklist's Allow and Deny boxes) needs neither
+    // pixels nor one of the few chrome slots, so every band is judged before any slot is given out:
+    // a checklist's dozen blank cells otherwise used the slots up, and a cell after them that one
+    // render did not see as blank refused the whole window.
+    std::vector<bool> plain;
+    if (!bands.empty()) PlainSurfaceBands(container, bands, plain);
+    size_t chromeBytes = 0;
+    for (size_t index = 0; index < bands.size(); ++index) {
+        const RECT& gap = bands[index];
+        if (index < plain.size() && plain[index]) continue;
+        const int width = gap.right - gap.left;
+        const int height = gap.bottom - gap.top;
         const size_t bytes = static_cast<size_t>(width) * height * 4;
         if (width > static_cast<int>(Ipc::kMaxChromeRegionDimension) ||
             height > static_cast<int>(Ipc::kMaxChromeRegionDimension) ||
             surface.chrome.size() >= Ipc::kMaxChromeRegions ||
             chromeBytes + bytes > Ipc::kMaxChromeRegionBytes) {
-            // More than the caps carry is still nothing when it is only the surface the
-            // projection draws behind every control (the empty room beside a button row).
-            if (IsPlainSurfaceBand(container, gap)) continue;
             if (chromeBytes + bytes > Ipc::kMaxChromeRegionBytes &&
                 width <= static_cast<int>(Ipc::kMaxChromeRegionDimension) &&
                 height <= static_cast<int>(Ipc::kMaxChromeRegionDimension) &&
@@ -1487,6 +1555,18 @@ bool IsPlainSurfaceBand(HWND container, const RECT& band) noexcept {
         return surface.Rendered() && IsSurfaceFillBand(surface, band);
     } catch (...) {
         return false;
+    }
+}
+
+void PlainSurfaceBands(HWND container, const std::vector<RECT>& bands, std::vector<bool>& plain) noexcept {
+    try {
+        plain.assign(bands.size(), false);
+        const PaintedClientSurface surface(container);
+        if (!surface.Rendered()) return;
+        for (size_t index = 0; index < bands.size(); ++index)
+            plain[index] = IsSurfaceFillBand(surface, bands[index]);
+    } catch (...) {
+        try { plain.assign(bands.size(), false); } catch (...) {}
     }
 }
 
@@ -2047,6 +2127,7 @@ constexpr std::array kClassAdapters{
     ClassAdapter{ RICHEDIT_CLASSW, &ProbeRichEdit },
     ClassAdapter{ L"ComboBox", &ProbeComboBox },
     ClassAdapter{ WC_COMBOBOXEXW, &ProbeComboBoxEx },
+    ClassAdapter{ L"SPD_GroupBox", &ProbeSpdGroupBox },
     ClassAdapter{ L"ListBox", &ProbeListBox },
     ClassAdapter{ PROGRESS_CLASSW, &ProbeProgressBar },
     ClassAdapter{ WC_LINK, &ProbeSysLink },
@@ -2272,7 +2353,7 @@ bool CaptureReferencedImageList(
             if (itemOverlays) {
                 overlay = (*itemOverlays)[slot];
                 if (overlay < 0 || overlay > 15)
-                    return Reject(reason, L"TreeView overlay image index is outside 0..15");
+                    return Reject(reason, L"item overlay image index is outside 0..15");
             }
             references.push_back({ index, overlay });
         }
@@ -2512,13 +2593,13 @@ bool CaptureStaticBitmapState(HWND hwnd, ControlNode& node, std::wstring& reason
             node.imageFormat, node.imageData) ? true :
             Reject(reason, L"symbol-font Windows Forms label could not render its glyphs");
     }
-    if (IsWindowsFormsInertSurface(hwnd, style)) {
+    if (IsInertPaintedSurface(hwnd, style)) {
         RECT client{};
         GetClientRect(hwnd, &client);
         PaintedClientSurface paint(hwnd);
         return paint.Rendered() && paint.Crop(client, node.imageWidth, node.imageHeight,
             node.imageFormat, node.imageData) ? true :
-            Reject(reason, L"Windows Forms surface could not render its owned pixels");
+            Reject(reason, L"painted surface could not render its owned pixels");
     }
     if ((style & SS_REALSIZECONTROL) != 0)
         return Reject(reason, L"scaled Static bitmap is not supported");
@@ -3008,6 +3089,8 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.columnWidths.clear();
     node.columnOrder.clear();
     node.rows.clear();
+    node.itemDetails.clear();
+    const bool tile = node.listViewMode == L"tile";
     node.items.clear();
     node.itemRects.clear();
     node.itemNativeIds.clear();
@@ -3043,6 +3126,8 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     // admissible, but an empty ID vector cannot authorize item activation.
     if (stableIds) node.itemNativeIds.reserve(static_cast<size_t>(count));
     std::unordered_set<uint32_t> nativeIds;
+    std::vector<int> overlays;
+    overlays.reserve(windowRows);
     CaptureTrace(L"ListView columns read; reading rows");
     for (int row = windowStart; row < windowEnd; ++row) {
         if (CaptureTraceEnabled()) CaptureTrace(L"ListView row " + std::to_wstring(row));
@@ -3087,6 +3172,11 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             image.iImage = query.item.iImage == I_IMAGECALLBACK ? I_IMAGENONE : query.item.iImage;
         }
         node.itemImages.push_back(image.iImage);
+        // The overlay the control composites on the icon (the Sound applet's default and
+        // unplugged badges), composited the same way into the captured icon.
+        overlays.push_back(static_cast<int>(
+            (SendMessageW(hwnd, LVM_GETITEMSTATE, static_cast<WPARAM>(row), LVIS_OVERLAYMASK) &
+             LVIS_OVERLAYMASK) >> 8));
         bool groupVisible = true;
         if (node.groupViewEnabled) {
             node.itemGroupIds.push_back(image.iGroupId);
@@ -3095,6 +3185,25 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             if (group == node.listViewGroups.end() && image.iGroupId != I_GROUPIDNONE)
                 return Reject(reason, L"ListView item names an unknown group");
             groupVisible = group != node.listViewGroups.end() && !group->collapsed && !group->hidden;
+        }
+        if (tile) {
+            // The subitems the tile shows under its label, in the order it shows them.
+            std::array<UINT, kMaxTileDetailLines> columns{};
+            LVTILEINFO info{};
+            info.cbSize = sizeof(info);
+            info.iItem = row;
+            info.cColumns = static_cast<UINT>(columns.size());
+            info.puColumns = columns.data();
+            std::vector<std::wstring> details;
+            if (SendMessageW(hwnd, LVM_GETTILEINFO, 0, reinterpret_cast<LPARAM>(&info))) {
+                for (UINT line = 0; line < std::min<UINT>(info.cColumns, kMaxTileDetailLines); ++line) {
+                    std::wstring text;
+                    if (!ReadListViewCell(hwnd, row, static_cast<int>(columns[line]), text, reason)) return false;
+                    if (!withinTextBudget(text.size())) return false;
+                    details.push_back(std::move(text));
+                }
+            }
+            node.itemDetails.push_back(std::move(details));
         }
         node.items.push_back(cells.front());
         if (report) node.rows.push_back(std::move(cells));
@@ -3117,11 +3226,11 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     }
     CaptureTrace(L"ListView rows read");
     // Read the current list after the item callbacks, which can populate it.
-    // Large icons use LVSIL_NORMAL; all other admitted views draw LVSIL_SMALL.
+    // Large icons and tiles use LVSIL_NORMAL; all other admitted views draw LVSIL_SMALL.
     if (!CaptureReferencedImageList(reinterpret_cast<HIMAGELIST>(
             SendMessageW(hwnd, LVM_GETIMAGELIST,
-                node.listViewMode == L"largeIcon" ? LVSIL_NORMAL : LVSIL_SMALL, 0)),
-            node.itemImages, nullptr, nullptr, node.imageList, reason)) return false;
+                node.listViewMode == L"largeIcon" || tile ? LVSIL_NORMAL : LVSIL_SMALL, 0)),
+            node.itemImages, nullptr, &overlays, node.imageList, reason)) return false;
     const HWND editControl = reinterpret_cast<HWND>(
         SendMessageW(hwnd, LVM_GETEDITCONTROL, 0, 0));
     node.editingIndex = editControl && IsWindow(editControl)
@@ -3374,11 +3483,11 @@ bool CaptureSysLinkState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     prefix = shown(prefix);
     suffix = shown(suffix);
     const std::wstring flattened = prefix + label + suffix;
+    // A label that also occurs elsewhere in the text carries where the link itself starts.
     const size_t labelAt = flattened.find(label);
-    if (labelAt != prefix.size() ||
-        flattened.find(label, labelAt + label.size()) != std::wstring::npos) {
-        return Reject(reason, L"SysLink label is ambiguous in its flattened text");
-    }
+    node.linkStarts.clear();
+    if (labelAt != prefix.size() || flattened.find(label, labelAt + label.size()) != std::wstring::npos)
+        node.linkStarts.push_back(static_cast<int>(prefix.size()));
     node.text = flattened;
     node.automationName = node.text;
     node.items.push_back(label);
@@ -3399,7 +3508,13 @@ bool IsTinyGlyphButton(HWND hwnd, const std::wstring& text) noexcept {
 bool CaptureButtonState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const auto style = static_cast<DWORD>(node.style);
     node.isDefault = (style & BS_TYPEMASK) == BS_DEFPUSHBUTTON ||
-        (style & BS_TYPEMASK) == BS_DEFCOMMANDLINK;
+        (style & BS_TYPEMASK) == BS_DEFCOMMANDLINK || (style & BS_TYPEMASK) == BS_DEFSPLITBUTTON;
+    // A split button (the Sound applet's Set Default) is a push button with an arrow that asks
+    // its owner for a menu (BCN_DROPDOWN).
+    if ((style & BS_TYPEMASK) == BS_SPLITBUTTON || (style & BS_TYPEMASK) == BS_DEFSPLITBUTTON) {
+        node.presentationVariant = L"splitButton";
+        return true;
+    }
     if ((style & BS_TYPEMASK) == BS_COMMANDLINK || (style & BS_TYPEMASK) == BS_DEFCOMMANDLINK) {
         node.presentationVariant = L"commandLink";
         node.helpText.clear();
@@ -3419,7 +3534,9 @@ bool CaptureButtonState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     if ((style & BS_TYPEMASK) == BS_OWNERDRAW && !IsWindowsFormsWindow(hwnd)) {
         // The owner paints the whole face, so the picture is the face as painted, not a glyph on a
         // background to key out (a colour swatch is all background); the text stays the accessible name.
-        if (!CapturePaintedFace(hwnd, Ipc::kMaxImageDimension, node.imageWidth, node.imageHeight,
+        RECT client{};
+        if (!GetClientRect(hwnd, &client) || client.bottom > static_cast<LONG>(Ipc::kMaxOwnerDrawFaceHeight) ||
+            !CapturePaintedFace(hwnd, Ipc::kMaxOwnerDrawFaceWidth, node.imageWidth, node.imageHeight,
                 node.imageFormat, node.imageData))
             return Reject(reason, L"owner-draw button face exceeds the picture cap or did not render");
         return true;
@@ -3520,8 +3637,9 @@ bool CaptureRichTextState(HWND hwnd, ControlNode& node, std::wstring& reason) {
 // owner for its text stays native.
 bool CaptureComboBoxExState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.editable = (static_cast<DWORD>(node.style) & 0x0003u) == CBS_DROPDOWN;
-    if (SendMessageW(hwnd, CBEM_GETIMAGELIST, 0, 0))
-        return Reject(reason, L"ComboBoxEx item images are not projected");
+    const bool images = SendMessageW(hwnd, CBEM_GETIMAGELIST, 0, 0) != 0;
+    if (images && node.editable)
+        return Reject(reason, L"editable ComboBoxEx item images are not projected");
     const LRESULT rawCount = SendMessageW(hwnd, CB_GETCOUNT, 0, 0);
     if (rawCount < 0 || rawCount > static_cast<LRESULT>(Ipc::kMaxListItems))
         return Reject(reason, L"invalid or excessive ComboBoxEx item count");
@@ -3552,6 +3670,20 @@ bool CaptureComboBoxExState(HWND hwnd, ControlNode& node, std::wstring& reason) 
     node.selectedIndex = static_cast<int>(SendMessageW(hwnd, CB_GETCURSEL, 0, 0));
     if (node.selectedIndex < -1 || node.selectedIndex >= static_cast<int>(node.items.size()))
         return Reject(reason, L"ComboBoxEx selection is outside its items");
+    // Items that draw an image (recdisc's drives) travel as the faces the ComboBoxEx paints for
+    // them -- it is the owner of its inner owner-draw combo -- each named by the text it stores.
+    if (images) {
+        const std::vector<std::wstring> labels = node.items;
+        const HWND inner = reinterpret_cast<HWND>(SendMessageW(hwnd, CBEM_GETCOMBOCONTROL, 0, 0));
+        if (!inner || !IsWindow(inner) || !CaptureOwnerDrawComboBox(inner, node, reason, &labels)) return false;
+        // Its items are owner-drawn -- by the ComboBoxEx, through its inner combo -- so the style
+        // evidence says so, as an owner-draw combo's own style does.
+        node.style |= static_cast<DWORD>(GetWindowLongPtrW(inner, GWL_STYLE)) &
+            (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE);
+        node.editable = false;
+        node.text = node.selectedIndex < 0 ? std::wstring() : node.items[static_cast<size_t>(node.selectedIndex)];
+        return true;
+    }
     // What the box shows: the typed text of an editable one, the selected item otherwise.
     const HWND edit = reinterpret_cast<HWND>(SendMessageW(hwnd, CBEM_GETEDITCONTROL, 0, 0));
     if (node.editable) {
@@ -3575,6 +3707,8 @@ bool CaptureStringListState(HWND hwnd, ControlNode& node, std::wstring& reason) 
     if (combo && IsComboBoxExWindow(hwnd)) return CaptureComboBoxExState(hwnd, node, reason);
     if (combo && (static_cast<DWORD>(node.style) & (CBS_OWNERDRAWFIXED | CBS_OWNERDRAWVARIABLE)))
         return CaptureOwnerDrawComboBox(hwnd, node, reason);
+    if (!combo && (static_cast<DWORD>(node.style) & (LBS_OWNERDRAWFIXED | LBS_OWNERDRAWVARIABLE)))
+        return CaptureOwnerDrawListBox(hwnd, node, reason);
     node.editable = combo && (static_cast<DWORD>(node.style) & 0x0003u) == CBS_DROPDOWN;
     if (node.editable) node.cueBanner = ReadCueBanner(hwnd, CB_GETCUEBANNER);
     if (!ReadStringItems(hwnd, combo, node.items, reason)) return false;
@@ -3712,8 +3846,10 @@ bool DescribeToolbarButtonStyle(
     // it changes nothing about the button, which stays an ordinary push button.
     // Performance Monitor's snap-in toolbar buttons carry it that way.
     const bool grouped = toggle && (style & BTNS_GROUP) != 0;
+    // BTNS_NOPREFIX only says the label's '&' is a character, not an access key; the label is
+    // carried escaped so (see the label read).
     constexpr BYTE acceptedButtonStyle = BTNS_AUTOSIZE | BTNS_SHOWTEXT | BTNS_CHECK |
-        BTNS_GROUP | BTNS_DROPDOWN | BTNS_WHOLEDROPDOWN;
+        BTNS_GROUP | BTNS_DROPDOWN | BTNS_WHOLEDROPDOWN | BTNS_NOPREFIX;
     if ((style & ~acceptedButtonStyle) != 0) {
         wchar_t evidence[152]{};
         swprintf_s(evidence,
@@ -3905,6 +4041,18 @@ bool CaptureToolbarState(HWND hwnd, ControlNode& node, std::wstring& reason) {
                     return Reject(reason, L"ToolbarWindow32 labels exceed the aggregate text cap");
                 totalText += length;
                 item.text.assign(label.data(), length);
+                // A BTNS_NOPREFIX label shows its '&' as is: doubled, it stays a character
+                // through the projection's mnemonic handling.
+                if ((button.fsStyle & BTNS_NOPREFIX) != 0) {
+                    std::wstring escaped;
+                    for (const wchar_t character : item.text) {
+                        escaped.push_back(character);
+                        if (character == L'&') escaped.push_back(L'&');
+                    }
+                    if (escaped.size() >= kMaxTabLabelChars)
+                        return Reject(reason, L"ToolbarWindow32 push button label exceeds the bounded text cap");
+                    item.text = std::move(escaped);
+                }
             }
 
             const bool drawsItsOwnLabel = length != 0;
@@ -4171,6 +4319,10 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.editingIndex = -1;
     node.selectedIndex = -1;
     node.multiSelect = false;
+    // TVS_CHECKBOXES: the control's own state list is its unchecked (1) and checked (2) box.
+    // The projection draws a real check box from checkedIndices instead of those glyphs.
+    node.checkBoxes = (static_cast<DWORD>(node.style) & TVS_CHECKBOXES) != 0;
+    node.checkedIndices.clear();
     if (handles.empty()) return true;
     const HWND editControl = reinterpret_cast<HWND>(
         SendMessageW(hwnd, TVM_GETEDITCONTROL, 0, 0));
@@ -4186,6 +4338,13 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     const int stateCount = stateImages ? ImageList_GetImageCount(stateImages) : 0;
     if (stateImages && stateCount < 0)
         return Reject(reason, L"TreeView state image list metadata is unavailable");
+    // The Space key (or a click on the box) advances an item to the next image of the state list,
+    // wrapping after the last: two states only when the list is the control's own blank,
+    // unchecked and checked trio.  An application list with more images is a multi-state toggle.
+    // The control builds its trio when it first paints, so a tree not painted yet has none.
+    if (node.checkBoxes && stateCount != 0 && stateCount != 3)
+        return Reject(reason, (L"TreeView check boxes do not use the two-state image list (" +
+            std::to_wstring(stateCount) + L" images)").c_str());
     size_t totalText = 0;
     std::vector<int> overlays;
     overlays.reserve(handles.size());
@@ -4234,7 +4393,15 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         // I_IMAGENONE, not -1: -1 is I_IMAGECALLBACK, and the shared image
         // capture rejects that when a list exists. The capture remaps the
         // sentinel to the protocol's -1 afterwards.
-        if (stateImage == 0 || !stateImages) {
+        if (node.checkBoxes) {
+            // State 0 hides an item's box, which a list of check boxes cannot say.
+            if (stateImage == 2) node.checkedIndices.push_back(static_cast<int>(index));
+            else if (stateImage != 1)
+                return Reject(reason, stateImage == 0
+                    ? L"TreeView check box item hides its check box"
+                    : L"TreeView check box item is in neither the checked nor the unchecked state");
+            node.itemStateImages.push_back(I_IMAGENONE);
+        } else if (stateImage == 0 || !stateImages) {
             node.itemStateImages.push_back(I_IMAGENONE);
         } else if (stateImage >= stateCount) {
             return Reject(reason, L"TreeView state image index is outside the state image list");
@@ -4249,8 +4416,8 @@ bool CaptureTreeViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
             SendMessageW(hwnd, TVM_GETIMAGELIST, TVSIL_NORMAL, 0)),
             node.itemImages, &node.itemSelectedImages, &overlays, node.imageList, reason))
         return false;
-    if (!CaptureReferencedImageList(
-            stateImages, node.itemStateImages, nullptr, nullptr, node.stateImageList, reason))
+    if (!CaptureReferencedImageList(node.checkBoxes ? nullptr : stateImages,
+            node.itemStateImages, nullptr, nullptr, node.stateImageList, reason))
         return false;
     // A tree MMC hosts for a snap-in's result view (Device Manager's devices) opens an item on a
     // double-click (Enter); MMC's own scope tree only expands and selects.
@@ -4706,7 +4873,7 @@ bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
         std::wstring spinReason;
         if (ProbeWindowsFormsSpin(hwnd, kind, spinReason)) return true;
         if (ProbePaneContainer(hwnd, style, kind, containerReason)) return true;
-        if (IsWindowsFormsInertSurface(hwnd, style)) {
+        if (IsInertPaintedSurface(hwnd, style)) {
             kind = ControlKind::StaticBitmap;
             return true;
         }
@@ -5160,6 +5327,31 @@ bool SetListBoxSelection(HWND listBox, const std::vector<int>& indices) noexcept
         std::sort(actual.begin(), actual.end());
         return actual == indices;
     } catch (...) {
+        return false;
+    }
+}
+
+bool RequestSplitButtonDropDown(HWND button, std::wstring& reason) noexcept {
+    try {
+        if (!button || GetWindowThreadProcessId(button, nullptr) != GetCurrentThreadId())
+            return Reject(reason, L"split button is not on this GUI thread");
+        const HWND owner = GetParent(button);
+        const auto type = static_cast<DWORD>(GetWindowLongPtrW(button, GWL_STYLE)) & BS_TYPEMASK;
+        if (!owner || (type != BS_SPLITBUTTON && type != BS_DEFSPLITBUTTON) || !IsWindowEnabled(button))
+            return Reject(reason, L"the button is no longer an enabled split button");
+        RECT rect{};
+        if (!GetClientRect(button, &rect)) return Reject(reason, L"the split button has no rectangle");
+        if (GuiThreadOperationCancelled()) return Reject(reason, L"drop-down request was cancelled");
+        // What the button's own click on its arrow sends: its owner answers by tracking a menu.
+        NMBCDROPDOWN notification{};
+        notification.hdr.hwndFrom = button;
+        notification.hdr.idFrom = static_cast<UINT_PTR>(GetDlgCtrlID(button));
+        notification.hdr.code = BCN_DROPDOWN;
+        notification.rcButton = rect;
+        SendMessageW(owner, WM_NOTIFY, notification.hdr.idFrom, reinterpret_cast<LPARAM>(&notification));
+        return true;
+    } catch (...) {
+        reason = L"drop-down request failed";
         return false;
     }
 }

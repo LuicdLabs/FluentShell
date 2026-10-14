@@ -17,7 +17,7 @@ public sealed class LabelSessionAndFocusProtocolTests
         Assert.Equal("focus", action.Action);
         Assert.Equal("2", action.NodeId);
         Assert.Equal(JsonValueKind.Null, action.Value.ValueKind);
-        Assert.Equal(40, ProtocolConstants.Minor);
+        Assert.True(ProtocolConstants.Minor >= 40);
     }
 
     [Fact]

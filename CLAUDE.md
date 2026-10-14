@@ -426,3 +426,36 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
   or links keep it native. A `ScrollBar` with `SBS_SIZEGRIP`/`SBS_SIZEBOX` is the dialog's resize corner and is
   absorbed. regedit's Modify Binary Data stays native: its private `HEX` control publishes no text, value or
   accessible data to read or write.
+- Protocol minor 41: a tile-view ListView (`LV_VIEW_TILE`, the Sound applet's devices) carries each tile's detail lines
+  as `itemDetails`; a `BS_SPLITBUTTON` is a `button` with `presentationVariant: splitButton`, whose arrow is the
+  `splitDropDown` action (`BCN_DROPDOWN` to the owner; the renderer uses a plain WinUI `SplitButton`, since a subclass of
+  it cannot take its style). A `TVS_CHECKBOXES` tree carries `checkBoxes`/`checkedIndices` (the box glyphs are never sent
+  as state images) and `setItemCheck` makes the item the caret and sends the Space key sequence (`SetTreeViewItemCheck`):
+  the only gesture that reaches comctl32's `TVN_KEYDOWN`/`TVN_ITEMCHANGED` listeners and a Windows Forms tree's
+  `AfterCheck` alike. The control builds its blank/unchecked/checked state list when it first paints. An owner-draw
+  `ListBox` carries `ownerDrawList`: every row's face from the owner's own `WM_DRAWITEM` and a selected face only for the
+  selected rows (the Mouse applet's 17 pointer rows fit the 1 MiB face budget only that way).
+- A list, tree or list box with `WS_EX_CLIENTEDGE`/`WS_EX_STATICEDGE`/`WS_BORDER` is drawn inside a card (theme fill and
+  stroke, `HasNativeFrame`): an empty native list (Performance Options' DEP list) otherwise showed as blank dialog face.
+  WinUI's `TextBox`/`ComboBox` styles apply a 64 px `MinWidth` after `ApplyBounds` has looked, so those controls set
+  `MinWidth = 0` themselves (WSH Settings' 44 px timeout box).
+- A tab-stop `BS_OWNERDRAW` push button wider than the 96 px picture cap is still a button whose picture is its whole
+  face, up to 512 by 128 (Internet Options' colour buttons paint their label and a swatch; the schema keys this on the
+  style's `BS_OWNERDRAW` type). A SysLink or shell `Link Window` that holds no link (Computer Name Changes' explanation)
+  is classified as a static label, and one whose label also occurs elsewhere in its text (User Profiles: "...使用者帳戶...
+  `<A>使用者帳戶</A>`") carries `linkStarts`, where the link starts; without it the renderer places a label by search. A private pane container judges every uncovered band for plainness before giving
+  out its four chrome slots: an ACL checklist's dozen blank Allow/Deny cells otherwise used them up, and a later cell one
+  render did not see as blank refused the Print Server's Security page intermittently.
+- An owned DirectUI dialog (Advanced Security Settings, the Join Domain wizard, IE's add-on manager) inherits its
+  projected owner's cloak, and while cloaked UIA reports every DirectUI element offscreen, so the generic lane retains
+  no semantics ("semantic count ... (0)") and the owner graph goes native while it is open.
+- Generic DirectUI lane: Win32's SysLink provider publishes the control as a pane whose child is its link, with no window
+  of its own; `CaptureUia` folds that link into the SysLink (the link takes it as backing, the pane is dropped) and its
+  geometry is checked as inside the control. A maximized window's caption buttons carry a `-Restore` suffix
+  (`Minimize-Restore`), and the adapter gate accepts the hyperlinks inside a projected SysLink node. Display Color
+  Calibration (dccw) projects through this; its later pages drive the display's gamma ramp, so tests stop at page 2.
+- Out of reach by design, not by adapter: msra.exe runs with the Microsoft-signed-only binary signature mitigation
+  (the Bridge cannot load); psr.exe already hosts `Windows.UI.Xaml`; notepad.exe launches the packaged app; Folder Options
+  and Work Folders open inside explorer.exe; wiaacmgr relaunches itself at another integrity level; Media Player's first
+  run is the 32-bit `setup_wm.exe` (the Bridge is x64 only). Free-form painted canvases (charmap's grid, eudcedit's glyph
+  editor, fxscover, fontview's sample pane, WFS's preview) have no contract to project and exceed the pixel budgets.

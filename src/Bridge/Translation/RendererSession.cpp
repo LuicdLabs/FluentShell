@@ -2208,7 +2208,7 @@ bool IsRecoverableActionFailure(std::wstring_view action) noexcept {
         // A context menu the application declines to open, or an item it declines to
         // activate, changes nothing.
         action == L"contextMenu" || action == L"openItem" || action == L"setScroll" || action == L"setTopIndex" ||
-        action == L"toolbarDropDown" ||
+        action == L"toolbarDropDown" || action == L"splitDropDown" ||
         action == L"move" || action == L"resize" ||
         action == L"minimize" || action == L"maximize" || action == L"restore";
 }

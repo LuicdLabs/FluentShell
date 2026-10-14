@@ -1221,7 +1221,7 @@ public sealed class TranslatedWindow : Window
             _committed && _interactive && !_retired;
         if (!CanEmitActions && !terminalPopup) return null;
         if ((property == "invoke" || property == "close" || property == "contextMenu" || property == "openItem" ||
-             property == "toolbarDropDown" ||
+             property == "toolbarDropDown" || property == "splitDropDown" ||
              property.StartsWith("menu:", StringComparison.Ordinal) ||
              property.StartsWith("popup:", StringComparison.Ordinal)) &&
             _pending.Values.Any(pending =>

@@ -80,7 +80,15 @@ public static class ProtocolConstants
     // tree, and the thread's native focus follows it (menu commands act on the focused pane).
     // It also adds a toolbar item's labelBeside (a TBSTYLE_LIST button draws its own label
     // beside its icon) and an edit box's cueBanner (the grey hint it shows while empty).
-    public const ushort Minor = 40;
+    // Minor 41 adds the tile ListView mode, whose items carry itemDetails: the lines a tile
+    // shows under its label (the Sound applet's devices), and the splitButton variant of a
+    // button, whose arrow is the splitDropDown action (BCN_DROPDOWN to its owner).  A
+    // TVS_CHECKBOXES tree carries checkBoxes and checkedIndices, and setItemCheck toggles one;
+    // an owner-draw ListBox carries ownerDrawList, the rows as its owner paints them, and an owner-draw
+    // push button's picture is its whole face, up to 512 by 128.  A SysLink label that also occurs
+    // elsewhere in its text carries linkStarts.
+    public const ushort Minor = 41;
+    public const int MaxTileDetailLines = 8;
     // Minor 32 also lets a container carry its scroll bars; one setScroll moves at
     // most this many application line steps.
     public const int MaxScrollLines = 100;
@@ -121,6 +129,9 @@ public static class ProtocolConstants
     public const int MaxMenuItemPathChars = 64;
     public const int MaxImageDimension = 96;
     public const int MaxImageBytes = MaxImageDimension * MaxImageDimension * 4;
+    // An owner-draw push button's whole face (minor 41), under the owner-draw combo face bound.
+    public const int MaxOwnerDrawFaceWidth = 512;
+    public const int MaxOwnerDrawFaceHeight = 128;
     public const int MaxDirectUiBitmapDimension = 1024;
     public const int MaxDirectUiBitmapBytes = 2 * 1024 * 1024;
     public const int MaxImageBase64Chars = (MaxImageBytes + 2) / 3 * 4;

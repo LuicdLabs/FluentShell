@@ -314,8 +314,10 @@ void TestObscuredHostIsNotCaptured() {
         40, 40, 420, 320, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     const HWND host = root ? CreateWindowExW(0, L"Static", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
         10, 10, 300, 200, root, nullptr, GetModuleHandleW(nullptr), nullptr) : nullptr;
+    // A tab stop makes the painted leaf interactive, which the capture cannot project (a passive
+    // one would be projected as the picture it paints).
     const HWND inner = host && registered ? CreateWindowExW(0, L"FluentShellTestPaintedLeaf", L"",
-        WS_CHILD | WS_VISIBLE, 20, 20, 100, 60, host, nullptr, GetModuleHandleW(nullptr), nullptr) : nullptr;
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP, 20, 20, 100, 60, host, nullptr, GetModuleHandleW(nullptr), nullptr) : nullptr;
     const HWND cover = root ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT,
         12, 12, 296, 192, root, nullptr, GetModuleHandleW(nullptr), nullptr) : nullptr;
     Check(root && host && inner && cover, "obscured host fixture was not created");

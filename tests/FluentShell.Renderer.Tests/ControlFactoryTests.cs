@@ -225,6 +225,15 @@ public sealed class ControlFactoryTests
         Assert.Equal(AutomationControlType.TabItem, ControlFactory.TabItemAutomationControlType());
     }
 
+    // A sunken (WS_EX_CLIENTEDGE), static-edge or bordered list shows its box even while empty.
+    [Theory]
+    [InlineData(0x50010134UL, 0x204UL, true)]
+    [InlineData(0x50010134UL, 0x20004UL, true)]
+    [InlineData(0x50810134UL, 0x4UL, true)]
+    [InlineData(0x50010134UL, 0x4UL, false)]
+    public void FramedListsKeepTheirNativeBox(ulong style, ulong exStyle, bool framed) =>
+        Assert.Equal(framed, ControlFactory.HasNativeFrame(style, exStyle));
+
     [Fact]
     public void TreeViewProjectionNeedsOneCompleteHierarchy()
     {

@@ -209,15 +209,33 @@ JsonObject NodeToJson(const ControlNode& node) {
         items.Append(JsonValue::CreateStringValue(item));
     }
     result.Insert(L"items", items);
-    if (node.ownerDrawCombo) {
-        const auto imageJson = [](const ImageListEntry& image) {
+    if (!node.linkStarts.empty()) {
+        JsonArray starts;
+        for (const int start : node.linkStarts) starts.Append(JsonValue::CreateNumberValue(start));
+        result.Insert(L"linkStarts", starts);
+    }
+    const auto imageJson = [](const ImageListEntry& image) {
+        JsonObject value;
+        value.Insert(L"imageWidth", JsonValue::CreateNumberValue(image.imageWidth));
+        value.Insert(L"imageHeight", JsonValue::CreateNumberValue(image.imageHeight));
+        value.Insert(L"imageFormat", JsonValue::CreateStringValue(image.imageFormat));
+        value.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(image.imageData)));
+        return value;
+    };
+    if (node.ownerDrawList) {
+        JsonObject painted;
+        painted.Insert(L"mode", JsonValue::CreateStringValue(node.ownerDrawList->mode));
+        JsonArray faces;
+        for (const auto& item : node.ownerDrawList->items) {
             JsonObject value;
-            value.Insert(L"imageWidth", JsonValue::CreateNumberValue(image.imageWidth));
-            value.Insert(L"imageHeight", JsonValue::CreateNumberValue(image.imageHeight));
-            value.Insert(L"imageFormat", JsonValue::CreateStringValue(image.imageFormat));
-            value.Insert(L"imageData", JsonValue::CreateStringValue(Base64Encode(image.imageData)));
-            return value;
-        };
+            value.Insert(L"normal", imageJson(item.normal));
+            if (!item.selected.imageData.empty()) value.Insert(L"selected", imageJson(item.selected));
+            faces.Append(value);
+        }
+        painted.Insert(L"items", faces);
+        result.Insert(L"ownerDrawList", painted);
+    }
+    if (node.ownerDrawCombo) {
         JsonObject painted;
         painted.Insert(L"mode", JsonValue::CreateStringValue(node.ownerDrawCombo->mode));
         JsonArray faces;
@@ -257,6 +275,15 @@ JsonObject NodeToJson(const ControlNode& node) {
     result.Insert(L"rows", rows);
     if (node.kind == ControlKind::ListView) {
         result.Insert(L"listViewMode", JsonValue::CreateStringValue(node.listViewMode));
+        if (node.listViewMode == L"tile") {
+            JsonArray itemDetails;
+            for (const auto& details : node.itemDetails) {
+                JsonArray lines;
+                for (const auto& line : details) lines.Append(JsonValue::CreateStringValue(line));
+                itemDetails.Append(lines);
+            }
+            result.Insert(L"itemDetails", itemDetails);
+        }
         result.Insert(L"itemActivationSupported",
             JsonValue::CreateBooleanValue(node.itemActivationSupported));
         JsonArray itemNativeIds;
@@ -341,6 +368,15 @@ JsonObject NodeToJson(const ControlNode& node) {
             itemStateImages.Append(JsonValue::CreateNumberValue(image));
         }
         result.Insert(L"itemStateImages", itemStateImages);
+        // Minor 41: a TVS_CHECKBOXES tree's boxes, which a tree without them never carries.
+        if (node.checkBoxes) {
+            result.Insert(L"checkBoxes", JsonValue::CreateBooleanValue(true));
+            JsonArray checkedIndices;
+            for (const int index : node.checkedIndices) {
+                checkedIndices.Append(JsonValue::CreateNumberValue(index));
+            }
+            result.Insert(L"checkedIndices", checkedIndices);
+        }
     }
     if (node.kind == ControlKind::TreeView || node.kind == ControlKind::ListView) {
         if (node.itemDefaultActivation)
@@ -1629,7 +1665,7 @@ bool ParseActionInvoke(
             L"setSelection", L"setFocusedIndex", L"focus", L"setItemCheck", L"setItemText", L"activateItem", L"scrollBy", L"setValue", L"setExpand",
             L"setSplit", L"setColumnOrder", L"setGroupExpanded", L"islandInvoke", L"htmlInvoke", L"htmlScroll",
             L"diskSelect", L"diskContext", L"diskScroll", L"contextMenu", L"openItem", L"setScroll", L"setTopIndex",
-            L"menuCommand", L"popupCommand", L"toolbarCommand", L"toolbarDropDown", L"mdiCommand",
+            L"menuCommand", L"popupCommand", L"toolbarCommand", L"toolbarDropDown", L"splitDropDown", L"mdiCommand",
             L"move", L"resize", L"minimize", L"maximize", L"restore", L"close"
         };
         if (std::find(std::begin(kActions), std::end(kActions), action.action) == std::end(kActions)) {
@@ -1651,6 +1687,7 @@ bool ParseActionInvoke(
             action.action == L"contextMenu" || action.action == L"openItem" || action.action == L"setScroll" ||
             action.action == L"setTopIndex" ||
             action.action == L"toolbarCommand" || action.action == L"toolbarDropDown" ||
+            action.action == L"splitDropDown" ||
             action.action == L"mdiCommand";
         if (requiresNode != action.nodeId.has_value()) {
             error = L"action.invoke nodeId does not match action semantics";
@@ -2147,13 +2184,15 @@ bool ValidateActionForSnapshot(
         return true;
     }
     if (action.action == L"setItemCheck") {
-        if (node.kind != ControlKind::ListView || !node.checkBoxes) {
-            error = L"setItemCheck requires a checkbox-enabled ListView node";
+        if ((node.kind != ControlKind::ListView && node.kind != ControlKind::TreeView) ||
+            !node.checkBoxes) {
+            error = L"setItemCheck requires a checkbox-enabled ListView or TreeView node";
             return false;
         }
-        if (action.itemIndex < 0 ||
-            static_cast<size_t>(action.itemIndex) >= ListViewItemCount(node)) {
-            error = L"setItemCheck index is outside the ListView";
+        const size_t itemCount = node.kind == ControlKind::TreeView
+            ? node.items.size() : ListViewItemCount(node);
+        if (action.itemIndex < 0 || static_cast<size_t>(action.itemIndex) >= itemCount) {
+            error = L"setItemCheck index is outside the control's items";
             return false;
         }
         return true;
@@ -2191,6 +2230,11 @@ bool ValidateActionForSnapshot(
             return false;
         }
         return true;
+    }
+    if (action.action == L"splitDropDown") {
+        if (node.kind == ControlKind::Button && node.presentationVariant == L"splitButton") return true;
+        error = L"splitDropDown requires a split button";
+        return false;
     }
     if (action.action == L"mdiCommand") {
         if (node.kind != ControlKind::MdiChild) {
@@ -2250,6 +2294,7 @@ bool IsRequestSemanticAction(std::wstring_view action) noexcept {
     // request semantics as invoke/close and are rebased onto the current revision
     // by HandleNativeAction.
     return action == L"invoke" || action == L"toolbarCommand" || action == L"toolbarDropDown" ||
+        action == L"splitDropDown" ||
         action == L"close" ||
         action == L"move" || action == L"resize" || action == L"setValue" ||
         action == L"setSplit" ||

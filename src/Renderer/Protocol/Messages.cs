@@ -63,6 +63,21 @@ public sealed record OwnerDrawComboItem
     public ImageListEntry Selected { get; init; } = new();
 }
 
+// Minor 41: an owner-draw ListBox's rows as its owner paints them.  Only the selected rows carry a
+// selected face.
+public sealed record OwnerDrawListItem
+{
+    public ImageListEntry Normal { get; init; } = new();
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ImageListEntry? Selected { get; init; }
+}
+
+public sealed record OwnerDrawListSnapshot
+{
+    public string Mode { get; init; } = string.Empty;
+    public List<OwnerDrawListItem> Items { get; init; } = [];
+}
+
 public sealed record OwnerDrawComboSnapshot
 {
     public string Mode { get; init; } = string.Empty;
@@ -196,8 +211,13 @@ public sealed record ControlNode
     public bool Vertical { get; init; }
     public bool Reversed { get; init; }
     public List<string> Items { get; init; } = [];
+    // Minor 41: where each SysLink label starts in Text, carried when a label also occurs elsewhere in it.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<int>? LinkStarts { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public OwnerDrawComboSnapshot? OwnerDrawCombo { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public OwnerDrawListSnapshot? OwnerDrawList { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<PixelRect>? ItemRects { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -220,6 +240,9 @@ public sealed record ControlNode
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<int>? ColumnOrder { get; init; }
     public List<List<string>> Rows { get; init; } = [];
+    // Minor 41: a tile-view list's detail lines under each item's label.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<List<string>>? ItemDetails { get; init; }
     // Minor 33: a large virtual report list carries the rows from ItemWindowStart on;
     // ItemCount is the list's length and every index stays absolute.
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

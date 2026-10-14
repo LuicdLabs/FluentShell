@@ -165,6 +165,8 @@ bool SetListBoxSelection(HWND listBox, const std::vector<int>& indices) noexcept
 // menu. The button (position and command id) must still be an enabled drop-down. The caller
 // arms popup interception first; the owner's TrackPopupMenu runs inside this.
 bool RequestToolbarDropDown(HWND toolbar, int index, uint32_t commandId, std::wstring& reason) noexcept;
+// A split button's arrow: its owner is sent the BCN_DROPDOWN the arrow sends, and tracks a menu.
+bool RequestSplitButtonDropDown(HWND button, std::wstring& reason) noexcept;
 
 // Activates the item the way its control answers a double-click: the item is selected and the
 // Enter key is delivered to the control (MMC lists and snap-in trees open the item's default

@@ -60,6 +60,11 @@ internal static class PopupMenuAnchor
             var button = node.ToolbarItems[popup.ItemIndex];
             return button.DropDown == true && button.Rect.Width > 0 && button.Rect.Height > 0 ? button.Rect : null;
         }
+        // A split button's menu opens under the whole button, in the button's own coordinates.
+        if (node is { Kind: "button", Visible: true, PresentationVariant: "splitButton" } &&
+            node.NodeId == popup.NodeId && popup.ItemIndex == 0)
+            return node.Rect.Width > 0 && node.Rect.Height > 0
+                ? new PixelRect { Width = node.Rect.Width, Height = node.Rect.Height } : null;
         if (node is null || node.NodeId != popup.NodeId || node.Kind != "accessibleIsland" ||
             !node.Visible || popup.ItemIndex < 0 || popup.ItemIndex >= node.IslandItems.Count)
             return null;

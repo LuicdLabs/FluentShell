@@ -83,6 +83,11 @@ void TestWizardSheetTabStripIsNotCaptured() {
         }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&tabs));
+    // A strip too narrow for its tabs scrolls them with an up-down of its own (IExpress's
+    // wizard); it goes with the strip.
+    const HWND scroller = tabs ? CreateWindowExW(0, UPDOWN_CLASSW, L"", WS_CHILD | WS_VISIBLE | UDS_HORZ,
+        0, 0, 38, 19, tabs, reinterpret_cast<HMENU>(1), GetModuleHandleW(nullptr), nullptr) : nullptr;
+    Check(scroller != nullptr, "the wizard sheet fixture could not give its strip a scroller");
     Translation::CaptureContext context;
     context.surfaceId = L"f1f1f1f1-2a2a-3b3b-4c4c-5d5d5d5d5d5d";
     context.generation = 1;
@@ -93,8 +98,8 @@ void TestWizardSheetTabStripIsNotCaptured() {
     if (!captured) std::wcerr << L"wizard sheet capture: " << reason << L"\n";
     Check(tabs != nullptr, "the wizard sheet fixture exposed no tab control");
     Check(captured && std::none_of(snapshot.nodes.begin(), snapshot.nodes.end(),
-        [tabs](const auto& node) { return node.hwnd == tabs; }),
-        "a wizard sheet's covered tab strip was captured or refused the wizard");
+        [tabs, scroller](const auto& node) { return node.hwnd == tabs || node.hwnd == scroller; }),
+        "a wizard sheet's covered tab strip or its scroller was captured or refused the wizard");
     DestroyWindow(wizard);
 }
 

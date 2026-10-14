@@ -92,7 +92,9 @@ bool WindowText(HWND hwnd, std::wstring& value, std::wstring& reason) {
         reason = L"window text exceeds the 64 KiB protocol string limit";
         return false;
     }
-    captured.resize(static_cast<size_t>(length));
+    // A window that counts its terminator in what WM_GETTEXT copied (the Date and Time clock)
+    // ends its text there all the same.
+    captured.resize(wcsnlen_s(captured.c_str(), static_cast<size_t>(length)));
     value = std::move(captured);
     return true;
 }
@@ -770,9 +772,18 @@ bool IsHiddenTabStrip(HWND child) noexcept {
     return true;
 }
 
+// What a hidden strip keeps inside itself -- the up-down scroller a too-narrow strip creates
+// (IExpress's wizard) -- goes with it.
+bool InsideHiddenTabStrip(HWND root, HWND child) noexcept {
+    for (HWND parent = GetParent(child); parent && parent != root; parent = GetParent(parent)) {
+        if (IsHiddenTabStrip(parent)) return true;
+    }
+    return false;
+}
+
 bool CapturedChild(HWND root, HWND child) noexcept {
     return IsWindowVisible(child) && !IsCompositeImplementationChild(child) &&
-        DrawsInsideRoot(root, child) && !IsHiddenTabStrip(child);
+        DrawsInsideRoot(root, child) && !IsHiddenTabStrip(child) && !InsideHiddenTabStrip(root, child);
 }
 
 // The outermost window between `child` and `root` that a sibling above covers but for
@@ -1262,6 +1273,17 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
             }
             hashOptionalImage(node.ownerDrawCombo->selectionFace);
         }
+        HashBytes(hash, node.linkStarts.size());
+        for (const int start : node.linkStarts) HashBytes(hash, start);
+        HashBytes(hash, node.ownerDrawList.has_value());
+        if (node.ownerDrawList) {
+            HashString(hash, node.ownerDrawList->mode);
+            HashBytes(hash, node.ownerDrawList->items.size());
+            for (const auto& item : node.ownerDrawList->items) {
+                hashImage(item.normal);
+                hashImage(item.selected);
+            }
+        }
         HashBytes(hash, node.document.has_value());
         if (node.document) {
             HashString(hash, node.document->documentId);
@@ -1312,6 +1334,11 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         for (const auto& row : node.rows) {
             HashBytes(hash, row.size());
             for (const auto& cell : row) HashString(hash, cell);
+        }
+        HashBytes(hash, node.itemDetails.size());
+        for (const auto& details : node.itemDetails) {
+            HashBytes(hash, details.size());
+            for (const auto& line : details) HashString(hash, line);
         }
         HashBytes(hash, node.itemCount);
         HashBytes(hash, node.itemWindowStart);

@@ -74,11 +74,31 @@ void TestComboBoxExCapture() {
           comboFor(snapshot, 5012)->selectedIndex == 0 && comboFor(snapshot, 5012)->text == L"alpha.contoso.test",
         "the ComboBoxEx selection did not reach the captured text");
 
-    // Item images are not projected: a ComboBoxEx with an image list stays native.
-    const HIMAGELIST images = ImageList_Create(16, 16, ILC_COLOR32, 1, 1);
+    // A drop-down list whose items draw images (recdisc's drives) carries the faces the
+    // ComboBoxEx paints, named by the text it stores; its style evidence says owner-drawn.
+    const HIMAGELIST images = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 1, 1);
+    Check(images && ImageList_AddIcon(images, LoadIconW(nullptr, IDI_APPLICATION)) == 0,
+        "ComboBoxEx fixture could not build its image list");
     SendMessageW(dropList, CBEM_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(images));
-    Check(!capture(snapshot, error) && error.find(L"ComboBoxEx item images") != std::wstring::npos,
-        "a ComboBoxEx with item images was projected without them");
+    const bool painted = capture(snapshot, error);
+    if (!painted) std::wcerr << L"ComboBoxEx image capture rejection: " << error << L'\n';
+    const auto* pictured = painted ? comboFor(snapshot, 5013) : nullptr;
+    Check(pictured && pictured->ownerDrawCombo && pictured->ownerDrawCombo->items.size() == 2 &&
+          pictured->ownerDrawCombo->selectionFace && !pictured->editable &&
+          pictured->items == std::vector<std::wstring>{ L"alpha.contoso.test", L"beta" } &&
+          pictured->selectedIndex == 1 && (pictured->style & CBS_OWNERDRAWFIXED) != 0 &&
+          !pictured->ownerDrawCombo->items[0].normal.imageData.empty(),
+        "a ComboBoxEx whose items draw images was not carried as its painted faces");
+    // With nothing selected the closed field is blank, not a refusal.
+    SendMessageW(dropList, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+    Check(capture(snapshot, error) && comboFor(snapshot, 5013) && comboFor(snapshot, 5013)->ownerDrawCombo &&
+          comboFor(snapshot, 5013)->ownerDrawCombo->selectionFace && comboFor(snapshot, 5013)->selectedIndex == -1,
+        "an owner-drawn ComboBoxEx with nothing selected kept its window native");
+    // An editable one with images would need an edit box beside the faces: it stays native.
+    SendMessageW(editable, CBEM_SETIMAGELIST, 0, reinterpret_cast<LPARAM>(images));
+    Check(!capture(snapshot, error) && error.find(L"editable ComboBoxEx item images") != std::wstring::npos,
+        "an editable ComboBoxEx with item images was projected without them");
+    SendMessageW(editable, CBEM_SETIMAGELIST, 0, 0);
     SendMessageW(dropList, CBEM_SETIMAGELIST, 0, 0);
     if (images) ImageList_Destroy(images);
 }

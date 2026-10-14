@@ -216,9 +216,15 @@ inline void TestAdmissionAndActivation(void (*check)(bool, const char*)) {
         error.find(L"LVS_OWNERDRAWFIXED") != std::wstring::npos,
         "ListView owner-draw rejection lost its specific diagnostic");
     if (unsupported) DestroyWindow(unsupported);
+    // Tile view (minor 41) is its own mode, never read as the legacy icon view its style says.
     SetWindowSubclass(fixture.list, TileViewEvidence, 700, 0);
-    check(!ClassifyControl(fixture.list, kind, error) && error.find(L"tile") != std::wstring::npos,
-        "tile view was admitted as a legacy icon view");
+    ControlNode tileNode;
+    tileNode.kind = ControlKind::ListView;
+    tileNode.hwnd = fixture.list;
+    check(ClassifyControl(fixture.list, kind, error) && kind == ControlKind::ListView &&
+          CaptureControlDetail(fixture.list, tileNode, error) && tileNode.listViewMode == L"tile" &&
+          tileNode.itemDetails.size() == ListViewItemCount(tileNode),
+        "tile view was refused or read as a legacy icon view");
     RemoveWindowSubclass(fixture.list, TileViewEvidence, 700);
 
     const std::wstring nonce = L"00112233445566778899aabbccddeeff";

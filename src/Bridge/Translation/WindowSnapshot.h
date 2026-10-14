@@ -319,6 +319,14 @@ struct OwnerDrawComboSnapshot final {
     std::optional<ImageListEntry> selectionFace;
 };
 
+// An owner-draw ListBox's rows as its owner paints them (minor 41; the Mouse applet's
+// pointer list): every row's face, and the selected face of the rows selected now.  An
+// unselected row's `selected` stays empty, which keeps a long list inside the pixel budget.
+struct OwnerDrawListSnapshot final {
+    std::wstring mode;
+    std::vector<OwnerDrawComboItemSnapshot> items;
+};
+
 struct ToolbarItemSnapshot final {
     ToolbarItemKind kind = ToolbarItemKind::PushButton;
     uint32_t commandId = 0;
@@ -419,7 +427,11 @@ struct ControlNode final {
     bool vertical = false;
     bool reversed = false;
     std::vector<std::wstring> items;
+    // Minor 41: where a SysLink's link label starts in its text, carried only when the label also
+    // occurs elsewhere in that text (User Profiles: "...user account... <A>User Accounts</A>").
+    std::vector<int> linkStarts;
     std::optional<OwnerDrawComboSnapshot> ownerDrawCombo;
+    std::optional<OwnerDrawListSnapshot> ownerDrawList;
     // ListView presentation mode. Report remains the default for old snapshots;
     // icon/list modes carry item labels and geometry without synthetic columns.
     std::wstring listViewMode = L"report";
@@ -449,6 +461,9 @@ struct ControlNode final {
     // order, so nothing on the wire changes meaning when the user reorders them.
     std::vector<int> columnOrder;
     std::vector<std::vector<std::wstring>> rows;
+    // A tile-view list's detail lines under each item's label, one list per item: the
+    // subitems the tile shows (LVM_GETTILEINFO), in order.  Empty in every other view.
+    std::vector<std::vector<std::wstring>> itemDetails;
     // A large virtual report list carries a window of its rows: `items` and `rows`
     // hold the rows from itemWindowStart on, and itemCount is the list's full length.
     // Zero means the node carries every row.  Every index on the wire (selection,

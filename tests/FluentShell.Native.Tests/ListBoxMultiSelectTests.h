@@ -100,11 +100,14 @@ void TestMultiSelectListBox() {
           !Translation::SetListBoxSelection(single, { 0 }),
         "a list box accepted an unordered, out-of-range or single-selection request");
 
-    // The styles that change what an item is still keep the window native.
+    // A style that changes what an item is still keeps the window native; an owner-draw list is
+    // admitted by style and judged at capture by whether its owner paints its rows.
     const HWND columns = makeList(LBS_MULTICOLUMN | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL, 10, 44);
     const HWND ownerDraw = makeList(LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL, 10, 45);
     if (columns && ownerDraw) {
-        Check(!Translation::ClassifyControl(columns, kind, reason) && !Translation::ClassifyControl(ownerDraw, kind, reason),
-            "a multi-column or owner-draw ListBox was admitted");
+        Check(!Translation::ClassifyControl(columns, kind, reason),
+            "a multi-column ListBox was admitted");
+        Check(Translation::ClassifyControl(ownerDraw, kind, reason) && kind == Translation::ControlKind::ListBox,
+            "an owner-draw ListBox was not admitted by style");
     }
 }
