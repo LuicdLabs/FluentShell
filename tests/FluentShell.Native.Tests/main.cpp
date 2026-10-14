@@ -9,6 +9,7 @@
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
 #include "../../src/Bridge/Translation/RollbackEvent.h"
+#include "../../src/injector/WatchPolicy.h"
 #include "../../src/Bridge/Translation/VirtualTaskDialog.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
@@ -5198,6 +5199,44 @@ void TestRollbackEventName() {
         "rollback event names do not separate windows");
 }
 
+// The watcher offers the Bridge only to the processes this table makes eligible, and retries a failed
+// injection on a bounded schedule.
+void TestWatchPolicy() {
+    using namespace FluentShell::Injector;
+    TargetFacts eligible;
+    eligible.readable = true;
+    eligible.sameSession = true;
+    eligible.sameIntegrity = true;
+    Check(Decide(eligible) == Eligibility::Eligible, "a same-session, same-integrity window is not eligible");
+
+    Check(Decide(TargetFacts{}) == Eligibility::Unreadable, "an unreadable process is not refused as unreadable");
+    auto refused = [&](auto change) {
+        TargetFacts facts = eligible;
+        change(facts);
+        return Decide(facts);
+    };
+    Check(refused([](TargetFacts& f) { f.sameSession = false; }) == Eligibility::OtherSession,
+        "a process in another session is not refused");
+    Check(refused([](TargetFacts& f) { f.higherIntegrity = true; f.sameIntegrity = false; }) == Eligibility::Elevated,
+        "an elevated process is not refused");
+    Check(refused([](TargetFacts& f) { f.sameIntegrity = false; }) == Eligibility::DifferentIntegrity,
+        "a process at a different integrity level is not refused");
+    Check(refused([](TargetFacts& f) { f.denied = true; }) == Eligibility::Denied,
+        "a denied process is not refused");
+    Check(refused([](TargetFacts& f) { f.optedOut = true; }) == Eligibility::OptedOut,
+        "an opted-out application is not refused");
+    Check(refused([](TargetFacts& f) { f.injected = true; }) == Eligibility::AlreadyInjected,
+        "an already injected process is offered again");
+    Check(refused([](TargetFacts& f) { f.readable = false; f.denied = true; }) == Eligibility::Unreadable,
+        "the first refusal in the table is not the one reported");
+
+    Check(RetryDelayMs(1) == 2000 && RetryDelayMs(2) == 4000 && RetryDelayMs(3) == 8000,
+        "retry delays do not double from 2 s");
+    Check(RetryDelayMs(5) == 30000 && RetryDelayMs(12) == 30000, "retry delay is not capped at 30 s");
+    Check(MayRetry(1) && MayRetry(kMaxInjectAttempts - 1) && !MayRetry(kMaxInjectAttempts),
+        "retry attempts are not capped at twelve");
+}
+
 int wmain() {
 #ifdef _DEBUG
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
@@ -5241,6 +5280,7 @@ int wmain() {
     TestPipeRoundTrip();
     TestRootSuppressionLedger();
     TestRollbackEventName();
+    TestWatchPolicy();
     TestReadFrameUsesOneDeadline();
     TestWriteFrameUsesOneDeadline();
     TestScalarContracts();

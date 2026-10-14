@@ -40,6 +40,7 @@ inline bool IsProcessDenied(std::wstring_view exeName) {
         L"MsMpEng.exe", L"SecurityHealthService.exe", L"smartscreen.exe",
         // FluentShell must never translate or recursively inject its own hosts.
         L"FluentShell.Injector.exe",
+        L"FluentShell.Gui.exe",
         L"FluentShell.Renderer.exe",
         L"FluentShell.Shell.exe",
         L"FluentShell.Server.exe",

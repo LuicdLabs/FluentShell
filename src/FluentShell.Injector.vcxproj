@@ -84,6 +84,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="Injector\main.cpp" />
+    <ClCompile Include="Injector\InjectorCore.cpp" />
+    <ClCompile Include="Injector\Watcher.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Injector\InjectorCore.h" />
+    <ClInclude Include="Injector\WatchPolicy.h" />
+    <ClInclude Include="Injector\Watcher.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="FluentShell.Bridge.vcxproj">
