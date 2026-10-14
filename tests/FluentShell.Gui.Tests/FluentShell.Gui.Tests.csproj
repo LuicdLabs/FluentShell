@@ -8,6 +8,9 @@
     <PlatformTarget>x64</PlatformTarget>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The test output copies FluentShell.Gui.exe beside the tests; keep it out of build\bin, where that copy
+         would look like a runnable GUI that cannot find the injector. -->
+    <OutDir>$(MSBuildThisFileDirectory)..\..\build\tests\FluentShell.Gui.Tests\$(Configuration)\</OutDir>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
