@@ -8,6 +8,7 @@
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
+#include "../../src/Bridge/Translation/RollbackEvent.h"
 #include "../../src/Bridge/Translation/VirtualTaskDialog.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
@@ -5183,6 +5184,20 @@ void TestRootSuppressionLedger() {
     Check(ledger.Count() == 0, "a destroyed window's entry was kept");
 }
 
+// The GUI finds a root's rollback event by this name, so the format is part of the contract.
+void TestRollbackEventName() {
+    using FluentShell::Bridge::Translation::RollbackEventName;
+    Check(RollbackEventName(1234, reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1a2b))) ==
+            L"Local\\FluentShell.Rollback.1234.1a2b",
+        "a rollback event name does not match the GUI's contract");
+    Check(RollbackEventName(1234, reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1a2b))) !=
+            RollbackEventName(1235, reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1a2b))),
+        "rollback event names do not separate processes");
+    Check(RollbackEventName(1234, reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1a2b))) !=
+            RollbackEventName(1234, reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1a2c))),
+        "rollback event names do not separate windows");
+}
+
 int wmain() {
 #ifdef _DEBUG
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
@@ -5225,6 +5240,7 @@ int wmain() {
     TestHeaderValidation();
     TestPipeRoundTrip();
     TestRootSuppressionLedger();
+    TestRollbackEventName();
     TestReadFrameUsesOneDeadline();
     TestWriteFrameUsesOneDeadline();
     TestScalarContracts();

@@ -8,6 +8,7 @@
 #include "MenuBarCapture.h"
 #include "UiAutomationValidator.h"
 #include "DirectUiEngine.h"
+#include "RollbackEvent.h"
 
 #include <sddl.h>
 #include <shobjidl_core.h>
@@ -3894,26 +3895,69 @@ void RendererSession::RestoreAll(std::wstring_view reason) noexcept {
 // left projected under a native owner is cloaked along with it.  No lock is held on entry;
 // RestoreSurface takes the barriers itself.
 void RendererSession::RestoreOwnerGroup(HWND root, std::wstring_view reason) noexcept {
-    std::vector<std::pair<size_t, std::shared_ptr<Surface>>> group;
+    // A surface is anchored at the window it belongs to: its native root, or for a translated dialog the
+    // owner the application gave it.  The host of a translated dialog is a hidden window of its own, and
+    // the dialogs its callback opens are anchored at that host, so they join the group through it.
+    struct Member {
+        std::shared_ptr<Surface> surface;
+        HWND anchor = nullptr;
+        HWND host = nullptr;
+        bool virtualDialog = false;
+    };
+    std::vector<Member> candidates;
     try {
         std::scoped_lock lock(surfacesMutex_);
         for (const auto& [_, surface] : surfaces_) {
-            HWND surfaceRoot = nullptr;
+            Member member{ surface };
             {
                 std::scoped_lock surfaceLock(surface->mutex);
-                if (surface->agent) surfaceRoot = surface->agent->Root();
+                member.virtualDialog = surface->virtualDialog;
+                if (surface->virtualDialog) {
+                    member.anchor = surface->snapshot.ownerHwnd;
+                    member.host = surface->dialogHost;
+                } else if (surface->agent) {
+                    member.anchor = surface->agent->Root();
+                }
             }
-            if (surfaceRoot && (surfaceRoot == root || IsOwnedBy(surfaceRoot, root))) {
-                group.emplace_back(OwnerDepth(surfaceRoot), surface);
-            }
+            if (member.anchor) candidates.push_back(std::move(member));
         }
     } catch (...) {
         try { FluentShell::Log(L"Owner group could not be collected for restore"); } catch (...) {}
         return;
     }
-    std::stable_sort(group.begin(), group.end(),
+    // Grows the group until nothing else joins: a candidate joins when its anchor is a member or is
+    // owned by one.  The loop ends because each pass that adds a candidate marks it taken.
+    std::unordered_set<HWND> members{ root };
+    std::vector<bool> taken(candidates.size(), false);
+    std::vector<Member> group;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (size_t index = 0; index < candidates.size(); ++index) {
+            if (taken[index]) continue;
+            const Member& candidate = candidates[index];
+            bool joins = false;
+            for (const HWND member : members) {
+                if (candidate.anchor == member || IsOwnedBy(candidate.anchor, member)) {
+                    joins = true;
+                    break;
+                }
+            }
+            if (!joins) continue;
+            taken[index] = true;
+            grew = true;
+            if (candidate.host) members.insert(candidate.host);
+            group.push_back(candidate);
+        }
+    }
+    // Deepest first.  A translated dialog sits one level below the window it is anchored at.
+    std::vector<std::pair<size_t, std::shared_ptr<Surface>>> ordered;
+    ordered.reserve(group.size());
+    for (const Member& member : group) {
+        ordered.emplace_back(OwnerDepth(member.anchor) + (member.virtualDialog ? 1 : 0), member.surface);
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
         [](const auto& left, const auto& right) { return left.first > right.first; });
-    for (const auto& [_, surface] : group) {
+    for (const auto& [_, surface] : ordered) {
         try { RestoreSurface(surface, reason); }
         catch (...) { /* RestoreSurface has its own firewall. */ }
     }
@@ -3938,6 +3982,50 @@ void RendererSession::SuppressRoot(HWND root) noexcept {
             + DescribeTopLevel(root));
     } catch (...) {}
     RestoreOwnerGroup(root, L"userRestore");
+}
+
+// A rollback event exists while its root is projected: created when the root projects, closed when it
+// stops.  The GUI finds the windows this process projects by opening these events.
+void RendererSession::SyncRollbackEvents() noexcept {
+    try {
+        std::unordered_set<HWND> projected;
+        {
+            std::scoped_lock lock(surfacesMutex_);
+            for (const auto& [_, surface] : surfaces_) {
+                std::scoped_lock surfaceLock(surface->mutex);
+                if (surface->state == SurfaceState::Projected && surface->agent && surface->agent->Root()) {
+                    projected.insert(surface->agent->Root());
+                }
+            }
+        }
+        for (auto entry = rollbackEvents_.begin(); entry != rollbackEvents_.end();) {
+            if (projected.contains(entry->first)) {
+                ++entry;
+                continue;
+            }
+            CloseHandle(entry->second);
+            entry = rollbackEvents_.erase(entry);
+        }
+        for (const HWND root : projected) {
+            if (rollbackEvents_.contains(root)) continue;
+            SECURITY_ATTRIBUTES security{};
+            PSECURITY_DESCRIPTOR descriptor = nullptr;
+            if (!CreatePipeSecurity(security, descriptor)) continue;
+            const std::wstring name = RollbackEventName(GetCurrentProcessId(), root);
+            HANDLE event = CreateEventW(&security, FALSE, FALSE, name.c_str());
+            LocalFree(descriptor);
+            if (event) rollbackEvents_.emplace(root, event);
+        }
+    } catch (...) {}
+}
+
+// Each signaled event is a request to roll its root back.  The wait consumes the signal (auto-reset).
+void RendererSession::ServiceRollbackRequests() noexcept {
+    std::vector<HWND> requested;
+    for (const auto& [root, event] : rollbackEvents_) {
+        if (WaitForSingleObject(event, 0) == WAIT_OBJECT_0) requested.push_back(root);
+    }
+    for (const HWND root : requested) SuppressRoot(root);
 }
 
 void RendererSession::HeartbeatMain() noexcept {
@@ -4021,10 +4109,14 @@ void RendererSession::RunSupervisor() {
             }
             lastDiscovery = 0;
         }
+        // Events follow projection even while dormant, so a root restored by dormancy stops advertising
+        // itself.  A rollback request is serviced only while running.
+        SyncRollbackEvents();
         if (dormant_.load()) {
             Sleep(kReconcileTickMs);
             continue;
         }
+        ServiceRollbackRequests();
         const uint64_t now = GetTickCount64();
         const bool burst = now < burstUntil;
         if (now - lastDiscovery >= (burst ? kDiscoveryBurstTickMs : kDiscoveryIntervalMs)) {
@@ -4045,6 +4137,8 @@ void RendererSession::RunSupervisor() {
         }
     }
     RestoreAll(L"restore");
+    for (const auto& [_, event] : rollbackEvents_) CloseHandle(event);
+    rollbackEvents_.clear();
     Stop();
 }
 

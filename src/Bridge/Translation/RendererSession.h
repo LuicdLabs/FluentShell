@@ -333,6 +333,12 @@ private:
     // discovery is idle.  Only the supervisor thread touches these two.
     std::atomic<bool> dormant_{ false };
     HANDLE dormantEvent_ = nullptr;
+    // One auto-reset event per projected root (RollbackEvent.h).  Only the supervisor thread touches
+    // them: it creates them as roots project, closes them as roots stop projecting, and turns a
+    // signal into SuppressRoot.
+    std::unordered_map<HWND, HANDLE> rollbackEvents_;
+    void SyncRollbackEvents() noexcept;
+    void ServiceRollbackRequests() noexcept;
     // Hands every projected owner of a window the projection cannot take back to
     // native, together, and arranges for the graph to be offered again once that
     // window is gone: a root waits in ownerGraphDeferrals_, an owned dialog gets
