@@ -4019,6 +4019,28 @@ void RendererSession::SyncRollbackEvents() noexcept {
     } catch (...) {}
 }
 
+// The watcher's mutex, opened and closed at once: holding a handle would keep the mutex alive after
+// the watcher exits, and the lease would never see it go.  Access denied means it exists.
+bool WatchMutexExists() noexcept {
+    HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\FluentShell.Watch");
+    if (!mutex) return GetLastError() == ERROR_ACCESS_DENIED;
+    CloseHandle(mutex);
+    return true;
+}
+
+void RendererSession::CheckWatchLease() noexcept {
+    try {
+        if (WatchMutexExists()) {
+            watchLeased_ = true;
+            return;
+        }
+        if (!watchLeased_) return;
+        watchLeased_ = false;
+        FluentShell::Log(L"Global apply's watcher has ended; this window panics to native");
+    } catch (...) {}
+    if (dormantEvent_) SetEvent(dormantEvent_);
+}
+
 // Each signaled event is a request to roll its root back.  The wait consumes the signal (auto-reset).
 void RendererSession::ServiceRollbackRequests() noexcept {
     std::vector<HWND> requested;
@@ -4112,6 +4134,7 @@ void RendererSession::RunSupervisor() {
         // Events follow projection even while dormant, so a root restored by dormancy stops advertising
         // itself.  A rollback request is serviced only while running.
         SyncRollbackEvents();
+        CheckWatchLease();
         if (dormant_.load()) {
             Sleep(kReconcileTickMs);
             continue;

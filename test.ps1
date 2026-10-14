@@ -143,6 +143,29 @@ foreach ($exe in @($injector, $win32Injector)) {
     }
 }
 Write-Host "Injector CLI cutover gate passed (x64 and x86)."
+
+# Global apply's guardrails.  Each gate names a constraint the design depends on: no elevation, no autostart,
+# no authenticated control pipe in this slice, and no global hooks in the watcher.
+$guardedSources = @(Get-ChildItem -Path (Join-Path $Root "src") -Recurse -File -Include *.cpp, *.h, *.cs, *.csproj, *.vcxproj)
+$guardedInjector = @($guardedSources | Where-Object { $_.FullName -like "*\src\injector\*" })
+function Assert-Absent([object[]]$Files, [string]$Pattern, [string]$Reason) {
+    foreach ($file in $Files) {
+        if (Select-String -LiteralPath $file.FullName -Pattern $Pattern -SimpleMatch -Quiet) {
+            throw "$Reason ($($file.FullName))"
+        }
+    }
+}
+Assert-Absent $guardedSources "runas" "UAC elevation is forbidden: the 'runas' verb appears"
+Assert-Absent $guardedSources "RequireAdministrator" "UAC elevation is forbidden: an elevation manifest appears"
+Assert-Absent $guardedSources "UseShellExecute = true" "The GUI must not launch through the shell (elevation path)"
+Assert-Absent $guardedSources "CurrentVersion\Run" "Autostart is forbidden: a Run-key entry appears"
+Assert-Absent $guardedSources "FluentShell.Control" "The authenticated control pipe is out of scope for this slice"
+Assert-Absent $guardedInjector "SetWindowsHookEx" "The watcher must not use global hooks"
+Assert-Absent $guardedInjector "SetWinEventHook" "The watcher must not use WinEvent hooks"
+Assert-Absent $guardedInjector "AppInit_DLLs" "The watcher must not use AppInit_DLLs"
+Assert-Absent $guardedInjector "Image File Execution Options" "The watcher must not use IFEO"
+Assert-Absent $guardedInjector "ShellExecute" "The injector must not launch through the shell"
+Write-Host "Global apply guardrail gates passed."
 Write-Host "All available tests and production gates passed."
 # The CLI gate runs the Injector without arguments, which exits 1 by design; every
 # failure above has already thrown, so reaching here means success.

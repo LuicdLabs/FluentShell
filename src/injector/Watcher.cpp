@@ -340,6 +340,7 @@ public:
 
         for (auto entry = tracked_.begin(); entry != tracked_.end();) {
             if (!entry->second.busy && !windowsByPid.contains(entry->first)) {
+                Emit({ L"gone", std::to_wstring(entry->first) });
                 entry = tracked_.erase(entry);
             } else {
                 ++entry;
@@ -449,6 +450,8 @@ private:
         }
         if (signature == entry->second.lastWindowLines) return;
         entry->second.lastWindowLines = signature;
+        // The header replaces every window the GUI holds for this process, including when none are left.
+        Emit({ L"windows", std::to_wstring(pid), std::to_wstring(windows.size()) });
         for (const auto& window : windows) {
             Emit({ L"window", std::to_wstring(pid), Hex(reinterpret_cast<uintptr_t>(window.hwnd)), window.title });
         }

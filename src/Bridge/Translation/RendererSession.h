@@ -339,6 +339,11 @@ private:
     std::unordered_map<HWND, HANDLE> rollbackEvents_;
     void SyncRollbackEvents() noexcept;
     void ServiceRollbackRequests() noexcept;
+    // The global watcher's lease.  While the watcher's mutex exists this Bridge is leased to it; when the
+    // mutex goes, the watcher has ended and this Bridge panics to native (sets the dormancy event).
+    // Supervisor thread only.
+    bool watchLeased_ = false;
+    void CheckWatchLease() noexcept;
     // Hands every projected owner of a window the projection cannot take back to
     // native, together, and arranges for the graph to be offered again once that
     // window is gone: a root waits in ownerGraphDeferrals_, an owned dialog gets

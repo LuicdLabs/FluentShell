@@ -1,6 +1,14 @@
 # Global apply, GUI, and sticky rollback: design
 
-Status: design only. The x86 lane is implemented (see below). Nothing in this document other than the x86 lane has been built.
+Status: implemented on branch `feature/global-apply-gui`, with these exceptions: the live global run against the desktop's other applications is not yet done (it needs the user's go-ahead, since it injects into every window), and the authenticated control pipe is out of scope for this slice.
+
+Built so far: the x86 lane; dormancy; per-window rollback events; the owner-group fix for translated dialogs; the injector's shared core with handle-pinned checks; `watch` (consent-gated, manual start, panic hotkey, opt-outs, `--dry-run`); the Bridge's watcher lease; the WinForms GUI (`Gui\FluentShell.Gui.exe`); and the guardrail gates in `test.ps1`.
+
+Changes to the decisions below, made during implementation:
+
+- **Restore-all does not clear per-window rollback.** The text under "Reconciled decisions" says a rolled-back window's re-projection waits for the resume path. This slice matches that: the only way a rolled-back window projects again is an application restart. Clearing it on dormancy reset would let any same-session process re-project a window through the shared event, and this slice keeps the forced-native direction unauthenticated and the projecting direction authenticated.
+- **Autostart is off.** The watcher runs only while the GUI runs it. Closing the GUI, the panic hotkey, or Stop ends it. The Bridges' lease then restores every window.
+- **Stop and panic are the same path.** The GUI sets the dormancy event before it stops the watcher, so Stop restores every window.
 
 Scope comes from the user's 2026-10-14 decisions:
 

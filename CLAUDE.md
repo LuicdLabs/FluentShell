@@ -284,8 +284,18 @@ production entry point. The target is resolved through a file
 handle; the path read from the selected process must match that canonical path; `--pid` is mandatory
 when several processes share the image; injector and target integrity levels must match. Shell,
 security, XAML hosts, the renderer, and FluentShell's own tools are hard-denied in
-`src/Common/ProcessPolicy.h`. `--signer` is deliberately rejected until implemented. There is no
-process-name injection, system-wide discovery, or watch mode.
+`src/Common/ProcessPolicy.h`. `--signer` is deliberately rejected until implemented. Name-only injection
+is still unsupported.
+
+`FluentShell.Injector.exe watch` is the one opt-in global mode (global apply): it offers the Bridge to every
+eligible top-level window of this user's session. It is manual-start only (the GUI starts it; nothing writes a
+Run key), and it starts only while `HKCU\Software\FluentShell\Watch` has `Enabled=1` and `AcceptedRiskSha256`
+equal to the SHA-256 of the warning it prints (`watch-warning`, `src/injector/Watcher.cpp`). It never elevates:
+an elevated window is `skipped`, and the eligibility table is `src/injector/WatchPolicy.h`. Per-application
+opt-outs live in `HKCU\...\Watch\OptOut`. It stops on the panic hotkey (Ctrl+Alt+Shift+F12), on Stop, or when
+the GUI closes; each Bridge leases to the watcher's mutex `Local\FluentShell.Watch` and panics to native when it
+goes. Every injection runs through `src/injector/InjectorCore.cpp`, which checks the target through one handle it
+holds for the whole operation, so a reused PID cannot be injected into.
 
 `dllmain.cpp` starts `BridgeWorker` from `DLL_PROCESS_ATTACH`: pin the module, refuse denied
 targets and processes that already host XAML, start the `RendererSession`, install the
@@ -316,12 +326,19 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
 - Do not modify anything under `ref_src` — it is read-only reference material. WinUIShell informs the
   server/IPC/lifetime shape only; its reflection RPC layer is not copied. The GPL-3.0
   `win32-ui-modernizer` sample is behavioral research and contributes no code.
-- Do not reintroduce Bootstrap, in-process Island/Strategy C, dialog repaint overlays, broad system
-  injection, or name-only injection.
-- Renderer and Windows App SDK runtime files stay under `Renderer\`; nothing but
-  `FluentShell.Injector.exe`, `FluentShell.Bridge.dll`, and `LegacyDialogHost.exe` at the
-  production root. The Win32 `FluentShell.Injector.exe` and `FluentShell.Bridge.dll` live only in
-  `x86\`, and `build.ps1` refuses any other file there.
+- Do not reintroduce Bootstrap, in-process Island/Strategy C, dialog repaint overlays, or name-only
+  injection. Broad injection exists only as `watch` under the rules in Injection safety.
+- No UAC: nothing elevates, and `test.ps1` fails on `runas`, an elevation manifest, or a shell launch in
+  the GUI. No autostart: `test.ps1` fails on a `CurrentVersion\Run` entry.
+- The authenticated control pipe (`FluentShell.Control`) is not built. Per-window rollback needs no
+  authentication (it only forces native); re-projecting a rolled-back window needs an application restart.
+  `test.ps1` fails if the control-pipe name appears in source.
+- The watcher uses no global hooks: `test.ps1` fails on `SetWindowsHookEx`, `SetWinEventHook`, AppInit_DLLs,
+  IFEO, or a shell launch in `src\injector\`.
+- Renderer and Windows App SDK runtime files stay under `Renderer\`; the WinForms GUI (`FluentShell.Gui.exe`,
+  no App SDK) stays under `Gui\`; nothing but `FluentShell.Injector.exe`, `FluentShell.Bridge.dll`, and
+  `LegacyDialogHost.exe` at the production root. The Win32 `FluentShell.Injector.exe` and
+  `FluentShell.Bridge.dll` live only in `x86\`, and `build.ps1` refuses any other file there.
 - A WOW64 (32-bit) target is injected only by the Win32 injector: the x64 injector validates the request,
   then passes it to `x86\FluentShell.Injector.exe` and returns that exit code. The Win32 Bridge's exports
   are fixed by `src\Bridge\FluentShell.Bridge.def`, so the injector's `GetProcAddress` finds undecorated
@@ -333,7 +350,13 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
   is read by every Bridge's supervisor each tick. Signaled, each Bridge restores its windows once and runs
   no discovery; reset, discovery offers the windows again. A restored root's one discovery attempt is
   forgotten on entry, or it would stay native after the reset. Rolled-back roots (`SuppressRoot`,
-  `RootSuppression.h`) stay native across the reset until allowed; their trigger is not wired yet.
+  `RootSuppression.h`) stay native across the reset and until the application restarts: the resume path that
+  would allow them again is the authenticated control pipe, which is not built.
+- Per-window rollback: while a root is projected, its Bridge holds the auto-reset event
+  `Local\FluentShell.Rollback.<pid>.<hwnd hex>` (`RollbackEvent.h`). The supervisor creates it on projection,
+  closes it when the root stops projecting, and turns a signal into `SuppressRoot`. The GUI treats the event's
+  presence as "projected" and signals it to roll a window back. `RestoreOwnerGroup` includes translated dialogs
+  through their owner window and host.
 - The native projects restore only CppWinRT (`src/packages.config`); WinUI and the Windows App SDK
   belong to the renderer's own `PackageReference`s and never to native code.
 - Source files are CRLF and carry localized comments/diagnostics; `Directory.Build.props` forces

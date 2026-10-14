@@ -7,7 +7,7 @@
 **Truth Owner:** The native HWND/control tree and the original Win32 API arguments/results.
 **Contract Boundary:** A single authenticated full-duplex named pipe using the versioned `FLSH` frame and JSON schemas under `src/Protocol`.
 **Cutover:** Capture and validate the complete native tree, create a hidden proxy, validate `surface.ready` against the latest revision, cloak the native root, then reveal the proxy.
-**Displaced Path:** Production Bootstrap, in-process WinUI/Island Strategy C, dialog repaint overlays, broad system injection, and name-only injection.
+**Displaced Path:** Production Bootstrap, in-process WinUI/Island Strategy C, dialog repaint overlays, name-only injection, and any broad injection outside the consented, manual-start `watch` mode (see GLOBAL-GUI-DESIGN.md).
 **Value Density:** The first slice translates the LegacyDialogHost main window, MessageBox, and static TaskDialog with live binding and all-or-nothing fallback.
 **Evidence Gate:** Release build, protocol tests, dependency inspection, Computer Use/UIA interaction and rollback evidence, and Chrome isolation evidence.
 **Acceptance Evidence:** Recorded in `EVIDENCE.md` with commands, screenshots, UIA output, native oracle state, renderer-kill recovery, and WER checks.

@@ -13,6 +13,8 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RendererProject = Join-Path $Root "src\Renderer\FluentShell.Renderer.csproj"
 $OutputRoot = Join-Path $Root "build\bin\$Platform\$Configuration"
 $RendererOutput = Join-Path $OutputRoot "Renderer"
+$GuiProject = Join-Path $Root "src\Gui\FluentShell.Gui.csproj"
+$GuiOutput = Join-Path $OutputRoot "Gui"
 Set-Location $Root
 
 function Find-MSBuild {
@@ -132,6 +134,17 @@ if (-not $CoreOnly) {
         -p:PublishTrimmed=false `
         -p:WindowsAppSDKSelfContained=true
     if ($LASTEXITCODE -ne 0) { throw "renderer publish failed" }
+
+    # The GUI is a framework-dependent WinForms app in Gui\, beside Renderer\. It carries no App SDK.
+    Write-Host "Publishing the FluentShell GUI..."
+    & dotnet publish $GuiProject `
+        --configuration $Configuration `
+        --runtime win-x64 `
+        --self-contained false `
+        --output $GuiOutput `
+        -p:Platform=x64 `
+        -p:PlatformTarget=x64
+    if ($LASTEXITCODE -ne 0) { throw "GUI publish failed" }
 }
 
 $required = @(
@@ -143,6 +156,7 @@ $required = @(
 )
 if (-not $CoreOnly) {
     $required += Join-Path $RendererOutput "FluentShell.Renderer.exe"
+    $required += Join-Path $GuiOutput "FluentShell.Gui.exe"
 }
 foreach ($file in $required) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
@@ -156,7 +170,9 @@ $forbiddenRootPayload = @(
     "CoreMessagingXP.dll",
     "Microsoft.UI.dll",
     "Microsoft.UI.Xaml.dll",
-    "Microsoft.WindowsAppRuntime.dll"
+    "Microsoft.WindowsAppRuntime.dll",
+    "FluentShell.Gui.exe",
+    "FluentShell.Gui.dll"
 )
 foreach ($name in $forbiddenRootPayload) {
     if (Test-Path -LiteralPath (Join-Path $OutputRoot $name)) {
