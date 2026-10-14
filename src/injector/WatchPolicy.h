@@ -46,7 +46,7 @@ inline const char* ReasonText(Eligibility eligibility) noexcept {
     case Eligibility::OtherSession: return "another session";
     case Eligibility::Elevated: return "elevated: this user cannot inject into it";
     case Eligibility::DifferentIntegrity: return "different integrity level";
-    case Eligibility::Denied: return "shell, security, or FluentShell process";
+    case Eligibility::Denied: return "shell, security, FluentShell, or the Claude app (denied by name)";
     case Eligibility::OptedOut: return "turned off by the user";
     case Eligibility::AlreadyInjected: return "already projected";
     }

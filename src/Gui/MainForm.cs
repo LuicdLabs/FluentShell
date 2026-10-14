@@ -39,6 +39,9 @@ internal sealed class MainForm : Form {
         Font = new Font(FontFamily.GenericMonospace, 8.5f),
     };
 
+    // Set by Stop so the watcher's exit does not overwrite the status Stop reported.  Cleared by Start.
+    private bool _stopRequested;
+
     private readonly ContextMenuStrip _targetMenu = new();
     private readonly ToolStripMenuItem _turnOff = new("Turn this application off, and roll back its windows");
     private readonly ToolStripMenuItem _turnOn = new("Turn this application back on");
@@ -57,34 +60,41 @@ internal sealed class MainForm : Form {
         buttons.Controls.Add(_start);
         buttons.Controls.Add(_stop);
         buttons.Controls.Add(_hint);
-        // Docking follows the order of Controls: edge-docked controls are added first and the Fill control
-        // last, so Fill takes only the space the edges leave.
-        var header = new Panel { Dock = DockStyle.Top, Height = 82, Padding = new Padding(10, 6, 10, 0) };
-        header.Controls.Add(_status);
-        header.Controls.Add(buttons);
+        // Explicit rows instead of Dock: a docked control's position depended on the order it was added in, and
+        // the status line, the buttons and the list headings were drawn on top of one another.
+        var targetsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        targetsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        targetsPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        targetsPanel.Controls.Add(new Label { Text = "Applications the watcher has seen", AutoSize = true, Margin = new Padding(6, 6, 0, 4) }, 0, 0);
+        targetsPanel.Controls.Add(_targets, 0, 1);
 
-        var targetsPanel = new Panel { Dock = DockStyle.Fill };
-        targetsPanel.Controls.Add(new Label { Text = "Applications the watcher has seen", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(10, 6, 0, 4) });
-        targetsPanel.Controls.Add(_targets);
-
-        var windowsBar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(10, 4, 10, 4) };
-        windowsBar.Controls.Add(new Label { Text = "Windows of applications FluentShell projects", AutoSize = true, Padding = new Padding(0, 6, 12, 0) });
+        var windowsBar = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 0, 0, 4) };
+        windowsBar.Controls.Add(new Label { Text = "Windows of applications FluentShell projects", AutoSize = true, Margin = new Padding(6, 6, 12, 0) });
         windowsBar.Controls.Add(_rollback);
-        var windowsPanel = new Panel { Dock = DockStyle.Fill };
-        windowsPanel.Controls.Add(windowsBar);
-        windowsPanel.Controls.Add(_windows);
+        var windowsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        windowsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        windowsPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        windowsPanel.Controls.Add(windowsBar, 0, 0);
+        windowsPanel.Controls.Add(_windows, 0, 1);
 
-        var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 300 };
+        var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 200 };
         split.Panel1.Controls.Add(targetsPanel);
         split.Panel2.Controls.Add(windowsPanel);
+        // A splitter distance is only valid once the container has its real height, so it is set when shown.
+        Shown += (_, _) => split.SplitterDistance = split.Height * 45 / 100;
 
-        var logPanel = new Panel { Dock = DockStyle.Bottom, Height = 150, Padding = new Padding(10, 0, 10, 10) };
-        logPanel.Controls.Add(new Label { Text = "Log", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 4, 0, 2) });
-        logPanel.Controls.Add(_log);
-
-        Controls.Add(header);
-        Controls.Add(logPanel);
-        Controls.Add(split);
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(10, 4, 10, 10) };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));   // status line
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));   // buttons and hint
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // the two lists
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));   // log caption
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));  // log
+        layout.Controls.Add(_status, 0, 0);
+        layout.Controls.Add(buttons, 0, 1);
+        layout.Controls.Add(split, 0, 2);
+        layout.Controls.Add(new Label { Text = "Log", AutoSize = true, Margin = new Padding(0, 4, 0, 0) }, 0, 3);
+        layout.Controls.Add(_log, 0, 4);
+        Controls.Add(layout);
 
         _targetMenu.Items.Add(_turnOff);
         _targetMenu.Items.Add(_turnOn);
@@ -136,6 +146,7 @@ internal sealed class MainForm : Form {
                 WatchSettings.RecordAcceptance(warning.Sha256);
                 Log("Risk warning accepted. The watcher will start only while this acceptance matches.");
             }
+            _stopRequested = false;
             Dormancy.Resume();
             _watcher.Start(_injectorPath);
             SetRunning(running: true, "starting");
@@ -149,6 +160,7 @@ internal sealed class MainForm : Form {
     // watcher is stopped so nothing new is injected.
     private void StopGlobalApply() {
         try {
+            _stopRequested = true;
             Dormancy.SetDormant();
             _watcher.Stop();
             SetRunning(running: false, "stopped by you; every window is native");
@@ -183,6 +195,11 @@ internal sealed class MainForm : Form {
     }
 
     private void OnWatcherExited(int code) {
+        // Stop kills the watcher, and its exit must not overwrite the status Stop already set.
+        if (_stopRequested) {
+            Log($"The watcher stopped (exit code {code}).");
+            return;
+        }
         if (!_watcher.IsRunning) {
             SetRunning(running: false, $"the watcher ended (exit {code}); every window is native");
             Log($"The watcher ended with exit code {code}.");

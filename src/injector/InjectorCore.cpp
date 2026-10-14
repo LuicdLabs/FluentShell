@@ -547,7 +547,7 @@ InjectResult InjectTarget(
         return { InjectStatus::Refused, L"the target image changed before injection" };
     }
     if (FluentShell::IsProcessDenied(FluentShell::FileNameOf(*actualImage))) {
-        return { InjectStatus::Refused, L"shell, security, XAML, or FluentShell process" };
+        return { InjectStatus::Refused, L"shell, security, XAML, FluentShell, or the Claude app (denied by name)" };
     }
 
     const auto session = SessionOf(process.get());
@@ -597,7 +597,7 @@ int InjectRequestedTarget(const InjectOptions& options) {
 
     const auto name = FluentShell::FileNameOf(*canonical);
     if (FluentShell::IsProcessDenied(name)) {
-        PrintRefusal(std::wstring(name) + L" is a shell, security, XAML, or FluentShell process.");
+        PrintRefusal(std::wstring(name) + L" is denied: a shell, security, XAML, FluentShell, or Claude app process.");
         return 4;
     }
     if (options.sha256) {

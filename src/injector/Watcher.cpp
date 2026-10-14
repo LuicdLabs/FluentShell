@@ -446,9 +446,16 @@ private:
             PhaseName(target.phase), target.reason });
     }
 
-    void ReportWindows(DWORD pid, const std::vector<WindowInfo>& windows) {
+    void ReportWindows(DWORD pid, const std::vector<WindowInfo>& allWindows) {
         auto entry = tracked_.find(pid);
         if (entry == tracked_.end()) return;
+        // Only a target the watcher manages has windows in the GUI.  A denied process (the renderer's proxy
+        // carries its application's title), an elevated one, or any other skipped process would otherwise list
+        // windows that global apply does not own.  An empty list is still reported, so rows drop when a target
+        // stops being managed.
+        static const std::vector<WindowInfo> kNone;
+        const bool managed = entry->second.phase == Phase::Injected || entry->second.phase == Phase::Pending;
+        const auto& windows = managed ? allWindows : kNone;
         std::wstring signature;
         for (const auto& window : windows) {
             signature += Hex(reinterpret_cast<uintptr_t>(window.hwnd)) + L"|" + window.title + L"\n";
