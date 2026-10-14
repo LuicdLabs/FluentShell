@@ -9,6 +9,7 @@ Changes to the decisions below, made during implementation:
 - **Restore-all does not clear per-window rollback.** The text under "Reconciled decisions" says a rolled-back window's re-projection waits for the resume path. This slice matches that: the only way a rolled-back window projects again is an application restart. Clearing it on dormancy reset would let any same-session process re-project a window through the shared event, and this slice keeps the forced-native direction unauthenticated and the projecting direction authenticated.
 - **Autostart is off.** The watcher runs only while the GUI runs it. Closing the GUI, the panic hotkey, or Stop ends it. The Bridges' lease then restores every window.
 - **Stop and panic are the same path.** The GUI sets the dormancy event before it stops the watcher, so Stop restores every window.
+- **The Claude desktop app is denied by default** (`claude.exe` in `ProcessPolicy.h`). It hosts the session that drives this work, and the user decided it must not be injected into. The deny list is by image name, so a renamed copy would pass; the same weakness applies to every name on the list, and the warning says so.
 
 Scope comes from the user's 2026-10-14 decisions:
 

@@ -10,6 +10,7 @@
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
 #include "../../src/Bridge/Translation/RollbackEvent.h"
 #include "../../src/injector/WatchPolicy.h"
+#include "../../src/Common/ProcessPolicy.h"
 #include "../../src/Bridge/Translation/VirtualTaskDialog.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
@@ -5235,6 +5236,11 @@ void TestWatchPolicy() {
     Check(RetryDelayMs(5) == 30000 && RetryDelayMs(12) == 30000, "retry delay is not capped at 30 s");
     Check(MayRetry(1) && MayRetry(kMaxInjectAttempts - 1) && !MayRetry(kMaxInjectAttempts),
         "retry attempts are not capped at twelve");
+
+    // The shell, the security products, FluentShell itself, and the Claude app that hosts the session.
+    Check(FluentShell::IsProcessDenied(L"explorer.exe"), "explorer.exe is not denied to global apply");
+    Check(FluentShell::IsProcessDenied(L"claude.exe"), "the Claude desktop app is not denied to global apply");
+    Check(FluentShell::IsProcessDenied(L"FluentShell.Gui.exe"), "the GUI is not denied to global apply");
 }
 
 int wmain() {
