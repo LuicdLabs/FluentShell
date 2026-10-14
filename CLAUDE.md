@@ -18,8 +18,9 @@ FluentShell.Bridge.dll -- versioned pipe -- Renderer\FluentShell.Renderer.exe
 
 ## Build And Test
 
-Requires Visual Studio with the x64 C++ toolchain, Windows SDK 10.0.26100, and the .NET 8+ SDK.
-Everything is x64-only; `Debug` and `Release` are the only configurations.
+Requires Visual Studio with the x64 and x86 (Win32) C++ toolchains, Windows SDK 10.0.26100, and the .NET 8+ SDK.
+Native payloads are x64, plus one Win32 lane (the Bridge and Injector in `x86\`) that serves WOW64 targets;
+the renderer is x64 only. `Debug` and `Release` are the only configurations.
 
 ```powershell
 .\build.ps1 -Configuration Release      # nuget + dotnet restore, build solution, publish renderer, verify payload layout
@@ -319,10 +320,20 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
   injection, or name-only injection.
 - Renderer and Windows App SDK runtime files stay under `Renderer\`; nothing but
   `FluentShell.Injector.exe`, `FluentShell.Bridge.dll`, and `LegacyDialogHost.exe` at the
-  production root.
+  production root. The Win32 `FluentShell.Injector.exe` and `FluentShell.Bridge.dll` live only in
+  `x86\`, and `build.ps1` refuses any other file there.
+- A WOW64 (32-bit) target is injected only by the Win32 injector: the x64 injector validates the request,
+  then passes it to `x86\FluentShell.Injector.exe` and returns that exit code. The Win32 Bridge's exports
+  are fixed by `src\Bridge\FluentShell.Bridge.def`, so the injector's `GetProcAddress` finds undecorated
+  names; `test.ps1` checks the exact names.
 
 ## Repository Notes
 
+- Dormancy: the named manual-reset event `Local\FluentShell.Dormant` (created with the renderer pipe's DACL)
+  is read by every Bridge's supervisor each tick. Signaled, each Bridge restores its windows once and runs
+  no discovery; reset, discovery offers the windows again. A restored root's one discovery attempt is
+  forgotten on entry, or it would stay native after the reset. Rolled-back roots (`SuppressRoot`,
+  `RootSuppression.h`) stay native across the reset until allowed; their trigger is not wired yet.
 - The native projects restore only CppWinRT (`src/packages.config`); WinUI and the Windows App SDK
   belong to the renderer's own `PackageReference`s and never to native code.
 - Source files are CRLF and carry localized comments/diagnostics; `Directory.Build.props` forces
@@ -457,5 +468,5 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
 - Out of reach by design, not by adapter: msra.exe runs with the Microsoft-signed-only binary signature mitigation
   (the Bridge cannot load); psr.exe already hosts `Windows.UI.Xaml`; notepad.exe launches the packaged app; Folder Options
   and Work Folders open inside explorer.exe; wiaacmgr relaunches itself at another integrity level; Media Player's first
-  run is the 32-bit `setup_wm.exe` (the Bridge is x64 only). Free-form painted canvases (charmap's grid, eudcedit's glyph
+  run is the 32-bit `setup_wm.exe` (now reachable through the x86 lane, not yet verified against it). Free-form painted canvases (charmap's grid, eudcedit's glyph
   editor, fxscover, fontview's sample pane, WFS's preview) have no contract to project and exceed the pixel budgets.

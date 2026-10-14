@@ -360,7 +360,10 @@ std::wstring RendererSession::RendererPath() const {
     const DWORD length = GetModuleFileNameW(
         bridgeModule_, modulePath, static_cast<DWORD>(std::size(modulePath)));
     if (!length || length >= std::size(modulePath)) return {};
-    return (fs::path(modulePath).parent_path() / L"Renderer" / L"FluentShell.Renderer.exe").wstring();
+    fs::path directory = fs::path(modulePath).parent_path();
+    // A WOW64 Bridge ships in x86\ beside the production root; the x64 renderer is shared at its Renderer\.
+    if (directory.filename() == L"x86") directory = directory.parent_path();
+    return (directory / L"Renderer" / L"FluentShell.Renderer.exe").wstring();
 }
 
 bool RendererSession::CreatePipeAndRenderer(uint64_t handshakeDeadline) {
@@ -553,6 +556,16 @@ bool RendererSession::Start() {
     // when the session stops, and an event handle is all it costs.
     discoveryWake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     SetTopLevelShownEvent(discoveryWake_);
+    // Shared by every Bridge in the session, so one signal restores each target and a reset
+    // lifts it.  Manual-reset: an auto-reset event would wake only one of the waiters.  Never
+    // closed, for the same reason as discoveryWake_.  Same DACL as the renderer pipe.
+    SECURITY_ATTRIBUTES dormancySecurity{};
+    PSECURITY_DESCRIPTOR dormancyDescriptor = nullptr;
+    if (CreatePipeSecurity(dormancySecurity, dormancyDescriptor)) {
+        dormantEvent_ = CreateEventW(&dormancySecurity, TRUE, FALSE, L"Local\\FluentShell.Dormant");
+        LocalFree(dormancyDescriptor);
+    }
+    if (!dormantEvent_) FluentShell::Log(L"Dormancy event unavailable; restore-all cannot be requested");
     if (!InstallTopLevelShownHook(bridgeModule_))
         FluentShell::Log(L"Top-level show events unavailable; discovery keeps its periodic pass");
     actionWorker_ = std::thread([this] { ActionMain(); });
@@ -1524,6 +1537,11 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
     const HWND directOwner = EffectiveTopLevelOwner(window);
     DiscoveryDecision decision;
     std::scoped_lock lock(surfacesMutex_);
+    // A root the user rolled back stays native, and so does every window it owns.  Refused
+    // silently: the rollback itself was already logged.
+    for (HWND owner = window; owner; owner = EffectiveTopLevelOwner(owner)) {
+        if (suppressedRoots_.IsSuppressed(owner)) return decision;
+    }
 
     // A root that recently owned a visible top-level stays native until the owner
     // graph has been quiet for kOwnerGraphQuietMs.  Classic dialog sequences
@@ -1841,7 +1859,7 @@ void RendererSession::ScheduleReprojection(HWND root, std::wstring_view reason) 
         const uint64_t projectedAt = since->second;
         projectedSince_.erase(since);
         if (!root || !IsWindow(root) || reason == L"nativeDestroyed" || reason == L"shutdown" ||
-            reason == L"ownedTopLevel") return;
+            reason == L"ownedTopLevel" || reason == L"userRestore") return;
         const uint64_t now = GetTickCount64();
         auto& retry = discoveryRetries_[root];
         if (now - projectedAt >= kStableProjectionMs) retry.reprojections = 0;
@@ -1908,6 +1926,14 @@ void RendererSession::ContinueReprojection(HWND root) noexcept {
 }
 
 bool RendererSession::OpenNativeWindow(HWND root) {
+    {
+        // Discovery refuses suppressed roots before it gets here; this keeps every other way
+        // into the projection honest as well.
+        std::scoped_lock lock(surfacesMutex_);
+        for (HWND owner = root; owner; owner = EffectiveTopLevelOwner(owner)) {
+            if (suppressedRoots_.IsSuppressed(owner)) return false;
+        }
+    }
     bool transient = false;
     auto agent = SourceThreadAgent::Attach(root, bridgeModule_, &transient);
     if (!agent) {
@@ -3864,6 +3890,56 @@ void RendererSession::RestoreAll(std::wstring_view reason) noexcept {
     }
 }
 
+// Restores a root and every projected window it owns, deepest first, as one unit: a dialog
+// left projected under a native owner is cloaked along with it.  No lock is held on entry;
+// RestoreSurface takes the barriers itself.
+void RendererSession::RestoreOwnerGroup(HWND root, std::wstring_view reason) noexcept {
+    std::vector<std::pair<size_t, std::shared_ptr<Surface>>> group;
+    try {
+        std::scoped_lock lock(surfacesMutex_);
+        for (const auto& [_, surface] : surfaces_) {
+            HWND surfaceRoot = nullptr;
+            {
+                std::scoped_lock surfaceLock(surface->mutex);
+                if (surface->agent) surfaceRoot = surface->agent->Root();
+            }
+            if (surfaceRoot && (surfaceRoot == root || IsOwnedBy(surfaceRoot, root))) {
+                group.emplace_back(OwnerDepth(surfaceRoot), surface);
+            }
+        }
+    } catch (...) {
+        try { FluentShell::Log(L"Owner group could not be collected for restore"); } catch (...) {}
+        return;
+    }
+    std::stable_sort(group.begin(), group.end(),
+        [](const auto& left, const auto& right) { return left.first > right.first; });
+    for (const auto& [_, surface] : group) {
+        try { RestoreSurface(surface, reason); }
+        catch (...) { /* RestoreSurface has its own firewall. */ }
+    }
+}
+
+// The user rolled this root back.  The root and its owned windows go native now, and discovery
+// refuses the root from here on, until the rollback is allowed again.  A root that cannot carry
+// the suppression stamp is still restored, but is not kept native.
+void RendererSession::SuppressRoot(HWND root) noexcept {
+    bool suppressed = false;
+    try {
+        std::scoped_lock lock(surfacesMutex_);
+        suppressed = suppressedRoots_.Suppress(root);
+        // A reprojection this root had pending must not run.
+        projectedSince_.erase(root);
+        discoveryRetries_.erase(root);
+    } catch (...) {}
+    try {
+        FluentShell::Log((suppressed
+                ? L"Native window rolled back by the user; it stays native: "
+                : L"Native window rolled back by the user, but it cannot be kept native: ")
+            + DescribeTopLevel(root));
+    } catch (...) {}
+    RestoreOwnerGroup(root, L"userRestore");
+}
+
 void RendererSession::HeartbeatMain() noexcept {
     uint64_t lastOutboundHeartbeat = 0;
     try {
@@ -3918,6 +3994,37 @@ void RendererSession::RunSupervisor() {
     // The burst also covers a window whose WM_SHOWWINDOW arrived before it was visible.
     uint64_t burstUntil = 0;
     while (!stopping_.load() && !failed_.load()) {
+        // Dormancy: while the session's event is signaled, every window is native and discovery
+        // and reconcile do nothing.  Entering restores what is projected.  Leaving offers every
+        // window again, except the roots the user rolled back.
+        const bool dormantNow = dormantEvent_ && WaitForSingleObject(dormantEvent_, 0) == WAIT_OBJECT_0;
+        if (dormantNow != dormant_.load()) {
+            dormant_ = dormantNow;
+            FluentShell::Log(dormantNow
+                ? L"Dormant: every window stays native until the dormancy event is reset"
+                : L"Dormancy lifted; discovery offers the windows again");
+            if (dormantNow) {
+                std::vector<HWND> roots;
+                {
+                    std::scoped_lock lock(surfacesMutex_);
+                    for (const auto& [_, surface] : surfaces_) {
+                        std::scoped_lock surfaceLock(surface->mutex);
+                        if (surface->agent && surface->agent->Root()) roots.push_back(surface->agent->Root());
+                    }
+                }
+                RestoreAll(L"userRestore");
+                // A restored root has used its one discovery attempt.  Without this, discovery
+                // would keep it native after the dormancy is reset; discovery is idle until then,
+                // so forgetting the attempt now is the same as forgetting it at resume.
+                std::scoped_lock lock(surfacesMutex_);
+                for (const HWND root : roots) discoveryAttempts_.erase(root);
+            }
+            lastDiscovery = 0;
+        }
+        if (dormant_.load()) {
+            Sleep(kReconcileTickMs);
+            continue;
+        }
         const uint64_t now = GetTickCount64();
         const bool burst = now < burstUntil;
         if (now - lastDiscovery >= (burst ? kDiscoveryBurstTickMs : kDiscoveryIntervalMs)) {

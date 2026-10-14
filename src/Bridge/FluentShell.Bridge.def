@@ -1,0 +1,5 @@
+LIBRARY FluentShell.Bridge
+EXPORTS
+    FluentShell_Start
+    FluentShell_IsRendererReady
+    FluentShell_Ping

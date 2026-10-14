@@ -15,7 +15,12 @@
 #include "../../src/Bridge/Translation/PaintedPixel.h"
 #include "../../src/Bridge/Translation/RichText.h"
 #include "../../src/Bridge/Translation/PerformanceChart.h"
+#include "../../src/Bridge/Translation/RootSuppression.h"
 #include "ItemImageCaptureTests.h"
+
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include "MmcHtmlDocumentTests.h"
 #include "ListViewModeRegressionTests.h"
 #include "OwnerDataListViewTests.h"
@@ -5119,6 +5124,65 @@ void TestMdiFrameCaptureAndCommands() {
 
 } // namespace
 
+// A rollback suppression holds only while its window carries the stamp it was made with, so a
+// destroyed window, or one created at a reused HWND, must never inherit the rollback.
+struct FakeWindowStore final {
+    struct State final {
+        std::unordered_set<int> alive;
+        std::unordered_map<int, uintptr_t> stamps;
+        bool refuseStamps = false;
+    };
+    std::shared_ptr<State> state = std::make_shared<State>();
+    bool Attach(int window, uintptr_t stamp) const {
+        if (state->refuseStamps) return false;
+        state->stamps[window] = stamp;
+        return true;
+    }
+    uintptr_t Stamp(int window) const {
+        const auto found = state->stamps.find(window);
+        return found == state->stamps.end() ? 0 : found->second;
+    }
+    void Detach(int window) const { state->stamps.erase(window); }
+    bool Alive(int window) const { return state->alive.contains(window); }
+};
+
+void TestRootSuppressionLedger() {
+    using Ledger = FluentShell::Bridge::Translation::RootSuppressionLedger<int, FakeWindowStore>;
+    FakeWindowStore store;
+    const auto& state = store.state;
+    state->alive = { 1, 2, 3 };
+    Ledger ledger(store);
+
+    Check(ledger.Suppress(1), "a live root could not be suppressed");
+    Check(ledger.IsSuppressed(1), "a suppressed root is not suppressed");
+    Check(!ledger.IsSuppressed(2), "an unrelated window is suppressed");
+    Check(!ledger.Suppress(9), "a window that does not exist was suppressed");
+
+    // Destroying the window drops its property list; a new window at the same handle has no stamp.
+    state->alive.erase(1);
+    state->stamps.erase(1);
+    state->alive.insert(1);
+    Check(!ledger.IsSuppressed(1), "a window at a reused handle inherited a rollback");
+    Check(ledger.Count() == 0, "a stale suppression was not dropped");
+
+    Check(ledger.Suppress(2), "a second root could not be suppressed");
+    ledger.Allow(2);
+    Check(!ledger.IsSuppressed(2), "an allowed root is still suppressed");
+    Check(state->stamps.count(2) == 0, "allowing a root left its stamp on the window");
+
+    // A window that cannot carry the stamp is not recorded as suppressed.
+    state->refuseStamps = true;
+    Check(!ledger.Suppress(3), "a root without a stamp was recorded as suppressed");
+    Check(!ledger.IsSuppressed(3), "an unstamped root reads as suppressed");
+    state->refuseStamps = false;
+
+    // A suppressed window that is destroyed ends its suppression.
+    Check(ledger.Suppress(3), "a live root could not be suppressed again");
+    state->alive.erase(3);
+    Check(!ledger.IsSuppressed(3), "a destroyed window stayed suppressed");
+    Check(ledger.Count() == 0, "a destroyed window's entry was kept");
+}
+
 int wmain() {
 #ifdef _DEBUG
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
@@ -5160,6 +5224,7 @@ int wmain() {
     FluentShell::Tests::TestReferencedItemImagery(Check);
     TestHeaderValidation();
     TestPipeRoundTrip();
+    TestRootSuppressionLedger();
     TestReadFrameUsesOneDeadline();
     TestWriteFrameUsesOneDeadline();
     TestScalarContracts();

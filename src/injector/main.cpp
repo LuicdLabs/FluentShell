@@ -25,6 +25,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr wchar_t kRendererExeName[] = L"FluentShell.Renderer.exe";
+constexpr wchar_t kInjectorExeName[] = L"FluentShell.Injector.exe";
 
 struct InjectOptions {
     std::wstring requestedImagePath;
@@ -43,7 +44,10 @@ std::wstring BridgePath() {
 }
 
 std::wstring RendererPath() {
-    return (fs::path(ExeDir()) / L"Renderer" / kRendererExeName).wstring();
+    // The Win32 injector runs from x86\; the x64 renderer it launches is shared at the production root's Renderer\.
+    fs::path directory = ExeDir();
+    if (directory.filename() == L"x86") directory = directory.parent_path();
+    return (directory / L"Renderer" / kRendererExeName).wstring();
 }
 
 std::wstring StripExtendedPrefix(std::wstring path) {
@@ -241,20 +245,37 @@ std::optional<DWORD> ProcessIntegrityLevel(DWORD pid) {
     return *GetSidSubAuthority(label->Label.Sid, count - 1);
 }
 
-bool IsArchitectureCompatible(DWORD pid) {
+// The target's machines as IsWow64Process2 reports them: processMachine is UNKNOWN for a
+// process of the host's native architecture and I386 for a 32-bit (WOW64) process.
+bool QueryProcessMachines(DWORD pid, USHORT& processMachine, USHORT& nativeMachine) {
     using IsWow64Process2Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
     const auto kernel = GetModuleHandleW(L"kernel32.dll");
     const auto function = kernel ? reinterpret_cast<IsWow64Process2Fn>(
         GetProcAddress(kernel, "IsWow64Process2")) : nullptr;
-    if (!function) return true;
+    if (!function) return false;
 
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return false;
-    USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
-    USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
     const BOOL ok = function(process, &processMachine, &nativeMachine);
     CloseHandle(process);
-    if (!ok) return false;
+    return ok == TRUE;
+}
+
+#if defined(_M_X64) || defined(__x86_64__)
+bool IsWow64Target(DWORD pid) {
+    USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    return QueryProcessMachines(pid, processMachine, nativeMachine) &&
+           processMachine == IMAGE_FILE_MACHINE_I386;
+}
+#endif
+
+bool IsArchitectureCompatible(DWORD pid) {
+    USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+    if (!QueryProcessMachines(pid, processMachine, nativeMachine)) return false;
 
 #if defined(_M_X64) || defined(__x86_64__)
     return processMachine == IMAGE_FILE_MACHINE_UNKNOWN &&
@@ -508,6 +529,35 @@ bool InjectBridge(DWORD pid, const std::wstring& expectedTargetPath) {
     return false;
 }
 
+#if defined(_M_X64) || defined(__x86_64__)
+// A 32-bit (WOW64) target is injected only by the Win32 injector and Bridge in x86\. The x64
+// injector passes the already-validated request on and returns that injector's exit code.
+int InjectWithWin32Injector(const std::wstring& canonicalImage, DWORD pid, const InjectOptions& options) {
+    const auto injector = (fs::path(ExeDir()) / L"x86" / kInjectorExeName).wstring();
+    if (!fs::is_regular_file(injector)) {
+        std::wcerr << L"Missing Win32 injector for a 32-bit target: " << injector << L"\n";
+        return 5;
+    }
+    std::wstring commandLine = L"\"" + injector + L"\" inject \"" + canonicalImage +
+                               L"\" --pid " + std::to_wstring(pid);
+    if (options.sha256) commandLine += L" --sha256 " + *options.sha256;
+
+    STARTUPINFOW startup{ sizeof(startup) };
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(injector.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+            0, nullptr, nullptr, &startup, &process)) {
+        std::wcerr << L"Cannot start the Win32 injector: " << GetLastError() << L"\n";
+        return 5;
+    }
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exitCode = 5;
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exitCode);
+}
+#endif
+
 int InjectRequestedTarget(const InjectOptions& options) {
     const auto canonical = CanonicalFilePath(options.requestedImagePath);
     if (!canonical) {
@@ -546,8 +596,11 @@ int InjectRequestedTarget(const InjectOptions& options) {
         std::wcerr << L"REFUSED: injector and target must run at the same integrity level.\n";
         return 4;
     }
+#if defined(_M_X64) || defined(__x86_64__)
+    if (IsWow64Target(*pid)) return InjectWithWin32Injector(*canonical, *pid, options);
+#endif
     if (!IsArchitectureCompatible(*pid)) {
-        std::wcerr << L"REFUSED: target architecture does not match the x64 payload.\n";
+        std::wcerr << L"REFUSED: target architecture does not match this injector's payload.\n";
         return 4;
     }
 
@@ -564,8 +617,8 @@ void PrintUsage() {
         L"  FluentShell.Injector inject <absolute-image-path> [--pid <pid>] [--sha256 <hex>]\n\n"
         L"Injection requires one canonical image path. If more than one matching process is\n"
         L"running, --pid is mandatory. Bridge is loaded directly; Renderer\\FluentShell.Renderer.exe\n"
-        L"must be present beside the injector directory. System-wide and name-only injection\n"
-        L"are intentionally unsupported.\n";
+        L"must be in the production root's Renderer folder. 32-bit targets are served by x86\\.\n"
+        L"System-wide and name-only injection are intentionally unsupported.\n";
 }
 
 } // namespace

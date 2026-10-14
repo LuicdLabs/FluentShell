@@ -82,30 +82,34 @@ if ($nativeTests.Count -eq 0) { Write-Host "No native test project is currently 
 
 $bridge = Join-Path $OutputRoot "FluentShell.Bridge.dll"
 $injector = Join-Path $OutputRoot "FluentShell.Injector.exe"
+$win32Bridge = Join-Path $OutputRoot "x86\FluentShell.Bridge.dll"
+$win32Injector = Join-Path $OutputRoot "x86\FluentShell.Injector.exe"
 $renderer = Join-Path $OutputRoot "Renderer\FluentShell.Renderer.exe"
-foreach ($required in @($bridge, $injector, $renderer)) {
+foreach ($required in @($bridge, $injector, $win32Bridge, $win32Injector, $renderer)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required production payload missing: $required"
     }
 }
 
-$dependencies = (& $dumpbin /nologo /dependents $bridge | Out-String)
-if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $bridge" }
-foreach ($forbidden in @("Microsoft.UI", "Microsoft.WindowsAppRuntime", "CoreMessagingXP")) {
-    if ($dependencies -match [regex]::Escape($forbidden)) {
-        throw "Bridge has forbidden in-process dependency: $forbidden"
+foreach ($dll in @($bridge, $win32Bridge)) {
+    $dependencies = (& $dumpbin /nologo /dependents $dll | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $dll" }
+    foreach ($forbidden in @("Microsoft.UI", "Microsoft.WindowsAppRuntime", "CoreMessagingXP")) {
+        if ($dependencies -match [regex]::Escape($forbidden)) {
+            throw "$dll has forbidden in-process dependency: $forbidden"
+        }
+    }
+    # Exact export names: the injector resolves them with GetProcAddress, and a 32-bit
+    # DLL without the .def file exports _FluentShell_Start@4, which a substring match accepts.
+    $exports = (& $dumpbin /nologo /exports $dll | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $exports -notmatch "\s[0-9A-F]{8}\s+FluentShell_Start\s+=") {
+        throw "$dll restart export FluentShell_Start is missing or decorated"
+    }
+    if ($exports -notmatch "\s[0-9A-F]{8}\s+FluentShell_IsRendererReady\s+=") {
+        throw "$dll readiness export FluentShell_IsRendererReady is missing or decorated"
     }
 }
-Write-Host "Bridge dependency gate passed."
-
-$exports = (& $dumpbin /nologo /exports $bridge | Out-String)
-if ($LASTEXITCODE -ne 0 -or $exports -notmatch "FluentShell_Start") {
-    throw "Bridge restart export FluentShell_Start is missing"
-}
-if ($exports -notmatch "FluentShell_IsRendererReady") {
-    throw "Bridge readiness export FluentShell_IsRendererReady is missing"
-}
-Write-Host "Bridge export gate passed."
+Write-Host "Bridge dependency and export gates passed (x64 and x86)."
 
 foreach ($forbidden in @(
     "FluentShell.Bootstrap.dll",
@@ -129,14 +133,16 @@ foreach ($projectText in @($solutionText, $injectorProjectText, $bridgeProjectTe
     }
 }
 
-$usage = (& $injector 2>&1 | Out-String)
-if ($usage -match "inject <pid\|exe>" -or
-    $usage -match "system \[" -or
-    $usage -match "\bl0\b" -or
-    $usage -match "island-(demo|smoke)") {
-    throw "Injector still advertises a removed diagnostic/broad/name-only entry point"
+foreach ($exe in @($injector, $win32Injector)) {
+    $usage = (& $exe 2>&1 | Out-String)
+    if ($usage -match "inject <pid\|exe>" -or
+        $usage -match "system \[" -or
+        $usage -match "\bl0\b" -or
+        $usage -match "island-(demo|smoke)") {
+        throw "$(Split-Path -Leaf $exe) still advertises a removed diagnostic/broad/name-only entry point"
+    }
 }
-Write-Host "Injector CLI cutover gate passed."
+Write-Host "Injector CLI cutover gate passed (x64 and x86)."
 Write-Host "All available tests and production gates passed."
 # The CLI gate runs the Injector without arguments, which exits 1 by design; every
 # failure above has already thrown, so reaching here means success.

@@ -2,6 +2,7 @@
 
 #include "SourceThreadAgent.h"
 #include "VirtualTaskDialog.h"
+#include "RootSuppression.h"
 
 #include <commctrl.h>
 
@@ -32,6 +33,11 @@ public:
     void RunSupervisor();
     void Stop() noexcept;
     bool IsReady() const noexcept { return ready_.load() && !failed_.load(); }
+
+    // The user rolled this root back.  It and the windows it owns are restored as one unit and
+    // stay native: discovery does not take the root again until the rollback is allowed.  Any
+    // thread may call it; the restore takes the surface barriers itself.
+    void SuppressRoot(HWND root) noexcept;
 
     std::optional<int> ShowMessageBox(
         HWND owner,
@@ -227,6 +233,8 @@ private:
         const RestoreAttempt& attempt, std::wstring_view protocolReason) noexcept;
     void ScheduleEmergencyUncloakRetry(const RestoreAttempt& attempt) noexcept;
     void RestoreAll(std::wstring_view reason) noexcept;
+    // Restores a root and every projected window it owns, deepest first, under one reason.
+    void RestoreOwnerGroup(HWND root, std::wstring_view reason) noexcept;
     bool IsRetiredSurface(std::wstring_view surfaceId) noexcept;
     void RememberRetiredSurfaceLocked(std::wstring_view surfaceId) noexcept;
     void RetireSurfaceIfClosed(const std::shared_ptr<Surface>& surface) noexcept;
@@ -318,6 +326,13 @@ private:
     // open: each holds the root it belongs to native, because projecting the root
     // again would only hand the graph back. Guarded by surfacesMutex_.
     std::unordered_set<HWND> refusedDialogs_;
+    // Roots the user rolled back: projection neither takes them again nor the windows they own,
+    // until the user allows them.  Guarded by surfacesMutex_.
+    RootSuppressionLedger<HWND, WindowPropertyStamps> suppressedRoots_;
+    // Mirrors the session-wide dormancy event: while it is signaled every window is native and
+    // discovery is idle.  Only the supervisor thread touches these two.
+    std::atomic<bool> dormant_{ false };
+    HANDLE dormantEvent_ = nullptr;
     // Hands every projected owner of a window the projection cannot take back to
     // native, together, and arranges for the graph to be offered again once that
     // window is gone: a root waits in ownerGraphDeferrals_, an owned dialog gets

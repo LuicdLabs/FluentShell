@@ -102,6 +102,24 @@ foreach ($target in $targets) {
     if ($LASTEXITCODE -ne 0) { throw "Build failed: $target" }
 }
 
+# The 32-bit lane: a Win32 Injector and Bridge that serve WOW64 targets from x86\.
+$win32Targets = @(
+    "third_party\detours\detours.vcxproj",
+    "src\FluentShell.Bridge.vcxproj",
+    "src\FluentShell.Injector.vcxproj"
+)
+foreach ($target in $win32Targets) {
+    Write-Host "Building $target ($Configuration|Win32)..."
+    & $msbuild $target /m /p:Configuration=$Configuration /p:Platform=Win32 /v:m
+    if ($LASTEXITCODE -ne 0) { throw "Build failed: $target (Win32)" }
+}
+$win32Output = Join-Path $Root "build\bin\Win32\$Configuration"
+$x86Output = Join-Path $OutputRoot "x86"
+New-Item -ItemType Directory -Path $x86Output -Force | Out-Null
+foreach ($name in @("FluentShell.Injector.exe", "FluentShell.Bridge.dll")) {
+    Copy-Item -LiteralPath (Join-Path $win32Output $name) -Destination $x86Output -Force
+}
+
 if (-not $CoreOnly) {
     Write-Host "Publishing out-of-process renderer..."
     & dotnet publish $RendererProject `
@@ -119,7 +137,9 @@ if (-not $CoreOnly) {
 $required = @(
     (Join-Path $OutputRoot "FluentShell.Injector.exe"),
     (Join-Path $OutputRoot "FluentShell.Bridge.dll"),
-    (Join-Path $OutputRoot "LegacyDialogHost.exe")
+    (Join-Path $OutputRoot "LegacyDialogHost.exe"),
+    (Join-Path $OutputRoot "x86\FluentShell.Injector.exe"),
+    (Join-Path $OutputRoot "x86\FluentShell.Bridge.dll")
 )
 if (-not $CoreOnly) {
     $required += Join-Path $RendererOutput "FluentShell.Renderer.exe"
@@ -145,6 +165,11 @@ foreach ($name in $forbiddenRootPayload) {
 }
 
 Write-Host ""
+$x86Files = @(Get-ChildItem -LiteralPath $x86Output -Force | Select-Object -ExpandProperty Name | Sort-Object)
+if (($x86Files -join ",") -ne "FluentShell.Bridge.dll,FluentShell.Injector.exe") {
+    throw "Unexpected files under x86\: $($x86Files -join ', ')"
+}
+
 Write-Host "Build OK. Production outputs:"
 Get-ChildItem -LiteralPath $OutputRoot | Format-Table Name, Length, LastWriteTime
 Write-Host ""
