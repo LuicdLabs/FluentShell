@@ -3,6 +3,8 @@
 #include "InjectorCore.h"
 #include "WatchPolicy.h"
 
+#include "../Bridge/Translation/RollbackEvent.h"
+
 #include "../Common/ProcessPolicy.h"
 
 #include <condition_variable>
@@ -35,6 +37,10 @@ constexpr UINT kPanicModifiers = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEA
 constexpr UINT kPanicKey = VK_F12;
 constexpr UINT kWakeMessage = WM_APP + 1;
 constexpr DWORD kTickMs = 1000;
+// After a target is injected, the next injection waits until that target's window has projected (its
+// rollback event exists), for at most this long.  Two injections in flight let the second projection take
+// the foreground from the first, and the first then fails the foreground handoff.
+constexpr DWORD kProjectionWaitMs = 10000;
 
 // The text the user accepts.  The GUI shows these exact bytes and records their SHA-256; the watcher
 // starts only while the recorded hash equals the hash of this text, so changing the text voids consent.
@@ -235,6 +241,7 @@ struct Job {
     DWORD pid = 0;
     ULONGLONG created = 0;
     std::wstring image;
+    std::vector<HWND> windows;  // the target's windows when the job was submitted
 };
 
 struct Outcome {
@@ -276,6 +283,27 @@ public:
     }
 
 private:
+    // Returns when one of the target's windows has a rollback event (it projected), when the timeout passes, or
+    // when the worker is stopping.  The event exists only while its root is projected, so its presence is the
+    // signal.  A window that never projects costs the timeout once and does not hold the queue longer.
+    void WaitForProjection(const Job& job) {
+        const ULONGLONG deadline = GetTickCount64() + kProjectionWaitMs;
+        while (GetTickCount64() < deadline) {
+            {
+                std::scoped_lock lock(mutex_);
+                if (stop_) return;
+            }
+            for (const HWND window : job.windows) {
+                const std::wstring name = Bridge::Translation::RollbackEventName(job.pid, window);
+                if (HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, name.c_str())) {
+                    CloseHandle(event);
+                    return;
+                }
+            }
+            Sleep(100);
+        }
+    }
+
     void Run() {
         for (;;) {
             Job job;
@@ -288,6 +316,7 @@ private:
             }
             Outcome outcome{ job.pid, job.created,
                 InjectTarget(job.pid, job.created, job.image, std::nullopt) };
+            if (outcome.result.status == InjectStatus::Injected) WaitForProjection(job);
             {
                 std::scoped_lock lock(mutex_);
                 outcomes_.push_back(std::move(outcome));
@@ -387,7 +416,9 @@ public:
                 if (target.phase == Phase::Pending || target.phase == Phase::Skipped || retryDue) {
                     target.phase = Phase::Pending;
                     target.busy = true;
-                    worker_->Submit(Job{ pid, target.created, target.image });
+                    std::vector<HWND> handles;
+                    for (const auto& window : windows) handles.push_back(window.hwnd);
+                    worker_->Submit(Job{ pid, target.created, target.image, std::move(handles) });
                 }
             } else if (decision == Eligibility::AlreadyInjected) {
                 // Nothing to do: the Bridge is still in the process.

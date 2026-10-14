@@ -4,6 +4,20 @@ Status: implemented on branch `feature/global-apply-gui`, with these exceptions:
 
 Built so far: the x86 lane; dormancy; per-window rollback events; the owner-group fix for translated dialogs; the injector's shared core with handle-pinned checks; `watch` (consent-gated, manual start, panic hotkey, opt-outs, `--dry-run`); the Bridge's watcher lease; the WinForms GUI (`Gui\FluentShell.Gui.exe`); and the guardrail gates in `test.ps1`.
 
+Live-verified, non-elevated, against `LegacyDialogHost` (64-bit and WOW64 32-bit):
+
+- The watcher injects a target, and a WOW64 target goes through the x86 injector.
+- The Bridge's lease panics to native when the watcher is killed; a dormancy reset projects again; the panic hotkey stops the watcher.
+- A GUI-driven session: consent by keyboard, Start, two oracles projected, one row per oracle in the window list, a per-window rollback, and Stop leaving every window native.
+
+Defects the GUI test found and that are now fixed:
+
+- The main form's docked controls overlapped, so Start could not be pressed. The layout is now `TableLayoutPanel` rows.
+- The window list showed the renderer's proxy window (it carries the application's title) and denied processes. It now lists only managed targets.
+- Stop's status was overwritten by the watcher's exit.
+
+Known limitation, now mitigated: two windows that appear within the same second used to race for the foreground. The second projection's handoff (`CommitProvisional`, `AwaitProxyVisible`) runs only when its target process is foreground, so the first projection's proxy took the slot and the second fell back to native. That is the safe outcome, but it lost the projection. The fix is in the watcher: the injection worker waits up to 10 s for the previous injected window to project (its rollback event exists) before it injects the next target.
+
 Changes to the decisions below, made during implementation:
 
 - **Restore-all does not clear per-window rollback.** The text under "Reconciled decisions" says a rolled-back window's re-projection waits for the resume path. This slice matches that: the only way a rolled-back window projects again is an application restart. Clearing it on dormancy reset would let any same-session process re-project a window through the shared event, and this slice keeps the forced-native direction unauthenticated and the projecting direction authenticated.
@@ -88,9 +102,11 @@ Implemented in the Bridge. **Dormancy is verified live** (projected, dormant and
 - `RestoreOwnerGroup` restores a root and its projected owned windows, deepest first, as one unit. `SuppressRoot` ties rollback to the ledger.
 - Dormancy: the session-wide manual-reset event `Local\FluentShell.Dormant`, created with the renderer pipe's DACL. While it is signaled every Bridge restores its windows once and runs no discovery. Resetting it lifts dormancy, and suppressed roots stay native.
 
-**Not yet wired:** nothing calls `SuppressRoot` yet. The per-window trigger is the control pipe, which comes next with the GUI. Until then the only live control is dormancy.
+**Wired:** `SuppressRoot` is called from the per-window rollback event (`Local\FluentShell.Rollback.<pid>.<hwnd>`, see Changes below), which the GUI signals. The control pipe is still not built.
 
-**Known gap:** `RestoreOwnerGroup` finds windows through their `SourceThreadAgent`. A virtual dialog (a MessageBox or TaskDialog projection) is matched by its `dialogHost` instead, which the group does not check yet. A projected virtual dialog under a rolled-back root therefore stays projected until its own restore. Fixing this is part of the next slice.
+**Closed:** `RestoreOwnerGroup` now includes a virtual dialog (a MessageBox or TaskDialog projection) through its owner window and its `dialogHost`, so a projected dialog under a rolled-back root goes native with it. Not yet exercised live.
+
+**Still open:** a live check of a translated dialog under a rolled-back root; the elevated-window skip (unit-tested, not run against an elevated process, since this session cannot elevate).
 
 ## Open decisions for the user
 
