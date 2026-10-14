@@ -106,7 +106,10 @@ Implemented in the Bridge. **Dormancy is verified live** (projected, dormant and
 
 **Closed:** `RestoreOwnerGroup` now includes a virtual dialog (a MessageBox or TaskDialog projection) through its owner window and its `dialogHost`, so a projected dialog under a rolled-back root goes native with it. Not yet exercised live.
 
-**Still open:** a live check of a translated dialog under a rolled-back root; the elevated-window skip (unit-tested, not run against an elevated process, since this session cannot elevate).
+**Still open:**
+
+- A live check of a translated dialog under a rolled-back root. It is blocked: pressing the oracle's MessageBox button while its window is projected produced no Bridge activity and no translated dialog, by either UI Automation invoke or keyboard Enter on the focused button. The native `#32770` MessageBox appeared only after the rollback. This needs a look at whether projected button actions reach the native app, which may be a projection-layer regression rather than a harness problem.
+- The elevated-window skip. It is unit-tested, but this session cannot run an elevated process.
 
 ## Open decisions for the user
 
