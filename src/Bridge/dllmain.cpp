@@ -1,5 +1,6 @@
 #include "../Common/FluentShell.h"
 #include "../Common/ProcessPolicy.h"
+#include "../Common/ExplorerDialogPolicy.h"
 #include "Translation/DialogTranslator.h"
 #include "Translation/MenuBarCapture.h"
 #include "Translation/SourceThreadAgent.h"
@@ -418,7 +419,10 @@ DWORD WINAPI BridgeWorker(LPVOID) noexcept {
         wchar_t executablePath[MAX_PATH * 4]{};
         GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)));
         const auto executableName = FluentShell::FileNameOf(executablePath);
-        if (FluentShell::IsProcessDenied(executableName) || HostAlreadyHasXaml()) {
+        const bool explorerDialogsOnly = FluentShell::IsSystemExplorerImage(executablePath) &&
+            FluentShell::CurrentExplorerDialogGrant();
+        if (!explorerDialogsOnly &&
+            (FluentShell::IsProcessDenied(executableName) || HostAlreadyHasXaml())) {
             FluentShell::Log(L"Bridge refused denied or existing-XAML target");
             return 0;
         }
@@ -426,11 +430,13 @@ DWORD WINAPI BridgeWorker(LPVOID) noexcept {
         // The hooks go in before the session starts: the very first capture reads a
         // menu-bar toolbar by opening the application's own menus with the popup
         // interception armed, and that interception *is* one of these hooks.
-        if (!InstallHooks()) {
+        // Explorer is never given process-wide MessageBox/TaskDialog/menu detours.
+        // Its exception covers HWND-backed dialogs only, even when it hosts XAML.
+        if (!explorerDialogsOnly && !InstallHooks()) {
             FluentShell::Log(L"Translation hook installation failed; whole-window projection remains active");
         }
         reset.session = std::make_shared<
-            FluentShell::Bridge::Translation::RendererSession>(g_self);
+            FluentShell::Bridge::Translation::RendererSession>(g_self, explorerDialogsOnly);
         FluentShell::Bridge::Translation::SetActiveRendererSession(reset.session);
         reset.published = true;
         if (!reset.session->Start()) {

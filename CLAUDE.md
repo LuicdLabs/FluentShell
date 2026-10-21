@@ -177,6 +177,35 @@ proxy shown behind its cloak during preparation (the fallback when content does 
 (`HideProxyGracefully`, no cloak) and the renderer delays its cloak (`AfterHideTransition`), so DWM's
 close transition plays.
 
+### A native press is delivered the way a native click is
+
+Windows gates some of its own controls on the window being the foreground one. Explorer's
+"Open File - Security Warning" runs the file only while its dialog is in the foreground: the press
+reaches the button and the dialog refuses it. A projected surface keeps the WinUI proxy in the
+foreground instead, so the press has to be delivered in the state a native click produces.
+
+`src/Bridge/Translation/NativePressActivation.cpp` owns that state. The press takes the focus first
+(BM_CLICK focuses the button between its button-down and its button-up, and an activation in between
+cancels the press half-way -- the click is accepted and BN_CLICKED never comes), then the native
+window borrows the foreground for the press and gives it back afterwards. The native window stays
+application-cloaked, so none of it is drawn: only the activation state changes, and only while the
+press runs. A dialog that is not a `#32770` window is no different: the rule is the foreground, not
+the class.
+
+Windows only lets a process take the foreground when it is allowed to, so the renderer grants that
+right before it sends the action: the proxy owns the foreground and received the user's input, so
+`NativeWindowInterop.AllowForegroundForNativePress` hands the right to the injected process
+(`WindowRegistry.NativePressNeedsForeground` names the actions that press a native control). The
+Bridge takes the foreground on the native window's own thread, where the press belongs, and falls
+back to joining the input queues of the foreground thread when the grant did not arrive. When the
+handover does not take, the Bridge logs it: the press was delivered, but a control that gates on the
+foreground may have refused it.
+
+`tests/FluentShell.Native.Tests/NativePressActivationTests.h` runs the arrangement in two
+processes, the way the product runs it: a renderer stand-in holds the foreground and grants the
+right, the bridge side owns the dialog and presses its button, and the dialog refuses a press that
+arrives while the proxy is in the foreground.
+
 ### The owner graph
 
 A dialog the application runs modally against an owner (the dialog manager disables the owner) is
@@ -296,6 +325,14 @@ opt-outs live in `HKCU\...\Watch\OptOut`. It stops on the panic hotkey (Ctrl+Alt
 the GUI closes; each Bridge leases to the watcher's mutex `Local\FluentShell.Watch` and panics to native when it
 goes. Every injection runs through `src/injector/InjectorCore.cpp`, which checks the target through one handle it
 holds for the whole operation, so a reused PID cannot be injected into.
+
+The one exception to the shell deny list is global-only (`src/Common/ExplorerDialogPolicy.h`): while `watch` runs, the
+system `explorer.exe` (checked by file identity, not name) is injected only when it shows a visible `#32770` dialog
+(Explorer's "Open File - Security Warning", Win+R, Properties), and only under a watcher-owned grant event
+`Local\FluentShell.ExplorerDialogs.<pid>.<creation time>`. That Bridge runs a dialog-only session: no Detours, no
+translated MessageBox/TaskDialog, no generic DirectUI, no folder/desktop/taskbar roots; a dialog modal to a disabled
+`CabinetWClass` keeps that native folder window as its proxy's owner (`ResolveExplorerDialogOwner` in the renderer).
+The session ends when the grant goes. Manual `inject` still refuses Explorer. A Bridge fault can still crash Explorer.
 
 `dllmain.cpp` starts `BridgeWorker` from `DLL_PROCESS_ATTACH`: pin the module, refuse denied
 targets and processes that already host XAML, start the `RendererSession`, install the
@@ -490,6 +527,6 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
   Calibration (dccw) projects through this; its later pages drive the display's gamma ramp, so tests stop at page 2.
 - Out of reach by design, not by adapter: msra.exe runs with the Microsoft-signed-only binary signature mitigation
   (the Bridge cannot load); psr.exe already hosts `Windows.UI.Xaml`; notepad.exe launches the packaged app; Folder Options
-  and Work Folders open inside explorer.exe; wiaacmgr relaunches itself at another integrity level; Media Player's first
+  and Work Folders open inside explorer.exe (reachable only through global apply's Explorer dialog exception); wiaacmgr relaunches itself at another integrity level; Media Player's first
   run is the 32-bit `setup_wm.exe` (now reachable through the x86 lane, not yet verified against it). Free-form painted canvases (charmap's grid, eudcedit's glyph
   editor, fxscover, fontview's sample pane, WFS's preview) have no contract to project and exceed the pixel budgets.

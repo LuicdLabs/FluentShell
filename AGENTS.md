@@ -126,6 +126,27 @@ gate. While gated, `TranslatedWindow.ApplyPreInteractiveGate` swallows input and
 Stages after the provisional commit reject through `RejectAfterCommit`, which restores the native
 window first.
 
+### A native press is delivered the way a native click is
+
+Windows gates some of its own controls on the window being the foreground one. Explorer's
+"Open File - Security Warning" runs the file only while its dialog is in the foreground: the press
+reaches the button and the dialog refuses it. A projected surface keeps the WinUI proxy in the
+foreground instead, so the press has to be delivered in the state a native click produces.
+
+`src/Bridge/Translation/NativePressActivation.cpp` owns that state. The press takes the focus
+first (BM_CLICK focuses the button between its button-down and its button-up, and an activation in
+between cancels the press half-way), then the native window borrows the foreground for the press and
+gives it back afterwards. The native window stays application-cloaked, so none of it is drawn: only
+the activation state changes, and only while the press runs.
+
+Windows only lets a process take the foreground when it is allowed to, so the renderer grants that
+right before it sends the action: the proxy owns the foreground and received the user's input, so
+`NativeWindowInterop.AllowForegroundForNativePress` hands the right to the injected process
+(`WindowRegistry.NativePressNeedsForeground` names the actions that press a native control). The
+Bridge then takes the foreground on the native window's own thread, where the press belongs. When the
+handover does not take, the Bridge logs it: the press was delivered, but a control that gates on the
+foreground may have refused it.
+
 ### Threading rules
 
 - **All native reads and writes happen on the HWND's own GUI thread.** `SourceThreadAgent` installs
@@ -283,6 +304,14 @@ when several processes share the image; injector and target integrity levels mus
 security, XAML hosts, the renderer, and FluentShell's own tools are hard-denied in
 `src/Common/ProcessPolicy.h`. `--signer` is deliberately rejected until implemented. There is no
 process-name injection, system-wide discovery, or watch mode.
+
+The implemented GUI global watcher has one user-authorized shell exception:
+`src/Common/ExplorerDialogPolicy.h` permits the system Explorer only with a live watcher-owned
+grant bound to PID and creation time, and only for eligible HWND-backed `#32770` dialogs.
+Manual injection still denies Explorer. Its restricted Bridge session never installs the
+process-wide dialog/menu Detours, never projects shell/XAML roots or generic DirectUI surfaces,
+and ends when the grant disappears. Keep this exception restricted to global mode; do not
+remove Explorer from the ordinary deny list.
 
 `dllmain.cpp` starts `BridgeWorker` from `DLL_PROCESS_ATTACH`: pin the module, refuse denied
 targets and processes that already host XAML, start the `RendererSession`, install the

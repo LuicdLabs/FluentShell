@@ -1,5 +1,38 @@
 # Global apply, GUI, and sticky rollback: design
 
+## Global-only Explorer dialog exception
+
+The system Explorer may participate only through the global watcher and only when it has an
+eligible visible Win32 `#32770` dialog. The executable is checked against the Windows Explorer
+file identity; a copied or renamed executable does not receive the exception. Manual `inject`
+continues to deny Explorer, including while global apply is running.
+
+The watcher owns a signaled per-process grant keyed by PID and process creation time. The injector
+requires both its explicit Explorer-dialog scope and that live grant. The Bridge independently
+checks the system image and grant, starts a dialog-only renderer session, and does not install
+process-wide MessageBox, TaskDialog, or menu Detours in Explorer. Existing XAML in Explorer does
+not authorize XAML projection: non-dialog roots and generic DirectUI fallback are excluded, and
+normal whole-surface capture and UIA gates still apply. A modal dialog may retain a disabled,
+visible native `CabinetWClass`/`ExploreWClass` owner in that same Explorer process. The renderer
+checks the authenticated parent PID/creation time, system Explorer path, live grant, and HWND
+owner relationship before assigning it; it never changes that native owner's enabled state.
+Other visible unprojected owners retain the existing owner-graph refusal.
+
+Desktop, taskbar, folder and other shell windows remain native. Closing the watcher or revoking
+the grant ends the restricted Bridge session and restores its dialogs. Turning Explorer off
+revokes the grant. This scope limits projection, not the consequences of injecting code: a Bridge
+fault can still crash Explorer. The GUI risk text includes this exception and requires acceptance
+of the updated text before global apply starts.
+
+The shell's security warning ("Open File - Security Warning") is the dialog this exception exists
+for, and it only accepts its own buttons while it is the foreground window: the press reaches the
+button, and the dialog refuses it. A projected surface keeps the WinUI proxy in the foreground, so
+the press is delivered with the native window in the foreground and the foreground is given back
+afterwards. The renderer owns the foreground and received the user's input, so it grants the right
+to take it to the injected process before the action that presses the control. The native window
+stays application-cloaked throughout: nothing of the shell dialog is drawn, and the WinUI copy
+remains the only surface on the screen.
+
 Status: implemented on branch `feature/global-apply-gui`, with these exceptions: the live global run against the desktop's other applications is not yet done (it needs the user's go-ahead, since it injects into every window), and the authenticated control pipe is out of scope for this slice.
 
 Built so far: the x86 lane; dormancy; per-window rollback events; the owner-group fix for translated dialogs; the injector's shared core with handle-pinned checks; `watch` (consent-gated, manual start, panic hotkey, opt-outs, `--dry-run`); the Bridge's watcher lease; the WinForms GUI (`Gui\FluentShell.Gui.exe`); and the guardrail gates in `test.ps1`.

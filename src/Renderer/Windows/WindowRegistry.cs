@@ -12,13 +12,18 @@ public sealed class WindowRegistry
     private readonly Dictionary<Guid, int> _modalOwnerBlockCounts = [];
     private readonly Dictionary<Guid, bool> _modalOwnerWasBlocked = [];
     private readonly string _sessionNonce;
+    private readonly uint _parentProcessId;
+    private readonly ulong _parentCreated;
     private readonly Func<IProtocolMessage, ulong, Task> _send;
     private long _eventSequence;
 
-    public WindowRegistry(string sessionNonce, Func<IProtocolMessage, ulong, Task> send)
+    public WindowRegistry(string sessionNonce, Func<IProtocolMessage, ulong, Task> send,
+        uint parentProcessId = 0, ulong parentCreated = 0)
     {
         _sessionNonce = sessionNonce;
         _send = send;
+        _parentProcessId = parentProcessId;
+        _parentCreated = parentCreated;
     }
 
     public async Task HandleAsync(IProtocolMessage message, ulong headerRevision)
@@ -179,7 +184,10 @@ public sealed class WindowRegistry
                 string.Equals(candidate.Value.ViewModel.NativeHwnd, message.Window.OwnerHwnd, StringComparison.OrdinalIgnoreCase));
             if (owner.Value is null)
             {
-                ownerReady = false;
+                var nativeOwner = NativeWindowInterop.ResolveExplorerDialogOwner(
+                    message.Window.NativeHwnd, message.Window.OwnerHwnd, _parentProcessId, _parentCreated);
+                ownerReady = nativeOwner != 0;
+                if (ownerReady) translated.SetOwner(nativeOwner, modalPresenter: false);
             }
             else
             {
@@ -215,8 +223,25 @@ public sealed class WindowRegistry
             UiaReady = prepared.UiaReady,
         }, translated.ViewModel.Revision);
 
-    private Task SendActionAsync(ActionInvokeMessage message, ulong revision) =>
-        _send(message with { SessionNonce = _sessionNonce }, revision);
+    private Task SendActionAsync(ActionInvokeMessage message, ulong revision)
+    {
+        // A native press is delivered the way a native click is: the native window
+        // is the foreground window while the press runs. The proxy owns the
+        // foreground, so it hands the right to take it over to the injected
+        // process for the length of the press.
+        if (NativePressNeedsForeground(message.Action))
+            NativeWindowInterop.AllowForegroundForNativePress(_parentProcessId);
+        return _send(message with { SessionNonce = _sessionNonce }, revision);
+    }
+
+    /// <summary>
+    /// The actions the Bridge delivers as a press on a native control or as a
+    /// native command that runs with the native window in the foreground.
+    /// </summary>
+    internal static bool NativePressNeedsForeground(string action) => action is
+        "invoke" or "setCheck" or "activateItem" or "islandInvoke" or
+        "contextMenu" or "openItem" or "menuCommand" or "popupCommand" or
+        "toolbarCommand" or "toolbarDropDown" or "splitDropDown";
 
     private string NextEventId() =>
         checked((ulong)Interlocked.Increment(ref _eventSequence)).ToString(System.Globalization.CultureInfo.InvariantCulture);

@@ -716,8 +716,20 @@ bool ProbeSysLink(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reaso
     LITEM first{};
     first.mask = LIF_ITEMINDEX;
     first.iLink = 0;
-    if ((style & (0xFFFFu | WS_TABSTOP)) == 0 &&
+    if ((style & ((0xFFFFu & ~LWS_NOPREFIX) | WS_TABSTOP)) == 0 &&
         !SendMessageW(hwnd, LM_GETITEM, 0, reinterpret_cast<LPARAM>(&first))) {
+        if ((style & LWS_NOPREFIX) != 0) {
+            // Security-warning filename/publisher fields are inert SysLinks
+            // with NOPREFIX. Admit only text the current static-text contract
+            // can preserve; an ampersand must not become a mnemonic.
+            const int length = GetWindowTextLengthW(hwnd);
+            if (length < 0 || length > 32768)
+                return Reject(reason, L"inert SysLink text exceeds the bounded adapter");
+            std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+            text.resize(static_cast<size_t>(GetWindowTextW(hwnd, text.data(), length + 1)));
+            if (text.find_first_of(L"&<>") != std::wstring::npos)
+                return Reject(reason, L"inert NOPREFIX SysLink needs literal text or markup semantics");
+        }
         kind = ControlKind::StaticText;
         return true;
     }

@@ -67,6 +67,61 @@ internal static class WindowMessages
 /// </summary>
 internal static class NativeWindowInterop
 {
+    // Only the authenticated Explorer parent, with a live global grant, may
+    // supply a native modal owner. Never enable/disable this owner from WinUI.
+    internal static nint ResolveExplorerDialogOwner(string? rootText, string ownerText,
+        uint parentPid, ulong parentCreated)
+    {
+        try
+        {
+            if (parentPid == 0 || parentCreated == 0 || rootText is null) return 0;
+            var root = (nint)Convert.ToUInt64(rootText[2..], 16);
+            var owner = (nint)Convert.ToUInt64(ownerText[2..], 16);
+            GetWindowThreadProcessId(root, out var rootPid);
+            GetWindowThreadProcessId(owner, out var ownerPid);
+            if (rootPid != parentPid || ownerPid != parentPid ||
+                !IsWindowVisible(root) || !IsWindowVisible(owner) || IsWindowEnabled(owner)) return 0;
+            var name = new System.Text.StringBuilder(128);
+            GetClassNameW(root, name, name.Capacity);
+            if (name.ToString() != "#32770") return 0;
+            name.Clear();
+            GetClassNameW(owner, name, name.Capacity);
+            if (name.ToString() is not ("CabinetWClass" or "ExploreWClass")) return 0;
+            var actualOwner = GetWindow(root, 4); // GW_OWNER
+            for (var depth = 0; actualOwner != 0 && depth < 256; depth++)
+            {
+                if (IsWindowVisible(actualOwner)) break;
+                actualOwner = GetWindow(actualOwner, 4);
+            }
+            if (actualOwner != owner) return 0;
+            using var parent = System.Diagnostics.Process.GetProcessById(checked((int)parentPid));
+            if ((ulong)parent.StartTime.ToFileTimeUtc() != parentCreated ||
+                !string.Equals(parent.MainModule?.FileName,
+                    System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                    StringComparison.OrdinalIgnoreCase)) return 0;
+            using var watcher = Mutex.OpenExisting(@"Local\FluentShell.Watch");
+            using var grant = EventWaitHandle.OpenExisting(
+                $@"Local\FluentShell.ExplorerDialogs.{parentPid}.{parentCreated}");
+            return grant.WaitOne(0) ? owner : 0;
+        }
+        catch { return 0; }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(nint hwnd, out uint pid);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(nint hwnd);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowEnabled(nint hwnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassNameW(nint hwnd, System.Text.StringBuilder name, int count);
+    [DllImport("user32.dll")]
+    private static extern nint GetWindow(nint hwnd, uint command);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AllowSetForegroundWindow(uint processId);
     internal delegate nint SubclassProc(
         nint hwnd, uint message, nint wParam, nint lParam, nuint subclassId, nuint refData);
 
@@ -132,6 +187,21 @@ internal static class NativeWindowInterop
     /// <summary>Establishes the real Win32 owner relationship behind a modal proxy.</summary>
     public static void SetOwner(nint hwnd, nint ownerHwnd) =>
         SetWindowLongPtr(hwnd, GwlHwndParent, ownerHwnd);
+
+    /// <summary>
+    /// Lets the injected process take the foreground for the length of one native
+    /// press. The proxy owns the foreground and received the user's input, so it is
+    /// the process that may hand that right over. Windows gates some native
+    /// controls on the window being the foreground one: Explorer's "Open File -
+    /// Security Warning" runs a file only while its dialog is in the foreground,
+    /// and a projected surface keeps the WinUI proxy in the foreground instead.
+    /// </summary>
+    internal static void AllowForegroundForNativePress(uint parentProcessId)
+    {
+        if (parentProcessId == 0) return;
+        try { AllowSetForegroundWindow(parentProcessId); }
+        catch { }
+    }
 
     public static void SetEnabled(nint hwnd, bool enabled) => EnableWindow(hwnd, enabled);
 

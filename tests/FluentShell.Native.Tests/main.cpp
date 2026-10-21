@@ -10,7 +10,9 @@
 #include "../../src/Bridge/Translation/DialogSnapshots.h"
 #include "../../src/Bridge/Translation/RollbackEvent.h"
 #include "../../src/injector/WatchPolicy.h"
+#include "../../src/injector/WatchWindowDiscovery.h"
 #include "../../src/Common/ProcessPolicy.h"
+#include "../../src/Common/ExplorerDialogPolicy.h"
 #include "../../src/Bridge/Translation/VirtualTaskDialog.h"
 #include "../../src/Bridge/Translation/AccessibleIsland.h"
 #include "../../src/Bridge/Translation/MenuBarCapture.h"
@@ -19,6 +21,7 @@
 #include "../../src/Bridge/Translation/RichText.h"
 #include "../../src/Bridge/Translation/PerformanceChart.h"
 #include "../../src/Bridge/Translation/RootSuppression.h"
+#include "../../src/Bridge/Translation/NativePressActivation.h"
 #include "ItemImageCaptureTests.h"
 
 #include <memory>
@@ -5119,6 +5122,8 @@ void TestMdiFrameCaptureAndCommands() {
 #include "ComboBoxExTests.h"
 #include "MstscPresentationTests.h"
 #include "ObjectPickerTests.h"
+#include "SecurityWarningTests.h"
+#include "NativePressActivationTests.h"
 #include "PassivePictureTests.h"
 #include "TileListViewTests.h"
 #include "SplitButtonTests.h"
@@ -5202,6 +5207,106 @@ void TestRollbackEventName() {
 
 // The watcher offers the Bridge only to the processes this table makes eligible, and retries a failed
 // injection on a bounded schedule.
+void TestExplorerDialogScope() {
+    const DWORD pid = GetCurrentProcessId();
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND folder = CreateWindowExW(0, L"Static", L"Explorer folder stand-in",
+        WS_POPUP | WS_VISIBLE, 40, 40, 200, 100, nullptr, nullptr, instance, nullptr);
+    HWND dialog = CreateWindowExW(0, L"#32770", L"Scoped dialog",
+        WS_POPUP | WS_VISIBLE, 60, 60, 200, 100, nullptr, nullptr, instance, nullptr);
+    Check(folder && dialog, "Explorer dialog fixtures were not created");
+    if (folder && dialog) {
+        Check(!FluentShell::IsExplorerDialogWindow(folder, pid), "a non-dialog shell window was admitted");
+        Check(FluentShell::IsExplorerDialogWindow(dialog, pid), "a native dialog was excluded");
+        Check(!FluentShell::IsExplorerDialogWindow(dialog, pid + 1), "a foreign-process dialog was admitted");
+        ShowWindow(dialog, SW_HIDE);
+        Check(!FluentShell::IsExplorerDialogWindow(dialog, pid), "a hidden dialog was admitted");
+        ShowWindow(dialog, SW_SHOWNOACTIVATE);
+        SetWindowLongPtrW(dialog, GWL_EXSTYLE, WS_EX_TOOLWINDOW);
+        Check(!FluentShell::IsExplorerDialogWindow(dialog, pid), "a tool dialog was admitted");
+        SetWindowLongPtrW(dialog, GWL_EXSTYLE, WS_EX_LAYERED);
+        Check(!FluentShell::IsExplorerDialogWindow(dialog, pid), "a layered dialog was admitted");
+        SetWindowLongPtrW(dialog, GWL_EXSTYLE, 0);
+        WNDCLASSW folderClass{};
+        folderClass.lpfnWndProc = DefWindowProcW;
+        folderClass.hInstance = instance;
+        folderClass.lpszClassName = L"CabinetWClass";
+        const ATOM atom = RegisterClassW(&folderClass);
+        HWND cabinet = CreateWindowExW(0, L"CabinetWClass", L"Native folder owner",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE, 40, 40, 300, 200, nullptr, nullptr, instance, nullptr);
+        Check(cabinet != nullptr, "native Explorer owner fixture was not created");
+        if (cabinet) {
+            SetWindowLongPtrW(dialog, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(cabinet));
+            Check(!FluentShell::ExplorerNativeModalOwner(dialog, pid), "an enabled native owner was admitted");
+            EnableWindow(cabinet, FALSE);
+            Check(FluentShell::ExplorerNativeModalOwner(dialog, pid) == cabinet,
+                "a modal dialog could not keep its disabled native folder owner");
+            Check(!FluentShell::ExplorerNativeModalOwner(dialog, pid + 1), "a foreign native owner was admitted");
+            SetWindowLongPtrW(dialog, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(folder));
+            EnableWindow(folder, FALSE);
+            Check(!FluentShell::ExplorerNativeModalOwner(dialog, pid), "an arbitrary disabled owner was admitted");
+            SetWindowLongPtrW(dialog, GWLP_HWNDPARENT, 0);
+            DestroyWindow(cabinet);
+        }
+        if (atom) UnregisterClassW(L"CabinetWClass", instance);
+    }
+    if (dialog) DestroyWindow(dialog);
+    if (folder) DestroyWindow(folder);
+    wchar_t windows[MAX_PATH]{}, self[MAX_PATH * 4]{};
+    GetWindowsDirectoryW(windows, MAX_PATH);
+    GetModuleFileNameW(nullptr, self, static_cast<DWORD>(std::size(self)));
+    Check(FluentShell::IsSystemExplorerImage(std::wstring(windows) + L"\\explorer.exe"),
+        "the system Explorer file identity was not recognized");
+    Check(!FluentShell::IsSystemExplorerImage(self) && !FluentShell::IsSystemExplorerImage(L""),
+        "a different or missing executable passed the Explorer identity gate");
+    Check(FluentShell::IsProcessDenied(L"explorer.exe"), "manual Explorer injection was enabled");
+    // The grant is bound to a PID plus creation stamp, and vanishes with the
+    // watcher's handles. No process injection is performed by this test.
+    constexpr ULONGLONG stamp = 123456789;
+    HANDLE watcher = CreateMutexW(nullptr, FALSE, L"Local\\FluentShell.Watch");
+    Check(watcher != nullptr, "watcher fixture mutex could not be created");
+    Check(!FluentShell::HasExplorerDialogGrant(pid, stamp), "an ambient watcher authorized Explorer");
+    HANDLE grant = CreateEventW(nullptr, TRUE, TRUE,
+        FluentShell::ExplorerDialogGrantName(pid, stamp).c_str());
+    Check(grant != nullptr && FluentShell::HasExplorerDialogGrant(pid, stamp), "scoped grant was not recognized");
+    Check(!FluentShell::HasExplorerDialogGrant(pid, stamp + 1), "a grant survived PID creation-stamp mismatch");
+    if (grant) ResetEvent(grant);
+    Check(!FluentShell::HasExplorerDialogGrant(pid, stamp), "a revoked grant remained active");
+    if (grant) CloseHandle(grant);
+    Check(!FluentShell::HasExplorerDialogGrant(pid, stamp), "a closed grant remained active");
+    if (watcher) CloseHandle(watcher);
+}
+
+void TestWatchWindowDiscovery() {
+    using FluentShell::Injector::IsWatchWindowCandidate;
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    HWND root = CreateWindowExW(0, L"Static", L"watch-root", WS_POPUP,
+        40, 40, 300, 200, nullptr, nullptr, instance, nullptr);
+    HWND stub = CreateWindowExW(0, L"Static", L"watch-hidden-stub", WS_POPUP,
+        50, 50, 200, 100, root, nullptr, instance, nullptr);
+    HWND sheet = CreateWindowExW(0, L"Static", L"watch-property-sheet", WS_POPUP | WS_VISIBLE,
+        60, 60, 200, 100, stub, nullptr, instance, nullptr);
+    Check(root && stub && sheet, "watch discovery fixtures were not created");
+    if (root && stub && sheet) {
+        Check(IsWatchWindowCandidate(sheet), "a property sheet with hidden owners was skipped");
+        Check(!IsWatchWindowCandidate(stub), "a hidden window was discovered");
+        ShowWindow(root, SW_SHOWNOACTIVATE);
+        Check(IsWatchWindowCandidate(root), "an unowned visible root was skipped");
+        Check(!IsWatchWindowCandidate(sheet), "a visible ancestor behind a hidden owner was ignored");
+        ShowWindow(root, SW_HIDE);
+        ShowWindow(stub, SW_SHOWNOACTIVATE);
+        ShowWindow(sheet, SW_SHOWNOACTIVATE);
+        Check(!IsWatchWindowCandidate(sheet), "a visible immediate owner was ignored");
+        SetWindowPos(stub, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        Check(IsWatchWindowCandidate(sheet), "a zero-area owner blocked discovery");
+        SetWindowLongPtrW(sheet, GWL_EXSTYLE, WS_EX_TOOLWINDOW);
+        Check(!IsWatchWindowCandidate(sheet), "a tool window was discovered");
+    }
+    if (sheet) DestroyWindow(sheet);
+    if (stub) DestroyWindow(stub);
+    if (root) DestroyWindow(root);
+}
+
 void TestWatchPolicy() {
     using namespace FluentShell::Injector;
     TargetFacts eligible;
@@ -5243,11 +5348,16 @@ void TestWatchPolicy() {
     Check(FluentShell::IsProcessDenied(L"FluentShell.Gui.exe"), "the GUI is not denied to global apply");
 }
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
 #ifdef _DEBUG
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
+    // The renderer stand-in of the foreground handover test: a second process
+    // that holds the foreground and grants the right to take it.
+    if (argc >= 5 && std::wstring(argv[1]) == L"--foreground-grant") {
+        return RunForegroundGrantOwner(static_cast<DWORD>(_wtoi(argv[2])), argv[3], argv[4]);
+    }
     SetUnhandledExceptionFilter(ReportUnhandledException);
     // Snapshot serialization uses WinRT JSON, so the apartment must exist before
     // the first test that serializes a frame.
@@ -5287,6 +5397,8 @@ int wmain() {
     TestRootSuppressionLedger();
     TestRollbackEventName();
     TestWatchPolicy();
+    TestWatchWindowDiscovery();
+    TestExplorerDialogScope();
     TestReadFrameUsesOneDeadline();
     TestWriteFrameUsesOneDeadline();
     TestScalarContracts();
@@ -5373,6 +5485,8 @@ int wmain() {
     TestCueBanners();
     TestDialogPaintedBands();
     TestObjectPickerControls();
+    TestSecurityWarningDialog();
+    TestNativePressActivation();
     TestPassivePictureControls();
     TestTileListViewCapture();
     TestSplitButtons();

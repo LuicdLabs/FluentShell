@@ -1,4 +1,5 @@
 #include "InjectorCore.h"
+#include "../Common/ExplorerDialogPolicy.h"
 
 #include "../Common/ProcessPolicy.h"
 
@@ -526,7 +527,7 @@ InjectResult InjectTarget(
     DWORD pid,
     std::optional<ULONGLONG> expectedCreation,
     const std::wstring& canonicalImage,
-    const std::optional<std::wstring>& sha256) {
+    const std::optional<std::wstring>& sha256, InjectScope scope) {
     if (pid == GetCurrentProcessId()) {
         return { InjectStatus::Refused, L"the injector cannot inject itself" };
     }
@@ -546,7 +547,13 @@ InjectResult InjectTarget(
     if (!actualImage || !SamePath(*actualImage, canonicalImage)) {
         return { InjectStatus::Refused, L"the target image changed before injection" };
     }
-    if (FluentShell::IsProcessDenied(FluentShell::FileNameOf(*actualImage))) {
+    const bool explorerDialogs = scope == InjectScope::ExplorerDialogs && expectedCreation &&
+        FluentShell::IsSystemExplorerImage(*actualImage) &&
+        FluentShell::HasExplorerDialogGrant(pid, *expectedCreation);
+    if (scope == InjectScope::ExplorerDialogs && !explorerDialogs) {
+        return { InjectStatus::Refused, L"Explorer dialogs require an active global watcher grant" };
+    }
+    if (FluentShell::IsProcessDenied(FluentShell::FileNameOf(*actualImage)) && !explorerDialogs) {
         return { InjectStatus::Refused, L"shell, security, XAML, FluentShell, or the Claude app (denied by name)" };
     }
 

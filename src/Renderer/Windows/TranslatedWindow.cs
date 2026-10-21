@@ -174,12 +174,16 @@ public sealed class TranslatedWindow : Window
         }
     }
 
-    public void SetOwner(nint ownerHwnd)
+    // A native owner (Explorer's folder window behind its security warning) gets only the Win32 owner link.
+    // A modal presenter disables its owner on show and puts back the state it saw then: the application had
+    // already disabled that window, so after the application re-enabled it on dismissal, the presenter left
+    // the folder window disabled for good. The application alone owns a native owner's enabled state.
+    public void SetOwner(nint ownerHwnd, bool modalPresenter = true)
     {
         if (ViewModel.Modal && ownerHwnd != 0)
         {
             NativeWindowInterop.SetOwner(Hwnd, ownerHwnd);
-            if (_appWindow.Presenter is OverlappedPresenter presenter) presenter.IsModal = true;
+            if (modalPresenter && _appWindow.Presenter is OverlappedPresenter presenter) presenter.IsModal = true;
         }
     }
 

@@ -2,6 +2,7 @@
 
 #include "../../Common/FluentShell.h"
 #include "../../Common/ProcessPolicy.h"
+#include "../../Common/ExplorerDialogPolicy.h"
 #include "../Ipc/FrameCodec.h"
 #include "CaptureTrace.h"
 #include "DialogSnapshots.h"
@@ -337,8 +338,9 @@ struct RendererSession::Surface final {
     HANDLE resultEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 };
 
-RendererSession::RendererSession(HMODULE bridgeModule) noexcept
+RendererSession::RendererSession(HMODULE bridgeModule, bool explorerDialogsOnly) noexcept
     : bridgeModule_(bridgeModule),
+      explorerDialogsOnly_(explorerDialogsOnly),
       shutdownEvent_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
 
 RendererSession::~RendererSession() {
@@ -936,6 +938,12 @@ void LogReadyMismatch(const SurfaceReady& ready, const WindowSnapshot& expected)
 bool RendererSession::ResolveOwnerProxy(ProjectionAttempt& attempt) {
     const auto& surface = attempt.surface;
     if (!surface->snapshot.ownerHwnd) return true;
+    if (explorerDialogsOnly_ && surface->agent &&
+        FluentShell::ExplorerNativeModalOwner(surface->agent->Root(), GetCurrentProcessId()) ==
+            surface->snapshot.ownerHwnd) {
+        attempt.expectedOwnerProxy = surface->snapshot.ownerHwnd;
+        return true;
+    }
     {
         std::scoped_lock surfacesLock(surfacesMutex_);
         for (const auto& [_, candidate] : surfaces_) {
@@ -1284,6 +1292,8 @@ bool RendererSession::VerifyNativeCloaked(const ProjectionAttempt& attempt) {
 // so an action emitted the moment the renderer consumes this frame cannot race
 // the local transition.
 bool RendererSession::CommitInteractive(ProjectionAttempt& attempt) {
+    if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant())
+        return RejectAfterCommit(attempt, L"Explorer dialog grant ended before interactive commit");
     const auto& surface = attempt.surface;
     {
         std::scoped_lock lock(surface->mutex);
@@ -1311,6 +1321,10 @@ bool RendererSession::OpenSurface(
     const std::shared_ptr<Surface>& surface,
     bool cloakNative) {
     if (!surface) return RejectProjection(L"null surface");
+    if (explorerDialogsOnly_ && (!FluentShell::CurrentExplorerDialogGrant() ||
+        !cloakNative || !surface->agent ||
+        !FluentShell::IsExplorerDialogWindow(surface->agent->Root(), GetCurrentProcessId())))
+        return RejectProjection(L"outside the global Explorer dialog scope");
     // WindowCapture and the renderer exchange physical pixel bounds.  The
     // injected process can be system-DPI-aware or DPI-unaware, so querying the
     // proxy from its inherited thread context would virtualize GetWindowRect
@@ -1587,7 +1601,9 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
     // covered by the fallback below or already fully native.  While its direct owner is
     // not a projection it waits without using its one attempt: a graph handed back to
     // native is projected again from its root, and the dialogs on it are offered after.
-    if (directOwner) {
+    const bool nativeExplorerOwner = explorerDialogsOnly_ && directOwner &&
+        FluentShell::ExplorerNativeModalOwner(window, GetCurrentProcessId()) == directOwner;
+    if (directOwner && !nativeExplorerOwner) {
         const bool ownerProjected = !projectedOwners.empty() &&
             projectedOwners.front()->agent->Root() == directOwner;
         if (!ownerProjected) {
@@ -1609,7 +1625,7 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
         if (surface->agent && surface->agent->Root() == window) return decision;
     }
 
-    if (directOwner) {
+    if (directOwner && !nativeExplorerOwner) {
         decision.projectedOwners = std::move(projectedOwners);
         // A dialog the application runs modally against a projected owner is a
         // surface in its own right: the proxy inherits the real owner and blocks it.
@@ -1636,7 +1652,13 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
 }
 
 void RendererSession::DiscoverTopLevelWindows() {
-    const TopLevelCensus census = EnumerateTopLevels();
+    if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant()) return;
+    TopLevelCensus census = EnumerateTopLevels();
+    if (explorerDialogsOnly_) {
+        std::erase_if(census.candidates, [](HWND window) {
+            return !FluentShell::IsExplorerDialogWindow(window, GetCurrentProcessId());
+        });
+    }
     LogDiscoveryCensus(census, discoveryCensusSignature_);
     PruneDiscoveryState();
     // Desktop z-order puts an owned dialog above its owner, but an owned window can only
@@ -1927,6 +1949,8 @@ void RendererSession::ContinueReprojection(HWND root) noexcept {
 }
 
 bool RendererSession::OpenNativeWindow(HWND root) {
+    if (explorerDialogsOnly_ && (!FluentShell::CurrentExplorerDialogGrant() ||
+        !FluentShell::IsExplorerDialogWindow(root, GetCurrentProcessId()))) return false;
     {
         // Discovery refuses suppressed roots before it gets here; this keeps every other way
         // into the projection honest as well.
@@ -1950,6 +1974,11 @@ bool RendererSession::OpenNativeWindow(HWND root) {
     const DirectUiWindowProfile* profile = nullptr;
     DirectUiAdmissionResult admission = DirectUiAdmissionResult::NotApplicable;
     if (agent->GenericDirectUiCandidate()) {
+        if (explorerDialogsOnly_) {
+            if (!agent->Shutdown()) RetainSourceThreadAgent(agent);
+            FluentShell::Log(L"Explorer dialog stays native: generic DirectUI is outside the dialog scope");
+            return false;
+        }
         admission = InspectGenericDirectUiSurface(*agent, 2000, shutdownEvent_, error,
             &surface->directUiOwnedProfile, &surface->snapshot,
             &surface->directUiBindings, &surface->directUiEvidence);
@@ -2167,6 +2196,10 @@ void RendererSession::HandleAction(const ActionRequest& action) {
 }
 
 void RendererSession::AdmitAction(const ActionRequest& action, const std::shared_ptr<Surface>& surface) {
+    if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant()) {
+        RestoreSurface(surface, L"globalExplorerScopeEnded");
+        return;
+    }
     if (action.action == kRendererFaultRollback) {
         RestoreSurface(surface, L"rendererSurfaceFault");
         return;
@@ -4104,6 +4137,9 @@ void RendererSession::RunSupervisor() {
     // The burst also covers a window whose WM_SHOWWINDOW arrived before it was visible.
     uint64_t burstUntil = 0;
     while (!stopping_.load() && !failed_.load()) {
+        // Losing the per-process grant ends this restricted session; an ambient
+        // watcher mutex alone must never keep Explorer projection alive.
+        if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant()) break;
         // Dormancy: while the session's event is signaled, every window is native and discovery
         // and reconcile do nothing.  Entering restores what is projected.  Leaving offers every
         // window again, except the roots the user rolled back.
@@ -4278,7 +4314,7 @@ std::optional<int> RendererSession::ShowMessageBox(
     WORD,
     const DialogIconImage* customIcon) {
     owner = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
-    if (!IsReady() || !IsProjectedOwner(owner) ||
+    if (explorerDialogsOnly_ || !IsReady() || !IsProjectedOwner(owner) ||
         (type & (MB_SERVICE_NOTIFICATION | MB_DEFAULT_DESKTOP_ONLY | MB_HELP)) != 0) {
         return std::nullopt;
     }
@@ -4306,7 +4342,7 @@ std::optional<int> RendererSession::ShowMessageBox(
 
 std::optional<TaskDialogResult> RendererSession::ShowTaskDialog(const TASKDIALOGCONFIG& config) {
     const HWND owner = config.hwndParent ? GetAncestor(config.hwndParent, GA_ROOT) : nullptr;
-    if (!IsReady() || !IsProjectedOwner(owner)) return std::nullopt;
+    if (explorerDialogsOnly_ || !IsReady() || !IsProjectedOwner(owner)) return std::nullopt;
     std::wstring reason;
     std::shared_ptr<VirtualTaskDialog> dialog = VirtualTaskDialog::Create(config, owner, reason);
     if (!dialog) {

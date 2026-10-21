@@ -90,6 +90,8 @@
   <ItemGroup>
     <ClInclude Include="Injector\InjectorCore.h" />
     <ClInclude Include="Injector\WatchPolicy.h" />
+    <ClInclude Include="Injector\WatchWindowDiscovery.h" />
+    <ClInclude Include="Common\ExplorerDialogPolicy.h" />
     <ClInclude Include="Injector\Watcher.h" />
   </ItemGroup>
   <ItemGroup>

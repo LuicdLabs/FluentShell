@@ -23,7 +23,7 @@ namespace FluentShell::Bridge::Translation {
 
 class RendererSession final : public std::enable_shared_from_this<RendererSession> {
 public:
-    explicit RendererSession(HMODULE bridgeModule) noexcept;
+    explicit RendererSession(HMODULE bridgeModule, bool explorerDialogsOnly = false) noexcept;
     ~RendererSession();
 
     RendererSession(const RendererSession&) = delete;
@@ -249,6 +249,7 @@ private:
     void Fail(std::wstring_view reason) noexcept;
 
     HMODULE bridgeModule_ = nullptr;
+    const bool explorerDialogsOnly_ = false;
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
     HANDLE rendererProcess_ = nullptr;
     HANDLE rendererThread_ = nullptr;

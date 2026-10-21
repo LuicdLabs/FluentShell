@@ -6,6 +6,7 @@
 #include "DirectUiEngine.h"
 #include "MenuBarCapture.h"
 #include "ListViewActivation.h"
+#include "NativePressActivation.h"
 #include "PerformanceChart.h"
 #include "WindowCapture.h"
 
@@ -899,6 +900,17 @@ WindowAction FindWindowAction(std::wstring_view action) noexcept {
 
 // --- Node-level actions -----------------------------------------------------
 
+// A native press is delivered the way a native click is: the window that owns the
+// control is the foreground window while the press runs.  Explorer's security
+// warning refuses its Run button while its dialog is not in the foreground, and a
+// projected surface keeps the WinUI proxy in the foreground instead.
+void PressNativeButtonOnAgent(SourceThreadAgent* agent, HWND button) noexcept {
+    if (!agent || !button) return;
+    if (!PressNativeButton(agent->Root(), button)) {
+        FluentShell::Log(L"Native press: the native window could not borrow the foreground");
+    }
+}
+
 bool ActivateSysLink(Command* command, HWND target) {
     // The bounded SysLink adapter accepts exactly one link.  Let the native
     // control generate its normal NM_RETURN notification instead of fabricating
@@ -964,7 +976,7 @@ bool ApplySetText(
 }
 
 bool ApplySetCheck(
-    Command* command, SourceThreadAgent*, HWND target, const ControlNode& node) {
+    Command* command, SourceThreadAgent* agent, HWND target, const ControlNode& node) {
     const bool toggle = node.kind == ControlKind::CheckBox ||
         node.kind == ControlKind::ThreeState ||
         node.kind == ControlKind::RadioButton;
@@ -981,12 +993,20 @@ bool ApplySetCheck(
     // value.  A click that does not move the state ends the walk.
     // An owner-draw WinForms toggle keeps no BM_GETCHECK state; its state is read
     // from the control's MSAA object, and BM_CLICK reaches its own click handler.
+    // The first BM_CLICK after the dialog lost activation can be spent re-activating it and leave the
+    // state where it was (Explorer's security warning: its check box unchecked once, then refused to
+    // check again); one click that moves nothing is absorbed, a second one ends the walk.
     int current = ReadButtonCheckState(target);
-    for (int attempt = 0; current >= 0 && current != requested && attempt <= maximum; ++attempt) {
+    bool absorbedNoOp = false;
+    for (int attempt = 0; current >= 0 && current != requested && attempt <= maximum + 1; ++attempt) {
         if (AbortIfCancelled(command)) return false;
-        SendMessageW(target, BM_CLICK, 0, 0);
+        PressNativeButtonOnAgent(agent, target);
         const int next = ReadButtonCheckState(target);
-        if (next == current) break;
+        if (next == current) {
+            if (absorbedNoOp) break;
+            absorbedNoOp = true;
+            continue;
+        }
         current = next;
     }
     command->success = ReadButtonCheckState(target) == requested;
@@ -3372,7 +3392,7 @@ void SourceThreadAgent::RunNativeActionOnSourceThread(const NativeActionRequest&
                 SendMessageW(request.source, WM_SYSCOMMAND, code, 0);
             }
         } else if (request.kind == ControlKind::Button) {
-            SendMessageW(request.source, BM_CLICK, 0, 0);
+            PressNativeButtonOnAgent(this, request.source);
         } else if (request.kind == ControlKind::SysLink && IsWindowsFormsLinkLabelWindow(request.source)) {
             if (node->items.size() == 1) InvokeWindowsFormsLink(request.source, node->items.front());
         } else if (request.kind == ControlKind::SysLink) {
@@ -3427,7 +3447,7 @@ void SourceThreadAgent::RunNativeActionOnOwner(const NativeActionRequest& reques
                 SendMessageW(request.source, WM_SYSCOMMAND, code, 0);
             }
         } else if (request.kind == ControlKind::Button) {
-            SendMessageW(request.source, BM_CLICK, 0, 0);
+            PressNativeButtonOnAgent(this, request.source);
         } else if (request.kind == ControlKind::SysLink && IsWindowsFormsLinkLabelWindow(request.source)) {
             if (node.items.size() == 1) InvokeWindowsFormsLink(request.source, node.items.front());
         } else if (request.kind == ControlKind::SysLink) {

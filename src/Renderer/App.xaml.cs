@@ -34,7 +34,8 @@ public sealed partial class App : Application
             ControlFactory.WarmThemeResources();
             var options = RendererOptions.Parse(Environment.GetCommandLineArgs().Skip(1).ToArray());
             _pipe = new PipeClient(options);
-            _windows = new WindowRegistry(options.Nonce, (message, revision) => _pipe.SendAsync(message, revision));
+            _windows = new WindowRegistry(options.Nonce, (message, revision) => _pipe.SendAsync(message, revision),
+                options.ParentProcessId, options.ParentCreated);
             var dispatcher = DispatcherQueue.GetForCurrentThread();
             _pipe.LivenessProbe = cancellationToken =>
                 dispatcher.EnqueueAsync(() => Task.CompletedTask).WaitAsync(cancellationToken);

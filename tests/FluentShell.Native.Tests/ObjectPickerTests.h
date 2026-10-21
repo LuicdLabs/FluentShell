@@ -70,6 +70,20 @@ void TestObjectPickerControls() {
     Check(labelNode && labelNode->kind == Translation::ControlKind::StaticText &&
           labelNode->text == L"Changes might affect access to network resources.",
         "a link control with no link was not carried as the label it is");
+    // File/publisher fields in Explorer's Open File security warning have no
+    // link item but do carry LWS_NOPREFIX. They are labels, not invokable links.
+    const LONG_PTR labelStyle = GetWindowLongPtrW(label, GWL_STYLE);
+    SetWindowLongPtrW(label, GWL_STYLE, labelStyle | LWS_NOPREFIX);
+    SetWindowTextW(label, L"C:\\Downloads\\main.bat");
+    Check(capture(snapshot, error) && nodeFor(snapshot, 1017) &&
+          nodeFor(snapshot, 1017)->kind == Translation::ControlKind::StaticText &&
+          nodeFor(snapshot, 1017)->text == L"C:\\Downloads\\main.bat",
+        "an inert NOPREFIX filename SysLink was not captured as text");
+    SetWindowTextW(label, L"C:\\Research & Development\\main.bat");
+    Check(!capture(snapshot, error), "a literal ampersand was admitted as a mnemonic");
+    SetWindowLongPtrW(label, GWL_STYLE, labelStyle);
+    SetWindowTextW(label, L"Changes might affect access to network resources.");
+    Check(capture(snapshot, error), "restoring the label did not restore capture");
     const auto* namesNode = nodeFor(snapshot, 214);
     Check(namesNode && namesNode->kind == Translation::ControlKind::Edit && !namesNode->readOnly &&
           namesNode->multiline,

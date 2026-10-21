@@ -74,6 +74,7 @@ ProcessHandle OpenInjectionTarget(DWORD pid);
 bool EnableDebugPrivilege();
 
 enum class InjectStatus { Injected, Refused, Failed };
+enum class InjectScope { Application, ExplorerDialogs };
 
 struct InjectResult {
     InjectStatus status = InjectStatus::Failed;
@@ -87,7 +88,8 @@ InjectResult InjectTarget(
     DWORD pid,
     std::optional<ULONGLONG> expectedCreation,
     const std::wstring& canonicalImage,
-    const std::optional<std::wstring>& sha256);
+    const std::optional<std::wstring>& sha256,
+    InjectScope scope = InjectScope::Application);
 
 // The explicit injector command: validates the request and runs InjectTarget.  Returns the exit code.
 int InjectRequestedTarget(const InjectOptions& options);

@@ -2,10 +2,12 @@
 
 #include "InjectorCore.h"
 #include "WatchPolicy.h"
+#include "WatchWindowDiscovery.h"
 
 #include "../Bridge/Translation/RollbackEvent.h"
 
 #include "../Common/ProcessPolicy.h"
+#include "../Common/ExplorerDialogPolicy.h"
 
 #include <condition_variable>
 #include <cwctype>
@@ -57,7 +59,9 @@ constexpr char kRiskWarning[] =
     "- Windows of elevated (administrator) applications cannot be reached without elevation. They are\n"
     "  skipped and stay native.\n"
     "- Shell, security, and FluentShell processes, and the Claude desktop app, are excluded by executable\n"
-    "  name. A renamed copy of an excluded program is not excluded.\n"
+    "  name, except eligible Win32 dialogs in the system Explorer during global apply. Explorer's desktop,\n"
+    "  taskbar, folders and XAML surfaces stay native. An injected Bridge fault can still crash Explorer.\n"
+    "  A renamed copy of an excluded program is not excluded.\n"
     "- Each injected application gets its own renderer process, so many applications mean many processes.\n"
     "- Only this Windows session is affected, and only while global apply runs. It does not start at\n"
     "  logon.\n"
@@ -68,7 +72,8 @@ constexpr char kRiskWarning[] =
     "風險：\n"
     "- 應用程式的行為可能不同，可能遺失輸入或當機。轉譯發生錯誤時，會連同注入的應用程式一起結束。\n"
     "- 以系統管理員權限執行的應用程式視窗無法在不提升權限的情況下存取，因此會略過，維持原生顯示。\n"
-    "- 殼層、安全性與 FluentShell 程序，以及 Claude 桌面應用程式，依執行檔名稱排除。更名後的排除程式副本不會被排除。\n"
+    "- 殼層、安全性與 FluentShell 程序，以及 Claude 桌面應用程式，依執行檔名稱排除；但全域模式允許系統 Explorer 的合格 Win32 對話框。\n"
+    "  桌面、工作列、資料夾與 XAML 視窗維持原生。Bridge 故障仍可能使 Explorer 當機。更名後的排除程式副本不會被排除。\n"
     "- 每個被注入的應用程式各有一個算繪程序，因此應用程式越多，程序就越多。\n"
     "- 只影響此 Windows 工作階段，且只在全域套用執行期間有效。它不會隨登入自動啟動。\n"
     "- 按下 Ctrl+Alt+Shift+F12、按下「全部還原」或關閉 FluentShell 時，全域套用會停止。\n"
@@ -192,19 +197,18 @@ struct WindowInfo {
     std::wstring title;
 };
 
-// Visible, unowned, titled top-level windows, grouped by owning process.  Cloaked windows are kept: a
+// Visible, effectively unowned, titled top-level windows, grouped by owning process. Cloaked windows are kept: a
 // projected window is cloaked by design, and the GUI still needs to find it to roll it back.
 std::map<DWORD, std::vector<WindowInfo>> EnumerateWindows() {
     std::map<DWORD, std::vector<WindowInfo>> result;
     EnumWindows([](HWND hwnd, LPARAM parameter) -> BOOL {
         auto& out = *reinterpret_cast<std::map<DWORD, std::vector<WindowInfo>>*>(parameter);
-        if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
-        if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (!IsWatchWindowCandidate(hwnd) && !FluentShell::ExplorerNativeModalOwner(hwnd, pid)) return TRUE;
         wchar_t title[512]{};
         const int length = GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
         if (length <= 0) return TRUE;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
         if (pid != 0) out[pid].push_back(WindowInfo{ hwnd, std::wstring(title, length) });
         return TRUE;
     }, reinterpret_cast<LPARAM>(&result));
@@ -242,6 +246,7 @@ struct Job {
     ULONGLONG created = 0;
     std::wstring image;
     std::vector<HWND> windows;  // the target's windows when the job was submitted
+    InjectScope scope = InjectScope::Application;
 };
 
 struct Outcome {
@@ -315,7 +320,7 @@ private:
                 jobs_.pop_front();
             }
             Outcome outcome{ job.pid, job.created,
-                InjectTarget(job.pid, job.created, job.image, std::nullopt) };
+                InjectTarget(job.pid, job.created, job.image, std::nullopt, job.scope) };
             if (outcome.result.status == InjectStatus::Injected) WaitForProjection(job);
             {
                 std::scoped_lock lock(mutex_);
@@ -357,6 +362,7 @@ struct Tracked {
     bool busy = false;
     std::wstring lastTargetLine;
     std::wstring lastWindowLines;
+    ProcessHandle explorerGrant;
 };
 
 class WatchLoop final {
@@ -381,15 +387,38 @@ public:
             }
         }
 
-        for (const auto& [pid, windows] : windowsByPid) {
+        for (const auto& [pid, discoveredWindows] : windowsByPid) {
             if (pid == GetCurrentProcessId()) continue;
+            Probe probe = ReadProbe(pid, ownSession_, ownIntegrity_);
+            const bool systemExplorer = FluentShell::EqualsIgnoreCase(
+                FluentShell::FileNameOf(probe.image), L"explorer.exe") &&
+                FluentShell::IsSystemExplorerImage(probe.image);
+            std::vector<WindowInfo> windows = discoveredWindows;
+            if (systemExplorer) {
+                std::erase_if(windows, [pid](const WindowInfo& window) {
+                    return !FluentShell::IsExplorerDialogWindow(window.hwnd, pid);
+                });
+                // Retain the process record/grant when its last dialog closes,
+                // but never inject Explorer merely because a folder is visible.
+                if (!windows.empty()) probe.facts.denied = false;
+            } else {
+                std::erase_if(windows, [](const WindowInfo& window) {
+                    return !IsWatchWindowCandidate(window.hwnd);
+                });
+                if (windows.empty()) continue;
+            }
             auto entry = tracked_.find(pid);
+            if (entry != tracked_.end() && entry->second.explorerGrant &&
+                optOuts.contains(LowerCase(probe.image))) {
+                ResetEvent(entry->second.explorerGrant.get());
+                entry->second.explorerGrant.Reset();
+                entry->second.phase = Phase::Skipped;
+            }
             if (entry != tracked_.end() && entry->second.busy) {
                 ReportWindows(pid, windows);
                 continue;
             }
 
-            Probe probe = ReadProbe(pid, ownSession_, ownIntegrity_);
             if (entry == tracked_.end() || entry->second.created != probe.created) {
                 // A new process, or a reused PID: a fresh record.
                 Tracked fresh;
@@ -402,6 +431,8 @@ public:
             target.imageKey = LowerCase(probe.image);
 
             probe.facts.optedOut = optOuts.contains(target.imageKey);
+            if (systemExplorer && target.phase == Phase::Injected && !target.explorerGrant)
+                target.phase = Phase::Skipped;
             probe.facts.injected = target.phase == Phase::Injected;
             const Eligibility decision = Decide(probe.facts);
 
@@ -414,11 +445,22 @@ public:
                 const bool retryDue = target.phase == Phase::Failed &&
                                       MayRetry(target.attempts) && now >= target.retryAt;
                 if (target.phase == Phase::Pending || target.phase == Phase::Skipped || retryDue) {
+                    if (systemExplorer && !target.explorerGrant) {
+                        target.explorerGrant = ProcessHandle(CreateEventW(nullptr, TRUE, TRUE,
+                            FluentShell::ExplorerDialogGrantName(pid, target.created).c_str()));
+                        if (!target.explorerGrant) {
+                            target.phase = Phase::Skipped;
+                            target.reason = L"Explorer dialog grant could not be created";
+                            ReportTarget(pid, target);
+                            continue;
+                        }
+                    }
                     target.phase = Phase::Pending;
                     target.busy = true;
                     std::vector<HWND> handles;
                     for (const auto& window : windows) handles.push_back(window.hwnd);
-                    worker_->Submit(Job{ pid, target.created, target.image, std::move(handles) });
+                    worker_->Submit(Job{ pid, target.created, target.image, std::move(handles),
+                        systemExplorer ? InjectScope::ExplorerDialogs : InjectScope::Application });
                 }
             } else if (decision == Eligibility::AlreadyInjected) {
                 // Nothing to do: the Bridge is still in the process.

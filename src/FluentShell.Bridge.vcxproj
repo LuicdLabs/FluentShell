@@ -102,6 +102,7 @@
     <ClCompile Include="Bridge\Translation\AccessibleIsland.cpp" />
     <ClCompile Include="Bridge\Translation\MmcHtmlDocument.cpp" />
     <ClCompile Include="Bridge\Translation\MenuBarCapture.cpp" />
+    <ClCompile Include="Bridge\Translation\NativePressActivation.cpp" />
     <ClCompile Include="Bridge\Translation\DialogSnapshots.cpp" />
     <ClCompile Include="Bridge\Translation\VirtualTaskDialog.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />
@@ -125,6 +126,7 @@
     <ClInclude Include="Bridge\Translation\AccessibleIsland.h" />
     <ClInclude Include="Bridge\Translation\MmcHtmlDocument.h" />
     <ClInclude Include="Bridge\Translation\MenuBarCapture.h" />
+    <ClInclude Include="Bridge\Translation\NativePressActivation.h" />
     <ClInclude Include="Bridge\Translation\DialogSnapshots.h" />
     <ClInclude Include="Bridge\Translation\VirtualTaskDialog.h" />
     <ClInclude Include="Bridge\Translation\DialogTranslator.h" />
