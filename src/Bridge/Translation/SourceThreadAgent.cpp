@@ -83,6 +83,14 @@ constexpr WPARAM kDeferredNativeAction = 4;
 constexpr WPARAM kDeferredLabelRename = 5;
 // How long a rename waits for the session the application's own Rename command opens.
 constexpr uint64_t kLabelRenameWaitMs = 1000;
+// How long a press keeps the native window in the foreground while it waits for
+// the application to finish reacting to the click.  It has to cover the click's
+// own settling time (kActivationSettleMs) and whatever the command then does.  A
+// press that closes its window (Run, Cancel, OK) releases as soon as the window
+// is gone and never reaches this; it only bounds a press the application did
+// nothing observable with, and while it is held the cloaked native window owns
+// the foreground instead of the proxy, so it is kept as short as that allows.
+constexpr ULONGLONG kNativePressHoldMs = 1600;
 
 struct Command final {
     explicit Command(std::shared_ptr<std::atomic<bool>> token = {})
@@ -667,6 +675,14 @@ LRESULT CALLBACK ControlSubclassProc(
     const auto owner = AgentForSubclass(
         reinterpret_cast<SourceThreadAgent*>(refData & ~DWORD_PTR{ 1 }));
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    // The application dispatched the click the press posted.  This says the click
+    // reached the control; it does not say the control told its dialog about it,
+    // which is what the root's BN_CLICKED observation reports, and neither says
+    // the application has finished reacting.  The press is only noted here.
+    if (owner && message == BM_CLICK && owner->NativePressPending() &&
+        owner->NativePressButton() == window) {
+        owner->NoteNativePressObserved(L"delivered, BM_CLICK reached the control");
+    }
     if (owner && !CaptureReadInProgress() &&
         (RelevantMessageFor(window, message, lParam, wParam) || (statusBar && message == SB_SETMINHEIGHT)))
         owner->MarkDirty(window, message);
@@ -705,6 +721,25 @@ LRESULT CALLBACK RootSubclassProc(
     if (message == WM_CLOSE || message == WM_DESTROY) DetachControlObservation(window);
     if (message == WM_CLOSE) ++t_closingRoots;
     const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    // The dialog was told about the click the press posted.  It has to be this
+    // control's notification: a BN_CLICKED from any other control would otherwise
+    // be read as this press having been acted on.  This is evidence only -- the
+    // shell's Run path merely *starts* in this handler, so ending the press here
+    // takes the foreground away in the middle of it.
+    if (owner && message == WM_COMMAND && HIWORD(wParam) == BN_CLICKED &&
+        owner->NativePressPending() &&
+        reinterpret_cast<HWND>(lParam) == owner->NativePressButton()) {
+        wchar_t phase[96]{};
+        swprintf_s(phase, L"the dialog got BN_CLICKED for id=%d",
+            static_cast<int>(LOWORD(wParam)));
+        owner->NoteNativePressObserved(phase);
+    }
+    // The window the press acted on is gone: the application has finished
+    // reacting to the click -- its modal loop has unwound and whatever the
+    // command does has run -- so the borrowed foreground goes back now.
+    if (owner && message == WM_DESTROY && owner->NativePressPending()) {
+        owner->CompleteNativePress(L"finished, the window the press acted on closed");
+    }
     if (message == WM_CLOSE) {
         --t_closingRoots;
         MarkWindowCloseCompleted(window);
@@ -901,16 +936,20 @@ WindowAction FindWindowAction(std::wstring_view action) noexcept {
 // --- Node-level actions -----------------------------------------------------
 
 // A native press is delivered the way a native click is: the window that owns the
-// control is the foreground window while the press runs.  Explorer's security
-// warning refuses its Run button while its dialog is not in the foreground, and a
-// projected surface keeps the WinUI proxy in the foreground instead.
-void PressNativeButtonOnAgent(SourceThreadAgent* agent, HWND button) noexcept {
+// control is the foreground window while the press runs, and it is a window the
+// user could act in.  Explorer's security warning refuses its Run button while
+// its dialog is application-cloaked (as a projection cloaks it) or layered.
+void PressNativeButtonOnAgent(SourceThreadAgent* agent, HWND button,
+    PressDelivery delivery = PressDelivery::ThroughTheApplicationLoop) noexcept {
     if (!agent || !button) return;
-    if (!PressNativeButton(agent->Root(), button)) {
-        FluentShell::Log(L"Native press: the native window could not borrow the foreground");
-    }
+    agent->PressNativeControl(button, delivery);
 }
 
+// The press borrows the foreground and the screen for the click.  The click the
+// application's own message loop dispatches arrives after the press that posted
+// it returned, and the controls that gate on the user having seen the window
+// look at that state when the click arrives, so the state has to outlive the
+// press: the agent holds it until the application has dispatched the click.
 bool ActivateSysLink(Command* command, HWND target) {
     // The bounded SysLink adapter accepts exactly one link.  Let the native
     // control generate its normal NM_RETURN notification instead of fabricating
@@ -1000,7 +1039,11 @@ bool ApplySetCheck(
     bool absorbedNoOp = false;
     for (int attempt = 0; current >= 0 && current != requested && attempt <= maximum + 1; ++attempt) {
         if (AbortIfCancelled(command)) return false;
-        PressNativeButtonOnAgent(agent, target);
+        // The walk reads the state right after the click, so the click has to be
+        // delivered synchronously: a posted click is dispatched by the
+        // application's own loop, and the loop is the thread this walk is
+        // running on.
+        PressNativeButtonOnAgent(agent, target, PressDelivery::Synchronous);
         const int next = ReadButtonCheckState(target);
         if (next == current) {
             if (absorbedNoOp) break;
@@ -2279,6 +2322,11 @@ bool ExecuteRestore(Command* command) {
     auto* agent = command->agent;
     if (AbortIfCancelled(command)) return false;
     agent->CancelPopupOnSourceThread();
+    // A press that is still waiting for its click has the native window in the
+    // foreground and on screen.  The restore gives the window back to the user,
+    // so the press ends with it: its state would put the window behind the proxy
+    // again.
+    agent->ReleaseNativePress();
     if (!SetCloakAndVerify(command, agent->Root(), false,
             L"native window remained application-cloaked")) {
         return false;
@@ -2397,6 +2445,21 @@ LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
         // Every callback owns the agent before entering application code. A
         // timed-out command can pump nested shutdown and outlive its surface.
         const auto agent = AgentForMessage(message->message);
+        if (agent && agent->NativePressPending()) {
+            // A press whose application finished nothing observable is ended on
+            // its deadline, and this hook runs on every message of the thread, so
+            // it is where the deadline is noticed.
+            //
+            // The command itself is not held back.  A press borrows the
+            // foreground, and no command takes the foreground away; a capture
+            // re-cloaks the window, which is state the dialog does not gate on
+            // (NATIVE-PRESS-EVIDENCE.md), so it has nothing of the press's to
+            // take.  Reposting the command to wait for the press, as this once
+            // did, put it straight back in front of this hook, which saw it and
+            // reposted it again: the target's GUI thread spun at full speed for
+            // as long as the press was held.
+            agent->ExpireNativePress();
+        }
         if (agent && message->message == agent->MessageId() &&
             message->wParam == kDeferredNativeAction) {
             const auto token = static_cast<uint64_t>(message->lParam);
@@ -2510,6 +2573,90 @@ LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
 } // namespace
 
 void SetTopLevelShownEvent(HANDLE event) noexcept { g_topLevelShownEvent.store(event); }
+
+// The press borrows the foreground and the screen for the click.  The click the
+// application's own message loop dispatches arrives after the press that posted
+// it returned, and the controls that gate on the user having seen the window
+// look at that state when the click arrives, so the state has to outlive the
+// press: the agent holds it until the application has dispatched the click.
+void SourceThreadAgent::PressNativeControl(HWND button, PressDelivery delivery) noexcept {
+    if (!button || !IsWindow(button)) return;
+    // A press that is still pending never had its click dispatched.  The state it
+    // borrowed is released before the next press borrows it again.
+    // A press that is still held means the native window has owned the foreground
+    // since that press took it, so the click's settling time is measured from
+    // then and a press that follows closely enough needs none of it left.
+    const bool holdingForeground = nativePress_ != nullptr &&
+        nativeForegroundSince_ != 0 && GetForegroundWindow() == root_;
+    if (nativePress_) {
+        FluentShell::Log(L"Native press released: the application never dispatched the click");
+        ReleaseNativePress();
+    }
+    auto press = std::make_unique<NativePressActivation>(root_,
+        proxyWindow_.load(std::memory_order_acquire));
+    const DWORD settle = NativePressActivationSettleMs();
+    DWORD remaining = settle;
+    if (holdingForeground) {
+        const ULONGLONG elapsed = GetTickCount64() - nativeForegroundSince_;
+        remaining = elapsed >= settle ? 0 : static_cast<DWORD>(settle - elapsed);
+    } else {
+        // This press is what brings the window forward -- either it took the
+        // foreground itself, or the renderer handed it over just before sending
+        // the action, which is equally recent.  Either way the clock starts now.
+        nativeForegroundSince_ = GetTickCount64();
+    }
+    const bool delivered = PressNativeButton(*press, button, delivery, remaining);
+    if (!delivered) {
+        FluentShell::Log(L"Native press: the native window was not in the foreground and on screen");
+    }
+    // A click that was delivered here has been handled when the call returns, and
+    // the press has already ended.  A posted click is still on its way to the
+    // application's own message loop: the agent keeps the state for it.
+    if (press->Released()) return;
+    if (GetCurrentThreadId() != threadId_) {
+        // The state is kept on the source thread only: the observation that ends
+        // the press runs there, with the control's own subclass.
+        press->Release();
+        return;
+    }
+    nativePress_ = std::move(press);
+    nativePressButton_ = button;
+    nativePressDeadline_ = GetTickCount64() + kNativePressHoldMs;
+}
+
+void SourceThreadAgent::NoteNativePressObserved(const wchar_t* phase) noexcept {
+    if (!nativePress_) return;
+    // Only evidence.  The click having been delivered, or the dialog having been
+    // told about it, is not the application having finished acting on it: the
+    // shell's own Run path only begins in that handler and finishes after the
+    // dialog's modal loop has unwound.  Ending the press here is exactly the bug
+    // this records (NATIVE-PRESS-EVIDENCE.md).
+    LogPressDispatchState(root_, nativePressButton_, phase);
+}
+
+void SourceThreadAgent::CompleteNativePress(const wchar_t* phase) noexcept {
+    if (!nativePress_) return;
+    LogPressDispatchState(root_, nativePressButton_, phase);
+    ReleaseNativePress();
+}
+
+void SourceThreadAgent::ReleaseNativePress() noexcept {
+    if (!nativePress_) return;
+    nativePress_.reset();
+    nativePressButton_ = nullptr;
+    nativePressDeadline_ = 0;
+    // The foreground goes back to the proxy with the press, so the next press has
+    // to bring the window forward again and pays the settling time afresh.
+    nativeForegroundSince_ = 0;
+}
+
+void SourceThreadAgent::ExpireNativePress() noexcept {
+    if (!nativePress_ || !nativePressDeadline_) return;
+    if (GetTickCount64() < nativePressDeadline_) return;
+    // The application did nothing that ends the press -- the usual case for a
+    // button that neither closes its window nor opens another one.
+    ReleaseNativePress();
+}
 
 namespace {
 

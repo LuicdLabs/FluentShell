@@ -128,24 +128,43 @@ window first.
 
 ### A native press is delivered the way a native click is
 
-Windows gates some of its own controls on the window being the foreground one. Explorer's
-"Open File - Security Warning" runs the file only while its dialog is in the foreground: the press
-reaches the button and the dialog refuses it. A projected surface keeps the WinUI proxy in the
-foreground instead, so the press has to be delivered in the state a native click produces.
+Windows gates some of its own controls on the state a native click has. Explorer's "Open File
+- Security Warning" (shdocvw's template 4416; Run is control 4426, Cancel is 2) guards its Run
+button -- and only its Run button -- against a click that arrives too soon after the window came
+forward. With every other piece of state held identical (cloak, foreground, the thread's active
+window, the focus, the default-button bit), a click at ~150 ms is declined and the same click at
+~700 ms runs the file. That is the whole reason the projected Run button did nothing while Cancel
+worked; the evidence is in
+`docs/goals/win32-to-winui-translation/NATIVE-PRESS-EVIDENCE.md`, and it rules out the rules the
+earlier version of this paragraph asserted (the dialog does not gate on being on screen, on the
+cloak, or on how the click was delivered).
 
-`src/Bridge/Translation/NativePressActivation.cpp` owns that state. The press takes the focus
-first (BM_CLICK focuses the button between its button-down and its button-up, and an activation in
-between cancels the press half-way), then the native window borrows the foreground for the press and
-gives it back afterwards. The native window stays application-cloaked, so none of it is drawn: only
-the activation state changes, and only while the press runs.
+`src/Bridge/Translation/NativePressActivation.cpp` owns that state. The native window takes the
+foreground and is uncloaked for the press; the focus follows (BM_CLICK focuses the button between its
+button-down and its button-up, and an activation in between cancels the press half-way, so the focus
+is taken before the press starts). The proxy covers the native window the whole time and is put back
+on top of it, so the user sees only the projected copy. The click waits out the rest of the settling
+time on a thread of its own, because the control's own thread has to stay free to pump, and the
+time is measured from when the native window actually came forward
+(`SourceThreadAgent::nativeForegroundSince_`), so a press that follows one still holding the
+foreground pays none of it.
+
+The state outlives the press. A click the application's own message loop dispatches is posted, and the
+application dispatches it *after* the press that posted it returned, so the agent holds the activation
+until the application has finished reacting (`SourceThreadAgent::CompleteNativePress`, from the
+dialog's own `BN_CLICKED` for that control or from the window closing); a press whose application
+does nothing observable is released on a deadline. No command is held back for a press: reposting one
+put it straight back in front of the `WH_GETMESSAGE` hook and spun the target's GUI thread.
 
 Windows only lets a process take the foreground when it is allowed to, so the renderer grants that
 right before it sends the action: the proxy owns the foreground and received the user's input, so
 `NativeWindowInterop.AllowForegroundForNativePress` hands the right to the injected process
 (`WindowRegistry.NativePressNeedsForeground` names the actions that press a native control). The
-Bridge then takes the foreground on the native window's own thread, where the press belongs. When the
-handover does not take, the Bridge logs it: the press was delivered, but a control that gates on the
-foreground may have refused it.
+right is spent with the take, so the press hands the foreground back to the proxy when it ends, and
+the Bridge grants the renderer the right to take it back itself
+(`TranslatedWindow.TakeForegroundBackFromNativePress` is the fallback). When the handover does not
+take, the Bridge logs it: the press was delivered, but a control that gates on the foreground or on the
+warning being seen may have refused it.
 
 ### Threading rules
 

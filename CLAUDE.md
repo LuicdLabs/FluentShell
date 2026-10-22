@@ -179,32 +179,67 @@ close transition plays.
 
 ### A native press is delivered the way a native click is
 
-Windows gates some of its own controls on the window being the foreground one. Explorer's
-"Open File - Security Warning" runs the file only while its dialog is in the foreground: the press
-reaches the button and the dialog refuses it. A projected surface keeps the WinUI proxy in the
-foreground instead, so the press has to be delivered in the state a native click produces.
+Windows gates some of its own controls on the state a native click has, so a press borrows that
+state: the window that owns the control is the foreground window for the press.
 
-`src/Bridge/Translation/NativePressActivation.cpp` owns that state. The press takes the focus first
-(BM_CLICK focuses the button between its button-down and its button-up, and an activation in between
-cancels the press half-way -- the click is accepted and BN_CLICKED never comes), then the native
-window borrows the foreground for the press and gives it back afterwards. The native window stays
-application-cloaked, so none of it is drawn: only the activation state changes, and only while the
-press runs. A dialog that is not a `#32770` window is no different: the rule is the foreground, not
-the class.
+**The click has to arrive late.** Explorer's "Open File - Security Warning" is shdocvw's dialog
+template 4416 (Run is control **4426**, Cancel is **2**), and it guards Run — not Cancel — against a
+click that arrives too soon after its window came forward. Measured with the cloak, the foreground,
+the thread's active window, the focus and the default-button bit all identical, a `BM_CLICK` at
+~150 ms after the activation is declined and the same click at ~700 ms runs the file
+(`kActivationSettleMs`; evidence in `docs/goals/win32-to-winui-translation/NATIVE-PRESS-EVIDENCE.md`).
+That is the whole reason the projected Run button did nothing while Cancel worked. The dialog does
+**not** gate on being uncloaked or on-screen, does not care whether the click was posted or sent or
+which process posted it, and imports no API with which it could ask where the input came from.
+
+The settling time is counted from when the native window actually came forward, which the agent
+records (`nativeForegroundSince_`): a press that follows one still holding the foreground pays none
+of it. The wait runs on a thread of its own, because the control's own thread has to stay free to
+pump or the window never finishes coming forward.
+
+`src/Bridge/Translation/NativePressActivation.cpp` owns that state. The native window takes the
+foreground and is uncloaked for the press; the focus follows (BM_CLICK focuses the button between its
+button-down and its button-up, and an activation in between cancels the press half-way -- the click
+is accepted and BN_CLICKED never comes -- so the focus is taken before the press starts). The proxy
+covers the native window the whole time and is put back on top of it, so the user sees only the
+projected copy. The rule is the foreground, the on-screen state and the focus, not the class of the
+window.
+
+The renderer hands the foreground over itself before it sends the action
+(`NativeWindowInterop.GiveForegroundToNativeForPress`): it owns the foreground and received the
+user's input, so it may simply name the native window, and the Bridge never has to join its input
+queue to the renderer's. That join was the earlier mechanism and it does not survive — unjoining the
+queues puts the active window straight back to the proxy — so the grant (`AllowSetForegroundWindow`)
+is kept only for a Bridge that still has to re-take the foreground itself.
+
+A click for a control of the press's own thread is posted, so the application's own message loop
+dispatches it; a control of another thread is sent, because that thread's loop dispatches a sent
+click anyway and the caller learns the outcome. The agent keeps the activation until the application
+acts on the click, and `SourceThreadAgent::CompleteNativePress` ends it from one of two observations,
+which are different evidence: the dialog's `WM_COMMAND`/`BN_CLICKED` **for that same control**
+(`RootSubclassProc`, nested inside the click, so normally the one that ends the press) says the
+dialog was told, while the control's own `BM_CLICK` (`ControlSubclassProc`) says only that the click
+reached the button. A press that shows the second and never the first was swallowed by the button.
+Nothing bounds the press by time: any command that arrives releases it, and the supervisor sends one
+every tick. A command is never held back for a press — reposting it put it straight back in front of
+the `WH_GETMESSAGE` hook, which spun the target's GUI thread, and the press does not need its state
+to outlive it.
 
 Windows only lets a process take the foreground when it is allowed to, so the renderer grants that
 right before it sends the action: the proxy owns the foreground and received the user's input, so
 `NativeWindowInterop.AllowForegroundForNativePress` hands the right to the injected process
 (`WindowRegistry.NativePressNeedsForeground` names the actions that press a native control). The
-Bridge takes the foreground on the native window's own thread, where the press belongs, and falls
-back to joining the input queues of the foreground thread when the grant did not arrive. When the
-handover does not take, the Bridge logs it: the press was delivered, but a control that gates on the
-foreground may have refused it.
+right is spent with the take, so the press hands the foreground back to the proxy when it ends, and
+the Bridge grants the renderer the right to take it back itself
+(`TranslatedWindow.TakeForegroundBackFromNativePress` is the fallback). The Bridge also joins the
+input queues of the foreground thread when the grant did not arrive, the way the menu-bar read does.
+When the handover does not take, the Bridge logs it: the press was delivered, but a control that
+gates on the foreground or on the warning being seen may have refused it.
 
-`tests/FluentShell.Native.Tests/NativePressActivationTests.h` runs the arrangement in two
-processes, the way the product runs it: a renderer stand-in holds the foreground and grants the
-right, the bridge side owns the dialog and presses its button, and the dialog refuses a press that
-arrives while the proxy is in the foreground.
+`tests/FluentShell.Native.Tests/NativePressActivationTests.h` stands the mechanism up against a
+**synthetic** dialog that is programmed to refuse a press unless the state is in place: it proves the
+Bridge establishes that state, not that any real shell dialog demands it. The real dialog's rule is
+the evidence doc above.
 
 ### The owner graph
 

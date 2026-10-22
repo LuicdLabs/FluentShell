@@ -1299,6 +1299,10 @@ bool RendererSession::CommitInteractive(ProjectionAttempt& attempt) {
         std::scoped_lock lock(surface->mutex);
         surface->state = SurfaceState::Projected;
     }
+    // The press path needs the proxy: the native window has to be on screen for
+    // the press, and the proxy is what keeps the native window out of the user's
+    // view while that happens.
+    if (surface->agent) surface->agent->SetProxyWindow(attempt.ready.proxyHwnd);
     const auto& snapshot = surface->snapshot;
     if (Send(Ipc::MessageType::SurfaceCommit, snapshot.revision,
             SerializeSurfaceCommit(
@@ -2797,6 +2801,11 @@ void RendererSession::HandleNativeAction(
     lock.unlock();
     ActionOutcome outcome;
     const bool actionApplied = agent && agent->Invoke(effectiveAction, outcome, 2000, shutdownEvent_);
+    // A native press borrows the foreground for the press and hands it back.  The
+    // hand-back can be refused: the right to take the foreground is spent with
+    // the take, and another process's window is not the foreground owner's to
+    // name.  The renderer is given the right to take it back itself.
+    if (rendererProcessId_) AllowSetForegroundWindow(rendererProcessId_);
     // A refused indexed action can carry the fresh canonical capture which
     // proved its index stale. Publish that revision through the same checked
     // path as a successful action, while reporting a non-replayable rejection.

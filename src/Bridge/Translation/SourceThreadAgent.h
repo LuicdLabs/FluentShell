@@ -2,6 +2,7 @@
 
 #include "ControlAdapters.h"
 #include "DateTimePickerValue.h"
+#include "NativePressActivation.h"
 #include "WindowCapture.h"
 #include "PopupMenuState.h"
 
@@ -675,6 +676,30 @@ public:
     void RearmDeferredActionsOnSourceThread() noexcept;
     void CancelDeferredActionOnSourceThread(WPARAM kind, uint64_t token) noexcept;
     void RequestMenuBarRefresh() noexcept { menuBarDirty_.store(true); }
+    // A native press borrows the foreground and the screen for the click.  The
+    // click the application's own message loop dispatches arrives after the press
+    // that posted it returned, and the controls that gate on the user having
+    // seen the window look at that state when the click arrives: the state has
+    // to outlive the press.  The agent holds the press until the application has
+    // dispatched the click.
+    void PressNativeControl(HWND button,
+        PressDelivery delivery = PressDelivery::ThroughTheApplicationLoop) noexcept;
+    // Records that the press was observed, without ending it: seeing the click is
+    // not the application having finished reacting to it.  Source thread only.
+    void NoteNativePressObserved(const wchar_t* phase) noexcept;
+    // Ends a press the application has finished reacting to, naming what finished
+    // it.  Source thread only.
+    void CompleteNativePress(const wchar_t* phase) noexcept;
+    // Ends a press without waiting for the application to act on it.  Source
+    // thread only.
+    void ReleaseNativePress() noexcept;
+    // Ends a press the application never finished reacting to, once the hold
+    // deadline has passed.  Source thread only.
+    void ExpireNativePress() noexcept;
+    // Whether a press is waiting for the application to dispatch its click.
+    bool NativePressPending() const noexcept { return nativePress_ != nullptr; }
+    // The control the pending press was posted to.
+    HWND NativePressButton() const noexcept { return nativePressButton_; }
     bool MenuBarCommandsCurrentOnSourceThread() const noexcept {
         return GetCurrentThreadId() == threadId_ &&
             (!captureContext_.menuBarToolbar ||
@@ -683,6 +708,13 @@ public:
     bool Shutdown() noexcept;
 
     HWND Root() const noexcept { return root_; }
+    // The WinUI proxy that covers the native window.  A native press needs it:
+    // the native window has to be on screen for the press, and the proxy is what
+    // keeps it out of the user's view while that happens.
+    HWND ProxyWindow() const noexcept { return proxyWindow_.load(std::memory_order_acquire); }
+    void SetProxyWindow(HWND proxy) noexcept {
+        proxyWindow_.store(proxy, std::memory_order_release);
+    }
     DWORD ThreadId() const noexcept { return threadId_; }
     bool IsDirty() const noexcept { return dirty_.load(); }
     void ClearDirty() noexcept { dirty_.store(false); }
@@ -762,6 +794,18 @@ private:
         std::wstring& error);
 
     HWND root_ = nullptr;
+    std::atomic<HWND> proxyWindow_{ nullptr };
+    // The press that is waiting for the application to finish reacting to its
+    // click, the control the click was posted to, and the deadline that ends a
+    // press whose application did nothing observable.
+    std::unique_ptr<NativePressActivation> nativePress_;
+    HWND nativePressButton_ = nullptr;
+    ULONGLONG nativePressDeadline_ = 0;
+    // When the native window last came forward for a press.  A security prompt
+    // guards its dangerous action against a click that arrives too soon after
+    // that, so the click's remaining settling time is measured from here and a
+    // press that follows one still holding the foreground pays none of it.
+    ULONGLONG nativeForegroundSince_ = 0;
     HMODULE module_ = nullptr;
     DWORD threadId_ = 0;
     UINT message_ = 0;

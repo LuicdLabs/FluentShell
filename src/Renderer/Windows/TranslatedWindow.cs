@@ -150,7 +150,7 @@ public sealed class TranslatedWindow : Window
         RefreshRenderDpi();
     }
 
-    private static nint? TryParseHwnd(string text) =>
+    internal static nint? TryParseHwnd(string text) =>
         text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) &&
         ulong.TryParse(text.AsSpan(2), System.Globalization.NumberStyles.AllowHexSpecifier,
             System.Globalization.CultureInfo.InvariantCulture, out var value) && value != 0
@@ -434,7 +434,45 @@ public sealed class TranslatedWindow : Window
         {
             _applyingCanonical = false;
         }
+        QueueForegroundTakeBackFromNativePress();
         QueuePopupSynchronization();
+    }
+
+    // How long the Bridge may hold the foreground for a native press before it
+    // gives it back itself.  It matches the Bridge's own hold, and the safety net
+    // below waits past it rather than racing it.
+    private static readonly TimeSpan NativePressHold = TimeSpan.FromMilliseconds(2000);
+
+    // A native press borrows the foreground for the press: the native window has
+    // to be the foreground window and its own thread the active one, or the
+    // control refuses the press.  The Bridge hands it back when the press ends.
+    //
+    // This is only the safety net for a Bridge that could not, and it must not
+    // race the press.  The action result it used to follow arrives as soon as the
+    // action is *accepted*, which is long before the application has acted on the
+    // click: taking the foreground back there pulled the state out from under the
+    // press, and Explorer's security warning then refused its Run button while
+    // its Cancel, finished inside its own WM_COMMAND, never noticed
+    // (docs/goals/win32-to-winui-translation/NATIVE-PRESS-EVIDENCE.md).  So the
+    // check waits until the Bridge's hold must have expired, and then only acts
+    // if the native window really is still the foreground one.
+    private void QueueForegroundTakeBackFromNativePress()
+    {
+        if (ViewModel.SurfaceKind != "window") return;
+        if (TryParseHwnd(ViewModel.NativeHwnd) is not { } native) return;
+        var timer = DispatcherQueue.CreateTimer();
+        timer.Interval = NativePressHold;
+        timer.IsRepeating = false;
+        timer.Tick += (sender, _) =>
+        {
+            sender.Stop();
+            _hideTimers.Remove(sender);
+            if (_closed) return;
+            if (NativeWindowInterop.TakeForegroundBack(native, Hwnd))
+                RendererDiagnostics.Log($"foreground taken back from the native window hwnd=0x{native:X}");
+        };
+        _hideTimers.Add(timer);
+        timer.Start();
     }
 
     public void Commit(bool show, ulong revision, bool interactive)

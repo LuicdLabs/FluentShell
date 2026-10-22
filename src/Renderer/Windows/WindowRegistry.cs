@@ -226,11 +226,24 @@ public sealed class WindowRegistry
     private Task SendActionAsync(ActionInvokeMessage message, ulong revision)
     {
         // A native press is delivered the way a native click is: the native window
-        // is the foreground window while the press runs. The proxy owns the
-        // foreground, so it hands the right to take it over to the injected
-        // process for the length of the press.
+        // is the foreground window while the press runs, and it is a window the
+        // user could act in.  The proxy owns the foreground and received the
+        // user's input, so it grants the injected process the right to take it for
+        // the length of the press.
         if (NativePressNeedsForeground(message.Action))
+        {
+            // The grant is kept for the Bridge that still has to re-take the
+            // foreground itself, but the handover is made here: this process owns
+            // the foreground, so it names the native window directly and the
+            // Bridge never has to join its input queue to this one.
             NativeWindowInterop.AllowForegroundForNativePress(_parentProcessId);
+            if (_windows.TryGetValue(message.SurfaceId, out var pressed) &&
+                pressed.ViewModel.SurfaceKind == "window" &&
+                TranslatedWindow.TryParseHwnd(pressed.ViewModel.NativeHwnd) is { } pressedNative)
+            {
+                NativeWindowInterop.GiveForegroundToNativeForPress(pressedNative);
+            }
+        }
         return _send(message with { SessionNonce = _sessionNonce }, revision);
     }
 

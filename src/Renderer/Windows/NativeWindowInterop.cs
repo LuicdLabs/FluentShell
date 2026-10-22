@@ -203,6 +203,58 @@ internal static class NativeWindowInterop
         catch { }
     }
 
+    /// <summary>
+    /// Hands the foreground to the native window for the length of one native
+    /// press, by setting it here rather than granting the injected process the
+    /// right to set it there.
+    /// </summary>
+    /// <remarks>
+    /// The grant alone did not hold: by the time the Bridge had queued the action
+    /// and reached the press, the right was gone, so the Bridge fell back to
+    /// joining its input queue to this one. That join is what broke the press.
+    /// Sharing an input queue gives the two threads one active window between
+    /// them, and this XAML thread keeps asserting its own, so the native dialog
+    /// was the active window at the instant the click was delivered and no longer
+    /// was when the shell checked — Explorer's security warning then refused its
+    /// Run button, while Cancel, which finishes inside its own WM_COMMAND, never
+    /// noticed (docs/goals/win32-to-winui-translation/NATIVE-PRESS-EVIDENCE.md).
+    ///
+    /// This process owns the foreground and received the user's input, so it may
+    /// simply name the native window instead, and no queue is ever joined.
+    /// </remarks>
+    internal static bool GiveForegroundToNativeForPress(nint nativeWindow)
+    {
+        if (nativeWindow == 0) return false;
+        try
+        {
+            if (GetForegroundWindow() == nativeWindow) return true;
+            return SetForegroundWindow(nativeWindow) && GetForegroundWindow() == nativeWindow;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Takes the foreground back when a native press left the native window in
+    /// it. The Bridge hands the foreground over for the press, and the right to
+    /// take it is spent with the take, so the renderer takes it back itself.
+    /// </summary>
+    internal static bool TakeForegroundBack(nint nativeWindow, nint proxyWindow)
+    {
+        if (nativeWindow == 0 || proxyWindow == 0) return false;
+        try
+        {
+            if (GetForegroundWindow() != nativeWindow) return false;
+            return SetForegroundWindow(proxyWindow);
+        }
+        catch { return false; }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(nint hwnd);
+
     public static void SetEnabled(nint hwnd, bool enabled) => EnableWindow(hwnd, enabled);
 
     /// <summary>DWM application cloak: composited or not, without changing z-order.</summary>

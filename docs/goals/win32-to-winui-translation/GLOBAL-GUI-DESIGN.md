@@ -25,13 +25,16 @@ fault can still crash Explorer. The GUI risk text includes this exception and re
 of the updated text before global apply starts.
 
 The shell's security warning ("Open File - Security Warning") is the dialog this exception exists
-for, and it only accepts its own buttons while it is the foreground window: the press reaches the
-button, and the dialog refuses it. A projected surface keeps the WinUI proxy in the foreground, so
-the press is delivered with the native window in the foreground and the foreground is given back
-afterwards. The renderer owns the foreground and received the user's input, so it grants the right
-to take it to the injected process before the action that presses the control. The native window
-stays application-cloaked throughout: nothing of the shell dialog is drawn, and the WinUI copy
-remains the only surface on the screen.
+for, and it guards its Run button -- and only its Run button -- against a click that arrives too
+soon after the window came forward: a click at ~150 ms is declined and the same click at ~700 ms
+runs the file. A projected surface keeps the WinUI proxy in the foreground, so the press borrows
+the foreground for its duration and waits out the rest of that settling time: the renderer hands the
+foreground over itself, the native window takes it and is uncloaked for the press only, the click
+waits on a thread of its own, and the renderer takes the foreground back when the press is done.
+The native window is never drawn -- the proxy covers it exactly -- so the WinUI copy remains the
+only surface on the screen, and it shows the same warning the shell refuses to act on without the
+user having seen it. The evidence is in
+`docs/goals/win32-to-winui-translation/NATIVE-PRESS-EVIDENCE.md`.
 
 Status: implemented on branch `feature/global-apply-gui`, with these exceptions: the live global run against the desktop's other applications is not yet done (it needs the user's go-ahead, since it injects into every window), and the authenticated control pipe is out of scope for this slice.
 

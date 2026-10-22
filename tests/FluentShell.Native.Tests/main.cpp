@@ -5353,11 +5353,6 @@ int wmain(int argc, wchar_t** argv) {
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
-    // The renderer stand-in of the foreground handover test: a second process
-    // that holds the foreground and grants the right to take it.
-    if (argc >= 5 && std::wstring(argv[1]) == L"--foreground-grant") {
-        return RunForegroundGrantOwner(static_cast<DWORD>(_wtoi(argv[2])), argv[3], argv[4]);
-    }
     SetUnhandledExceptionFilter(ReportUnhandledException);
     // Snapshot serialization uses WinRT JSON, so the apartment must exist before
     // the first test that serializes a frame.
@@ -5487,6 +5482,7 @@ int wmain(int argc, wchar_t** argv) {
     TestObjectPickerControls();
     TestSecurityWarningDialog();
     TestNativePressActivation();
+    TestNativePressSettlesBeforeTheClick();
     TestPassivePictureControls();
     TestTileListViewCapture();
     TestSplitButtons();
