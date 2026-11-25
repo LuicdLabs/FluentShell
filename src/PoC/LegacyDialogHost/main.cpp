@@ -861,11 +861,17 @@ int RunMdiOracle(HINSTANCE instance, int show) {
     return 0;
 }
 
+#include "ProjectionCoverageOracle.h"
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR commandLine, int show) {
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&controls);
+
+    if (commandLine && wcsstr(commandLine, L"--coverage") != nullptr) {
+        return RunProjectionCoverageOracle(instance, show);
+    }
 
     // The MDI oracle is a separate acceptance surface: one frame, one MDI client,
     // and real MDI child frames with their own controls.

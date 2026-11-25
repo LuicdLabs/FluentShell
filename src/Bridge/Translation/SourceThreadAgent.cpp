@@ -1748,8 +1748,8 @@ bool ExecuteInvoke(Command* command) {
         command->refused = true;
         command->error = L"native ListView revision changed before the indexed action";
         if (action.action != L"activateItem") {
-            // The application can reorder virtual rows without changing their
-            // count. Publish what was actually read, but never retarget or replay
+            // The application can reorder rows without changing their count.
+            // Publish what was actually read, but never retarget or replay
             // the user's old index against that new ordering.
             before.revision = action.expectedRevision + 1;
             command->outcome.revision = before.revision;
@@ -2694,8 +2694,10 @@ bool IsOwnerDataListViewIndexedAction(
             action.action != L"setFocusedIndex" && action.action != L"setItemText" &&
             action.action != L"setItemCheck")) return false;
     return std::any_of(snapshot.nodes.begin(), snapshot.nodes.end(), [&](const ControlNode& node) {
+        // A bounded stored row window omits per-item native IDs on the wire,
+        // just like owner-data rows. Its indices name only the published order.
         return node.nodeId == *action.nodeId && node.kind == ControlKind::ListView &&
-            (node.style & LVS_OWNERDATA) != 0;
+            ((node.style & LVS_OWNERDATA) != 0 || node.itemCount != 0);
     });
 }
 
@@ -2931,6 +2933,10 @@ bool SourceThreadAgent::Post(void* rawCommand, DWORD timeoutMs, HANDLE cancelEve
     command->deadline = GetTickCount64() + timeoutMs;
     bool dispatchReference = false;
     try {
+        if (!timeoutMs || (cancelEvent && WaitForSingleObject(cancelEvent, 0) != WAIT_TIMEOUT)) {
+            command->cancelled.store(true, std::memory_order_release);
+            return false;
+        }
         AddRef(command);
         dispatchReference = true;
         if (!TrackCommand(command)) {
@@ -2947,25 +2953,38 @@ bool SourceThreadAgent::Post(void* rawCommand, DWORD timeoutMs, HANDLE cancelEve
             Release(command);
             return false;
         }
-        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
-        const DWORD started = WaitForSingleObject(command->started, timeoutMs);
-        if (started != WAIT_OBJECT_0) {
-            command->cancelled = true;
-            return false;
-        }
-        const ULONGLONG now = GetTickCount64();
-        const DWORD remaining = now >= deadline
-            ? 0
-            : static_cast<DWORD>(std::min<ULONGLONG>(deadline - now, MAXDWORD));
-        if (!cancelEvent) {
-            const bool completed = WaitForSingleObject(command->completed, remaining) == WAIT_OBJECT_0;
-            if (!completed) command->cancelled = true;
-            return completed;
-        }
-        HANDLE waits[] = { command->completed, cancelEvent };
-        const DWORD result = WaitForMultipleObjects(2, waits, FALSE, remaining);
-        if (result != WAIT_OBJECT_0) command->cancelled = true;
-        return result == WAIT_OBJECT_0;
+        // Queuing, acknowledgement and execution share the command's original
+        // deadline. Cancellation also interrupts the acknowledgement wait when
+        // the GUI thread is blocked and cannot remove the posted command yet.
+        const auto await = [&](HANDLE event) noexcept {
+            const HANDLE waits[] = {event, cancelEvent};
+            const DWORD count = cancelEvent ? 2 : 1;
+            for (;;) {
+                const auto now = GetTickCount64();
+                if (command->cancelled.load(std::memory_order_acquire) || now >= command->deadline ||
+                        (cancelEvent && WaitForSingleObject(cancelEvent, 0) != WAIT_TIMEOUT)) return false;
+                const DWORD remaining = static_cast<DWORD>(
+                    std::min<ULONGLONG>(command->deadline - now, MAXDWORD));
+                const DWORD result = MsgWaitForMultipleObjectsEx(count, waits, remaining,
+                    QS_SENDMESSAGE, MWMO_INPUTAVAILABLE);
+                if (result == WAIT_OBJECT_0) {
+                    // Completion and shutdown can be signalled together. Do not
+                    // publish the command result after its cancellation won.
+                    return !command->cancelled.load(std::memory_order_acquire) &&
+                        GetTickCount64() < command->deadline &&
+                        (!cancelEvent || WaitForSingleObject(cancelEvent, 0) == WAIT_TIMEOUT);
+                }
+                if (result != WAIT_OBJECT_0 + count) return false;
+                // A child on the source thread can synchronously notify a parent
+                // on the waiting GUI thread. Service sent messages only; posted
+                // input and Bridge commands must remain in their native order.
+                MSG message{};
+                PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            }
+        };
+        const bool completed = await(command->started) && await(command->completed);
+        if (!completed) command->cancelled.store(true, std::memory_order_release);
+        return completed;
     } catch (...) {
         command->cancelled = true;
         if (dispatchReference && !command->queued.load(std::memory_order_acquire)) {

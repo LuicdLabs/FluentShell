@@ -1571,7 +1571,8 @@ void TestControlAdapterRegistry() {
         { L"ListBox", LBS_NODATA | LBS_OWNERDRAWFIXED, false, ControlKind::ListBox, "virtual ListBox" },
         { PROGRESS_CLASSW, 0, true, ControlKind::ProgressBar, "ProgressBar" },
         { PROGRESS_CLASSW, PBS_MARQUEE, true, ControlKind::ProgressBar, "marquee ProgressBar" },
-        { PROGRESS_CLASSW, PBS_VERTICAL, false, ControlKind::ProgressBar, "vertical ProgressBar" },
+        { PROGRESS_CLASSW, PBS_VERTICAL, true, ControlKind::ProgressBar, "vertical ProgressBar" },
+        { PROGRESS_CLASSW, PBS_VERTICAL | PBS_MARQUEE, true, ControlKind::ProgressBar, "vertical marquee ProgressBar" },
         { PROGRESS_CLASSW, WS_TABSTOP, true, ControlKind::ProgressBar, "tab-stop ProgressBar" },
         { STATUSCLASSNAMEW, 0, true, ControlKind::StatusBar, "StatusBar" },
         { STATUSCLASSNAMEW, WS_TABSTOP, false, ControlKind::StatusBar, "tab-stop StatusBar" },
@@ -2086,7 +2087,6 @@ void TestTabControlCaptureAndSelection() {
         { TCS_FLATBUTTONS, L"button" },
         { TCS_VERTICAL, L"vertical" },
         { TCS_BOTTOM, L"bottom" },
-        { TCS_FIXEDWIDTH, L"TCS_FIXEDWIDTH" },
         { TCS_TOOLTIPS, L"tooltips" },
     };
     for (const auto& entry : rejected) {
@@ -5117,6 +5117,7 @@ void TestMdiFrameCaptureAndCommands() {
 #include "WinFormsOwnerDrawTests.h"
 #include "ScrollingContainerTests.h"
 #include "EventViewerSurfaceTests.h"
+#include "ProjectionCoverageRegressionTests.h"
 #include "ActionsPaneIslandTests.h"
 #include "LabelSessionTests.h"
 #include "ComboBoxExTests.h"
@@ -5439,6 +5440,10 @@ int wmain(int argc, wchar_t** argv) {
     TestObscuredHostIsNotCaptured();
     TestListViewHeaderPlacementFlag();
     TestVirtualListWindow();
+    TestLargeStoredReportListWindow();
+    TestProjectedNodeBudgetIgnoresHiddenChildren();
+    TestFixedWidthTabCapture();
+    TestVerticalProgressCapture();
     TestEmptyReportListWithoutColumns();
     TestMmcBusyShieldIdentity();
     TestMenuActionValidationAndSerialization();

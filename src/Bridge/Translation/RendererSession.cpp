@@ -2949,31 +2949,32 @@ const wchar_t* RendererSession::ReconcileSurface(const std::shared_ptr<Surface>&
             pass.agent->IsDestroyed()) {
             return L"nativeDestroyed";
         }
-        pass.next = surface->snapshot;
-        pass.baseRevision = pass.next.revision;
-        pass.next.revision = pass.baseRevision + 1;
+        // Reject a quiet tick before copying the snapshot: its strings, item
+        // collections, and decoded-image payloads can be large. A pending page
+        // swap still advances every tick, and the slow poll remains the backstop
+        // for native changes outside the mutation-message whitelist.
+        if (!surface->directUiSwapPending && !pass.agent->IsDirty() &&
+            ++surface->reconcileSkips < kQuietReconcileTicks) return nullptr;
+        surface->reconcileSkips = 0;
+        pass.baseRevision = surface->snapshot.revision;
         pass.directUiAdapter = surface->directUiAdapter;
         pass.directUiProfile = surface->directUiProfile;
         if (pass.directUiAdapter) {
+            // DirectUI refresh updates the admitted slots in place.
+            pass.next = surface->snapshot;
             pass.directUiEvidence = surface->directUiEvidence;
             pass.directUiBindings = surface->directUiBindings;
             pass.directUiSwapPending = surface->directUiSwapPending;
             pass.directUiSwapDeadline = surface->directUiSwapDeadline;
+        } else {
+            // HWND capture replaces its output completely and reads only the
+            // requested surface identity and revision. Do not copy node/image
+            // payloads that would be discarded before any publication.
+            pass.next.surfaceId = surface->snapshot.surfaceId;
+            pass.next.generation = pass.sourceGeneration;
         }
+        pass.next.revision = pass.baseRevision + 1;
     }
-
-    // A quiet source thread does not need a full capture on every tick.  This is
-    // what keeps a drag or an open menu from being hammered with 2 s-deadline
-    // source-thread work it cannot service in time.  The slow poll stays as the
-    // backstop because the dirty whitelist cannot prove it observes every way
-    // native state can change.
-    // An armed page swap is the one case that must be advanced on every tick: the
-    // dirty flag says nothing about whether the next page has appeared yet.
-    if (!pass.directUiSwapPending && !pass.agent->IsDirty() &&
-        ++surface->reconcileSkips < kQuietReconcileTicks) {
-        return nullptr;
-    }
-    surface->reconcileSkips = 0;
 
     std::wstring error;
     bool timedOut = false;
@@ -3091,12 +3092,9 @@ const wchar_t* RendererSession::RefreshMenuBarToolbar(ReconcilePass& pass, std::
     if (!changed) return nullptr;
     // Do not publish a capture from before the cache change: menu and toolbar
     // visibility must move together in one canonical revision.
-    WindowSnapshot next = pass.next;
     std::wstring captureError;
     bool timedOut = false;
-    if (pass.agent->Capture(next, captureError, 2000, shutdownEvent_, &timedOut)) {
-        pass.next = std::move(next);
-    } else {
+    if (!pass.agent->Capture(pass.next, captureError, 2000, shutdownEvent_, &timedOut)) {
         try {
             FluentShell::Log(L"Recapture after menu-bar refresh failed: " + captureError);
         } catch (...) {}

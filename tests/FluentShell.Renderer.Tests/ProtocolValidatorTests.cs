@@ -852,7 +852,68 @@ public class ProtocolValidatorTests
         };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
         snapshot.Nodes[0] = valid with { Style = "0x54030640" };
+        ProtocolValidator.ValidateSnapshot(snapshot);
+        snapshot.Nodes[0] = valid with { Style = "0x54030740" };
         Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+    }
+
+    [Fact]
+    public void LargeStoredReportUsesAbsoluteIndicesWithBoundedRows()
+    {
+        var snapshot = TestData.Snapshot();
+        var node = NodeOfKind("listView") with
+        {
+            Style = "0x50000001",
+            Items = ["Row 5000", "Row 5001"],
+            Rows = [["Row 5000", "OK"], ["Row 5001", "OK"]],
+            ItemCount = 10000,
+            ItemWindowStart = 5000,
+            CheckBoxes = false,
+            CheckedIndices = [],
+            SelectedIndices = [9000],
+            FocusedIndex = 9000,
+            ItemImages = [-1, -1],
+            ItemNativeIds = [],
+            ItemActivationSupported = false,
+        };
+        snapshot.Nodes[0] = node;
+        ProtocolValidator.ValidateSnapshot(snapshot);
+        snapshot.Nodes[0] = node with { ItemWindowStart = 9999 };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = node with { ItemNativeIds = ["1", "2"] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = node with { ItemActivationSupported = true };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = node with { EditableLabels = true };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+        snapshot.Nodes[0] = node with { SelectedIndices = [10000] };
+        Assert.Throws<ProtocolException>(() => ProtocolValidator.ValidateSnapshot(snapshot));
+    }
+
+    [Fact]
+    public void VerticalProgressRetainsItsRangeThroughSerialization()
+    {
+        var snapshot = TestData.Snapshot();
+        snapshot.Nodes[0] = NodeOfKind("progressBar") with
+        {
+            Style = "0x5000000C",
+            Rect = new PixelRect { X = 10, Y = 10, Width = 24, Height = 180 },
+            Minimum = 10,
+            Maximum = 210,
+            Position = 110,
+            Indeterminate = true,
+        };
+        var message = Assert.IsType<WindowOpenMessage>(ProtocolSerializer.Deserialize(
+            FrameMessageType.WindowOpen, ProtocolSerializer.Serialize(new WindowOpenMessage
+            {
+                SessionNonce = TestData.Nonce,
+                Window = snapshot,
+            })));
+        var progress = message.Window.Nodes[0];
+        Assert.Equal("0x5000000C", progress.Style);
+        Assert.Equal(110, progress.Position);
+        Assert.True(progress.Indeterminate);
+        Assert.Equal(180, progress.Rect.Height);
     }
 
     [Fact]

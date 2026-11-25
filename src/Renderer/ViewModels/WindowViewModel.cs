@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using FluentShell.Renderer.Protocol;
 
@@ -187,9 +188,37 @@ public sealed class WindowViewModel : ObservableObject
         {
             throw new ProtocolException($"Patch revision {baseRevision}->{revision} does not follow canonical revision {Revision}.");
         }
-        foreach (var operation in patch.Operations) ApplyOperation(operation);
-        Revision = revision;
-        RaisePropertyChanged(nameof(Revision));
+        // A field patch can replace several coupled fields on the same node.
+        // Keep its presentation in the same transaction as a full snapshot.
+        var affectedNodes = patch.Operations.Any(operation => operation.Op is "add" or "remove")
+            ? Array.Empty<ControlNodeViewModel>()
+            : patch.Operations.Where(operation => operation.NodeId is not null &&
+                    operation.Op != "remove")
+                .Select(operation => operation.NodeId!).Distinct(StringComparer.Ordinal)
+                .Select(GetNode).ToArray();
+        var updates = affectedNodes.Select(node => node.BeginCanonicalUpdate()).ToArray();
+        ExceptionDispatchInfo? failure = null;
+        try
+        {
+            foreach (var operation in patch.Operations) ApplyOperation(operation);
+            Revision = revision;
+            RaisePropertyChanged(nameof(Revision));
+        }
+        catch (Exception exception)
+        {
+            failure = ExceptionDispatchInfo.Capture(exception);
+        }
+        finally
+        {
+            // A presenter may fail while completing a transaction. Retire every
+            // node's scope, and keep the original patch failure if there was one.
+            foreach (var update in updates)
+            {
+                try { update.Dispose(); }
+                catch (Exception exception) { failure ??= ExceptionDispatchInfo.Capture(exception); }
+            }
+        }
+        failure?.Throw();
     }
 
     public ControlNodeViewModel GetNode(string nodeId) =>

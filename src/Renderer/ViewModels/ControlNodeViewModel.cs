@@ -50,6 +50,28 @@ public sealed class ControlNodeViewModel : ObservableObject
     private ulong _style;
     private ulong _exStyle;
     private readonly Dictionary<string, string> _pendingEventIds = new(StringComparer.Ordinal);
+    private int _canonicalUpdateDepth;
+
+    internal bool IsApplyingCanonicalUpdate => _canonicalUpdateDepth != 0;
+    internal event Action? CanonicalUpdateCompleted;
+
+    internal IDisposable BeginCanonicalUpdate()
+    {
+        ++_canonicalUpdateDepth;
+        return new CanonicalUpdateScope(this);
+    }
+
+    private sealed class CanonicalUpdateScope(ControlNodeViewModel node) : IDisposable
+    {
+        private ControlNodeViewModel? _node = node;
+
+        public void Dispose()
+        {
+            if (_node is not { } current) return;
+            _node = null;
+            if (--current._canonicalUpdateDepth == 0) current.CanonicalUpdateCompleted?.Invoke();
+        }
+    }
 
     // Where the last projected context request on this node happened, in DIPs
     // relative to the node's own element. Renderer-only: the native popup that
@@ -122,7 +144,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     public int ImageHeight { get => _imageHeight; private set => SetProperty(ref _imageHeight, value); }
     public string ImageFormat { get => _imageFormat; private set => SetProperty(ref _imageFormat, value); }
     public string ImageData { get => _imageData; private set => SetProperty(ref _imageData, value); }
-    public ObservableCollection<string> Items { get; } = [];
+    public ObservableCollection<string> Items { get; } = new SnapshotCollection<string>();
     // Where each SysLink label starts in Text (minor 41), or empty when each label occurs once.
     public IReadOnlyList<int> LinkStarts { get; private set; } = [];
     public ObservableCollection<PixelRect> ItemRects { get; } = [];
@@ -181,7 +203,9 @@ public sealed class ControlNodeViewModel : ObservableObject
         bool preserveTransient = false,
         string? eventId = null)
     {
+        using var canonicalUpdate = BeginCanonicalUpdate();
         var previousText = Text;
+        var previousDraft = DraftText;
         var matchingTextEcho = preserveTransient && IsPendingEcho("text", eventId);
         var matchingToolbarEcho = preserveTransient && IsPendingEcho("toolbarCommand", eventId);
         var hasDraft = preserveTransient && !matchingTextEcho && DraftText != previousText;
@@ -303,6 +327,10 @@ public sealed class ControlNodeViewModel : ObservableObject
         // matching echo must still restore the native group's checked members.
         if (matchingToolbarEcho && !toolbarChanged)
             RaisePropertyChanged(nameof(ToolbarItems));
+        // Replacing a ComboBox's ItemsSource can write an empty selection back
+        // through its two-way text binding. Restore the intended draft before
+        // the completed transaction publishes its selection and faces.
+        DraftText = hasDraft ? previousDraft : node.Text;
     }
 
     internal event Action? PendingActionsChanged;
@@ -408,7 +436,11 @@ public sealed class ControlNodeViewModel : ObservableObject
             case "clientRect": ClientRect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid MDI child client rect patch."); break;
             case "rect": Rect = value.Deserialize<PixelRect>() ?? throw new ProtocolException("Invalid node rect patch."); break;
             case "linkStarts": LinkStarts = value.Deserialize<List<int>>()?.ToArray() ?? []; break;
-            case "items": ReplaceItems(value.Deserialize<List<string>>() ?? []); break;
+            case "items":
+                var intendedDraft = DraftText;
+                ReplaceItems(value.Deserialize<List<string>>() ?? []);
+                DraftText = intendedDraft;
+                break;
             case "itemRects": ReplaceItemRects(value.Deserialize<List<PixelRect>>() ?? []); break;
             case "columns": ReplaceColumns(value.Deserialize<List<string>>() ?? []); break;
             case "columnWidths": ReplaceColumnWidths(value.Deserialize<List<int>>() ?? []); break;
@@ -439,8 +471,7 @@ public sealed class ControlNodeViewModel : ObservableObject
     private void ReplaceItems(IEnumerable<string> items)
     {
         if (Items.SequenceEqual(items, StringComparer.Ordinal)) return;
-        Items.Clear();
-        foreach (var item in items) Items.Add(item);
+        ((SnapshotCollection<string>)Items).ReplaceWith(items);
         RaisePropertyChanged(nameof(Items));
     }
 
@@ -500,10 +531,10 @@ public sealed class ControlNodeViewModel : ObservableObject
 
     private void ReplaceItemDetails(IEnumerable<IEnumerable<string>> details)
     {
-        var copies = details.Select(lines => (IReadOnlyList<string>)lines.ToArray()).ToArray();
-        if (ItemDetails.Count == copies.Length &&
-            ItemDetails.Zip(copies).All(pair => pair.First.SequenceEqual(pair.Second, StringComparer.Ordinal))) return;
-        ItemDetails = copies;
+        var incoming = details as IReadOnlyList<IEnumerable<string>> ?? details.ToArray();
+        if (ItemDetails.Count == incoming.Count &&
+            ItemDetails.Zip(incoming).All(pair => pair.First.SequenceEqual(pair.Second, StringComparer.Ordinal))) return;
+        ItemDetails = incoming.Select(lines => (IReadOnlyList<string>)lines.ToArray()).ToArray();
         RaisePropertyChanged(nameof(ItemDetails));
     }
 
@@ -533,9 +564,10 @@ public sealed class ControlNodeViewModel : ObservableObject
 
     private void ReplaceRows(IEnumerable<IEnumerable<string>> rows, bool windowMoved = false)
     {
-        var copies = rows.Select(row => (IReadOnlyList<string>)row.ToArray()).ToArray();
-        if (!windowMoved && Rows.Count == copies.Length && Rows.Zip(copies).All(pair =>
+        var incoming = rows as IReadOnlyList<IEnumerable<string>> ?? rows.ToArray();
+        if (!windowMoved && Rows.Count == incoming.Count && Rows.Zip(incoming).All(pair =>
                 pair.First.SequenceEqual(pair.Second, StringComparer.Ordinal))) return;
+        var copies = incoming.Select(row => (IReadOnlyList<string>)row.ToArray()).ToArray();
         Rows.Clear();
         foreach (var row in copies) Rows.Add(row);
         RaisePropertyChanged(nameof(Rows));

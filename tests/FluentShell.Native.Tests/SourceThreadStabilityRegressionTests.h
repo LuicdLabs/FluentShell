@@ -158,7 +158,168 @@ LRESULT CALLBACK SourceLifetimeObjectSubclass(HWND window, UINT message, WPARAM 
     return result;
 }
 
+constexpr UINT kSourceCommandWaitBlock = WM_APP + 372;
+constexpr UINT kSourceCommandWaitDrain = WM_APP + 373;
+constexpr UINT kSourceCommandWaitNotify = WM_APP + 374;
+
+struct SourceCommandWaitRuntime final {
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE drained = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE cancelled = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::atomic<DWORD> thread{0};
+    std::atomic<HWND> root{nullptr};
+    std::atomic<HWND> child{nullptr};
+    std::atomic<HWND> notificationParent{nullptr};
+    std::atomic<unsigned> notifications{0};
+    std::atomic<DWORD> notificationThread{0};
+    std::atomic<bool> blockRead{false};
+    std::atomic<bool> expired{false};
+    bool Ready() const noexcept { return ready && entered && release && drained && cancelled; }
+    void Block() noexcept {
+        SetEvent(entered);
+        if (WaitForSingleObject(release, 5000) != WAIT_OBJECT_0) expired.store(true);
+    }
+    ~SourceCommandWaitRuntime() {
+        for (const HANDLE event : {ready, entered, release, drained, cancelled})
+            if (event) CloseHandle(event);
+    }
+};
+
+LRESULT CALLBACK SourceCommandWaitSubclass(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam, UINT_PTR subclassId, DWORD_PTR data) {
+    auto& state = *reinterpret_cast<SourceCommandWaitRuntime*>(data);
+    if (message == kSourceCommandWaitBlock) { state.Block(); return 0; }
+    if (message == kSourceCommandWaitDrain) { SetEvent(state.drained); return 0; }
+    if (message == kSourceCommandWaitNotify) {
+        state.notifications.fetch_add(1);
+        state.notificationThread.store(GetCurrentThreadId());
+        return 0x5139;
+    }
+    if (message == WM_GETTEXT && window == state.child.load()) {
+        if (state.blockRead.exchange(false)) state.Block();
+        if (const HWND parent = state.notificationParent.load()) {
+            DWORD_PTR result = 0;
+            // Bound the fixture's application callback too, so the old deadlock
+            // reports a failure instead of hanging the test process forever.
+            if (!SendMessageTimeoutW(parent, kSourceCommandWaitNotify, 0, 0,
+                    SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 1000, &result) || result != 0x5139)
+                state.expired.store(true);
+        }
+    }
+    const auto result = DefSubclassProc(window, message, wParam, lParam);
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, SourceCommandWaitSubclass, subclassId);
+    return result;
+}
+
+void TestSourceCommandWaitCancellation() {
+    SourceCommandWaitRuntime state;
+    Check(state.Ready(), "source command wait fixture could not create its events");
+    if (!state.Ready()) return;
+    std::thread gui([&] {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        state.thread.store(GetCurrentThreadId());
+        const HWND root = CreateWindowExW(0, L"Static", L"source-command-wait", WS_OVERLAPPEDWINDOW,
+            40, 40, 360, 240, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        const HWND child = root ? CreateWindowExW(0, L"Edit", L"canonical value", WS_CHILD | WS_VISIBLE,
+            8, 8, 220, 28, root, reinterpret_cast<HMENU>(711), GetModuleHandleW(nullptr), nullptr) : nullptr;
+        if (root && child) {
+            for (const HWND window : {root, child})
+                SetWindowSubclass(window, SourceCommandWaitSubclass, 0xAB79, reinterpret_cast<DWORD_PTR>(&state));
+            ShowWindow(root, SW_SHOWNOACTIVATE);
+        }
+        state.root.store(root);
+        state.child.store(child);
+        SetEvent(state.ready);
+        MSG message{};
+        while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+        if (root) DestroyWindow(root);
+        winrt::uninit_apartment();
+    });
+    std::shared_ptr<Translation::SourceThreadAgent> agent;
+    const auto cleanup = [&] {
+        SetEvent(state.release);
+        if (agent && !agent->Shutdown()) Translation::RetainSourceThreadAgent(agent);
+        agent.reset();
+        PostThreadMessageW(state.thread.load(), WM_QUIT, 0, 0);
+        gui.join();
+    };
+    const bool ready = WaitForSingleObject(state.ready, 3000) == WAIT_OBJECT_0 && state.child.load();
+    Check(ready, "source command wait fixture did not start its GUI thread");
+    if (!ready) { cleanup(); return; }
+    agent = Translation::SourceThreadAgent::Attach(state.root.load(), GetModuleHandleW(nullptr));
+    Check(agent != nullptr, "source command wait fixture could not attach its agent");
+    if (!agent) { cleanup(); return; }
+
+    Translation::WindowSnapshot snapshot;
+    snapshot.surfaceId = L"96969696-3434-5656-7878-909090909090";
+    snapshot.revision = 1;
+    std::wstring error;
+    // A cancellation already set must not wait for or enqueue GUI work.
+    SetEvent(state.cancelled);
+    auto started = GetTickCount64();
+    Check(!agent->Capture(snapshot, error, 2000, state.cancelled) && GetTickCount64() - started < 500 &&
+            snapshot.nodes.empty(), "pre-cancelled source capture waited for or published GUI work");
+    ResetEvent(state.cancelled);
+
+    // A blocked GUI thread cannot acknowledge the queued command. Cancellation
+    // must interrupt that first wait and prevent the command running later.
+    Check(PostMessageW(state.root.load(), kSourceCommandWaitBlock, 0, 0) &&
+            WaitForSingleObject(state.entered, 2000) == WAIT_OBJECT_0,
+        "source command acknowledgement fixture did not block");
+    std::thread cancelBeforeStart([&] { Sleep(80); SetEvent(state.cancelled); });
+    started = GetTickCount64();
+    const bool queuedCapture = agent->Capture(snapshot, error, 2000, state.cancelled);
+    cancelBeforeStart.join();
+    Check(!queuedCapture && GetTickCount64() - started < 750 && snapshot.nodes.empty(),
+        "cancellation did not interrupt the source command acknowledgement wait");
+    SetEvent(state.release);
+    Check(PostMessageW(state.root.load(), kSourceCommandWaitDrain, 0, 0) &&
+            WaitForSingleObject(state.drained, 2000) == WAIT_OBJECT_0,
+        "cancelled source command did not drain after its GUI thread resumed");
+    ResetEvent(state.cancelled);
+    ResetEvent(state.entered);
+    ResetEvent(state.release);
+    ResetEvent(state.drained);
+
+    // Also interrupt a command that started and is inside an application read.
+    state.blockRead.store(true);
+    std::thread cancelRunning([&] {
+        if (WaitForSingleObject(state.entered, 2000) == WAIT_OBJECT_0) SetEvent(state.cancelled);
+        else state.expired.store(true);
+    });
+    started = GetTickCount64();
+    const bool runningCapture = agent->Capture(snapshot, error, 2000, state.cancelled);
+    cancelRunning.join();
+    Check(!runningCapture && GetTickCount64() - started < 750 && snapshot.nodes.empty(),
+        "cancellation did not interrupt a started source capture without publishing partial state");
+    SetEvent(state.release);
+    Check(PostMessageW(state.root.load(), kSourceCommandWaitDrain, 0, 0) &&
+            WaitForSingleObject(state.drained, 2000) == WAIT_OBJECT_0,
+        "running cancelled source capture did not drain");
+    ResetEvent(state.cancelled);
+
+    // The waiting thread owns this parent HWND. The source control synchronously
+    // notifies it while capture is active; only sent messages should be pumped.
+    const HWND parent = CreateWindowExW(0, L"Static", L"capture-notification-parent", WS_OVERLAPPEDWINDOW,
+        40, 40, 200, 120, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Check(parent != nullptr, "source capture notification parent was not created");
+    if (parent) {
+        SetWindowSubclass(parent, SourceCommandWaitSubclass, 0xAB79, reinterpret_cast<DWORD_PTR>(&state));
+        state.notificationParent.store(parent);
+        Check(agent->Capture(snapshot, error, 2000) && !snapshot.nodes.empty() && state.notifications.load() > 0 &&
+                state.notificationThread.load() == GetCurrentThreadId(),
+            "source capture deadlocked on a synchronous notification to its waiting GUI thread");
+        state.notificationParent.store(nullptr);
+        DestroyWindow(parent);
+    }
+    Check(!state.expired.load(), "source command wait fixture exceeded an application callback deadline");
+    cleanup();
+}
+
 void TestSourceThreadCallbackLifetime() {
+    TestSourceCommandWaitCancellation();
     // Root and child callbacks cover both native subclass entry points; the
     // provider case covers a bounded command after its caller has timed out.
     for (const int scenario : {0, 1, 2}) {

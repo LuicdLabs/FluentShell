@@ -170,6 +170,19 @@ constexpr PROPERTYID kElementProperties[] = {
     UIA_IsValuePatternAvailablePropertyId,
 };
 
+// Ordinary HWND surfaces validate detail on named native nodes. Walking every
+// list cell with pattern-availability, bounds, and text properties adds provider
+// work that none of those checks consume. Still collect the identity of every
+// control-view descendant so foreign-process and extra/duplicate node checks
+// see exactly the same complete tree.
+constexpr PROPERTYID kElementIdentityProperties[] = {
+    UIA_ProcessIdPropertyId,
+    UIA_ControlTypePropertyId,
+    UIA_IsControlElementPropertyId,
+    UIA_FrameworkIdPropertyId,
+    UIA_AutomationIdPropertyId,
+};
+
 constexpr PROPERTYID kActionProperties[] = {
     UIA_IsInvokePatternAvailablePropertyId,
     UIA_IsTogglePatternAvailablePropertyId,
@@ -278,18 +291,73 @@ bool ReadCachedElementInfo(
     return true;
 }
 
+bool ReadCachedElementIdentity(
+    IUIAutomationElement* element, ElementInfo& info, std::wstring& error) noexcept {
+    info.element = element;
+    if (FAILED(element->get_CachedProcessId(&info.processId)) ||
+        FAILED(element->get_CachedControlType(&info.controlType)) ||
+        FAILED(element->get_CachedIsControlElement(&info.isControl)))
+        return Fail(error, L"cached UIA identity property read failed");
+    BSTR framework = nullptr;
+    BSTR identifier = nullptr;
+    const HRESULT frameworkResult = element->get_CachedFrameworkId(&framework);
+    const HRESULT identifierResult = element->get_CachedAutomationId(&identifier);
+    if (FAILED(frameworkResult) || FAILED(identifierResult)) {
+        if (framework) SysFreeString(framework);
+        if (identifier) SysFreeString(identifier);
+        return Fail(error, L"cached UIA identity string read failed");
+    }
+    info.framework.assign(framework ? framework : L"");
+    info.automationId.assign(identifier ? identifier : L"");
+    if (framework) SysFreeString(framework);
+    if (identifier) SysFreeString(identifier);
+    return true;
+}
+
+// BuildUpdatedCache reads detail only for this live COM element, not its
+// descendants. Compare its original bulk identity before replacing the record:
+// a provider changing IDs or its process between the two phases is a rejection.
+bool CompleteCachedElementInfo(
+    IUIAutomation* automation, ElementInfo& info, IUIAutomationCacheRequest* detailCache,
+    std::wstring& error) noexcept {
+    ComPtr<IUIAutomationElement> detailed;
+    const HRESULT result = info.element->BuildUpdatedCache(detailCache, &detailed);
+    if (FAILED(result) || !detailed)
+        return FailHr(error, L"UIA node detail caching failed", result);
+    BOOL same = FALSE;
+    const HRESULT comparison = automation->CompareElements(info.element.Get(), detailed.Get(), &same);
+    if (FAILED(comparison))
+        return FailHr(error, L"UIA node cache identity comparison failed", comparison);
+    if (!same) return Fail(error, L"UIA node identity changed while updating its cache");
+    ElementInfo full;
+    if (!ReadCachedElementInfo(detailed.Get(), full, error)) return false;
+    if (full.processId != info.processId || full.controlType != info.controlType ||
+        full.isControl != info.isControl || full.framework != info.framework ||
+        full.automationId != info.automationId)
+        return Fail(error, L"proxy UIA identity changed during node detail caching");
+    info = std::move(full);
+    return true;
+}
+
 bool BuildElementCacheRequest(
     IUIAutomation* automation,
     ComPtr<IUIAutomationCacheRequest>& request,
-    std::wstring& error) noexcept {
+    std::wstring& error, bool identityOnly = false) noexcept {
     HRESULT result = automation->CreateCacheRequest(&request);
     if (FAILED(result) || !request)
         return FailHr(error, L"UIA cache request creation failed", result);
-    for (const PROPERTYID property : kElementProperties) {
-        result = request->AddProperty(property);
+    const PROPERTYID* properties = identityOnly ? kElementIdentityProperties : kElementProperties;
+    const size_t propertyCount = identityOnly
+        ? sizeof(kElementIdentityProperties) / sizeof(PROPERTYID)
+        : sizeof(kElementProperties) / sizeof(PROPERTYID);
+    for (size_t index = 0; index != propertyCount; ++index) {
+        result = request->AddProperty(properties[index]);
         if (FAILED(result))
             return FailHr(error, L"UIA cache property registration failed", result);
     }
+    result = request->put_TreeScope(TreeScope_Element);
+    if (FAILED(result))
+        return FailHr(error, L"UIA cache element scope is unavailable", result);
     result = request->put_AutomationElementMode(AutomationElementMode_Full);
     if (FAILED(result))
         return FailHr(error, L"UIA cache element mode is unavailable", result);
@@ -300,9 +368,11 @@ bool BuildElementCacheRequest(
 // failure still names which enumeration refused, exactly as the two separate
 // loops did before they shared this walk.
 bool CollectCachedElements(
+    IUIAutomation* automation,
     IUIAutomationElement* scopeRoot,
     IUIAutomationCondition* condition,
     IUIAutomationCacheRequest* cache,
+    IUIAutomationCacheRequest* detailCache,
     DWORD rendererProcessId,
     const wchar_t* enumerationFailure,
     const wchar_t* countFailure,
@@ -331,9 +401,14 @@ bool CollectCachedElements(
         if (FAILED(elementResult) || !element)
             return FailHr(error, enumerationFailure, elementResult);
         ElementInfo info;
-        if (!ReadCachedElementInfo(element.Get(), info, error)) return false;
+        if (detailCache) {
+            if (!ReadCachedElementIdentity(element.Get(), info, error)) return false;
+        } else if (!ReadCachedElementInfo(element.Get(), info, error)) return false;
         if (info.processId != 0 && info.processId != static_cast<int>(rendererProcessId))
             return Fail(error, foreignFailure);
+        if (detailCache && (info.automationId.starts_with(L"FluentShell.Node.") ||
+                info.automationId == L"FluentShell.ContentViewport") &&
+                !CompleteCachedElementInfo(automation, info, detailCache, error)) return false;
         elements.push_back(std::move(info));
     }
     return true;
@@ -1219,9 +1294,20 @@ bool ValidateOnMta(
         return Fail(error, L"UIA control-view condition creation failed");
     ComPtr<IUIAutomationCacheRequest> elementCache;
     if (!BuildElementCacheRequest(automation.Get(), elementCache, error)) return false;
+    // Application adapters audit untagged actionable descendants. Decoration
+    // inertness also needs the original complete detail. Keep their full-tree
+    // cache unchanged; ordinary HWND control trees use the two-phase cache.
+    const bool identityOnly = snapshot.adapterId.empty() &&
+        std::none_of(snapshot.nodes.begin(), snapshot.nodes.end(), [](const ControlNode& node) {
+            return node.kind == ControlKind::StaticDecoration;
+        });
+    ComPtr<IUIAutomationCacheRequest> identityCache;
+    if (identityOnly && !BuildElementCacheRequest(automation.Get(), identityCache, error, true)) return false;
+    IUIAutomationCacheRequest* subtreeCache = identityOnly ? identityCache.Get() : elementCache.Get();
+    IUIAutomationCacheRequest* detailCache = identityOnly ? elementCache.Get() : nullptr;
     std::vector<ElementInfo> elements;
     progress.Begin(L"proxy descendants");
-    if (!CollectCachedElements(root.Get(), controlViewCondition.Get(), elementCache.Get(),
+    if (!CollectCachedElements(automation.Get(), root.Get(), controlViewCondition.Get(), subtreeCache, detailCache,
             options.rendererProcessId,
             L"proxy UIA descendant enumeration failed",
             L"proxy UIA descendant count is invalid",
@@ -1248,8 +1334,8 @@ bool ValidateOnMta(
         if (!FindHostedXamlProjectionRoot(automation.Get(), root.Get(), expectedViewport.Get(),
                 elementCache.Get(), options.rendererProcessId, projectionRoot, error)) return false;
         progress.Begin(L"XAML projection descendants");
-        if (!CollectCachedElements(projectionRoot.Get(), controlViewCondition.Get(),
-                elementCache.Get(), options.rendererProcessId,
+        if (!CollectCachedElements(automation.Get(), projectionRoot.Get(), controlViewCondition.Get(),
+                subtreeCache, detailCache, options.rendererProcessId,
                 L"XAML projection descendant enumeration failed",
                 L"XAML projection descendant count is invalid",
                 L"XAML projection contains a foreign process",

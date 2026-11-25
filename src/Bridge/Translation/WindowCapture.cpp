@@ -21,6 +21,10 @@ namespace {
 constexpr wchar_t kNodeGenerationProperty[] = L"FluentShell.Bridge.NodeGeneration";
 constexpr size_t kMaxMenuDepth = 8;
 constexpr size_t kMaxMenuItems = 256;
+// HWND implementation details and hidden property pages do not consume the
+// wire's projected-node budget. Bound discovery separately to keep captures
+// finite even when an application owns a much larger hidden control tree.
+constexpr size_t kMaxEnumeratedChildren = Ipc::kMaxNodes * 16;
 
 class PhysicalCoordinateScope final {
 public:
@@ -146,7 +150,7 @@ struct Enumeration final {
 BOOL CALLBACK CollectChild(HWND hwnd, LPARAM raw) {
     auto& enumeration = *reinterpret_cast<Enumeration*>(raw);
     enumeration.handles.push_back(hwnd);
-    return enumeration.handles.size() <= Ipc::kMaxNodes;
+    return enumeration.handles.size() <= kMaxEnumeratedChildren;
 }
 
 // What the window's own close button does: nothing without a system menu, nothing for a
@@ -816,8 +820,8 @@ bool CaptureChildNodes(
     std::wstring& reason) {
     Enumeration enumeration;
     EnumChildWindows(root, CollectChild, reinterpret_cast<LPARAM>(&enumeration));
-    if (enumeration.handles.size() > Ipc::kMaxNodes) {
-        reason = L"window exceeds the 512 node limit";
+    if (enumeration.handles.size() > kMaxEnumeratedChildren) {
+        reason = L"window exceeds the bounded 8192 child HWND discovery limit";
         return false;
     }
     // Probe adapters first so an unsupported focusable class reports its real
@@ -904,6 +908,10 @@ bool CaptureChildNodes(
         // The menu-bar toolbar is projected as the surface's menu, so it must not also
         // appear as a control: one native menu bar becomes one projected menu bar.
         if (child == context.menuBarToolbar && !context.menuBarToolbarMenu.empty()) continue;
+        if (next.nodes.size() >= Ipc::kMaxNodes) {
+            reason = L"window exceeds the 512 projected node limit";
+            return false;
+        }
         ControlNode node;
         if (!CaptureChildNode(child, context, scope, node, reason)) {
             AppendWindowEvidence(child, reason);
@@ -1322,6 +1330,8 @@ uint64_t SnapshotFingerprint(const WindowSnapshot& snapshot) noexcept {
         for (const auto& rect : node.itemRects) HashBytes(hash, rect);
         HashBytes(hash, node.itemNativeIds.size());
         for (const uint32_t nativeId : node.itemNativeIds) HashBytes(hash, nativeId);
+        HashBytes(hash, node.itemWindowNativeIds.size());
+        for (const uint32_t nativeId : node.itemWindowNativeIds) HashBytes(hash, nativeId);
         HashBytes(hash, node.itemActivationSupported);
         HashBytes(hash, node.itemDefaultActivation);
         HashBytes(hash, node.columns.size());

@@ -87,7 +87,9 @@ public static class ProtocolConstants
     // an owner-draw ListBox carries ownerDrawList, the rows as its owner paints them, and an owner-draw
     // push button's picture is its whole face, up to 512 by 128.  A SysLink label that also occurs
     // elsewhere in its text carries linkStarts.
-    public const ushort Minor = 41;
+    // Minor 42 admits fixed-width top tabs and vertical ProgressBar styles, and
+    // extends the existing bounded report-row window to large stored ListViews.
+    public const ushort Minor = 42;
     public const int MaxTileDetailLines = 8;
     // Minor 32 also lets a container carry its scroll bars; one setScroll moves at
     // most this many application line steps.

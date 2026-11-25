@@ -185,6 +185,140 @@ inline void TestIndexedActions(DWORD mode, void (*check)(bool, const char*)) {
     cleanup();
 }
 
+constexpr UINT kStoredRowWindowReorder = WM_APP + 275;
+constexpr UINT kStoredRowWindowClearState = WM_APP + 276;
+
+inline LRESULT CALLBACK StoredRowWindowProbe(HWND window, UINT message, WPARAM wParam,
+    LPARAM lParam, UINT_PTR id, DWORD_PTR data) {
+    const HWND list = reinterpret_cast<HWND>(data);
+    if (message == kStoredRowWindowReorder) {
+        // Move the first row to position one while preserving the row count.
+        wchar_t text[64]{};
+        ListView_GetItemText(list, 0, 0, text, 64);
+        if (!ListView_DeleteItem(list, 0)) return FALSE;
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = 1;
+        item.pszText = text;
+        return ListView_InsertItem(list, &item) == 1;
+    }
+    if (message == kStoredRowWindowClearState) {
+        ListView_SetItemState(list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        return TRUE;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, StoredRowWindowProbe, id);
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+inline void TestStoredRowWindowIndexedActions(void (*check)(bool, const char*)) {
+    const HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    check(ready != nullptr, "stored row-window action fixture did not allocate its event");
+    if (!ready) return;
+    std::atomic<DWORD> threadId{0};
+    std::atomic<HWND> root{nullptr};
+    std::thread gui([&] {
+        winrt::init_apartment(winrt::apartment_type::single_threaded);
+        threadId.store(GetCurrentThreadId());
+        const HWND owner = CreateWindowExW(0, L"Static", L"stored-row-window-actions", WS_OVERLAPPEDWINDOW,
+            20, 20, 440, 300, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        const HWND list = owner ? CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | LVS_REPORT,
+            0, 0, 400, 240, owner, reinterpret_cast<HMENU>(994), GetModuleHandleW(nullptr), nullptr) : nullptr;
+        bool created = owner && list;
+        if (created) {
+            LVCOLUMNW column{};
+            column.mask = LVCF_TEXT | LVCF_WIDTH;
+            column.pszText = const_cast<LPWSTR>(L"Name");
+            column.cx = 240;
+            created = ListView_InsertColumn(list, 0, &column) == 0;
+            SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+            for (int index = 0; created && index < static_cast<int>(Bridge::Ipc::kMaxListItems + 1); ++index) {
+                std::wstring label = L"Stored row " + std::to_wstring(index);
+                LVITEMW item{};
+                item.mask = LVIF_TEXT;
+                item.iItem = index;
+                item.pszText = label.data();
+                created = ListView_InsertItem(list, &item) == index;
+            }
+            SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+            SetWindowSubclass(owner, StoredRowWindowProbe, 994, reinterpret_cast<DWORD_PTR>(list));
+            ShowWindow(owner, SW_SHOWNOACTIVATE);
+            RedrawWindow(owner, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+        root.store(created ? owner : nullptr);
+        SetEvent(ready);
+        MSG message{};
+        while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+        if (owner) DestroyWindow(owner);
+        winrt::uninit_apartment();
+    });
+    std::shared_ptr<SourceThreadAgent> agent;
+    const auto cleanup = [&] {
+        if (agent && !agent->Shutdown()) RetainSourceThreadAgent(agent);
+        agent.reset();
+        PostThreadMessageW(threadId.load(), WM_QUIT, 0, 0);
+        gui.join();
+        CloseHandle(ready);
+    };
+    const bool started = WaitForSingleObject(ready, 5000) == WAIT_OBJECT_0 && root.load();
+    check(started, "stored row-window action fixture did not start");
+    if (!started) { cleanup(); return; }
+    agent = SourceThreadAgent::Attach(root.load(), GetModuleHandleW(nullptr));
+    check(agent != nullptr, "stored row-window action fixture did not attach");
+    if (!agent) { cleanup(); return; }
+    const auto listIn = [](const WindowSnapshot& snapshot) -> const ControlNode* {
+        const auto found = std::find_if(snapshot.nodes.begin(), snapshot.nodes.end(), [](const ControlNode& node) {
+            return node.kind == ControlKind::ListView;
+        });
+        return found == snapshot.nodes.end() ? nullptr : &*found;
+    };
+    std::wstring error;
+    for (const wchar_t* verb : {L"setSelection", L"setFocusedIndex"}) {
+        SendMessageW(root.load(), kStoredRowWindowClearState, 0, 0);
+        WindowSnapshot before;
+        before.surfaceId = L"67676767-3434-5656-7878-909090909090";
+        before.revision = 1;
+        const bool captured = agent->Capture(before, error);
+        const ControlNode* node = captured ? listIn(before) : nullptr;
+        check(node && node->itemCount == Bridge::Ipc::kMaxListItems + 1 && node->itemNativeIds.empty() &&
+                (node->style & LVS_OWNERDATA) == 0 && node->items.size() < node->itemCount,
+            "stored row-window action fixture did not capture a bounded native list");
+        if (!node || node->items.size() < 2) { cleanup(); return; }
+        ActionRequest action;
+        action.surfaceId = before.surfaceId;
+        action.expectedRevision = before.revision;
+        action.nodeId = node->nodeId;
+        action.action = verb;
+        action.itemIndex = 0;
+        action.integerValues = {0};
+        check(IsOwnerDataListViewIndexedAction(action, before),
+            "stored row-window indices were allowed to replay without a native witness");
+        action.expectedNativeFingerprint = SnapshotFingerprint(before);
+        check(SendMessageW(root.load(), kStoredRowWindowReorder, 0, 0) != FALSE,
+            "stored row-window fixture did not reorder its native rows");
+        ActionOutcome outcome;
+        check(!agent->Invoke(action, outcome) && outcome.refused && !outcome.accepted,
+            "stored row-window indexed action selected a different row after a same-count reorder");
+        const ControlNode* current = listIn(outcome.snapshot);
+        check(current && current->items.size() >= 2 && current->items[0] == node->items[1] && current->selectedIndices.empty() &&
+                current->focusedIndex == -1 && outcome.snapshot.revision == before.revision + 1,
+            "refused stored row-window action mutated state or failed to publish the current ordering");
+        if (!current) { cleanup(); return; }
+        // Missing witnesses are refused even for an index in the current window.
+        action.expectedRevision = outcome.snapshot.revision;
+        action.expectedNativeFingerprint = 0;
+        check(!agent->Invoke(action, outcome) && outcome.refused,
+            "stored row-window action ran without a published native witness");
+        action.expectedRevision = outcome.snapshot.revision;
+        action.expectedNativeFingerprint = SnapshotFingerprint(outcome.snapshot);
+        const bool applied = agent->Invoke(action, outcome);
+        current = listIn(outcome.snapshot);
+        check(applied && outcome.accepted && current && (action.action == L"setSelection"
+                ? current->selectedIndices == std::vector<int>{0} : current->focusedIndex == 0),
+            "stored row-window action with the current native witness was not applied");
+    }
+    cleanup();
+}
+
 inline void TestActionAdmission(void (*check)(bool, const char*)) {
     WindowSnapshot snapshot;
     ControlNode node;
@@ -249,6 +383,7 @@ inline void TestActionAdmission(void (*check)(bool, const char*)) {
 
 inline void TestOwnerDataListViewActions(void (*check)(bool, const char*)) {
     OwnerDataListViewActions::TestActionAdmission(check);
+    OwnerDataListViewActions::TestStoredRowWindowIndexedActions(check);
     OwnerDataListViewActions::TestIndexedActions(LVS_REPORT, check);
     OwnerDataListViewActions::TestIndexedActions(LVS_LIST, check);
 }

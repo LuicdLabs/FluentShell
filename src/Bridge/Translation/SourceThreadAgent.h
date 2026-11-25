@@ -90,8 +90,8 @@ void SetTopLevelShownEvent(HANDLE event) noexcept;
 bool InstallTopLevelShownHook(HMODULE module) noexcept;
 void RemoveTopLevelShownHook() noexcept;
 
-// Virtual item indices identify only the published ordering. These actions must
-// not run, or automatically replay, after that native snapshot has changed.
+// Owner-data and bounded row-window indices identify only the published ordering.
+// These actions must not run, or automatically replay, after that snapshot changes.
 bool IsOwnerDataListViewIndexedAction(
     const ActionRequest& action, const WindowSnapshot& snapshot) noexcept;
 

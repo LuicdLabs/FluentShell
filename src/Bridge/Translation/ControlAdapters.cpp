@@ -700,12 +700,9 @@ bool ProbeMonitorPalette(HWND, DWORD style, ControlKind& kind, std::wstring& rea
     return true;
 }
 
-bool ProbeProgressBar(HWND, DWORD style, ControlKind& kind, std::wstring& reason) {
+bool ProbeProgressBar(HWND, DWORD, ControlKind& kind, std::wstring&) {
     // WS_TABSTOP is tolerated: a dialog template can flag a progress bar as a stop, but
     // the control takes no keyboard input, so capture keeps it out of traversal.
-    if ((style & PBS_VERTICAL) != 0) {
-        return Reject(reason, L"vertical ProgressBar is not supported");
-    }
     kind = ControlKind::ProgressBar;
     return true;
 }
@@ -900,15 +897,14 @@ bool ProbeTabControl(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& re
         return Reject(reason, L"TabControl button and flat-button modes are not supported");
     if ((tabStyle & (TCS_VERTICAL | TCS_BOTTOM)) != 0)
         return Reject(reason, L"TabControl vertical, right, and bottom placement is not supported");
-    if ((tabStyle & TCS_FIXEDWIDTH) != 0)
-        return Reject(reason, L"TabControl TCS_FIXEDWIDTH cannot be captured faithfully");
     if ((tabStyle & TCS_TOOLTIPS) != 0 ||
         SendMessageW(hwnd, TCM_GETTOOLTIPS, 0, 0) != 0)
         return Reject(reason, L"TabControl tooltips are not supported");
 
     // TCS_RAGGEDRIGHT (WinForms' default) only changes how a multiline row is
-    // justified, and the projection uses each tab's native rectangle anyway.
-    constexpr DWORD accepted = TCS_MULTILINE | TCS_HOTTRACK | TCS_RAGGEDRIGHT;
+    // justified. TCS_FIXEDWIDTH takes its width from TCM_SETITEMSIZE, and both
+    // shapes already travel with each tab's actual native rectangle.
+    constexpr DWORD accepted = TCS_MULTILINE | TCS_HOTTRACK | TCS_RAGGEDRIGHT | TCS_FIXEDWIDTH;
     const DWORD unsupported = tabStyle & ~accepted;
     if (unsupported != 0) {
         wchar_t text[128]{};
@@ -3022,6 +3018,7 @@ bool ReadListViewGroups(HWND hwnd, ControlNode& node, std::wstring& reason) {
 // rows around its native top row: a page above and the rest below, enough that the
 // projection scrolls a page either way before it asks for the next window.
 constexpr int kListViewWindowThreshold = 512;
+constexpr int kListViewMinimumWindowRows = 48;
 constexpr int kListViewWindowRows = 192;
 
 bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
@@ -3037,14 +3034,17 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     // The mode the control itself is in, for the end-of-capture consistency check below.
     const std::wstring nativeMode = node.listViewMode;
     const LRESULT count = SendMessageW(hwnd, LVM_GETITEMCOUNT, 0, 0);
-    // A large virtual report list (Event Viewer's logs) answers every row through its
-    // owner, so it is carried as a window of rows around its native top row rather
-    // than read whole on every capture.  Labels it cannot edit and the absence of
-    // checkboxes keep every per-row action inside the rows the window carries; owner
-    // data never has groups.
-    const bool windowed = report && (style & (LVS_OWNERDATA | LVS_EDITLABELS)) == LVS_OWNERDATA &&
-        count > kListViewWindowThreshold && count <= static_cast<LRESULT>(Ipc::kMaxVirtualListItems) &&
-        (SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & LVS_EX_CHECKBOXES) == 0;
+    // Large stored report lists use the same bounded row window as virtual lists.
+    // Keep existing whole-list behavior below its cap, including stable-ID native
+    // activation. A row window has absolute selection/focus/scroll indices and
+    // text-witnessed context menus; labels, checkboxes and groups need the complete
+    // per-item contract and therefore remain outside this windowed shape.
+    const bool ownerData = (style & LVS_OWNERDATA) != 0;
+    const auto windowThreshold = ownerData ? kListViewWindowThreshold : Ipc::kMaxListItems;
+    const bool windowed = report && (style & LVS_EDITLABELS) == 0 &&
+        count > static_cast<LRESULT>(windowThreshold) && count <= static_cast<LRESULT>(Ipc::kMaxVirtualListItems) &&
+        (SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & LVS_EX_CHECKBOXES) == 0 &&
+        !SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0);
     if (count < 0 || (!windowed && count > static_cast<LRESULT>(Ipc::kMaxListItems))) {
         return Reject(reason, L"invalid or excessive ListView item count");
     }
@@ -3054,10 +3054,15 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         const int top = std::clamp(static_cast<int>(SendMessageW(hwnd, LVM_GETTOPINDEX, 0, 0)),
             0, static_cast<int>(count) - 1);
         const int perPage = std::clamp(static_cast<int>(SendMessageW(hwnd, LVM_GETCOUNTPERPAGE, 0, 0)),
-            1, kListViewWindowRows / 3);
-        windowStart = std::max(0, top - perPage);
-        windowEnd = std::min(static_cast<int>(count), windowStart + kListViewWindowRows);
-        windowStart = std::max(0, windowEnd - kListViewWindowRows);
+            1, kListViewWindowRows);
+        // Size a page from its actual native viewport rather than realizing 192
+        // rows for every small dialog. Keep modest leading overscan and enough
+        // trailing rows for the projected viewport and its next scroll gesture.
+        const int capacity = std::clamp(perPage * 2, kListViewMinimumWindowRows, kListViewWindowRows);
+        const int leading = std::min(perPage, 8);
+        windowStart = std::max(0, top - leading);
+        windowEnd = std::min(static_cast<int>(count), windowStart + capacity);
+        windowStart = std::max(0, windowEnd - capacity);
     }
     const auto windowRows = static_cast<size_t>(windowEnd - windowStart);
     const HWND header = report
@@ -3106,6 +3111,7 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.items.clear();
     node.itemRects.clear();
     node.itemNativeIds.clear();
+    node.itemWindowNativeIds.clear();
     node.columns.reserve(static_cast<size_t>(columnCount));
     node.columnWidths.reserve(static_cast<size_t>(columnCount));
     if (report && !ReadListViewColumnOrder(hwnd, columnCount, node.columnOrder, reason)) return false;
@@ -3136,7 +3142,7 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
          static_cast<int>(SendMessageW(hwnd, LVM_MAPIDTOINDEX, invalidId, 0)) == -1));
     // Older controls may lack this extension. Display and selection remain
     // admissible, but an empty ID vector cannot authorize item activation.
-    if (stableIds) node.itemNativeIds.reserve(static_cast<size_t>(count));
+    if (stableIds) node.itemNativeIds.reserve(windowRows);
     std::unordered_set<uint32_t> nativeIds;
     std::vector<int> overlays;
     overlays.reserve(windowRows);
@@ -3272,7 +3278,7 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     CaptureTrace(L"ListView selection read; asking for native default actions");
     // A Windows Forms list inside MMC (Task Scheduler's tasks) answers the accessible default
     // action without opening anything; its Enter is what raises ItemActivate.
-    node.itemActivationSupported = stableIds &&
+    node.itemActivationSupported = !windowed && stableIds &&
         !(IsWindowsFormsWindow(hwnd) && IsInsideMmcFrame(hwnd)) &&
         ListViewItemsHaveNativeDefaultActions(hwnd, node);
     CaptureTrace(L"ListView default actions answered");
@@ -3290,9 +3296,20 @@ bool CaptureListViewState(HWND hwnd, ControlNode& node, std::wstring& reason) {
         !ReadListViewMode(hwnd, static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE)),
             finalMode, reason) || finalMode != nativeMode)
         return Reject(reason, L"ListView item count or mode changed during capture");
+    if (windowed && ((GetWindowLongPtrW(hwnd, GWL_STYLE) & LVS_EDITLABELS) != 0 ||
+            (SendMessageW(hwnd, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0) & LVS_EX_CHECKBOXES) != 0 ||
+            SendMessageW(hwnd, LVM_ISGROUPVIEWENABLED, 0, 0)))
+        return Reject(reason, L"windowed ListView state contract changed during capture");
     for (size_t index = 0; index < node.itemNativeIds.size(); ++index) {
-        if (ResolveListViewItemByNativeId(hwnd, node.itemNativeIds[index]) != static_cast<int>(index))
+        if (ResolveListViewItemByNativeId(hwnd, node.itemNativeIds[index]) != windowStart + static_cast<int>(index))
             return Reject(reason, L"ListView item identity changed during capture");
+    }
+    // The minor-33 wire contract carries no per-item native IDs in a row window.
+    // Stored IDs above were private witnesses against replacement/reordering
+    // during capture, not authorization to activate a row outside this snapshot.
+    if (windowed) {
+        node.itemWindowNativeIds = std::move(node.itemNativeIds);
+        node.itemNativeIds.clear();
     }
     if (node.groupViewEnabled) {
         ControlNode finalGroups;
@@ -5112,7 +5129,11 @@ bool ReadListViewItemText(HWND listView, int row, int column,
 int ResolveListViewItemByNativeId(HWND listView, uint32_t nativeId) noexcept {
     if (!listView || nativeId == std::numeric_limits<uint32_t>::max()) return -1;
     const auto index = static_cast<int>(SendMessageW(listView, LVM_MAPIDTOINDEX, nativeId, 0));
-    if (index < 0 || static_cast<size_t>(index) >= Ipc::kMaxListItems) return -1;
+    const auto count = SendMessageW(listView, LVM_GETITEMCOUNT, 0, 0);
+    // An identity names an absolute native row, including a private witness in
+    // a bounded stored window. The carried-row cap does not bound that index.
+    if (index < 0 || count <= 0 || count > static_cast<LRESULT>(Ipc::kMaxVirtualListItems) ||
+        index >= count) return -1;
     return static_cast<uint32_t>(SendMessageW(listView, LVM_MAPINDEXTOID,
         static_cast<WPARAM>(index), 0)) == nativeId ? index : -1;
 }

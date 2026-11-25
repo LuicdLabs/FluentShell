@@ -1515,11 +1515,12 @@ internal static class ProtocolValidator
         if (windowed && (node.ItemCount is not { } total || node.ItemWindowStart is not { } start ||
                 total <= 0 || total > ProtocolConstants.MaxVirtualListItems || start < 0 || !report ||
                 node.GroupViewEnabled == true || node.CheckBoxes == true ||
+                node.EditableLabels == true ||
                 node.ItemActivationSupported == true || node.ItemNativeIds is { Count: > 0 } ||
                 node.Items.Count != node.Rows.Count || (long)start + carried > total ||
                 node.Rows.Where((row, index) => row.Count == 0 || row[0] != node.Items[index]).Any()))
             throw new ProtocolException(
-                "A windowed ListView needs a report window inside its row count, without groups, checkboxes, or native activation.");
+                "A windowed ListView needs a report window inside its row count, without groups, checkboxes, editable labels, or native activation.");
         var itemCount = windowed ? node.ItemCount!.Value : carried;
         if (node.GroupViewEnabled == true && report && (node.Items.Count != node.Rows.Count ||
             node.Rows.Where((row, index) => row.Count == 0 || row[0] != node.Items[index]).Any()))
@@ -1610,8 +1611,8 @@ internal static class ProtocolValidator
             node.Items.Any(string.IsNullOrEmpty) ||
             node.SelectedIndex is not { } selected || selected < 0 || selected >= node.Items.Count)
             throw new ProtocolException("TabControl requires bounded labels, itemRects, style evidence, and selection.");
-        // TCS_MULTILINE | TCS_HOTTRACK | TCS_RAGGEDRIGHT.
-        const ulong acceptedTabStyles = 0x0A40;
+        // TCS_MULTILINE | TCS_HOTTRACK | TCS_RAGGEDRIGHT | TCS_FIXEDWIDTH.
+        const ulong acceptedTabStyles = 0x0E40;
         var tabStyle = ParseHex64(node.Style, "tabControl.style");
         if ((tabStyle & 0xffffUL & ~acceptedTabStyles) != 0 ||
             (ParseHex64(node.ExStyle, "tabControl.exStyle") & ~0x00000004UL) != 0)

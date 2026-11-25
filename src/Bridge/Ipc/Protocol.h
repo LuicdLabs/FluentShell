@@ -95,7 +95,9 @@ inline constexpr uint16_t kProtocolMajor = 1;
 // an owner-draw ListBox carries ownerDrawList, the rows as its owner paints them, and an owner-draw
 // push button's picture is its whole face, up to 512 by 128.  A SysLink label that also occurs
 // elsewhere in its text carries linkStarts.
-inline constexpr uint16_t kProtocolMinor = 41;
+// Minor 42 admits fixed-width top tabs and vertical ProgressBar styles, and
+// extends the existing bounded report-row window to large stored ListViews.
+inline constexpr uint16_t kProtocolMinor = 42;
 inline constexpr uint32_t kMaxPayloadBytes = 4u * 1024u * 1024u;
 inline constexpr size_t kMaxJsonDepth = 32;
 inline constexpr size_t kMaxStringChars = 65536;

@@ -34,6 +34,9 @@ internal sealed class ControlFactory
     private const double ToolbarLabelPadding = 16;
     private static readonly BooleanToVisibilityConverter VisibilityConverter = new();
     private static readonly Win32MnemonicTextConverter MnemonicTextConverter = new();
+    // XAML image sources belong to their creating UI thread. Thread-local
+    // retention avoids sharing them with another dispatcher or test thread.
+    [ThreadStatic] private static BoundedImageCache<WriteableBitmap>? _bitmapCache;
     private readonly double _scale;
     private readonly Action<ControlNodeViewModel, string, object?> _action;
     private readonly Func<bool> _isApplyingCanonical;
@@ -356,8 +359,7 @@ internal sealed class ControlFactory
                 ? Stretch.Fill : StaticIconStretch(viewModel.PresentationVariant),
             IsHitTestVisible = false,
         };
-        void ApplyPixels() => image.Source = BitmapFromPixels(
-            viewModel.ImageWidth, viewModel.ImageHeight, DecodeImagePixels(viewModel));
+        void ApplyPixels() => image.Source = BitmapForNode(viewModel);
         ApplyPixels();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
@@ -382,7 +384,7 @@ internal sealed class ControlFactory
         };
     }
 
-    internal static byte[] DecodeImagePixels(ControlNodeViewModel viewModel)
+    private static void ValidateImageMetadata(ControlNodeViewModel viewModel)
     {
         var maxDimension = viewModel.Kind == "staticBitmap" ||
             viewModel.PresentationVariant is "bitmapDisplay" or "bitmapSwitch" or "monitorPalette"
@@ -392,6 +394,18 @@ internal sealed class ControlFactory
             viewModel.ImageWidth is <= 0 || viewModel.ImageHeight is <= 0 ||
             viewModel.ImageWidth > maxDimension || viewModel.ImageHeight > maxDimension)
             throw new InvalidOperationException("Validated Static icon metadata is unavailable.");
+    }
+
+    private static WriteableBitmap BitmapForNode(ControlNodeViewModel viewModel)
+    {
+        ValidateImageMetadata(viewModel);
+        return BitmapFromBase64(viewModel.ImageWidth, viewModel.ImageHeight,
+            viewModel.ImageFormat, viewModel.ImageData);
+    }
+
+    internal static byte[] DecodeImagePixels(ControlNodeViewModel viewModel)
+    {
+        ValidateImageMetadata(viewModel);
         var pixels = Convert.FromBase64String(viewModel.ImageData);
         if (pixels.Length != checked(viewModel.ImageWidth * viewModel.ImageHeight * 4))
             throw new InvalidOperationException("Validated Static icon pixel count changed.");
@@ -436,7 +450,10 @@ internal sealed class ControlFactory
     private SemanticProgressBarControl CreateProgressBar(ControlNodeViewModel viewModel)
     {
         var control = new SemanticProgressBarControl
-            { IsIndeterminate = viewModel.Indeterminate };
+        {
+            IsIndeterminate = viewModel.Indeterminate,
+            Vertical = ProgressBarLayout.IsVerticalStyle(viewModel.Style),
+        };
         void ApplyNativeState()
         {
             if (viewModel.Minimum > control.Maximum)
@@ -456,6 +473,8 @@ internal sealed class ControlFactory
         {
             if (args.PropertyName == nameof(viewModel.Indeterminate))
                 control.IsIndeterminate = viewModel.Indeterminate;
+            else if (args.PropertyName == nameof(viewModel.Style))
+                control.Vertical = ProgressBarLayout.IsVerticalStyle(viewModel.Style);
             else if (args.PropertyName is nameof(viewModel.Minimum) or nameof(viewModel.Maximum) or nameof(viewModel.Position))
                 ApplyNativeState();
         });
@@ -714,8 +733,7 @@ internal sealed class ControlFactory
             IsHitTestVisible = false,
         };
         AutomationProperties.SetAccessibilityView(image, AccessibilityView.Raw);
-        void ApplyPixels() => image.Source = BitmapFromPixels(
-            viewModel.ImageWidth, viewModel.ImageHeight, DecodeImagePixels(viewModel));
+        void ApplyPixels() => image.Source = BitmapForNode(viewModel);
         ApplyPixels();
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
@@ -984,11 +1002,20 @@ internal sealed class ControlFactory
                 _action(viewModel, "select", control.SelectedIndex);
             }
         };
+        var selectionUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, () =>
+        {
+            // Replacing ItemsSource can reset the selection even when the
+            // native selected index did not change in this revision.
+            var draft = viewModel.DraftText;
+            control.ApplyNativeFaces(viewModel, _scale);
+            control.ApplyCanonicalSelection(viewModel.SelectedIndex);
+            if (control.Text != draft) control.Text = draft;
+        });
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName == nameof(viewModel.SelectedIndex)) control.ApplyCanonicalSelection(viewModel.SelectedIndex);
+            if (args.PropertyName is nameof(viewModel.SelectedIndex) or nameof(viewModel.Items) or
+                nameof(viewModel.OwnerDrawCombo)) selectionUpdate.Request();
             if (args.PropertyName == nameof(viewModel.Editable)) control.IsEditable = viewModel.Editable;
-            if (args.PropertyName == nameof(viewModel.OwnerDrawCombo)) control.ApplyNativeFaces(viewModel, _scale);
             if (args.PropertyName == nameof(viewModel.DraftText) && control.Text != viewModel.DraftText)
                 control.Text = viewModel.DraftText;
             if (args.PropertyName == nameof(viewModel.Text)) pendingText = null;
@@ -1083,6 +1110,16 @@ internal sealed class ControlFactory
             }
         }
         ApplySelection();
+        var selectionUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, () =>
+        {
+            if (ownerDraw is not null)
+            {
+                applying = true;
+                try { ownerDraw.ApplyNativeFaces(viewModel, _scale); }
+                finally { applying = false; }
+            }
+            ApplySelection();
+        });
         control.SelectionChanged += (_, _) =>
         {
             if (applying || _isApplyingCanonical()) return;
@@ -1097,14 +1134,8 @@ internal sealed class ControlFactory
         };
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (ownerDraw is not null && args.PropertyName is nameof(viewModel.OwnerDrawList) or nameof(viewModel.Items))
-            {
-                applying = true;
-                try { ownerDraw.ApplyNativeFaces(viewModel, _scale); }
-                finally { applying = false; }
-                ApplySelection();
-            }
-            if (args.PropertyName is nameof(viewModel.SelectedIndex) or nameof(viewModel.SelectedIndices)) ApplySelection();
+            if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.OwnerDrawList) or
+                nameof(viewModel.SelectedIndex) or nameof(viewModel.SelectedIndices)) selectionUpdate.Request();
         });
         return control;
     }
@@ -1164,10 +1195,11 @@ internal sealed class ControlFactory
             text.Blocks.Add(paragraph);
         }
         RebuildText();
+        var textUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, RebuildText);
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Text) or nameof(viewModel.Items) or
-                nameof(viewModel.TabStop) or nameof(viewModel.TabIndex)) RebuildText();
+                nameof(viewModel.TabStop) or nameof(viewModel.TabIndex)) textUpdate.Request();
         });
         return control;
     }
@@ -1186,7 +1218,7 @@ internal sealed class ControlFactory
             HorizontalContentAlignment = HorizontalAlignment.Left,
         };
         ReportFocusEntry(control, viewModel);
-        ItemsPanelTemplate? checkedReportPanel = null;
+        ItemsPanelTemplate? physicalReportPanel = null;
         var positionedPanel = (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
             "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><Canvas/></ItemsPanelTemplate>");
         var contentBounds = new PixelRect();
@@ -1201,11 +1233,9 @@ internal sealed class ControlFactory
         // Scrolling past the carried rows asks the native list to move its top row there,
         // and the next snapshot carries the rows around it.  Indices on the wire stay
         // absolute; control.Items holds the window.
-        // Fresh spacers on every rebuild: an element still parented by the old header or
-        // footer presenter cannot be given to a new one (WinUI reports that as the
-        // misleading COMException 0x800F1000, "no installed components were detected").
-        var topSpacer = new Border { IsHitTestVisible = false };
-        var bottomSpacer = new Border { IsHitTestVisible = false };
+        // ItemsPresenter delay-loads its Footer until the viewport reaches it,
+        // so missing rows must be represented by the panel's own measured padding.
+        // Padding adds no generated item and preserves absolute selection indexes.
         FrameworkElement? columnHeader = null;
         var rowHeight = 22.0;
         var windowStart = 0;
@@ -1222,11 +1252,11 @@ internal sealed class ControlFactory
         int Absolute(int local) => local < 0 ? local : local + windowStart;
         void ApplyWindowSpacers()
         {
-            if (!viewModel.IsWindowedList) return;
+            if (!viewModel.IsWindowedList || control.ItemsPanelRoot is not StackPanel panel) return;
             var (above, below) = ListViewPresentation.SpacerHeights(
                 windowStart, control.Items.Count, viewModel.ItemCount, rowHeight);
-            topSpacer.Height = above;
-            bottomSpacer.Height = below;
+            var padding = new Thickness(0, above, 0, below);
+            if (!panel.Padding.Equals(padding)) panel.Padding = padding;
         }
         void RequestWindowForViewport()
         {
@@ -1261,17 +1291,6 @@ internal sealed class ControlFactory
                 $"(window {windowStart}+{control.Items.Count}, offset {scroll.VerticalOffset:F0}, row {rowHeight:F1}px)");
             _action(viewModel, "setTopIndex", first);
         }
-        var rebuildQueued = false;
-        void QueueWindowRebuild()
-        {
-            if (rebuildQueued) return;
-            rebuildQueued = true;
-            control.DispatcherQueue.TryEnqueue(() =>
-            {
-                rebuildQueued = false;
-                if (_lifetime.IsActive) RebuildRows();
-            });
-        }
         void ScheduleWindowCheck()
         {
             if (!viewModel.IsWindowedList || !_lifetime.IsActive) return;
@@ -1287,6 +1306,10 @@ internal sealed class ControlFactory
         }
         void OnWindowScroll(object? sender, ScrollViewerViewChangedEventArgs args)
         {
+            if (!args.IsIntermediate && sender is ScrollViewer scroll)
+                RendererDiagnostics.Log($"windowed list node={viewModel.NodeId} scroll offset={scroll.VerticalOffset:F0} " +
+                    $"extent={scroll.ExtentHeight:F0} viewport={scroll.ViewportHeight:F0} " +
+                    $"window={windowStart}+{control.Items.Count} total={viewModel.ItemCount}");
             if (!_isApplyingCanonical()) ScheduleWindowCheck();
         }
         void TrackWindowViewport()
@@ -1303,8 +1326,10 @@ internal sealed class ControlFactory
                 row.ActualHeight > 1 && Math.Abs(row.ActualHeight - rowHeight) > 0.5)
             {
                 rowHeight = row.ActualHeight;
-                ApplyWindowSpacers();
             }
+            // The panel is created by the template after the first rebuild.
+            // Apply its padding even when the measured row is still exactly 22px.
+            ApplyWindowSpacers();
             if (restoreOffset is { } target && windowScroll is { ViewportHeight: > 0 } restoring)
             {
                 if (Math.Abs(restoring.VerticalOffset - target) < 1 || ++restoreAttempts > 20)
@@ -1323,8 +1348,12 @@ internal sealed class ControlFactory
                 if (windowStart > 0)
                 {
                     var perPage = (int)Math.Floor(placed.ViewportHeight / rowHeight);
-                    placed.ChangeView(null, (columnHeader?.ActualHeight ?? 0) + (windowStart + perPage) * rowHeight,
-                        null, true);
+                    // Padding changes the extent on the next layout. Keep this
+                    // initial target until ChangeView reaches it; the temporary
+                    // clamped offset must never ask the native list for row zero.
+                    restoreOffset = (columnHeader?.ActualHeight ?? 0) + (windowStart + perPage) * rowHeight;
+                    restoreAttempts = 0;
+                    placed.ChangeView(null, restoreOffset.Value, null, true);
                 }
             }
         }
@@ -1730,14 +1759,18 @@ internal sealed class ControlFactory
                 var report = viewModel.ListViewMode == "report";
                 if (Positioned())
                     control.ItemsPanel = positionedPanel;
-                else if (viewModel.CheckBoxes)
+                else if (viewModel.CheckBoxes || viewModel.IsWindowedList)
                 {
                     // The UIA checkbox gate currently maps enumeration order to
                     // canonical row indexes. Keep every checkbox realized until
                     // that contract carries the identity of a virtualized row.
-                    checkedReportPanel ??= (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
+                    // A windowed list carries at most 192 rows. Its spacers stand
+                    // for every missing row, so scrolling must use physical pixels:
+                    // The physical panel includes padding for missing rows in its
+                    // desired extent, making ScrollPattern describe the whole list.
+                    physicalReportPanel ??= (ItemsPanelTemplate)Microsoft.UI.Xaml.Markup.XamlReader.Load(
                         "<ItemsPanelTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><StackPanel/></ItemsPanelTemplate>");
-                    control.ItemsPanel = checkedReportPanel;
+                    control.ItemsPanel = physicalReportPanel;
                 }
                 else
                 {
@@ -1765,17 +1798,7 @@ internal sealed class ControlFactory
                 // A new window answers the last request for one.
                 requestedTop = -1;
                 control.Footer = null;
-                if (viewModel.IsWindowedList)
-                {
-                    topSpacer = new Border { IsHitTestVisible = false };
-                    bottomSpacer = new Border { IsHitTestVisible = false };
-                    var head = new StackPanel();
-                    if (columnHeader is not null) head.Children.Add(columnHeader);
-                    head.Children.Add(topSpacer);
-                    control.Header = head;
-                    control.Footer = bottomSpacer;
-                }
-                else control.Header = columnHeader;
+                control.Header = columnHeader;
                 control.Items.Clear();
                 rowChecks.Clear();
                 rowContents.Clear();
@@ -1931,6 +1954,7 @@ internal sealed class ControlFactory
                 AllowsAction(viewModel, "setFocusedIndex"))
                 _action(viewModel, "setFocusedIndex", focus);
         };
+        var rowUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, RebuildRows);
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects) or
@@ -1943,11 +1967,7 @@ internal sealed class ControlFactory
                 nameof(viewModel.CheckBoxes) or nameof(viewModel.ItemImages) or
                 nameof(viewModel.EditableLabels) or nameof(viewModel.ItemDetails))
             {
-                // One snapshot announces Items, ItemImages and Rows one after another, and a
-                // window of rows is expensive to build, so a windowed list builds once, after
-                // the snapshot has been applied.
-                if (viewModel.IsWindowedList) QueueWindowRebuild();
-                else RebuildRows();
+                rowUpdate.Request();
             }
             else if (args.PropertyName == nameof(viewModel.MultiSelect))
             {
@@ -2122,13 +2142,14 @@ internal sealed class ControlFactory
             }
         }
         RebuildParts();
+        var partsUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, RebuildParts);
         control.Loaded += (_, _) => RendererDiagnostics.Log(
             $"statusBar layout requested={viewModel.Rect.Width}x{viewModel.Rect.Height} " +
             $"scale={_scale:F3} owner={control.ActualWidth:F1}x{control.ActualHeight:F1} " +
             $"grid={grid.ActualWidth:F1}x{grid.ActualHeight:F1} parts={viewModel.Items.Count}");
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ColumnWidths)) RebuildParts();
+            if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ColumnWidths)) partsUpdate.Request();
         });
         return control;
     }
@@ -2323,9 +2344,10 @@ internal sealed class ControlFactory
             }
         }
         Rebuild();
+        var toolbarUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, Rebuild);
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
-            if (args.PropertyName is nameof(viewModel.ToolbarItems) or nameof(viewModel.Style)) Rebuild();
+            if (args.PropertyName is nameof(viewModel.ToolbarItems) or nameof(viewModel.Style)) toolbarUpdate.Request();
         });
         return control;
     }
@@ -2381,7 +2403,9 @@ internal sealed class ControlFactory
         if (width is not { } w || height is not { } h ||
             format != "bgra8-premultiplied" || data is null)
             throw new InvalidOperationException("Validated pixel metadata is unavailable.");
-        return BitmapFromPixels(w, h, Convert.FromBase64String(data));
+        var cache = _bitmapCache ??= new BoundedImageCache<WriteableBitmap>(32 * 1024 * 1024, 256);
+        return cache.GetOrCreate(new(w, h, data),
+            () => BitmapFromPixels(w, h, Convert.FromBase64String(data)));
     }
 
     internal static WriteableBitmap BitmapFromPixels(int width, int height, byte[] pixels)
@@ -2577,6 +2601,7 @@ internal sealed class ControlFactory
                 control.Rebuild(viewModel.Items, viewModel.ItemRects, viewModel.SelectedIndex, _scale);
         }
         RebuildHeaders();
+        var headersUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, RebuildHeaders);
         // A native tab strip is a band of exact rectangles, and WinUI's TabView
         // template applies its own minimum item height and overflow behavior on top
         // of the sizes the projection asks for.  Recording both is the only way to
@@ -2595,7 +2620,7 @@ internal sealed class ControlFactory
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             if (args.PropertyName is nameof(viewModel.Items) or nameof(viewModel.ItemRects))
-                RebuildHeaders();
+                headersUpdate.Request();
             else if (args.PropertyName == nameof(viewModel.SelectedIndex))
                 control.ApplySelection(viewModel.SelectedIndex);
         });
@@ -2712,6 +2737,7 @@ internal sealed class ControlFactory
             if (ActivateLeaf(control.SelectedIndex)) args.Handled = true;
         }), true);
         Rebuild();
+        var treeUpdate = new CanonicalPresentationUpdate(viewModel, _lifetime, Rebuild);
         _lifetime.Subscribe(viewModel, (_, args) =>
         {
             // A node opening or closing, or an icon changing, does not change the hierarchy: the
@@ -2731,7 +2757,7 @@ internal sealed class ControlFactory
             {
                 if (viewModel.ItemDefaultActivation)
                     RendererDiagnostics.Log($"tree node={viewModel.NodeId} rebuilt for {args.PropertyName}");
-                Rebuild();
+                treeUpdate.Request();
             }
             else if (args.PropertyName == nameof(viewModel.SelectedIndex))
             {
@@ -2746,9 +2772,9 @@ internal sealed class ControlFactory
                 ApplyNativeEditSession();
             else if (args.PropertyName == nameof(viewModel.CheckedIndices) &&
                      (ItemChecks(viewModel) is not { } checks || !control.TryApplyChecks(checks)))
-                Rebuild();
+                treeUpdate.Request();
             else if (args.PropertyName == nameof(viewModel.CheckBoxes))
-                Rebuild();
+                treeUpdate.Request();
         });
         return control;
     }
@@ -3380,29 +3406,6 @@ internal sealed class ControlFactory
         target.SetBinding(property, new Binding { Path = new PropertyPath(path), Mode = mode, Converter = converter });
 }
 
-internal sealed class SemanticProgressBarControl : ContentControl
-{
-    private readonly ProgressBar _progress = new();
-
-    public SemanticProgressBarControl()
-    {
-        IsTabStop = false;
-        HorizontalContentAlignment = HorizontalAlignment.Stretch;
-        VerticalContentAlignment = VerticalAlignment.Stretch;
-        Content = _progress;
-        AutomationProperties.SetAccessibilityView(_progress, AccessibilityView.Raw);
-    }
-
-    public double Minimum { get => _progress.Minimum; set => _progress.Minimum = value; }
-    public double Maximum { get => _progress.Maximum; set => _progress.Maximum = value; }
-    public double Value { get => _progress.Value; set => _progress.Value = value; }
-    public bool IsIndeterminate
-        { get => _progress.IsIndeterminate; set => _progress.IsIndeterminate = value; }
-
-    protected override AutomationPeer OnCreateAutomationPeer() =>
-        new SemanticProgressBarAutomationPeer(this);
-}
-
 // A projected UpDown: the two arrows the native control draws, stacked or side by
 // side as its orientation says.  It owns no value of its own -- each arrow or
 // keyboard step asks the Bridge to run the native step, and the canonical position
@@ -3533,19 +3536,8 @@ internal sealed class SemanticProgressBarAutomationPeer(SemanticProgressBarContr
         patternInterface == PatternInterface.RangeValue && !owner.IsIndeterminate
             ? this : base.GetPatternCore(patternInterface);
     protected override IList<AutomationPeer> GetChildrenCore() => [];
-    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore()
-    {
-        var reported = base.GetBoundingRectangleCore();
-        if (owner.ActualWidth <= 0 || owner.ActualHeight <= 0 || reported.Width <= 0)
-            return reported;
-        var scale = reported.Width / owner.ActualWidth;
-        var semanticHeight = owner.ActualHeight * scale;
-        return new global::Windows.Foundation.Rect(
-            reported.X,
-            reported.Y - (semanticHeight - reported.Height) / 2,
-            reported.Width,
-            semanticHeight);
-    }
+    protected override global::Windows.Foundation.Rect GetBoundingRectangleCore() =>
+        ControlFactory.PhysicalLayoutBounds(owner, base.GetBoundingRectangleCore());
 
     public bool IsReadOnly => true;
     public double LargeChange => 0;

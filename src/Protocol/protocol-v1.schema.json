@@ -385,7 +385,7 @@
       "required": ["nodeId", "generation", "nativeHwnd", "kind", "controlId", "zIndex", "rect", "visible", "enabled", "tabStop", "dialogCode", "text", "editable", "items"],
       "allOf": [
         {
-          "$comment": "Minor 33: a large virtual report ListView carries a window of its rows. items and rows hold the rows from itemWindowStart on; itemCount is the list's length, and every index (selection, focus, actions) stays absolute.",
+          "$comment": "Minor 33: a large virtual report ListView carries a window of its rows. Minor 42 also admits large stored report lists through the same bounded contract. items and rows hold the rows from itemWindowStart on; itemCount is the list's length, and every index (selection, focus, actions) stays absolute. Native IDs, groups, checkboxes and editable labels are outside this windowed shape.",
           "if": { "required": ["itemCount"] },
           "then": {
             "properties": {
@@ -393,6 +393,8 @@
               "listViewMode": { "const": "report" },
               "checkBoxes": { "const": false },
               "groupViewEnabled": { "const": false },
+              "editableLabels": { "const": false },
+              "itemActivationSupported": { "const": false },
               "itemNativeIds": { "maxItems": 0 }
             }
           }

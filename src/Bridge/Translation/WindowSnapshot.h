@@ -446,6 +446,10 @@ struct ControlNode final {
     // vector means the control has no stable identity contract (e.g. owner data).
     // Delayed selection/activation must never be redirected to a replacement row.
     std::vector<uint32_t> itemNativeIds;
+    // Bridge-private identities for the carried rows of a stored report window.
+    // They participate in revision/action fingerprints but never travel as the
+    // wire's whole-list itemNativeIds or authorize deferred native activation.
+    std::vector<uint32_t> itemWindowNativeIds;
     // True only when stable item IDs and the native accessible default action
     // both exist. Older peers and controls without that capability expose false.
     bool itemActivationSupported = false;
