@@ -2,6 +2,9 @@
 
 #include <Windows.h>
 
+#include <atomic>
+#include <memory>
+
 namespace FluentShell::Bridge::Translation {
 
 // A native press has to reach its control the way a native click does: the
@@ -76,7 +79,18 @@ public:
     // The window the press is delivered to.
     HWND Root() const noexcept { return root_; }
 
+    // Whether the click is still waiting out its settling time on its own thread.  A
+    // second press of the same button in that window is the user clicking again because
+    // nothing has happened yet; it must not become a second click.
+    bool ClickStillWaiting() const noexcept {
+        return delayedClickPosted_ && !delayedClickPosted_->load(std::memory_order_acquire);
+    }
+    void TrackDelayedClick(std::shared_ptr<std::atomic<bool>> posted) noexcept {
+        delayedClickPosted_ = std::move(posted);
+    }
+
 private:
+    std::shared_ptr<std::atomic<bool>> delayedClickPosted_;
     HWND root_ = nullptr;
     HWND proxy_ = nullptr;
     // The foreground thread whose input queue this one is joined to, while the

@@ -1843,7 +1843,8 @@ std::unordered_map<HWND, HWND> RendererSession::RootsHoldingUnadmittedOwnedWindo
         const std::vector<HWND>* candidates;
         std::unordered_map<HWND, HWND>* held;
         DWORD rendererProcess;
-    } context{ &candidates, &held, rendererProcessId_ };
+        const HostScope* scope;
+    } context{ &candidates, &held, rendererProcessId_, &scope_ };
     EnumWindows([](HWND window, LPARAM raw) -> BOOL {
         auto& context = *reinterpret_cast<Context*>(raw);
         RECT bounds{};
@@ -1865,6 +1866,12 @@ std::unordered_map<HWND, HWND> RendererSession::RootsHoldingUnadmittedOwnedWindo
                 context.candidates->end();
         };
         if (isCandidate(window)) return TRUE;
+        // A dialog the scope itself takes is decided by the owned-dialog path, which
+        // projects it over its owner or hands the graph back on its own refusal.  One
+        // that became visible after the census was taken is not a candidate yet, and
+        // treating it as foreign sent Security's permission editor (and the sheet under
+        // it) to native for a few seconds every time it opened.
+        if (context.scope->ConsidersRoot(window)) return TRUE;
         HWND top = nullptr;
         HWND owner = GetWindow(window, GW_OWNER);
         for (unsigned depth = 0; owner && depth < 256; ++depth) {
@@ -2923,7 +2930,33 @@ void RendererSession::HandleNativeAction(
 
     lock.unlock();
     ActionOutcome outcome;
-    const bool actionApplied = agent && agent->Invoke(effectiveAction, outcome, 2000, shutdownEvent_);
+    bool actionApplied = agent && agent->Invoke(effectiveAction, outcome, 2000, shutdownEvent_);
+    // The native action ran and only its verifying capture failed: a tab switch brings up
+    // a property page whose icon the shell loads a moment later.  Reporting that as a
+    // refusal snapped the projected tab strip back to the page the native window had just
+    // left, and reconcile moved it forward again.  The source thread pumps between these
+    // attempts, which is what lets the page finish.  Reconcile is held off by the barrier.
+    if (!actionApplied && outcome.appliedUnverified && agent && !outcome.destroyed) {
+        constexpr DWORD kVerifyRetryMs = 60;
+        constexpr int kVerifyRetries = 8;
+        for (int attempt = 0; attempt < kVerifyRetries && !actionApplied; ++attempt) {
+            if (WaitForSingleObject(shutdownEvent_, kVerifyRetryMs) != WAIT_TIMEOUT) break;
+            if (agent->IsDestroyed() || !IsWindow(agent->Root())) break;
+            WindowSnapshot verified;
+            verified.surfaceId = effectiveAction.surfaceId;
+            verified.revision = effectiveAction.expectedRevision + 1;
+            std::wstring verifyError;
+            if (agent->Capture(verified, verifyError, 2000, shutdownEvent_)) {
+                FluentShell::Log(L"Native action verified after " + std::to_wstring((attempt + 1) * kVerifyRetryMs) +
+                    L" ms: " + action.action + L" (first capture: " + outcome.error + L")");
+                outcome.snapshot = std::move(verified);
+                outcome.revision = effectiveAction.expectedRevision + 1;
+                outcome.accepted = true;
+                outcome.error.clear();
+                actionApplied = true;
+            }
+        }
+    }
     // A native press borrows the foreground for the press and hands it back.  The
     // hand-back can be refused: the right to take the foreground is spent with
     // the take, and another process's window is not the foreground owner's to

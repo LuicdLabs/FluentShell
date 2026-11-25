@@ -1801,6 +1801,7 @@ bool ExecuteInvoke(Command* command) {
             action.surfaceId, action.expectedRevision + 1,
             command->outcome.snapshot, command->error);
         if (AbortIfCancelled(command)) return false;
+        command->outcome.appliedUnverified = !command->success;
         command->outcome.accepted = command->success;
         command->outcome.revision = action.expectedRevision + 1;
     }
@@ -2625,6 +2626,14 @@ void SetTopLevelShownEvent(HANDLE event) noexcept { g_topLevelShownEvent.store(e
 // press: the agent holds it until the application has dispatched the click.
 void SourceThreadAgent::PressNativeControl(HWND button, PressDelivery delivery) noexcept {
     if (!button || !IsWindow(button)) return;
+    // The same button pressed again while its first click is still waiting out the
+    // settling time: the user clicked twice because nothing had happened yet.  The
+    // waiting click is the press; a second one would act twice (Cancel on the next
+    // dialog, a check box toggled back).
+    if (nativePress_ && nativePressButton_ == button && nativePress_->ClickStillWaiting()) {
+        FluentShell::Log(L"Native press: the same button's click is still on its way; this press is the same request");
+        return;
+    }
     // A press that is still pending never had its click dispatched.  The state it
     // borrowed is released before the next press borrows it again.
     // A press that is still held means the native window has owned the foreground
@@ -2648,6 +2657,15 @@ void SourceThreadAgent::PressNativeControl(HWND button, PressDelivery delivery) 
         // foreground itself, or the renderer handed it over just before sending
         // the action, which is equally recent.  Either way the clock starts now.
         nativeForegroundSince_ = GetTickCount64();
+    }
+    // Cancel is what a click-through guard protects the user's way out with, never
+    // against: the security warning took a Cancel at ~150 ms and refused only Run
+    // (NATIVE-PRESS-EVIDENCE.md).  Waiting there made every projected Cancel feel dead
+    // for most of a second, long enough that the user clicked it again.  Only a push
+    // button is the way out: an ACL checklist cell is a check box whose id is also 2.
+    const LONG buttonType = GetWindowLongW(button, GWL_STYLE) & BS_TYPEMASK;
+    if (GetDlgCtrlID(button) == IDCANCEL && (buttonType == BS_PUSHBUTTON || buttonType == BS_DEFPUSHBUTTON)) {
+        remaining = 0;
     }
     const bool delivered = PressNativeButton(*press, button, delivery, remaining);
     if (!delivered) {

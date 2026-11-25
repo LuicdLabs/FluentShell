@@ -23,11 +23,19 @@ internal static partial class CompactControlStyles
     private static Style? _checkBox;
     private static bool _checkBoxTried;
 
+    // The animated templates move the way WinUI's own controls do: the check box draws its
+    // tick with WinUI's AnimatedIcon (AnimatedAcceptVisualSource, the stock check box's own
+    // visual) and the radio button's dot grows in.  The static templates are kept as the
+    // fallback for a WinUI that cannot load the animated ones.
     internal static Style? RadioButton
     {
         get
         {
-            if (!_radioButtonTried) { _radioButtonTried = true; _radioButton = Create(RadioButtonXaml, "RadioButton"); }
+            if (!_radioButtonTried)
+            {
+                _radioButtonTried = true;
+                _radioButton = Create(RadioButtonXaml, "RadioButton") ?? Create(StaticRadioButtonXaml, "RadioButton (static)");
+            }
             return _radioButton;
         }
     }
@@ -36,7 +44,11 @@ internal static partial class CompactControlStyles
     {
         get
         {
-            if (!_checkBoxTried) { _checkBoxTried = true; _checkBox = Create(CheckBoxXaml, "CheckBox"); }
+            if (!_checkBoxTried)
+            {
+                _checkBoxTried = true;
+                _checkBox = Create(CheckBoxXaml, "CheckBox") ?? Create(StaticCheckBoxXaml, "CheckBox (static)");
+            }
             return _checkBox;
         }
     }
@@ -105,7 +117,272 @@ internal static partial class CompactControlStyles
         return false;
     }
 
-    private const string RadioButtonXaml = """
+    // The dot is scaled rather than resized, so the animation runs on the compositor.  The
+    // states hold the end values with no duration and the transitions carry the motion: a
+    // control built already checked (a rebuild, a page switch) shows its dot at once, and
+    // only a change while the user watches animates.
+    internal const string RadioButtonXaml = """
+        <Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+               xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+               TargetType="RadioButton">
+          <Setter Property="Foreground" Value="{ThemeResource TextFillColorPrimaryBrush}"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="MinHeight" Value="0"/>
+          <Setter Property="HorizontalContentAlignment" Value="Left"/>
+          <Setter Property="VerticalContentAlignment" Value="Center"/>
+          <Setter Property="UseSystemFocusVisuals" Value="True"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="RadioButton">
+                <Grid x:Name="RootGrid" Background="{TemplateBinding Background}">
+                  <VisualStateManager.VisualStateGroups>
+                    <VisualStateGroup x:Name="CommonStates">
+                      <VisualState x:Name="Normal"/>
+                      <VisualState x:Name="PointerOver">
+                        <VisualState.Setters>
+                          <Setter Target="Ring.Fill" Value="{ThemeResource ControlAltFillColorTertiaryBrush}"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="Pressed">
+                        <VisualState.Setters>
+                          <Setter Target="Ring.Fill" Value="{ThemeResource ControlAltFillColorQuarternaryBrush}"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="Disabled">
+                        <VisualState.Setters>
+                          <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TextFillColorDisabledBrush}"/>
+                          <Setter Target="Ring.Stroke" Value="{ThemeResource ControlStrongStrokeColorDisabledBrush}"/>
+                          <Setter Target="Ring.Fill" Value="{ThemeResource ControlAltFillColorDisabledBrush}"/>
+                          <Setter Target="Dot.Fill" Value="{ThemeResource TextFillColorDisabledBrush}"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                    </VisualStateGroup>
+                    <VisualStateGroup x:Name="CheckStates">
+                      <VisualStateGroup.Transitions>
+                        <VisualTransition From="Unchecked" To="Checked" GeneratedDuration="0:0:0.167">
+                          <VisualTransition.GeneratedEasingFunction>
+                            <CubicEase EasingMode="EaseOut"/>
+                          </VisualTransition.GeneratedEasingFunction>
+                        </VisualTransition>
+                        <VisualTransition From="Checked" To="Unchecked" GeneratedDuration="0:0:0.083"/>
+                      </VisualStateGroup.Transitions>
+                      <VisualState x:Name="Unchecked">
+                        <Storyboard>
+                          <DoubleAnimation Storyboard.TargetName="DotScale" Storyboard.TargetProperty="ScaleX" To="0" Duration="0"/>
+                          <DoubleAnimation Storyboard.TargetName="DotScale" Storyboard.TargetProperty="ScaleY" To="0" Duration="0"/>
+                        </Storyboard>
+                      </VisualState>
+                      <VisualState x:Name="Checked">
+                        <Storyboard>
+                          <DoubleAnimation Storyboard.TargetName="DotScale" Storyboard.TargetProperty="ScaleX" To="1" Duration="0"/>
+                          <DoubleAnimation Storyboard.TargetName="DotScale" Storyboard.TargetProperty="ScaleY" To="1" Duration="0"/>
+                        </Storyboard>
+                        <VisualState.Setters>
+                          <Setter Target="Ring.Stroke" Value="{ThemeResource AccentFillColorDefaultBrush}"/>
+                          <Setter Target="Ring.Fill" Value="{ThemeResource AccentFillColorDefaultBrush}"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="Indeterminate"/>
+                    </VisualStateGroup>
+                  </VisualStateManager.VisualStateGroups>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Grid VerticalAlignment="Center" Width="16" Height="16">
+                    <Ellipse x:Name="Ring" Width="16" Height="16" StrokeThickness="1"
+                             Stroke="{ThemeResource ControlStrongStrokeColorDefaultBrush}"
+                             Fill="{ThemeResource ControlAltFillColorSecondaryBrush}"/>
+                    <Ellipse x:Name="Dot" Width="8" Height="8" RenderTransformOrigin="0.5,0.5"
+                             Fill="{ThemeResource TextOnAccentFillColorPrimaryBrush}">
+                      <Ellipse.RenderTransform>
+                        <ScaleTransform x:Name="DotScale" ScaleX="0" ScaleY="0"/>
+                      </Ellipse.RenderTransform>
+                    </Ellipse>
+                  </Grid>
+                  <ContentPresenter x:Name="ContentPresenter" Grid.Column="1"
+                                    Content="{TemplateBinding Content}"
+                                    ContentTemplate="{TemplateBinding ContentTemplate}"
+                                    Foreground="{TemplateBinding Foreground}"
+                                    Padding="{TemplateBinding Padding}"
+                                    HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                    VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                    TextWrapping="NoWrap"
+                                    AutomationProperties.AccessibilityView="Raw"/>
+                </Grid>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Style>
+        """;
+
+    // WinUI's check box goes to one combined state per (check, pointer) pair -- its stock
+    // template has no other group -- and drives the tick through AnimatedIcon.State: the
+    // icon plays the segment between the state it was in and the one it is given, which is
+    // the draw-in and wipe-out of the tick.  The brushes are the ones WinUI's own check box
+    // resources resolve to.  Indeterminate's down-level glyph is swapped by a storyboard
+    // because the fallback icon source is not an element a setter can target.
+    internal const string CheckBoxXaml = """
+        <Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+               xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+               xmlns:animatedvisuals="using:Microsoft.UI.Xaml.Controls.AnimatedVisuals"
+               TargetType="CheckBox">
+          <Setter Property="Foreground" Value="{ThemeResource TextFillColorPrimaryBrush}"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="MinHeight" Value="0"/>
+          <Setter Property="HorizontalContentAlignment" Value="Left"/>
+          <Setter Property="VerticalContentAlignment" Value="Center"/>
+          <Setter Property="UseSystemFocusVisuals" Value="True"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="CheckBox">
+                <Grid x:Name="RootGrid" Background="{TemplateBinding Background}">
+                  <VisualStateManager.VisualStateGroups>
+                    <VisualStateGroup x:Name="CombinedStates">
+                      <VisualState x:Name="UncheckedNormal">
+                        <VisualState.Setters>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="NormalOff"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="UncheckedPointerOver">
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource ControlAltFillColorTertiaryBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="PointerOverOff"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="UncheckedPressed">
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource ControlAltFillColorQuarternaryBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource ControlStrongStrokeColorDisabledBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="PressedOff"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="UncheckedDisabled">
+                        <VisualState.Setters>
+                          <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TextFillColorDisabledBrush}"/>
+                          <Setter Target="Box.Background" Value="{ThemeResource ControlAltFillColorDisabledBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource ControlStrongStrokeColorDisabledBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="NormalOff"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="CheckedNormal">
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorDefaultBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorDefaultBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="NormalOn"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="CheckedPointerOver">
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorSecondaryBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorSecondaryBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="PointerOverOn"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="CheckedPressed">
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorTertiaryBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorTertiaryBrush}"/>
+                          <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource TextOnAccentFillColorSecondaryBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="PressedOn"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="CheckedDisabled">
+                        <VisualState.Setters>
+                          <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TextFillColorDisabledBrush}"/>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorDisabledBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorDisabledBrush}"/>
+                          <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource TextOnAccentFillColorDisabledBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="NormalOn"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="IndeterminateNormal">
+                        <Storyboard>
+                          <ObjectAnimationUsingKeyFrames Storyboard.TargetName="DownLevelCheckGlyph" Storyboard.TargetProperty="Glyph">
+                            <DiscreteObjectKeyFrame KeyTime="0" Value="&#xE9AE;"/>
+                          </ObjectAnimationUsingKeyFrames>
+                        </Storyboard>
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorDefaultBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorDefaultBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="NormalIndeterminate"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="IndeterminatePointerOver">
+                        <Storyboard>
+                          <ObjectAnimationUsingKeyFrames Storyboard.TargetName="DownLevelCheckGlyph" Storyboard.TargetProperty="Glyph">
+                            <DiscreteObjectKeyFrame KeyTime="0" Value="&#xE9AE;"/>
+                          </ObjectAnimationUsingKeyFrames>
+                        </Storyboard>
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorSecondaryBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorSecondaryBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="PointerOverIndeterminate"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="IndeterminatePressed">
+                        <Storyboard>
+                          <ObjectAnimationUsingKeyFrames Storyboard.TargetName="DownLevelCheckGlyph" Storyboard.TargetProperty="Glyph">
+                            <DiscreteObjectKeyFrame KeyTime="0" Value="&#xE9AE;"/>
+                          </ObjectAnimationUsingKeyFrames>
+                        </Storyboard>
+                        <VisualState.Setters>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorTertiaryBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorTertiaryBrush}"/>
+                          <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource TextOnAccentFillColorSecondaryBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="PressedIndeterminate"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                      <VisualState x:Name="IndeterminateDisabled">
+                        <Storyboard>
+                          <ObjectAnimationUsingKeyFrames Storyboard.TargetName="DownLevelCheckGlyph" Storyboard.TargetProperty="Glyph">
+                            <DiscreteObjectKeyFrame KeyTime="0" Value="&#xE9AE;"/>
+                          </ObjectAnimationUsingKeyFrames>
+                        </Storyboard>
+                        <VisualState.Setters>
+                          <Setter Target="ContentPresenter.Foreground" Value="{ThemeResource TextFillColorDisabledBrush}"/>
+                          <Setter Target="Box.Background" Value="{ThemeResource AccentFillColorDisabledBrush}"/>
+                          <Setter Target="Box.BorderBrush" Value="{ThemeResource AccentFillColorDisabledBrush}"/>
+                          <Setter Target="CheckGlyph.Foreground" Value="{ThemeResource TextOnAccentFillColorDisabledBrush}"/>
+                          <Setter Target="CheckGlyph.(AnimatedIcon.State)" Value="NormalIndeterminate"/>
+                        </VisualState.Setters>
+                      </VisualState>
+                    </VisualStateGroup>
+                  </VisualStateManager.VisualStateGroups>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                  </Grid.ColumnDefinitions>
+                  <Grid VerticalAlignment="Center" Width="16" Height="16">
+                    <Border x:Name="Box" Width="16" Height="16" CornerRadius="3" BorderThickness="1"
+                            BorderBrush="{ThemeResource ControlStrongStrokeColorDefaultBrush}"
+                            Background="{ThemeResource ControlAltFillColorSecondaryBrush}"/>
+                    <AnimatedIcon x:Name="CheckGlyph" Width="16" Height="16" AnimatedIcon.State="NormalOff"
+                                  Foreground="{ThemeResource TextOnAccentFillColorPrimaryBrush}">
+                      <animatedvisuals:AnimatedAcceptVisualSource/>
+                      <AnimatedIcon.FallbackIconSource>
+                        <FontIconSource x:Name="DownLevelCheckGlyph" Glyph="&#xE73E;" FontSize="10"
+                                        FontFamily="{ThemeResource SymbolThemeFontFamily}"/>
+                      </AnimatedIcon.FallbackIconSource>
+                    </AnimatedIcon>
+                  </Grid>
+                  <ContentPresenter x:Name="ContentPresenter" Grid.Column="1"
+                                    Content="{TemplateBinding Content}"
+                                    ContentTemplate="{TemplateBinding ContentTemplate}"
+                                    Foreground="{TemplateBinding Foreground}"
+                                    Padding="{TemplateBinding Padding}"
+                                    HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                    VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                    TextWrapping="NoWrap"
+                                    AutomationProperties.AccessibilityView="Raw"/>
+                </Grid>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Style>
+        """;
+
+    private const string StaticRadioButtonXaml = """
         <Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                TargetType="RadioButton">
@@ -180,7 +457,7 @@ internal static partial class CompactControlStyles
         </Style>
         """;
 
-    private const string CheckBoxXaml = """
+    private const string StaticCheckBoxXaml = """
         <Style xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                TargetType="CheckBox">

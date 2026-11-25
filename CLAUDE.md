@@ -195,7 +195,10 @@ which process posted it, and imports no API with which it could ask where the in
 The settling time is counted from when the native window actually came forward, which the agent
 records (`nativeForegroundSince_`): a press that follows one still holding the foreground pays none
 of it. The wait runs on a thread of its own, because the control's own thread has to stay free to
-pump or the window never finishes coming forward.
+pump or the window never finishes coming forward. A Cancel push button (`IDCANCEL`; an ACL checklist cell is a check box with id 2 too) never waits: the warning took
+Cancel at ~150 ms, and the wait made every projected Cancel feel dead long enough to be clicked twice.
+A second press of the same button while its click is still waiting (`ClickStillWaiting`) is the same
+request and is dropped, so it never becomes a second click.
 
 `src/Bridge/Translation/NativePressActivation.cpp` owns that state. The native window takes the
 foreground and is uncloaked for the press; the focus follows (BM_CLICK focuses the button between its
@@ -382,7 +385,9 @@ thread hooks that act only for its own windows (`ThreadHooksActFor`); work for a
 and a press joins input only with the renderer proxy's thread. Discovery sends no message to a window outside the scope,
 retries a timing failure once, and treats any visible window (any process) owned by a projected dialog -- a copy
 progress window, an elevated dialog -- as owner-graph evidence that hands the dialog back to native while it is open
-(`RootsHoldingUnadmittedOwnedWindows`). Actions are an allowlist (no context menus, drop-downs, item activation, label
+(`RootsHoldingUnadmittedOwnedWindows`); a dialog the scope itself considers is left to the owned-dialog path even before
+it is a candidate (Security's permission editor, shown between the census and that sweep, used to send the sheet
+native for seconds). Actions are an allowlist (no context menus, drop-downs, item activation, label
 edits, menu or MDI commands). A dialog modal to a disabled `CabinetWClass` keeps that native folder window as its
 proxy's owner (`ResolveExplorerDialogOwner` in the renderer); the renderer gives an Explorer proxy no relaunch command
 and `PreventPinning`. The session ends when the grant goes. Manual `inject` still refuses Explorer. A Bridge fault can
@@ -501,7 +506,13 @@ These are enforced by `test.ps1` gates or by `docs/goals/win32-to-winui-translat
   16 px-glyph templates for both (and `WrapWhenTall`: a label wraps only when the control has room for two
   lines, because the capture does not carry `BS_MULTILINE`). A style is used only if every theme resource it
   names exists; otherwise the control keeps WinUI's template and the renderer log says `compact ... style not
-  used`.
+  used`. They keep WinUI's motion: the check box draws its tick with `AnimatedIcon`/`AnimatedAcceptVisualSource`
+  through the twelve `CombinedStates` WinUI's check box goes to, and the radio dot scales in through a
+  `VisualTransition` (the states themselves jump, so a control built already checked does not animate). The static
+  templates are the fallback if the animated ones cannot load.
+- A native action whose own effect landed but whose verifying capture failed (`appliedUnverified`: a tab switch
+  brings up a page whose icon the shell loads a moment later) is captured again for up to ~0.5 s before it is
+  reported refused; reported at once, the projected tab strip snapped back and then forward again.
 - A date or time picker (`SysDateTimePick32`: kinds `datePicker` and `timePicker`, protocol minor 37) carries its
   value in the range fields every node has, so `setValue` needs no new shape: `position` is a date's day number
   (days since 0001-01-01, `DateOnly.DayNumber`, `DateTimePickerValue.h`) or a time's second of the day. A

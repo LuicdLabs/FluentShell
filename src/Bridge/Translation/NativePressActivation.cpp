@@ -127,21 +127,30 @@ void HandForegroundBack(HWND proxy) noexcept {
 // dispatched into the very state the wait is there to let pass.  So a short-lived
 // thread does the waiting and posts the click, and the press's own hold keeps the
 // foreground in place until the application has acted on it.
-bool PostClickAfterActivationSettles(HWND button, DWORD settleMs) noexcept {
+bool PostClickAfterActivationSettles(NativePressActivation& press, HWND button, DWORD settleMs) noexcept {
     struct Pending final {
         HWND button;
         DWORD settleMs;
+        std::shared_ptr<std::atomic<bool>> posted;
     };
     const auto entry = [](void* parameter) -> DWORD {
         const std::unique_ptr<Pending> pending{ static_cast<Pending*>(parameter) };
         Sleep(pending->settleMs);
         if (IsWindow(pending->button)) PostMessageW(pending->button, BM_CLICK, 0, 0);
+        pending->posted->store(true, std::memory_order_release);
         return 0;
     };
-    auto pending = std::make_unique<Pending>(Pending{ button, settleMs });
+    std::unique_ptr<Pending> pending;
+    try {
+        pending = std::make_unique<Pending>(Pending{ button, settleMs, std::make_shared<std::atomic<bool>>(false) });
+    } catch (...) {
+        return PostMessageW(button, BM_CLICK, 0, 0) != FALSE;
+    }
+    const auto posted = pending->posted;
     const HANDLE thread = CreateThread(nullptr, 0, entry, pending.get(), 0, nullptr);
     if (!thread) return PostMessageW(button, BM_CLICK, 0, 0) != FALSE;
     pending.release();
+    press.TrackDelayedClick(posted);
     // The thread is not joined: joining would put the wait back on the thread that
     // has to pump.  It owns nothing but the window handle, which it re-validates.
     CloseHandle(thread);
@@ -286,13 +295,15 @@ bool PressNativeButton(NativePressActivation& press, HWND button,
     // and the caller learns the outcome.
     const bool ownThread = GetWindowThreadProcessId(button, nullptr) == GetCurrentThreadId();
     if (delivery == PressDelivery::Synchronous || !ownThread) {
+        const bool held = press.ForegroundHeld();
         SendMessageW(button, BM_CLICK, 0, 0);
         // The click has been handled when the call returns, so the state the
         // press borrowed ends with it.
         press.Release();
+        return held;
     } else if (settleMs == 0
             ? !PostMessageW(button, BM_CLICK, 0, 0)
-            : !PostClickAfterActivationSettles(button, settleMs)) {
+            : !PostClickAfterActivationSettles(press, button, settleMs)) {
         FluentShell::Log(L"Native press: the press could not be posted");
         press.Release();
         return false;

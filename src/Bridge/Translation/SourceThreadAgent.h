@@ -61,6 +61,11 @@ struct ActionOutcome final {
     // before it could run. Canonical state is intact, so the surface stays
     // projected and the renderer is told the action was rejected.
     bool refused = false;
+    // The native action ran, but the capture that verifies it did not: something the
+    // action brought up (a property page's icon, which the shell loads on its own
+    // schedule) was not ready to read yet.  The native state has moved, so the
+    // caller captures again rather than tell the renderer the action was refused.
+    bool appliedUnverified = false;
     uint64_t closeSequence = 0;
     uint64_t revision = 0;
     WindowSnapshot snapshot;
