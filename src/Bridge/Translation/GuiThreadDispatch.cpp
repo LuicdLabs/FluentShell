@@ -1,4 +1,5 @@
 #include "GuiThreadDispatch.h"
+#include "HostScope.h"
 
 #include <algorithm>
 #include <chrono>
@@ -354,6 +355,14 @@ bool DispatchToWindowThread(HWND window, std::function<void()> invoke,
             if (!GuiThreadOperationCancelled()) return true;
             cancelled->store(true, std::memory_order_release);
             error = L"native GUI operation exceeded its deadline or was cancelled";
+            return false;
+        }
+        // Reaching a child another thread owns means hooking that thread.  Inside Explorer
+        // that thread is the shell's (a folder, the desktop, the taskbar), so a guest
+        // refuses: the control then keeps the whole window native.
+        if (!ProcessHostScope().DispatchesToForeignThreads()) {
+            error = std::wstring(L"a window owned by another thread is outside the ") +
+                ProcessHostScope().Name() + L" scope";
             return false;
         }
         auto work = std::make_shared<Work>();

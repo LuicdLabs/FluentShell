@@ -573,6 +573,360 @@ bool ReadMmcMessageView(
     return false;
 }
 
+namespace {
+
+bool ModuleIsSystemFile(HMODULE module, std::wstring_view fileName) noexcept {
+    wchar_t modulePath[MAX_PATH]{};
+    wchar_t systemPath[MAX_PATH]{};
+    const DWORD moduleLength = module ? GetModuleFileNameW(module, modulePath, MAX_PATH) : 0;
+    const UINT systemLength = GetSystemDirectoryW(systemPath, MAX_PATH);
+    if (moduleLength == 0 || moduleLength >= MAX_PATH ||
+        systemLength == 0 || systemLength + 1 + fileName.size() >= MAX_PATH) return false;
+    wchar_t expected[MAX_PATH]{};
+    wcsncpy_s(expected, systemPath, systemLength);
+    wcscat_s(expected, L"\\");
+    const size_t used = wcslen(expected);
+    wcsncpy_s(expected + used, MAX_PATH - used, fileName.data(), fileName.size());
+    return FluentShell::EqualsIgnoreCase(modulePath, expected);
+}
+
+bool WindowClassIs(HWND window, const wchar_t* expected) noexcept {
+    wchar_t name[64]{};
+    return window && GetClassNameW(window, name, 64) > 0 &&
+        FluentShell::EqualsIgnoreCase(name, expected);
+}
+
+// twext's page template: the icon (201), the explanation (202, a SysLink with no link), the
+// list's label (207), the hidden placeholder the view replaces (203), and the Open (204) and
+// Restore (209) split buttons.
+bool IsPreviousVersionsPage(HWND page) noexcept {
+    if (!WindowClassIs(page, L"#32770")) return false;
+    if ((GetWindowLongPtrW(page, GWL_STYLE) & WS_CHILD) == 0) return false;
+    const auto instance = reinterpret_cast<HMODULE>(GetWindowLongPtrW(page, GWLP_HINSTANCE));
+    if (!ModuleIsSystemFile(instance, L"twext.dll")) return false;
+    struct TemplateControl final {
+        int id;
+        const wchar_t* className;
+    };
+    static constexpr TemplateControl kTemplate[]{
+        { 201, L"Static" }, { 202, L"SysLink" }, { 203, L"Static" }, { 207, L"Static" },
+        { 204, L"Button" }, { 209, L"Button" },
+    };
+    for (const TemplateControl& control : kTemplate) {
+        const HWND child = GetDlgItem(page, control.id);
+        if (!child || GetAncestor(child, GA_PARENT) != page ||
+            !WindowClassIs(child, control.className)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool IsPreviousVersionsFolderView(HWND defView) noexcept {
+    return WindowClassIs(defView, L"SHELLDLL_DefView") &&
+        (GetWindowLongPtrW(defView, GWL_STYLE) & WS_CHILD) != 0 &&
+        WindowClassRegisteredBySystemModule(defView, L"shell32.dll") &&
+        IsPreviousVersionsPage(GetAncestor(defView, GA_PARENT));
+}
+
+bool IsPreviousVersionsView(HWND island) noexcept {
+    return WindowClassIs(island, L"DirectUIHWND") &&
+        (GetWindowLongPtrW(island, GWL_STYLE) & WS_CHILD) != 0 &&
+        IsPreviousVersionsFolderView(GetAncestor(island, GA_PARENT));
+}
+
+bool DecidePreviousVersionsView(
+    const PreviousVersionsElement& root,
+    const RECT& client,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) {
+    items.clear();
+    const auto refuse = [&](std::wstring_view text) {
+        items.clear();
+        return Reject(reason, text);
+    };
+    const auto invisible = [](const PreviousVersionsElement& element) {
+        return (element.state & STATE_SYSTEM_INVISIBLE) != 0;
+    };
+    // An inert text at the element's own rectangle, which has to lie inside the island.
+    const auto publish = [&](const PreviousVersionsElement& element, std::wstring_view what) {
+        if ((element.state & STATE_SYSTEM_OFFSCREEN) != 0) {
+            reason = L"previous versions ";
+            reason += what;
+            reason += L" is offscreen";
+            return false;
+        }
+        if (element.name.empty()) {
+            reason = L"previous versions ";
+            reason += what;
+            reason += L" has no name";
+            return false;
+        }
+        if (element.name.size() > Ipc::kMaxStringChars) {
+            reason = L"previous versions ";
+            reason += what;
+            reason += L" exceeds the protocol cap";
+            return false;
+        }
+        const RECT& bounds = element.rect;
+        if (bounds.right <= bounds.left || bounds.bottom <= bounds.top ||
+            bounds.left < client.left || bounds.top < client.top ||
+            bounds.right > client.right || bounds.bottom > client.bottom) {
+            reason = L"previous versions ";
+            reason += what;
+            reason += L" falls outside the view";
+            return false;
+        }
+        AccessibleIslandItem item;
+        item.kind = AccessibleItemKind::Text;
+        item.name = element.name;
+        item.enabled = (element.state & STATE_SYSTEM_UNAVAILABLE) == 0;
+        item.rect = { bounds.left - client.left, bounds.top - client.top,
+            bounds.right - client.left, bounds.bottom - client.top };
+        items.push_back(std::move(item));
+        return true;
+    };
+    if (root.role != ROLE_SYSTEM_LIST) return refuse(L"previous versions view root is not a list");
+    if (invisible(root)) return refuse(L"previous versions view is invisible");
+    size_t headers = 0;
+    size_t texts = 0;
+    for (const PreviousVersionsElement& child : root.children) {
+        if (invisible(child)) continue;
+        switch (child.role) {
+        case ROLE_SYSTEM_LISTITEM:
+            // A version is listed: its rows, their selection and the Open/Restore commands
+            // they enable are a contract this reader does not have.
+            return refuse(L"previous versions list has entries");
+        case ROLE_SYSTEM_LIST: {
+            if (++headers > 1) return refuse(L"previous versions view has more than one header");
+            if ((child.state & STATE_SYSTEM_OFFSCREEN) != 0)
+                return refuse(L"previous versions header is offscreen");
+            size_t columns = 0;
+            for (const PreviousVersionsElement& column : child.children) {
+                if (invisible(column)) continue;
+                // The shell's items-view header reports its columns as split buttons (role 62:
+                // a column sorts on a click and drops a filter menu from its arrow); a plain
+                // column header is accepted as well.
+                if (column.role != ROLE_SYSTEM_COLUMNHEADER && column.role != ROLE_SYSTEM_SPLITBUTTON)
+                    return refuse(L"previous versions header holds a non-column child");
+                if (column.childCount > 0 || !column.children.empty())
+                    return refuse(L"previous versions column header owns children");
+                if (!publish(column, L"column header")) {
+                    items.clear();
+                    return false;
+                }
+                ++columns;
+            }
+            if (static_cast<size_t>(child.childCount) > child.children.size())
+                return refuse(L"previous versions header children could not all be read");
+            if (columns == 0) return refuse(L"previous versions header has no columns");
+            break;
+        }
+        case ROLE_SYSTEM_STATICTEXT:
+            if (++texts > 1) return refuse(L"previous versions view has more than one message");
+            if (child.childCount > 0 || !child.children.empty())
+                return refuse(L"previous versions message owns children");
+            if (!publish(child, L"message")) {
+                items.clear();
+                return false;
+            }
+            break;
+        default: {
+            wchar_t evidence[96]{};
+            swprintf_s(evidence, L"previous versions view has an element of role %ld", child.role);
+            return refuse(evidence);
+        }
+        }
+    }
+    if (static_cast<size_t>(root.childCount) > root.children.size())
+        return refuse(L"previous versions view children could not all be read");
+    if (headers != 1) return refuse(L"previous versions view has no header");
+    if (items.size() > Ipc::kMaxIslandItems)
+        return refuse(L"previous versions view exceeds the protocol item bound");
+    return true;
+}
+
+namespace {
+
+// Every provider call of the Previous Versions reader goes through one of these.  The view is
+// the shell's own DirectUI, read inside explorer.exe, and /EHsc does not stop an access
+// violation: a fault inside the provider would end the shell.  Under a structured handler it
+// refuses the view instead.  No C++ object lives in these frames, so __try needs no unwind.
+HRESULT GuardedObjectFromWindow(HWND window, IAccessible** object) noexcept {
+    __try {
+        return AccessibleObjectFromWindow(window, static_cast<DWORD>(OBJID_CLIENT),
+            IID_IAccessible, reinterpret_cast<void**>(object));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *object = nullptr;
+        return E_UNEXPECTED;
+    }
+}
+
+HRESULT GuardedRole(IAccessible* target, VARIANT id, VARIANT* value) noexcept {
+    __try { return target->get_accRole(id, value); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+}
+
+HRESULT GuardedState(IAccessible* target, VARIANT id, VARIANT* value) noexcept {
+    __try { return target->get_accState(id, value); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+}
+
+HRESULT GuardedName(IAccessible* target, VARIANT id, BSTR* value) noexcept {
+    __try { return target->get_accName(id, value); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+}
+
+HRESULT GuardedLocation(
+    IAccessible* target, VARIANT id, long* left, long* top, long* width, long* height) noexcept {
+    __try { return target->accLocation(left, top, width, height, id); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+}
+
+HRESULT GuardedChildCount(IAccessible* target, long* count) noexcept {
+    __try { return target->get_accChildCount(count); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+}
+
+HRESULT GuardedChildren(IAccessible* target, long count, VARIANT* children, long* obtained) noexcept {
+    __try { return AccessibleChildren(target, 0, count, children, obtained); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_UNEXPECTED; }
+}
+
+HRESULT GuardedQueryAccessible(IDispatch* dispatch, IAccessible** object) noexcept {
+    __try {
+        return dispatch->QueryInterface(IID_IAccessible, reinterpret_cast<void**>(object));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *object = nullptr;
+        return E_UNEXPECTED;
+    }
+}
+
+void GuardedRelease(IUnknown* object) noexcept {
+    __try { object->Release(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void GuardedVariantClear(VARIANT* value) noexcept {
+    __try { VariantClear(value); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { value->vt = VT_EMPTY; }
+}
+
+struct GuardedAccessible final {
+    IAccessible* value = nullptr;
+    GuardedAccessible() = default;
+    GuardedAccessible(const GuardedAccessible&) = delete;
+    GuardedAccessible& operator=(const GuardedAccessible&) = delete;
+    ~GuardedAccessible() { if (value) GuardedRelease(value); }
+};
+
+struct GuardedVariants final {
+    std::vector<VARIANT> values;
+    ~GuardedVariants() { for (VARIANT& value : values) GuardedVariantClear(&value); }
+};
+
+constexpr int kPreviousVersionsDepth = 2;
+
+// Describes one element: role, state, name and location, and -- for a visible element that is
+// an object of its own, down to kPreviousVersionsDepth -- its children.  An invisible element is
+// described by its state alone; the decision skips it.
+bool DescribePreviousVersionsElement(
+    IAccessible* target,
+    VARIANT id,
+    bool isObject,
+    int depth,
+    PreviousVersionsElement& element,
+    std::wstring& reason) {
+    VARIANT value{};
+    const HRESULT roleResult = GuardedRole(target, id, &value);
+    const bool roleRead = SUCCEEDED(roleResult) && value.vt == VT_I4;
+    if (roleRead) element.role = value.lVal;
+    GuardedVariantClear(&value);
+    if (!roleRead) return Reject(reason, L"previous versions element role is unavailable");
+    const HRESULT stateResult = GuardedState(target, id, &value);
+    const bool stateRead = SUCCEEDED(stateResult) && value.vt == VT_I4;
+    if (stateRead) element.state = value.lVal;
+    GuardedVariantClear(&value);
+    if (!stateRead) return Reject(reason, L"previous versions element state is unavailable");
+    if ((element.state & STATE_SYSTEM_INVISIBLE) != 0) return true;
+    BSTR name = nullptr;
+    if (SUCCEEDED(GuardedName(target, id, &name)) && name)
+        element.name = TrimmedText(std::wstring(name, SysStringLen(name)));
+    if (name) SysFreeString(name);
+    long left = 0, top = 0, width = 0, height = 0;
+    if (SUCCEEDED(GuardedLocation(target, id, &left, &top, &width, &height)) &&
+        width > 0 && height > 0) {
+        element.rect = { left, top, left + width, top + height };
+    }
+    // A simple child id is an element of its parent and owns nothing.
+    if (!isObject) return true;
+    if (FAILED(GuardedChildCount(target, &element.childCount)) || element.childCount < 0)
+        return Reject(reason, L"previous versions element child count is unavailable");
+    if (element.childCount == 0 || depth >= kPreviousVersionsDepth) return true;
+    if (static_cast<size_t>(element.childCount) > Ipc::kMaxIslandItems)
+        return Reject(reason, L"previous versions element has more children than the item bound");
+    GuardedVariants raw;
+    raw.values.resize(static_cast<size_t>(element.childCount));
+    long obtained = 0;
+    if (FAILED(GuardedChildren(target, element.childCount, raw.values.data(), &obtained)) ||
+        obtained < 0 || obtained > element.childCount)
+        return Reject(reason, L"previous versions children could not be enumerated");
+    for (long index = 0; index < obtained; ++index) {
+        const VARIANT& entry = raw.values[static_cast<size_t>(index)];
+        PreviousVersionsElement child;
+        if (entry.vt == VT_DISPATCH && entry.pdispVal) {
+            GuardedAccessible object;
+            if (FAILED(GuardedQueryAccessible(entry.pdispVal, &object.value)) || !object.value)
+                return Reject(reason, L"previous versions child is not an accessible element");
+            if (!DescribePreviousVersionsElement(object.value, SelfId(), true, depth + 1, child, reason))
+                return false;
+        } else if (entry.vt == VT_I4 && entry.lVal != CHILDID_SELF) {
+            if (!DescribePreviousVersionsElement(target, entry, false, depth + 1, child, reason))
+                return false;
+        } else {
+            return Reject(reason, L"previous versions child has an unsupported accessible form");
+        }
+        element.children.push_back(std::move(child));
+    }
+    return true;
+}
+
+bool ReadPreviousVersionsParts(
+    HWND island,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) {
+    POINT origin{ 0, 0 };
+    RECT client{};
+    if (!island || !IsWindow(island) || !ClientToScreen(island, &origin) ||
+        !GetClientRect(island, &client)) {
+        return Reject(reason, L"previous versions view window is unavailable");
+    }
+    const RECT screenClient{ origin.x, origin.y, origin.x + client.right, origin.y + client.bottom };
+    GuardedAccessible root;
+    if (FAILED(GuardedObjectFromWindow(island, &root.value)) || !root.value)
+        return Reject(reason, L"previous versions view answers no accessible object");
+    PreviousVersionsElement description;
+    if (!DescribePreviousVersionsElement(root.value, SelfId(), true, 0, description, reason))
+        return false;
+    return DecidePreviousVersionsView(description, screenClient, items, reason);
+}
+
+}  // namespace
+
+bool ReadPreviousVersionsView(
+    HWND island,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) noexcept {
+    items.clear();
+    try {
+        if (ReadPreviousVersionsParts(island, items, reason)) return true;
+    } catch (...) {
+        reason = L"previous versions accessible read raised an exception";
+    }
+    items.clear();
+    return false;
+}
+
 bool ReadAccessibleIslandItems(
     HWND island,
     std::vector<AccessibleIslandItem>& items,
@@ -587,6 +941,7 @@ bool ReadAccessibleIslandItems(
         if (FluentShell::EqualsIgnoreCase(className, L"Internet Explorer_Server"))
             return ReadMmcHtmlDocument(island, items, reason);
         if (IsMmcMessageView(island)) return ReadMmcMessageView(island, items, reason);
+        if (IsPreviousVersionsView(island)) return ReadPreviousVersionsView(island, items, reason);
         RECT screenRect{};
         if (!GetWindowRect(island, &screenRect)) {
             return Reject(reason, L"island bounds are unavailable");
@@ -662,6 +1017,9 @@ bool InvokeAccessibleIslandItem(
             !IsWindowEnabled(island)) {
             return Reject(reason, L"island window is unavailable for an action");
         }
+        // The Previous Versions view is published as inert text: nothing in it is an action.
+        if (IsPreviousVersionsView(island))
+            return Reject(reason, L"previous versions view offers no actions");
         POINT clientOrigin{};
         if (!ClientToScreen(island, &clientOrigin)) {
             return Reject(reason, L"island client origin is unavailable");

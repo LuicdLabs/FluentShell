@@ -4,6 +4,7 @@
 #include "../../src/Bridge/Translation/WindowCapture.h"
 #include "../../src/Bridge/Translation/SourceThreadAgent.h"
 #include "../../src/Bridge/Translation/GuiThreadDispatch.h"
+#include "../../src/Bridge/Translation/HostScope.h"
 #include "../../src/Bridge/Translation/ListViewActivation.h"
 #include "../../src/Bridge/Translation/UiAutomationGeometry.h"
 #include "../../src/Bridge/Translation/DirectUiEngine.h"
@@ -5130,6 +5131,11 @@ void TestMdiFrameCaptureAndCommands() {
 #include "SplitButtonTests.h"
 #include "TreeViewCheckBoxTests.h"
 #include "OwnerDrawListBoxTests.h"
+#include "ShellPropertiesProbe.h"
+#include "ShellPropertySheetTests.h"
+#include "PreviousVersionsViewTests.h"
+#include "AclChecklistTests.h"
+#include "HostScopeTests.h"
 
 } // namespace
 
@@ -5365,6 +5371,10 @@ int wmain(int argc, wchar_t** argv) {
     // precisely what MessageGeometryScale corrects for a real target.  The tests
     // declare the same awareness so their fixtures live in one space.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--probe-shell-properties") {
+        _setmode(_fileno(stdout), _O_U8TEXT);
+        return ProbeShellProperties(argv[2]);
+    }
     TestVisibleUiaBoundsClipping();
     TestGuiThreadDispatch();
     TestCrossThreadSurface();
@@ -5395,6 +5405,8 @@ int wmain(int argc, wchar_t** argv) {
     TestWatchPolicy();
     TestWatchWindowDiscovery();
     TestExplorerDialogScope();
+    TestHostScopeVerdicts();
+    TestHostScopeChokePoints();
     TestReadFrameUsesOneDeadline();
     TestWriteFrameUsesOneDeadline();
     TestScalarContracts();
@@ -5415,6 +5427,8 @@ int wmain(int argc, wchar_t** argv) {
     TestStructuredCommonControlCapture();
     TestListViewCheckNotificationSemantics();
     TestTabControlCaptureAndSelection();
+    TestPropertySheetTabItemDataIsNeverRequested();
+    TestAlphaStaticBitmapKeepsItsTransparency();
     TestTreeViewCaptureAndExpansion();
     TestTrackbarCaptureAndValue();
     TestMdiFrameCaptureAndCommands();
@@ -5462,6 +5476,9 @@ int wmain(int argc, wchar_t** argv) {
     TestAccessibleIslandBoundary();
     TestAccessiblePageTabs();
     TestMmcMessageViewAdapter();
+    TestPreviousVersionsViewShape();
+    TestPreviousVersionsViewIdentity();
+    TestAclChecklistLayout();
     TestMmcDescriptionBarIdentity();
     TestTabStopProgressBarLeavesTraversal();
     TestFullyClippedChildIsNotCaptured();

@@ -12,12 +12,12 @@ namespace FluentShell.Renderer.Windows;
 /// </summary>
 internal static class ProxyIdentity
 {
-    public static void Apply(nint proxy, nint native)
+    public static void Apply(nint proxy, nint native, bool explorerHost = false)
     {
         try
         {
             ApplyIcons(proxy, native);
-            ApplyTaskbarGroup(proxy, native);
+            ApplyTaskbarGroup(proxy, native, explorerHost);
         }
         catch (Exception exception)
         {
@@ -49,29 +49,26 @@ internal static class ProxyIdentity
     // One taskbar group per projected application: the application's own explicit
     // AppUserModelID when its window carries one, else one derived from its executable,
     // named and drawn from that executable so the group reads as the application.
-    private static void ApplyTaskbarGroup(nint proxy, nint native)
+    private static void ApplyTaskbarGroup(nint proxy, nint native, bool explorerHost)
     {
         var executable = ExecutablePath(native);
         if (executable is null) return;
-        var id = ReadString(native, AppUserModelId);
-        if (string.IsNullOrWhiteSpace(id))
-        {
-            var name = new string(Path.GetFileNameWithoutExtension(executable)
-                .Where(char.IsLetterOrDigit).Take(64).ToArray());
-            if (name.Length == 0) return;
-            id = "FluentShell.Projection." + name;
-        }
-        var description = FileVersionInfo.GetVersionInfo(executable).FileDescription;
-        if (string.IsNullOrWhiteSpace(description)) description = Path.GetFileNameWithoutExtension(executable);
+        var plan = PlanTaskbarGroup(executable, ReadString(native, AppUserModelId), explorerHost,
+            path => FileVersionInfo.GetVersionInfo(path).FileDescription);
+        if (plan is null) return;
         if (SHGetPropertyStoreForWindow(proxy, typeof(IPropertyStore).GUID, out var raw) != 0 ||
             raw is not IPropertyStore store) return;
         try
         {
-            // The relaunch properties have to come together or the shell ignores them.
-            SetString(store, RelaunchCommand, $"\"{executable}\"");
-            SetString(store, RelaunchIconResource, $"{executable},0");
-            SetString(store, RelaunchDisplayNameResource, description);
-            SetString(store, AppUserModelId, id);
+            if (plan.RelaunchCommand is not null)
+            {
+                // The relaunch properties have to come together or the shell ignores them.
+                SetString(store, RelaunchCommand, plan.RelaunchCommand);
+                SetString(store, RelaunchIconResource, plan.RelaunchIconResource!);
+                SetString(store, RelaunchDisplayNameResource, plan.RelaunchDisplayName!);
+            }
+            if (plan.PreventPinning) SetBool(store, PreventPinning, true);
+            if (plan.Id is not null) SetString(store, AppUserModelId, plan.Id);
             store.Commit();
         }
         finally
@@ -79,6 +76,35 @@ internal static class ProxyIdentity
             Marshal.ReleaseComObject(store);
         }
     }
+
+    /// <summary>What the proxy tells the shell about its taskbar group.</summary>
+    /// <remarks>
+    /// A proxy standing for an Explorer window (the parent is the system Explorer, or the
+    /// native window's image is) is never given a relaunch command: pinning it, or opening
+    /// it from a jump list, would start explorer.exe, which as a second shell process is not
+    /// what the user pinned.  It cannot be pinned at all (PreventPinning), and it keeps the
+    /// native dialog's own AppUserModelID only when the dialog has one.
+    /// </remarks>
+    internal static TaskbarGroupPlan? PlanTaskbarGroup(string executable, string? nativeId,
+        bool explorerHost, Func<string, string?> describe)
+    {
+        explorerHost |= ExplorerHostScope.IsSystemExplorerImage(executable);
+        var id = string.IsNullOrWhiteSpace(nativeId) ? null : nativeId;
+        if (explorerHost) return new TaskbarGroupPlan(id, null, null, null, PreventPinning: true);
+        if (id is null)
+        {
+            var name = new string(Path.GetFileNameWithoutExtension(executable)
+                .Where(char.IsLetterOrDigit).Take(64).ToArray());
+            if (name.Length == 0) return null;
+            id = "FluentShell.Projection." + name;
+        }
+        var description = describe(executable);
+        if (string.IsNullOrWhiteSpace(description)) description = Path.GetFileNameWithoutExtension(executable);
+        return new TaskbarGroupPlan(id, $"\"{executable}\"", $"{executable},0", description, PreventPinning: false);
+    }
+
+    internal sealed record TaskbarGroupPlan(string? Id, string? RelaunchCommand, string? RelaunchIconResource,
+        string? RelaunchDisplayName, bool PreventPinning);
 
     private static string? ExecutablePath(nint window)
     {
@@ -134,13 +160,22 @@ internal static class ProxyIdentity
         }
     }
 
+    private static void SetBool(IPropertyStore store, PropertyKey key, bool flag)
+    {
+        var value = new PropVariant { Type = VtBool, Bool = flag ? VariantTrue : (short)0 };
+        Marshal.ThrowExceptionForHR(store.SetValue(ref key, ref value));
+    }
+
     private static readonly Guid AppUserModelFormat = new("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3");
     private static readonly PropertyKey RelaunchCommand = new(AppUserModelFormat, 2);
     private static readonly PropertyKey RelaunchIconResource = new(AppUserModelFormat, 3);
     private static readonly PropertyKey RelaunchDisplayNameResource = new(AppUserModelFormat, 4);
     private static readonly PropertyKey AppUserModelId = new(AppUserModelFormat, 5);
+    private static readonly PropertyKey PreventPinning = new(AppUserModelFormat, 9);
 
     private const ushort VtLpwstr = 31;
+    private const ushort VtBool = 11;
+    private const short VariantTrue = -1;
     private const uint WmGetIcon = 0x007F;
     private const uint WmSetIcon = 0x0080;
     private const nint IconSmall = 0;
@@ -164,6 +199,7 @@ internal static class ProxyIdentity
     {
         [FieldOffset(0)] public ushort Type;
         [FieldOffset(8)] public nint Pointer;
+        [FieldOffset(8)] public short Bool;
     }
 
     [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

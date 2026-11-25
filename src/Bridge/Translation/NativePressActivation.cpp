@@ -1,4 +1,5 @@
 #include "NativePressActivation.h"
+#include "HostScope.h"
 
 #include <dwmapi.h>
 
@@ -195,7 +196,10 @@ NativePressActivation::NativePressActivation(HWND root, HWND proxy) noexcept
         const HWND foreground = GetForegroundWindow();
         const DWORD foreign = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
         const DWORD thread = GetCurrentThreadId();
-        if (foreign && foreign != thread && AttachThreadInput(thread, foreign, TRUE) != FALSE) {
+        // A guest in Explorer joins only the renderer proxy's own thread, never a shell
+        // thread (taskbar, folder): the press then fails visibly instead.
+        if (foreign && foreign != thread && ProcessHostScope().AllowsInputJoinWith(foreign, proxy_) &&
+            AttachThreadInput(thread, foreign, TRUE) != FALSE) {
             joinedThread_ = foreign;
             if (SetForegroundWindow(root_) != FALSE && GetForegroundWindow() == root_) {
                 foregroundHeld_ = true;

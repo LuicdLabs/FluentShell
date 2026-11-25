@@ -1,6 +1,5 @@
 #include "../Common/FluentShell.h"
 #include "../Common/ProcessPolicy.h"
-#include "../Common/ExplorerDialogPolicy.h"
 #include "Translation/DialogTranslator.h"
 #include "Translation/MenuBarCapture.h"
 #include "Translation/SourceThreadAgent.h"
@@ -419,9 +418,13 @@ DWORD WINAPI BridgeWorker(LPVOID) noexcept {
         wchar_t executablePath[MAX_PATH * 4]{};
         GetModuleFileNameW(nullptr, executablePath, static_cast<DWORD>(std::size(executablePath)));
         const auto executableName = FluentShell::FileNameOf(executablePath);
-        const bool explorerDialogsOnly = FluentShell::IsSystemExplorerImage(executablePath) &&
-            FluentShell::CurrentExplorerDialogGrant();
-        if (!explorerDialogsOnly &&
+        // Where this Bridge runs decides everything it may touch (HostScope.h).  It is
+        // published before any session, hook or agent exists, because hook callbacks and
+        // cross-thread dispatch consult it too.
+        const auto scope = FluentShell::Bridge::Translation::HostScope::ForCurrentProcess(executablePath);
+        FluentShell::Bridge::Translation::PublishProcessHostScope(scope);
+        FluentShell::Log(std::wstring(L"Bridge host scope: ") + scope.Name());
+        if (scope.RefusesDeniedOrXamlHost() &&
             (FluentShell::IsProcessDenied(executableName) || HostAlreadyHasXaml())) {
             FluentShell::Log(L"Bridge refused denied or existing-XAML target");
             return 0;
@@ -432,11 +435,11 @@ DWORD WINAPI BridgeWorker(LPVOID) noexcept {
         // interception armed, and that interception *is* one of these hooks.
         // Explorer is never given process-wide MessageBox/TaskDialog/menu detours.
         // Its exception covers HWND-backed dialogs only, even when it hosts XAML.
-        if (!explorerDialogsOnly && !InstallHooks()) {
+        if (scope.InstallsProcessDetours() && !InstallHooks()) {
             FluentShell::Log(L"Translation hook installation failed; whole-window projection remains active");
         }
         reset.session = std::make_shared<
-            FluentShell::Bridge::Translation::RendererSession>(g_self, explorerDialogsOnly);
+            FluentShell::Bridge::Translation::RendererSession>(g_self, scope);
         FluentShell::Bridge::Translation::SetActiveRendererSession(reset.session);
         reset.published = true;
         if (!reset.session->Start()) {

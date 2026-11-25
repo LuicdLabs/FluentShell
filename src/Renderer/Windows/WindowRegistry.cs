@@ -15,16 +15,30 @@ public sealed class WindowRegistry
     private readonly uint _parentProcessId;
     private readonly ulong _parentCreated;
     private readonly Func<IProtocolMessage, ulong, Task> _send;
+    private readonly ExplorerTaskbarTabs _explorerTabs;
     private long _eventSequence;
+
+    // Long enough for a responsive shell to take every button back before the process exits,
+    // short enough that a hung one cannot hold a shutdown.
+    private static readonly TimeSpan TaskbarFlushTimeout = TimeSpan.FromMilliseconds(1500);
 
     public WindowRegistry(string sessionNonce, Func<IProtocolMessage, ulong, Task> send,
         uint parentProcessId = 0, ulong parentCreated = 0)
+        : this(sessionNonce, send, parentProcessId, parentCreated, null)
+    {
+    }
+
+    internal WindowRegistry(string sessionNonce, Func<IProtocolMessage, ulong, Task> send,
+        uint parentProcessId, ulong parentCreated, ITaskbarTabSink? taskbarTabs)
     {
         _sessionNonce = sessionNonce;
         _send = send;
         _parentProcessId = parentProcessId;
         _parentCreated = parentCreated;
+        _explorerTabs = new ExplorerTaskbarTabs(IsExplorerParent, taskbarTabs ?? TaskbarTabWorker.Shell);
     }
+
+    private bool IsExplorerParent() => ExplorerHostScope.IsExplorerParent(_parentProcessId, _parentCreated);
 
     public async Task HandleAsync(IProtocolMessage message, ulong headerRevision)
     {
@@ -104,8 +118,11 @@ public sealed class WindowRegistry
             case SurfaceCommitMessage commit:
                 RequireHeaderRevision(headerRevision, commit.Revision, "surface.commit");
                 if (_retiredSurfaces.Contains(commit.SurfaceId)) break;
-                RequireWindow(commit.SurfaceId).Commit(
-                    commit.Show, ParseRevision(commit.Revision), commit.Interactive);
+                var committed = RequireWindow(commit.SurfaceId);
+                committed.Commit(commit.Show, ParseRevision(commit.Revision), commit.Interactive);
+                _explorerTabs.OnCommit(commit.SurfaceId, committed.ViewModel.SurfaceKind,
+                    committed.ViewModel.NativeHwnd, committed.ViewModel.ShowInTaskbar,
+                    commit.Show, commit.Interactive);
                 break;
             case WindowCloseMessage close:
                 if (!_retiredSurfaces.Contains(close.SurfaceId))
@@ -165,7 +182,14 @@ public sealed class WindowRegistry
         foreach (var window in _retiredWindows) window.CloseFromBridge();
         _windows.Clear();
         _retiredWindows.Clear();
+        _explorerTabs.RestoreAll(TaskbarFlushTimeout);
     }
+
+    /// <summary>
+    /// The last thing a dying renderer does: puts back the taskbar buttons it took from an
+    /// Explorer parent's native windows.  Nothing else of the registry is touched.
+    /// </summary>
+    internal void RestoreExplorerTaskbarTabs() => _explorerTabs.RestoreAll(TaskbarFlushTimeout);
 
     private async Task OpenAsync(WindowOpenMessage message, ulong headerRevision)
     {
@@ -175,7 +199,8 @@ public sealed class WindowRegistry
             throw new ProtocolException("Duplicate surfaceId in window.open.");
         var revision = ParseRevision(message.Window.Revision);
         if (headerRevision != revision) throw new ProtocolException("window.open header and payload revisions differ.");
-        var translated = new TranslatedWindow(message.Window, SendActionAsync, NextEventId);
+        var translated = new TranslatedWindow(message.Window, SendActionAsync, NextEventId,
+            explorerHost: IsExplorerParent());
         _windows.Add(message.Window.SurfaceId, translated);
         var ownerReady = true;
         if (message.Window.Modal && message.Window.OwnerHwnd is not null)
@@ -271,6 +296,7 @@ public sealed class WindowRegistry
             throw new ProtocolException($"Unknown surfaceId '{surfaceId}'.");
         }
         _retiredSurfaces.Remember(surfaceId);
+        _explorerTabs.OnClosed(surfaceId);
         if (_windows.Count == 0)
         {
             window.RetireFromBridge();

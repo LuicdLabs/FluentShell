@@ -1,5 +1,6 @@
 #pragma once
 
+#include "HostScope.h"
 #include "SourceThreadAgent.h"
 #include "VirtualTaskDialog.h"
 #include "RootSuppression.h"
@@ -23,7 +24,7 @@ namespace FluentShell::Bridge::Translation {
 
 class RendererSession final : public std::enable_shared_from_this<RendererSession> {
 public:
-    explicit RendererSession(HMODULE bridgeModule, bool explorerDialogsOnly = false) noexcept;
+    explicit RendererSession(HMODULE bridgeModule, HostScope scope = HostScope::Application()) noexcept;
     ~RendererSession();
 
     RendererSession(const RendererSession&) = delete;
@@ -249,7 +250,8 @@ private:
     void Fail(std::wstring_view reason) noexcept;
 
     HMODULE bridgeModule_ = nullptr;
-    const bool explorerDialogsOnly_ = false;
+    // Where this Bridge runs: every decision that differs inside Explorer is asked of it.
+    const HostScope scope_;
     HANDLE pipe_ = INVALID_HANDLE_VALUE;
     HANDLE rendererProcess_ = nullptr;
     HANDLE rendererThread_ = nullptr;
@@ -308,6 +310,8 @@ private:
     // by surfacesMutex_.
     std::unordered_map<HWND, uint64_t> projectedSince_;
     void ScheduleDiscoveryRetry(HWND window);
+    std::unordered_map<HWND, HWND> RootsHoldingUnadmittedOwnedWindows(const std::vector<HWND>& candidates) const;
+    void HandProjectedOwnersOfUnadmittedWindowsToNative(const std::unordered_map<HWND, HWND>& held);
     void ScheduleReprojection(HWND root, std::wstring_view reason) noexcept;
     void ContinueReprojection(HWND root) noexcept;
     void WatchTopology(HWND root, bool timed = false) noexcept;

@@ -1,5 +1,6 @@
 #include "SourceThreadAgent.h"
 #include "GuiThreadDispatch.h"
+#include "HostScope.h"
 #include "NativeDocument.h"
 #include "DiskView.h"
 #include "AccessibleIsland.h"
@@ -150,11 +151,18 @@ Command* CreateCommand(UINT kind, SourceThreadAgent* agent,
     return command;
 }
 
-std::mutex g_agentsMutex;
-std::unordered_map<UINT, SourceThreadAgent*> g_agents;
-std::mutex g_commandsMutex;
-std::unordered_set<Command*> g_pendingCommands;
-std::vector<std::shared_ptr<SourceThreadAgent>> g_retainedAgents;
+// Process-lifetime registries, deliberately leaked.  The Bridge is pinned, and inside
+// Explorer the host outlives every session: a static destructor would run at process
+// exit under the loader lock and shut retained agents down against threads that are
+// already gone.  Hook and subclass callbacks can also still run then.
+// Recursive: a thread hook asks it which windows are in scope (ThreadHooksActFor), and a
+// message sent on the same thread while it is held reaches that hook.
+std::recursive_mutex& g_agentsMutex = *new std::recursive_mutex();
+std::unordered_map<UINT, SourceThreadAgent*>& g_agents = *new std::unordered_map<UINT, SourceThreadAgent*>();
+std::mutex& g_commandsMutex = *new std::mutex();
+std::unordered_set<Command*>& g_pendingCommands = *new std::unordered_set<Command*>();
+std::vector<std::shared_ptr<SourceThreadAgent>>& g_retainedAgents =
+    *new std::vector<std::shared_ptr<SourceThreadAgent>>();
 std::atomic<UINT> g_nextMessage{ WM_APP + 0x4A1 };
 std::atomic<uint64_t> g_nextGeneration{ 1 };
 thread_local unsigned g_boundedSourceCommandDepth = 0;
@@ -2531,9 +2539,40 @@ LRESULT CALLBACK SourceHook(int code, WPARAM wParam, LPARAM lParam) {
 
 std::atomic<HANDLE> g_topLevelShownEvent{ nullptr };
 
+// Whether a window on the hooked thread is one the thread hooks act for.  An application's
+// thread is all its own.  Inside Explorer a dialog can share its thread with a folder
+// window (the security warning is shown on the thread of the folder that opened the file),
+// so the hooks act only for the windows of a root an agent of this thread projects, and a
+// dialog root that could become one.  Everything else on the thread passes straight on.
+bool ThreadHooksActFor(HWND window) noexcept {
+    if (!ProcessHostScope().IsExplorer()) return true;
+    if (!window) return false;
+    const HWND root = GetAncestor(window, GA_ROOT);
+    if (!root) return false;
+    const DWORD threadId = GetCurrentThreadId();
+    try {
+        std::scoped_lock lock(g_agentsMutex);
+        for (const auto& [_, agent] : g_agents) {
+            if (agent && agent->ThreadId() == threadId && agent->Root() == root) return true;
+        }
+    } catch (...) {}
+    return false;
+}
+
+// A dialog root the guest's discovery may want to look at as soon as it shows.  Read from
+// the window itself (no message): at WM_SHOWWINDOW it is not visible yet.
+bool IsDialogRoot(HWND window) noexcept {
+    if (!window || GetAncestor(window, GA_ROOT) != window) return false;
+    wchar_t name[16]{};
+    return GetClassNameW(window, name, static_cast<int>(std::size(name))) > 0 &&
+        FluentShell::EqualsIgnoreCase(name, L"#32770");
+}
+
 void SignalIfTopLevel(HWND window) noexcept {
     const HANDLE event = g_topLevelShownEvent.load();
-    if (event && window && GetAncestor(window, GA_ROOT) == window) SetEvent(event);
+    if (!event || !window || GetAncestor(window, GA_ROOT) != window) return;
+    if (ProcessHostScope().IsExplorer() && !IsDialogRoot(window)) return;
+    SetEvent(event);
 }
 
 LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
@@ -2542,7 +2581,8 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
     case HCBT_DESTROYWND:
     case HCBT_MINMAX:
     case HCBT_MOVESIZE:
-        MarkCurrentThreadAgentsDirty(reinterpret_cast<HWND>(wParam));
+        if (ThreadHooksActFor(reinterpret_cast<HWND>(wParam)))
+            MarkCurrentThreadAgentsDirty(reinterpret_cast<HWND>(wParam));
         break;
     case HCBT_ACTIVATE:
         SignalIfTopLevel(reinterpret_cast<HWND>(wParam));
@@ -2556,6 +2596,10 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wParam, LPARAM lParam) {
 LRESULT CALLBACK CallWndRetHook(int code, WPARAM wParam, LPARAM lParam) {
     if (code >= 0 && lParam) {
         const auto* message = reinterpret_cast<CWPRETSTRUCT*>(lParam);
+        if (!ThreadHooksActFor(message->hwnd)) {
+            if (message->message == WM_SHOWWINDOW && message->wParam) SignalIfTopLevel(message->hwnd);
+            return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
         const bool menuChanged = MenuMutationMessage(message->message, message->lParam);
         const bool observed = !CaptureReadInProgress() &&
             (RelevantMessageFor(message->hwnd, message->message, message->lParam, message->wParam) ||
@@ -2673,6 +2717,8 @@ std::atomic<HWINEVENTHOOK> g_topLevelShownHook{ nullptr };
 } // namespace
 
 bool InstallTopLevelShownHook(HMODULE module) noexcept {
+    // Process-wide and in context: never inside a host the scope keeps it out of.
+    if (!ProcessHostScope().InstallsProcessShowHook()) return false;
     if (g_topLevelShownHook.load()) return true;
     const HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, module,
         TopLevelShownWinEvent, GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
@@ -2910,7 +2956,17 @@ std::shared_ptr<SourceThreadAgent> SourceThreadAgent::Attach(
 }
 
 SourceThreadAgent::~SourceThreadAgent() {
-    Shutdown();
+    // Callers shut an agent down and retain it when that fails (RetainSourceThreadAgent). A last
+    // reference dropped without that must still never leave this object registered: hook and
+    // subclass callbacks find their agent through g_agents, and a host such as Explorer outlives
+    // every agent. Thread hooks can be removed from any thread; a subclass left on the source
+    // thread then finds no agent and only forwards to DefSubclassProc.
+    if (Shutdown()) return;
+    UnhookAll();
+    try {
+        std::scoped_lock lock(g_agentsMutex);
+        g_agents.erase(message_);
+    } catch (...) {}
 }
 
 void SourceThreadAgent::UnhookAll() noexcept {

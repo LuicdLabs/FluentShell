@@ -19,6 +19,10 @@ public sealed partial class App : Application
         {
             System.Diagnostics.Debug.WriteLine(args.Exception);
             RendererDiagnostics.Log("application unhandled exception: " + args.Exception);
+            // The process is about to end: an Explorer dialog must not be left without its
+            // taskbar button (the Bridge inside Explorer never removes or restores it).
+            try { _windows?.RestoreExplorerTaskbarTabs(); }
+            catch { }
             args.Handled = false;
         };
     }

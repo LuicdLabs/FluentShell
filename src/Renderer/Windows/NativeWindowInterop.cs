@@ -94,15 +94,9 @@ internal static class NativeWindowInterop
                 actualOwner = GetWindow(actualOwner, 4);
             }
             if (actualOwner != owner) return 0;
-            using var parent = System.Diagnostics.Process.GetProcessById(checked((int)parentPid));
-            if ((ulong)parent.StartTime.ToFileTimeUtc() != parentCreated ||
-                !string.Equals(parent.MainModule?.FileName,
-                    System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
-                    StringComparison.OrdinalIgnoreCase)) return 0;
-            using var watcher = Mutex.OpenExisting(@"Local\FluentShell.Watch");
-            using var grant = EventWaitHandle.OpenExisting(
-                $@"Local\FluentShell.ExplorerDialogs.{parentPid}.{parentCreated}");
-            return grant.WaitOne(0) ? owner : 0;
+            // The owner is lent only while the grant is live, not merely once it was.
+            return ExplorerHostScope.IsExplorerParent(parentPid, parentCreated) &&
+                ExplorerHostScope.GrantIsLive(parentPid, parentCreated) ? owner : 0;
         }
         catch { return 0; }
     }

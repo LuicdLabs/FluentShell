@@ -97,6 +97,47 @@ bool ReadMmcMessageView(
     std::vector<AccessibleIslandItem>& items,
     std::wstring& reason) noexcept;
 
+// The Previous Versions page (twext.dll) of a shell Properties sheet: a SHELLDLL_DefView
+// (registered by System32 shell32.dll) on a child #32770 page whose instance is System32
+// twext.dll and which carries twext's template controls (201, 202, 203, 207, 204, 209).
+// The view's DirectUIHWND class is registered by the host executable, so its own module
+// proves nothing; the island is identified by the two windows around it.
+bool IsPreviousVersionsFolderView(HWND defView) noexcept;
+bool IsPreviousVersionsView(HWND island) noexcept;
+
+// One element of the Previous Versions view as MSAA describes it: what the shape decision
+// below reads, captured once so the decision is a pure function of it.  `rect` is in screen
+// pixels (empty when the provider gave no location); `childCount` is the provider's own
+// count, `children` the ones that were read.
+struct PreviousVersionsElement final {
+    long role = 0;
+    long state = 0;
+    std::wstring name;
+    RECT rect{};
+    long childCount = 0;
+    std::vector<PreviousVersionsElement> children;
+};
+
+// The empty view only: a list root holding exactly one header list whose visible children
+// are all column headers, and at most one static text (the empty-state message).  Invisible
+// elements are skipped.  A list item (the page has versions), any other role, a second text,
+// a non-column header child, or an element outside `islandScreenClient` refuses the view,
+// and the whole window with it.  Publishes inert Text items: the column names and the
+// message at their rectangles, relative to the island's client area, with no actions.
+bool DecidePreviousVersionsView(
+    const PreviousVersionsElement& root,
+    const RECT& islandScreenClient,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason);
+
+// Reads the view through MSAA (every provider call behind a structured-exception guard, so
+// a fault in the shell's provider refuses the view instead of ending the process) and
+// decides it with DecidePreviousVersionsView.
+bool ReadPreviousVersionsView(
+    HWND island,
+    std::vector<AccessibleIslandItem>& items,
+    std::wstring& reason) noexcept;
+
 // Opt-in field diagnostics for an unadmitted HWND. Never invokes provider actions.
 // The tree is capped by depth, node count, and text length.
 std::wstring DescribeAccessibleIsland(HWND window) noexcept;

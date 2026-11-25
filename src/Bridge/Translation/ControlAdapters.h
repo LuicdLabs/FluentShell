@@ -66,6 +66,15 @@ bool IsWindowsFormsLinkLabelWindow(HWND hwnd) noexcept;
 // A ComboBoxEx (WC_COMBOBOXEX): a comboBox node whose typed text lives in an edit box of its own.
 bool IsComboBoxExWindow(HWND hwnd) noexcept;
 
+// The grid aclui.dll's permission checklist (CHECKLIST_ACLUI) lays its children out in: one row per
+// permission, a Static text label with control ID row * stride and, for columns 1..n (Allow, Deny),
+// a cell with ID row * stride + column -- a Static SS_ICON (read-only page) or a BS_AUTOCHECKBOX
+// (Edit dialog) -- on that label's row band, every column at one x. One stride, every row with
+// every column, nothing else. Only the shape: the window's identity (its class registered by
+// System32's aclui.dll) is ProbeAclChecklist's, and a window that fails either is judged as an
+// unregistered class. Reads window geometry, styles and IDs only; never sends a message.
+bool HasAclChecklistLayout(HWND checklist, std::wstring& reason) noexcept;
+
 // What a dialog (#32770) paints itself in a full-width band above or below all of its
 // controls, such as mstsc's banner.  A band it only fills with its background is left out;
 // so is one past the chrome pixel caps.  False only when the dialog could not be rendered.

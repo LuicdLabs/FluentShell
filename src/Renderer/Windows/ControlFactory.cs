@@ -77,7 +77,7 @@ internal sealed class ControlFactory
             "datePicker" => CreateDatePicker(viewModel),
             "timePicker" => CreateTimePicker(viewModel),
             "staticDecoration" => CreateStaticDecoration(viewModel),
-            "separator" => new Border { Height = 1, Background = new SolidColorBrush(Microsoft.UI.Colors.Gray) },
+            "separator" => CreateSeparator(viewModel),
             "button" => viewModel.PresentationVariant == "splitButton"
                 ? CreateSplitButton(viewModel) : CreateButton(viewModel),
             "checkBox" => CreateCheckBox(viewModel, false),
@@ -249,6 +249,50 @@ internal sealed class ControlFactory
         {
             if (args.PropertyName is nameof(viewModel.Style) or nameof(viewModel.ExStyle)) Apply();
         });
+    }
+
+    // SS_ETCHEDHORZ/SS_ETCHEDVERT: a hairline in the theme's divider colour (a fixed grey was
+    // too strong on light and too bright on dark), re-resolved when the theme changes.
+    private static FrameworkElement CreateSeparator(ControlNodeViewModel viewModel)
+    {
+        var vertical = viewModel.Rect.Height > viewModel.Rect.Width;
+        var line = new Border
+        {
+            Height = vertical ? double.NaN : 1,
+            Width = vertical ? 1 : double.NaN,
+        };
+        void Apply() => line.Background = ThemeResourceBrush("DividerStrokeColorDefaultBrush",
+            global::Windows.UI.Color.FromArgb(0x29, 0x80, 0x80, 0x80));
+        Apply();
+        line.ActualThemeChanged += (_, _) => Apply();
+        return line;
+    }
+
+    // A read-only edit box without a native frame (a Properties page's Type, Location, Size and
+    // Contains values) is selectable text on the dialog face natively, not an input field.  Drawn
+    // as WinUI's TextBox chrome it was a dozen boxes; it keeps the TextBox (selection, copy, the
+    // UIA value) but loses the frame, the fill, the focus underline and the hover state.
+    internal static bool PresentsAsPlainText(bool readOnly, ulong style, ulong exStyle) =>
+        readOnly && !HasNativeFrame(style, exStyle);
+
+    private static readonly string[] PlainTextBrushKeys =
+    [
+        "TextControlBackground", "TextControlBackgroundPointerOver", "TextControlBackgroundFocused",
+        "TextControlBackgroundDisabled", "TextControlBackgroundReadOnly",
+        "TextControlBorderBrush", "TextControlBorderBrushPointerOver", "TextControlBorderBrushFocused",
+        "TextControlBorderBrushDisabled",
+    ];
+
+    private static void ApplyPlainTextPresentation(TextBox control)
+    {
+        var transparent = new SolidColorBrush(Microsoft.UI.Colors.Transparent);
+        foreach (var key in PlainTextBrushKeys) control.Resources[key] = transparent;
+        control.Resources["TextControlBorderThemeThickness"] = new Thickness(0);
+        control.Resources["TextControlBorderThemeThicknessFocused"] = new Thickness(0);
+        control.Background = transparent;
+        control.BorderBrush = transparent;
+        control.BorderThickness = new Thickness(0);
+        control.Padding = new Thickness(0);
     }
 
     private static Brush ThemeResourceBrush(string key, global::Windows.UI.Color fallback) =>
@@ -778,6 +822,8 @@ internal sealed class ControlFactory
             TextWrapping = viewModel.Multiline ? TextWrapping.Wrap : TextWrapping.NoWrap,
             IsReadOnly = viewModel.ReadOnly,
         };
+        if (PresentsAsPlainText(viewModel.ReadOnly, viewModel.Style, viewModel.ExStyle))
+            ApplyPlainTextPresentation(control);
         BindCueBanner(viewModel, text => control.PlaceholderText = text);
         Bind(control, TextBox.TextProperty, nameof(viewModel.DraftText), BindingMode.TwoWay);
         // A retained Value peer can still change a detached control. Remove its

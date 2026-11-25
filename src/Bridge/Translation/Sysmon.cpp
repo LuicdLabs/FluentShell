@@ -538,8 +538,11 @@ bool SubscribeImpl(void* raw) {
     return true;
 }
 
-std::mutex g_recordersMutex;
-std::unordered_map<HWND, std::shared_ptr<Recorder>> g_recorders;
+// Leaked on purpose (see g_agents in SourceThreadAgent.cpp): no static destructor of the
+// pinned Bridge may release COM objects or touch windows at process exit.
+std::mutex& g_recordersMutex = *new std::mutex();
+std::unordered_map<HWND, std::shared_ptr<Recorder>>& g_recorders =
+    *new std::unordered_map<HWND, std::shared_ptr<Recorder>>();
 
 } // namespace
 

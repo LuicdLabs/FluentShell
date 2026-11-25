@@ -166,6 +166,32 @@ Assert-Absent $guardedInjector "AppInit_DLLs" "The watcher must not use AppInit_
 Assert-Absent $guardedInjector "Image File Execution Options" "The watcher must not use IFEO"
 Assert-Absent $guardedInjector "ShellExecute" "The injector must not launch through the shell"
 Write-Host "Global apply guardrail gates passed."
+
+# The Explorer host boundary.  Inside explorer.exe the Bridge is a guest, and every decision that
+# differs there is asked of HostScope (src\Bridge\Translation\HostScope.h).  Only HostScope.cpp may
+# read the Explorer policy inside the Bridge, the bare session flag it replaced may not come back,
+# and the primitives that reach past a dialog (process-wide WinEvent hooks, input joins, the
+# in-process taskbar list) stay in the files whose wrappers ask the scope first.
+$bridgeSources = @($guardedSources | Where-Object { $_.FullName -like "*\src\Bridge\*" })
+$hostScopeSource = Join-Path $Root "src\Bridge\Translation\HostScope.cpp"
+Assert-Absent @($bridgeSources | Where-Object { $_.FullName -ne $hostScopeSource }) "ExplorerDialogPolicy.h" `
+    "Only HostScope.cpp may consult the Explorer dialog policy inside the Bridge"
+Assert-Absent $bridgeSources "explorerDialogsOnly" "Explorer decisions belong to HostScope, not to a session flag"
+function Assert-OnlyIn([object[]]$Files, [string]$Pattern, [string[]]$Allowed, [string]$Reason) {
+    foreach ($file in $Files) {
+        if ($Allowed -contains $file.Name) { continue }
+        if (Select-String -LiteralPath $file.FullName -Pattern $Pattern -SimpleMatch -Quiet) {
+            throw "$Reason ($($file.FullName))"
+        }
+    }
+}
+Assert-OnlyIn $bridgeSources "SetWinEventHook(" @("SourceThreadAgent.cpp") `
+    "A process-wide WinEvent hook outside SourceThreadAgent.cpp bypasses HostScope"
+Assert-OnlyIn $bridgeSources "AttachThreadInput(" @("NativePressActivation.cpp", "MenuBarCapture.cpp") `
+    "An input join outside the scope-checked press and menu-bar read bypasses HostScope"
+Assert-OnlyIn $bridgeSources "ITaskbarList" @("RendererSession.cpp") `
+    "The in-process taskbar list outside the scope-gated TaskbarTabs bypasses HostScope"
+Write-Host "Explorer host boundary gates passed."
 Write-Host "All available tests and production gates passed."
 # The CLI gate runs the Injector without arguments, which exits 1 by design; every
 # failure above has already thrown, so reaching here means success.

@@ -1817,6 +1817,8 @@ bool ProbePaneContainer(HWND hwnd, DWORD style, ControlKind& kind, std::wstring&
     return true;
 }
 
+bool IsAclChecklist(HWND hwnd) noexcept;
+
 bool CapturePaneContainerState(HWND hwnd, ControlNode& node, std::wstring& reason) {
     node.splits.clear();
     RECT client{};
@@ -1835,6 +1837,12 @@ bool CapturePaneContainerState(HWND hwnd, ControlNode& node, std::wstring& reaso
         node.clientRect = { origin.x - window.left, origin.y - window.top,
             origin.x - window.left + client.right - client.left,
             origin.y - window.top + client.bottom - client.top };
+    }
+    // aclui.dll's permission checklist paints only its background around its grid, by contract
+    // (ProbeAclChecklist): no chrome, and nothing between two cells is a split.
+    if (IsAclChecklist(hwnd)) {
+        node.chromeRegions.clear();
+        return true;
     }
     std::vector<RECT> children;
     CollectVisibleChildRects(hwnd, children);
@@ -1889,6 +1897,16 @@ bool ProbeAccessibleIsland(HWND hwnd, DWORD style, ControlKind& kind, std::wstri
     if (!ReadAccessibleIslandItems(hwnd, items, reason)) return false;
     kind = ControlKind::AccessibleIsland;
     return true;
+}
+
+// The shell's folder view (SHELLDLL_DefView) is a frame around a DirectUI items view whose
+// contract is the shell's, not a form.  It is admitted only as the frame of the Previous
+// Versions page's empty view (IsPreviousVersionsFolderView: shell32's class on twext's page),
+// where the island inside it has a reader of its own; anywhere else it keeps the window native.
+bool ProbeShellFolderView(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    if (!IsPreviousVersionsFolderView(hwnd))
+        return Reject(reason, L"shell folder view is admitted only on the Previous Versions page");
+    return ProbePaneContainer(hwnd, style, kind, reason);
 }
 
 bool ProbeNativeDocument(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
@@ -2108,6 +2126,60 @@ bool IsAnimationControl(HWND hwnd) noexcept {
     return FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, className), ANIMATE_CLASSW);
 }
 
+// What ClassifyControl does with a class the registry does not name (defined beside it).
+bool ClassifyUnregisteredControl(HWND hwnd, std::wstring_view className, DWORD style,
+    ControlKind& kind, std::wstring& reason);
+
+// The permission checklist of an ACL editor's Security page and of its Edit dialog: the class
+// aclui.dll registers, CHECKLIST_ACLUI. Its children are a grid HasAclChecklistLayout proves; the
+// checklist itself paints nothing but its background around them, and that is its contract rather
+// than a render's verdict. Judged by pixels, the strip between each row's Allow and Deny cells was a
+// band of its own -- a dozen of them against four chrome slots -- and the verdict, taken up to three
+// times a capture (the owner probe, the child capture, the container's state), did not always come
+// out alike, so the page was refused now and then. Identity is the registering module, not the name:
+// a CHECKLIST_ACLUI any other module registers is judged as an unregistered class always was.
+bool HasAclChecklistIdentity(HWND hwnd, DWORD style) noexcept {
+    if ((style & WS_CHILD) == 0) return false;
+    wchar_t className[kMaxClassNameChars]{};
+    if (!FluentShell::EqualsIgnoreCase(ClassNameOf(hwnd, className), L"CHECKLIST_ACLUI")) return false;
+    const auto exStyle = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    if ((exStyle & (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_COMPOSITED)) != 0) return false;
+    if (const HMENU menu = GetMenu(hwnd); menu && IsMenu(menu)) return false;
+    HRGN region = CreateRectRgn(0, 0, 0, 0);
+    if (!region) return false;
+    const int regionType = GetWindowRgn(hwnd, region);
+    DeleteObject(region);
+    if (regionType != ERROR) return false;
+    return WindowClassRegisteredBySystemModule(hwnd, L"aclui.dll");
+}
+
+bool IsAclChecklist(HWND hwnd) noexcept {
+    if (!hwnd) return false;
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    if (!HasAclChecklistIdentity(hwnd, style)) return false;
+    std::wstring ignored;
+    return HasAclChecklistLayout(hwnd, ignored);
+}
+
+// Anything short of both identity and layout is judged exactly as before the row existed: as a
+// class the registry does not name. The admitted checklist is a pane container whose scroll bar
+// projects as any container's; CapturePaneContainerState gives it no chrome and no splits.
+bool ProbeAclChecklist(HWND hwnd, DWORD style, ControlKind& kind, std::wstring& reason) {
+    wchar_t className[kMaxClassNameChars]{};
+    const auto name = ClassNameOf(hwnd, className);
+    std::wstring layoutReason;
+    if (!HasAclChecklistIdentity(hwnd, style) || !HasAclChecklistLayout(hwnd, layoutReason))
+        return ClassifyUnregisteredControl(hwnd, name, style, kind, reason);
+    RECT client{};
+    std::vector<ScrollBarSnapshot> bars;
+    std::wstring scrollReason;
+    if (!GetClientRect(hwnd, &client) || client.right - client.left <= 0 || client.bottom - client.top <= 0 ||
+        ((style & (WS_HSCROLL | WS_VSCROLL)) != 0 && !ReadContainerScrollBars(hwnd, style, bars, scrollReason)))
+        return ClassifyUnregisteredControl(hwnd, name, style, kind, reason);
+    kind = ControlKind::PaneContainer;
+    return true;
+}
+
 using ProbeFn = bool (*)(HWND, DWORD, ControlKind&, std::wstring&);
 
 struct ClassAdapter final {
@@ -2151,6 +2223,10 @@ constexpr std::array kClassAdapters{
     ClassAdapter{ L"MDIClient", &ProbeMdiClient },
     ClassAdapter{ STATUSCLASSNAMEW, &ProbeStatusBar },
     ClassAdapter{ TOOLBARCLASSNAMEW, &ProbeToolbar },
+    // The shell's folder view: only the Previous Versions page's (twext.dll) empty view.
+    ClassAdapter{ L"SHELLDLL_DefView", &ProbeShellFolderView },
+    // aclui.dll's permission checklist (a Security page, its Edit dialog).
+    ClassAdapter{ L"CHECKLIST_ACLUI", &ProbeAclChecklist },
 };
 
 // ---------------------------------------------------------------------------
@@ -2568,6 +2644,37 @@ bool ReadBitmapPixels(HBITMAP bitmap, int& width, int& height,
     }
 }
 
+// A 32-bit bitmap whose alpha bytes say something: not all zero (a 32-bit bitmap drawn
+// without alpha leaves them 0, which comctl32 then BitBlts opaque) and not all 0xFF.
+bool BitmapCarriesAlpha(HBITMAP bitmap, const std::vector<uint8_t>& pixels) noexcept {
+    BITMAP source{};
+    if (GetObjectW(bitmap, sizeof(source), &source) != sizeof(source) || source.bmBitsPixel != 32) return false;
+    bool anyTransparent = false;
+    bool anyVisible = false;
+    for (size_t offset = 3; offset < pixels.size(); offset += 4) {
+        if (pixels[offset] != 0xff) anyTransparent = true;
+        if (pixels[offset] != 0) anyVisible = true;
+        if (anyTransparent && anyVisible) return true;
+    }
+    return false;
+}
+
+// Premultiplies BGRA pixels in place unless they already are: a premultiplied pixel never
+// has a colour channel above its alpha.
+void PremultiplyIfStraight(std::vector<uint8_t>& pixels) noexcept {
+    bool straight = false;
+    for (size_t offset = 0; offset + 3 < pixels.size() && !straight; offset += 4) {
+        const uint8_t a = pixels[offset + 3];
+        straight = pixels[offset] > a || pixels[offset + 1] > a || pixels[offset + 2] > a;
+    }
+    if (!straight) return;
+    for (size_t offset = 0; offset + 3 < pixels.size(); offset += 4) {
+        const unsigned a = pixels[offset + 3];
+        for (size_t channel = 0; channel < 3; ++channel)
+            pixels[offset + channel] = static_cast<uint8_t>((pixels[offset + channel] * a + 127) / 255);
+    }
+}
+
 // An SS_BITMAP control BitBlts its HBITMAP at the client origin and leaves the rest
 // of its client area to the background, so the projection carries exactly that: a
 // client-sized image with the bitmap's pixels opaque at (0,0) and nothing elsewhere.
@@ -2631,6 +2738,12 @@ bool CaptureStaticBitmapState(HWND hwnd, ControlNode& node, std::wstring& reason
     node.imageHeight = static_cast<uint32_t>(height);
     node.imageFormat = L"bgra8-premultiplied";
     node.imageData.assign(static_cast<size_t>(width) * height * 4, 0);
+    // comctl32 v6 alpha-blends a 32-bit bitmap that carries an alpha channel (the shell's
+    // Sharing page draws its folder thumbnail that way), leaving the rest of the client area
+    // to the background, so its alpha travels and nothing is filled around it.  Taken opaque,
+    // its transparent pixels showed black.  Straight alpha is premultiplied for the wire.
+    const bool alpha = BitmapCarriesAlpha(bitmap, pixels);
+    if (alpha) PremultiplyIfStraight(pixels);
     // Destination of the bitmap's (0,0); negative when a centered bitmap is larger
     // than the control and is cropped on both sides.
     const int left = centered ? (width - sourceWidth) / 2 : 0;
@@ -2641,14 +2754,14 @@ bool CaptureStaticBitmapState(HWND hwnd, ControlNode& node, std::wstring& reason
             const int sourceColumn = column - left;
             const bool inside = sourceRow >= 0 && sourceRow < sourceHeight &&
                 sourceColumn >= 0 && sourceColumn < sourceWidth;
-            if (!inside && !centered) continue;
+            if (!inside && (!centered || alpha)) continue;
             const size_t from = inside
                 ? (static_cast<size_t>(sourceRow) * sourceWidth + sourceColumn) * 4 : 0;
             const size_t to = (static_cast<size_t>(row) * width + column) * 4;
             node.imageData[to] = pixels[from];
             node.imageData[to + 1] = pixels[from + 1];
             node.imageData[to + 2] = pixels[from + 2];
-            node.imageData[to + 3] = 0xff;
+            node.imageData[to + 3] = alpha ? pixels[from + 3] : 0xff;
         }
     }
     return true;
@@ -3806,7 +3919,10 @@ bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) 
     for (size_t index = 0; index < count; ++index) {
         std::fill(buffer.begin(), buffer.end(), L'\0');
         TCITEMW item{};
-        item.mask = TCIF_TEXT | TCIF_IMAGE | TCIF_PARAM | TCIF_STATE;
+        // Never TCIF_PARAM: a tab control given TCM_SETITEMEXTRA (every property sheet's is)
+        // copies that many bytes into lParam, past the end of this TCITEMW, and overruns the
+        // stack. The item data is the application's and is never read here anyway.
+        item.mask = TCIF_TEXT | TCIF_IMAGE | TCIF_STATE;
         item.dwStateMask = 0xffffffffu;
         item.pszText = buffer.data();
         item.cchTextMax = static_cast<int>(buffer.size());
@@ -3817,8 +3933,6 @@ bool CaptureTabControlState(HWND hwnd, ControlNode& node, std::wstring& reason) 
             return Reject(reason, L"TabControl callback text is not supported");
         if (item.iImage != -1)
             return Reject(reason, L"TabControl image-backed item is not supported");
-        // lParam is opaque application identity. It remains owned by the native
-        // item and is deliberately neither interpreted nor copied to ControlNode.
         constexpr DWORD acceptedState = TCIS_BUTTONPRESSED | TCIS_HIGHLIGHTED;
         if ((item.dwState & ~acceptedState) != 0)
             return Reject(reason, L"TabControl custom item state is not supported");
@@ -4853,41 +4967,104 @@ bool ProbeWindowsFormsSpin(HWND hwnd, ControlKind& kind, std::wstring& reason) n
     return true;
 }
 
-bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
-    wchar_t buffer[kMaxClassNameChars]{};
-    const auto className = ClassNameOf(hwnd, buffer);
-    const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
-    // An MDI child frame is identified by the role its frame gave it rather than
-    // by its class name: the class belongs to the application, while the caption,
-    // state, and system commands the projection replaces belong to
-    // DefMDIChildProc.  Its client content still goes through the registry below,
-    // one child window at a time.
-    if ((static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & WS_EX_MDICHILD) != 0) {
-        return ProbeMdiChild(hwnd, style, kind, reason);
-    }
-    for (const auto& adapter : kClassAdapters) {
-        if (FluentShell::EqualsIgnoreCase(className, adapter.className)) {
-            if (!adapter.probe(hwnd, style, kind, reason)) return false;
-            // A control that owns visible child windows is not drawing its own content
-            // there: a Static with children is a panel the application used as a frame,
-            // which is a long-standing Win32 idiom.  Reclassify it geometrically so the
-            // children it frames have a container to live in; if it does not qualify as
-            // one either, the original refusal stands.
-            if (kind == ControlKind::StaticText && HasVisibleChildWindow(hwnd)) {
-                std::wstring panelReason;
-                if (ProbePaneContainer(hwnd, style, kind, panelReason)) return true;
-                kind = ControlKind::StaticText;
-                reason = L"Static frames child windows but is not a usable container: " +
-                    panelReason;
-                return false;
+bool HasAclChecklistLayout(HWND checklist, std::wstring& reason) noexcept {
+    try {
+        reason.clear();
+        struct Label final {
+            int id = 0;
+            RECT rect{};
+        };
+        struct Cell final {
+            int id = 0;
+            RECT rect{};
+        };
+        std::vector<Label> labels;
+        std::vector<Cell> cells;
+        for (HWND child = GetWindow(checklist, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (GetWindow(child, GW_CHILD)) return Reject(reason, L"a checklist child frames windows of its own");
+            wchar_t className[kMaxClassNameChars]{};
+            const auto name = ClassNameOf(child, className);
+            const auto style = static_cast<DWORD>(GetWindowLongPtrW(child, GWL_STYLE));
+            const int id = GetDlgCtrlID(child);
+            if (id < 0) return Reject(reason, L"a checklist child has no row identity");
+            const RECT rect = ChildRectInParent(checklist, child);
+            if (FluentShell::EqualsIgnoreCase(name, L"Static")) {
+                const DWORD type = style & SS_TYPEMASK;
+                if (type == SS_ICON) {
+                    cells.push_back(Cell{ id, rect });
+                } else if (type == SS_LEFT || type == SS_CENTER || type == SS_RIGHT || type == SS_LEFTNOWORDWRAP) {
+                    labels.push_back(Label{ id, rect });
+                } else {
+                    return Reject(reason, L"a checklist Static is neither a text label nor an icon cell");
+                }
+            } else if (FluentShell::EqualsIgnoreCase(name, L"Button") &&
+                       (style & BS_TYPEMASK) == BS_AUTOCHECKBOX) {
+                cells.push_back(Cell{ id, rect });
+            } else {
+                return Reject(reason, L"a checklist child is not a label, an icon cell or a check box cell");
             }
-            return true;
         }
+        // An empty checklist (no principal selected) shows only its background.
+        if (labels.empty() && cells.empty()) return true;
+        if (labels.empty()) return Reject(reason, L"checklist cells have no row label");
+        std::sort(labels.begin(), labels.end(), [](const Label& a, const Label& b) { return a.id < b.id; });
+        int columns = 0;
+        int stride = 0;
+        if (labels.size() >= 2) {
+            stride = labels[1].id - labels[0].id;
+        } else {
+            for (const Cell& cell : cells) columns = std::max(columns, cell.id - labels[0].id);
+            stride = columns + 1;
+        }
+        if (stride < 2) return Reject(reason, L"checklist rows have no room for a cell");
+        for (size_t row = 0; row < labels.size(); ++row) {
+            if (labels[row].id != static_cast<int>(row) * stride)
+                return Reject(reason, L"checklist label IDs do not follow one row stride");
+            if (row > 0 && labels[row].rect.top < labels[row - 1].rect.bottom)
+                return Reject(reason, L"checklist rows overlap or are out of order");
+        }
+        for (const Cell& cell : cells) columns = std::max(columns, cell.id % stride);
+        if (columns < 1) return Reject(reason, L"checklist has no cell column");
+        std::vector<std::vector<bool>> seen(labels.size(), std::vector<bool>(static_cast<size_t>(columns), false));
+        std::vector<std::optional<LONG>> columnLeft(static_cast<size_t>(columns));
+        for (const Cell& cell : cells) {
+            const int row = cell.id / stride;
+            const int column = cell.id % stride;
+            if (row >= static_cast<int>(labels.size()) || column < 1)
+                return Reject(reason, L"a checklist cell ID names no row and column");
+            const auto slot = static_cast<size_t>(column - 1);
+            if (seen[static_cast<size_t>(row)][slot]) return Reject(reason, L"a checklist cell is repeated");
+            seen[static_cast<size_t>(row)][slot] = true;
+            const RECT& label = labels[static_cast<size_t>(row)].rect;
+            // A checked read-only cell is its icon (16x16 beside a 15 px label), an unchecked one an
+            // empty window at the cell's corner: either way its middle is on the label's row.
+            const LONG middle = cell.rect.top + (cell.rect.bottom - cell.rect.top) / 2;
+            if (middle < label.top || middle > label.bottom || cell.rect.left < label.right)
+                return Reject(reason, L"a checklist cell is off its label's row");
+            auto& left = columnLeft[slot];
+            if (!left) left = cell.rect.left;
+            else if (*left != cell.rect.left) return Reject(reason, L"a checklist column is not aligned");
+        }
+        for (const auto& row : seen) {
+            for (const bool present : row)
+                if (!present) return Reject(reason, L"a checklist row lacks a cell");
+        }
+        return true;
+    } catch (...) {
+        reason.clear();
+        return false;
     }
-    // A class the registry does not know can still be nothing but a frame around
-    // other windows, or a host for content that owns no HWND at all.  Both are decided
-    // by evidence rather than by name, so the rejection below reports whichever refusal
-    // is the real one for this window.
+}
+
+namespace {
+
+// A class the registry does not know can still be nothing but a frame around
+// other windows, or a host for content that owns no HWND at all.  Both are decided
+// by evidence rather than by name, so the rejection below reports whichever refusal
+// is the real one for this window.  A registry row whose own contract does not hold
+// (ProbeAclChecklist) hands the window back here, so it is judged exactly as before.
+bool ClassifyUnregisteredControl(HWND hwnd, std::wstring_view className, DWORD style,
+    ControlKind& kind, std::wstring& reason) {
     std::wstring containerReason;
     if (IsAccessibleIslandClass(className)) {
         if (ProbeAccessibleIsland(hwnd, style, kind, containerReason)) return true;
@@ -4925,6 +5102,42 @@ bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
         }
     }
     return false;
+}
+
+} // namespace
+
+bool ClassifyControl(HWND hwnd, ControlKind& kind, std::wstring& reason) {
+    wchar_t buffer[kMaxClassNameChars]{};
+    const auto className = ClassNameOf(hwnd, buffer);
+    const auto style = static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_STYLE));
+    // An MDI child frame is identified by the role its frame gave it rather than
+    // by its class name: the class belongs to the application, while the caption,
+    // state, and system commands the projection replaces belong to
+    // DefMDIChildProc.  Its client content still goes through the registry below,
+    // one child window at a time.
+    if ((static_cast<DWORD>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE)) & WS_EX_MDICHILD) != 0) {
+        return ProbeMdiChild(hwnd, style, kind, reason);
+    }
+    for (const auto& adapter : kClassAdapters) {
+        if (FluentShell::EqualsIgnoreCase(className, adapter.className)) {
+            if (!adapter.probe(hwnd, style, kind, reason)) return false;
+            // A control that owns visible child windows is not drawing its own content
+            // there: a Static with children is a panel the application used as a frame,
+            // which is a long-standing Win32 idiom.  Reclassify it geometrically so the
+            // children it frames have a container to live in; if it does not qualify as
+            // one either, the original refusal stands.
+            if (kind == ControlKind::StaticText && HasVisibleChildWindow(hwnd)) {
+                std::wstring panelReason;
+                if (ProbePaneContainer(hwnd, style, kind, panelReason)) return true;
+                kind = ControlKind::StaticText;
+                reason = L"Static frames child windows but is not a usable container: " +
+                    panelReason;
+                return false;
+            }
+            return true;
+        }
+    }
+    return ClassifyUnregisteredControl(hwnd, className, style, kind, reason);
 }
 
 bool CaptureControlDetail(HWND hwnd, ControlNode& node, std::wstring& reason) {
@@ -4974,6 +5187,8 @@ bool SetPaneSplit(HWND container, int index, int position) noexcept {
             }, reason) && *moved;
         }
         if (GuiThreadOperationCancelled()) return false;
+        // An ACL checklist offers no splits (CapturePaneContainerState).
+        if (IsAclChecklist(container)) return false;
         RECT client{};
         if (!GetClientRect(container, &client)) return false;
         std::wstring ignored;

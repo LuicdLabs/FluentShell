@@ -103,6 +103,7 @@
     <ClCompile Include="Bridge\Translation\MmcHtmlDocument.cpp" />
     <ClCompile Include="Bridge\Translation\MenuBarCapture.cpp" />
     <ClCompile Include="Bridge\Translation\NativePressActivation.cpp" />
+    <ClCompile Include="Bridge\Translation\HostScope.cpp" />
     <ClCompile Include="Bridge\Translation\DialogSnapshots.cpp" />
     <ClCompile Include="Bridge\Translation\VirtualTaskDialog.cpp" />
     <ClCompile Include="Bridge\Translation\DialogTranslator.cpp" />

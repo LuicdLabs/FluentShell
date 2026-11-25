@@ -1,6 +1,7 @@
 #include "UiAutomationValidator.h"
 #include "UiAutomationGeometry.h"
 #include "UiAutomationProjection.h"
+#include "HostScope.h"
 
 #include "../../Common/FluentShell.h"
 
@@ -1133,6 +1134,11 @@ bool ValidateNativeIsolation(
     // traverses unrelated applications' providers: on a populated desktop this
     // took 12 seconds and poisoned otherwise valid MMC projections. Child scope
     // checks top-level exposure without depending on those applications' content.
+    // Inside Explorer the desktop's children are the shell's own windows (taskbar, desktop,
+    // every folder), and the scan would call into each of their providers from a Bridge thread
+    // in the shell.  A guest settles for what was checked above on the native root itself:
+    // its DWM application cloak and its own provider's identity.
+    if (!ProcessHostScope().SweepsDesktopForIsolation()) return true;
     ComPtr<IUIAutomationElement> desktop;
     progress.Begin(L"desktop native isolation preparation");
     if (FAILED(automation->GetRootElement(&desktop)) || !desktop)

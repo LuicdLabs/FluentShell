@@ -73,7 +73,8 @@ public sealed class TranslatedWindow : Window
     public bool IsCommitted => _committed;
     internal bool InteractionBlocked => _interactionBlocked;
 
-    public TranslatedWindow(WindowSnapshot snapshot, Func<ActionInvokeMessage, ulong, Task> sendAction, Func<string> nextEventId)
+    public TranslatedWindow(WindowSnapshot snapshot, Func<ActionInvokeMessage, ulong, Task> sendAction, Func<string> nextEventId,
+        bool explorerHost = false)
     {
         ViewModel = WindowViewModel.FromSnapshot(snapshot);
         _sendAction = sendAction;
@@ -118,7 +119,7 @@ public sealed class TranslatedWindow : Window
         _root.ActualThemeChanged += (_, _) => ApplyPaintedBands();
         // A translated message box or task dialog stands for no native window of its own.
         if (ViewModel.SurfaceKind == "window" && TryParseHwnd(ViewModel.NativeHwnd) is { } native)
-            ProxyIdentity.Apply(Hwnd, native);
+            ProxyIdentity.Apply(Hwnd, native, explorerHost);
         // WinUI requires an owner before an overlapped presenter can be marked
         // modal.  The owner proxy is resolved by WindowRegistry after this
         // window is constructed, so defer IsModal until SetOwner.

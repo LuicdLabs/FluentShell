@@ -364,10 +364,41 @@ holds for the whole operation, so a reused PID cannot be injected into.
 The one exception to the shell deny list is global-only (`src/Common/ExplorerDialogPolicy.h`): while `watch` runs, the
 system `explorer.exe` (checked by file identity, not name) is injected only when it shows a visible `#32770` dialog
 (Explorer's "Open File - Security Warning", Win+R, Properties), and only under a watcher-owned grant event
-`Local\FluentShell.ExplorerDialogs.<pid>.<creation time>`. That Bridge runs a dialog-only session: no Detours, no
-translated MessageBox/TaskDialog, no generic DirectUI, no folder/desktop/taskbar roots; a dialog modal to a disabled
-`CabinetWClass` keeps that native folder window as its proxy's owner (`ResolveExplorerDialogOwner` in the renderer).
-The session ends when the grant goes. Manual `inject` still refuses Explorer. A Bridge fault can still crash Explorer.
+`Local\FluentShell.ExplorerDialogs.<pid>.<creation time>`. Inside Explorer the Bridge is a guest, and **every decision
+that differs there is a question asked of `HostScope`** (`src/Bridge/Translation/HostScope.h`): decided once in
+`BridgeWorker`, held by `RendererSession` as `scope_`, and published process-wide (`ProcessHostScope()`) for hook
+callbacks, cross-thread dispatch and capture. Only `HostScope.cpp` reads `ExplorerDialogPolicy.h` inside the Bridge, and
+`test.ps1` gates that, the absence of the old `explorerDialogsOnly` flag, and where `SetWinEventHook`,
+`AttachThreadInput` and `ITaskbarList` may appear. `HostScopeTests.h` runs both hosts' verdicts in one process
+(`ScopedProcessHostScope`) and fails on a protocol action the Explorer scope has not classified. The guest installs
+nothing process-wide: no Detours (so no translated MessageBox/TaskDialog and no popup interception), no in-context
+`EVENT_OBJECT_SHOW` hook (it runs on the taskbar's, desktop's and every folder's thread), no dormancy event or watch lease
+(its revocation is the grant; the shell never exits), no `ITaskbarList` (the renderer swaps the native dialog's taskbar
+button out of process, `ExplorerTaskbarTabs.cs`, and puts it back on close, rollback and renderer exit), no generic
+DirectUI, no menu-bar read, no desktop-wide UIA isolation sweep. Roots are admitted **before** `Attach` (a visible
+`#32770` of the process whose direct children are all standard Win32 controls or child pages: a common item dialog or a
+task dialog never gets a hook). A dialog on a shared shell thread (the security warning runs on its folder's thread) gets
+thread hooks that act only for its own windows (`ThreadHooksActFor`); work for a child another thread owns is refused,
+and a press joins input only with the renderer proxy's thread. Discovery sends no message to a window outside the scope,
+retries a timing failure once, and treats any visible window (any process) owned by a projected dialog -- a copy
+progress window, an elevated dialog -- as owner-graph evidence that hands the dialog back to native while it is open
+(`RootsHoldingUnadmittedOwnedWindows`). Actions are an allowlist (no context menus, drop-downs, item activation, label
+edits, menu or MDI commands). A dialog modal to a disabled `CabinetWClass` keeps that native folder window as its
+proxy's owner (`ResolveExplorerDialogOwner` in the renderer); the renderer gives an Explorer proxy no relaunch command
+and `PreventPinning`. The session ends when the grant goes. Manual `inject` still refuses Explorer. A Bridge fault can
+still crash Explorer, so the Bridge's process-lifetime registries are leaked (no static destructor runs at exit) and
+every MSAA call into the shell's own providers sits behind a structured-exception guard (`/EHsc` does not catch an
+access violation).
+
+The folder Properties sheet (`SHObjectProperties`, its own shell thread, owned by a hidden disabled `StubWindow32`, so it
+projects as a root) is verified offline: `FluentShell.Native.Tests.exe --probe-shell-properties <folder>` opens the real
+sheet in the test process and runs the real capture on every page (`FS_PROBE_HOLD_PAGE=n` keeps a page open for UIA
+or MSAA inspection). A property sheet's tab control has `TCM_SETITEMEXTRA`, so `TCM_GETITEM` must never ask for
+`TCIF_PARAM` (it overran the caller's `TCITEMW` on the stack). The Security page's `CHECKLIST_ACLUI` (identified by its
+registering module, System32 `aclui.dll`, and by its label/cell grid, `HasAclChecklistLayout`) is a pane container with
+no chrome by contract: the pixel verdict on its blank cells was not repeatable. The Previous Versions page's shell view
+(a `SHELLDLL_DefView` on twext's page) is admitted only in its empty state (`ReadPreviousVersionsView`: header columns,
+which MSAA reports as split buttons, and the message as inert text); a listed version keeps the sheet native.
 
 `dllmain.cpp` starts `BridgeWorker` from `DLL_PROCESS_ATTACH`: pin the module, refuse denied
 targets and processes that already host XAML, start the `RendererSession`, install the

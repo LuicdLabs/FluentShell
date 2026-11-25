@@ -2,7 +2,6 @@
 
 #include "../../Common/FluentShell.h"
 #include "../../Common/ProcessPolicy.h"
-#include "../../Common/ExplorerDialogPolicy.h"
 #include "../Ipc/FrameCodec.h"
 #include "CaptureTrace.h"
 #include "DialogSnapshots.h"
@@ -175,8 +174,11 @@ enum class SurfaceState {
     Closed,
 };
 
-std::mutex g_activeSessionMutex;
-std::shared_ptr<RendererSession> g_activeSession;
+// Leaked on purpose: a static destructor would tear the session down at process exit under
+// the loader lock (in Explorer, at every logoff or shell restart), restoring windows whose
+// threads are already gone.
+std::mutex& g_activeSessionMutex = *new std::mutex();
+std::shared_ptr<RendererSession>& g_activeSession = *new std::shared_ptr<RendererSession>();
 
 std::wstring CurrentLogonSidString() {
     HANDLE token = nullptr;
@@ -338,9 +340,9 @@ struct RendererSession::Surface final {
     HANDLE resultEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 };
 
-RendererSession::RendererSession(HMODULE bridgeModule, bool explorerDialogsOnly) noexcept
+RendererSession::RendererSession(HMODULE bridgeModule, HostScope scope) noexcept
     : bridgeModule_(bridgeModule),
-      explorerDialogsOnly_(explorerDialogsOnly),
+      scope_(scope),
       shutdownEvent_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
 
 RendererSession::~RendererSession() {
@@ -562,14 +564,23 @@ bool RendererSession::Start() {
     // Shared by every Bridge in the session, so one signal restores each target and a reset
     // lifts it.  Manual-reset: an auto-reset event would wake only one of the waiters.  Never
     // closed, for the same reason as discoveryWake_.  Same DACL as the renderer pipe.
+    // A guest in Explorer does not take part: the shell never exits, so it would keep the
+    // shared event alive (and could leave it signaled) for the whole logon.
     SECURITY_ATTRIBUTES dormancySecurity{};
     PSECURITY_DESCRIPTOR dormancyDescriptor = nullptr;
-    if (CreatePipeSecurity(dormancySecurity, dormancyDescriptor)) {
+    if (scope_.FollowsDormancyAndLease() && CreatePipeSecurity(dormancySecurity, dormancyDescriptor)) {
         dormantEvent_ = CreateEventW(&dormancySecurity, TRUE, FALSE, L"Local\\FluentShell.Dormant");
         LocalFree(dormancyDescriptor);
     }
-    if (!dormantEvent_) FluentShell::Log(L"Dormancy event unavailable; restore-all cannot be requested");
-    if (!InstallTopLevelShownHook(bridgeModule_))
+    if (!dormantEvent_ && scope_.FollowsDormancyAndLease())
+        FluentShell::Log(L"Dormancy event unavailable; restore-all cannot be requested");
+    // The in-context show hook runs on every thread of the process.  In Explorer that is
+    // the taskbar's, the desktop's and every folder's: a guest keeps to its periodic
+    // discovery and to the show signals of the threads it already hooks.
+    if (!scope_.InstallsProcessShowHook())
+        FluentShell::Log(std::wstring(L"Bridge scope ") + scope_.Name() +
+            L": no process-wide hooks; discovery keeps its periodic pass");
+    else if (!InstallTopLevelShownHook(bridgeModule_))
         FluentShell::Log(L"Top-level show events unavailable; discovery keeps its periodic pass");
     actionWorker_ = std::thread([this] { ActionMain(); });
     reader_ = std::thread([this] { ReaderMain(); });
@@ -938,9 +949,7 @@ void LogReadyMismatch(const SurfaceReady& ready, const WindowSnapshot& expected)
 bool RendererSession::ResolveOwnerProxy(ProjectionAttempt& attempt) {
     const auto& surface = attempt.surface;
     if (!surface->snapshot.ownerHwnd) return true;
-    if (explorerDialogsOnly_ && surface->agent &&
-        FluentShell::ExplorerNativeModalOwner(surface->agent->Root(), GetCurrentProcessId()) ==
-            surface->snapshot.ownerHwnd) {
+    if (surface->agent && scope_.NativeModalOwner(surface->agent->Root()) == surface->snapshot.ownerHwnd) {
         attempt.expectedOwnerProxy = surface->snapshot.ownerHwnd;
         return true;
     }
@@ -1292,7 +1301,7 @@ bool RendererSession::VerifyNativeCloaked(const ProjectionAttempt& attempt) {
 // so an action emitted the moment the renderer consumes this frame cannot race
 // the local transition.
 bool RendererSession::CommitInteractive(ProjectionAttempt& attempt) {
-    if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant())
+    if (!scope_.Active())
         return RejectAfterCommit(attempt, L"Explorer dialog grant ended before interactive commit");
     const auto& surface = attempt.surface;
     {
@@ -1308,8 +1317,10 @@ bool RendererSession::CommitInteractive(ProjectionAttempt& attempt) {
             SerializeSurfaceCommit(
                 nonce_, snapshot.surfaceId, snapshot.revision, true, true))) {
         // The proxy is the window on the taskbar now; the cloaked native window's own
-        // button would only activate something nobody can see.
-        if (attempt.nativeRoot && snapshot.showInTaskbar) {
+        // button would only activate something nobody can see.  Inside Explorer the
+        // renderer swaps the button out of process instead: the guest Bridge never edits
+        // the shell's own taskbar.
+        if (attempt.nativeRoot && snapshot.showInTaskbar && scope_.ManagesTaskbarButtons()) {
             {
                 std::scoped_lock lock(surface->mutex);
                 surface->taskbarTabHidden = true;
@@ -1325,10 +1336,12 @@ bool RendererSession::OpenSurface(
     const std::shared_ptr<Surface>& surface,
     bool cloakNative) {
     if (!surface) return RejectProjection(L"null surface");
-    if (explorerDialogsOnly_ && (!FluentShell::CurrentExplorerDialogGrant() ||
-        !cloakNative || !surface->agent ||
-        !FluentShell::IsExplorerDialogWindow(surface->agent->Root(), GetCurrentProcessId())))
-        return RejectProjection(L"outside the global Explorer dialog scope");
+    if (scope_.IsExplorer()) {
+        // A guest projects only native dialogs it admitted: no virtual (translated) surface.
+        std::wstring outside;
+        if (!cloakNative || !surface->agent || !scope_.AdmitsRoot(surface->agent->Root(), &outside))
+            return RejectProjection(outside.empty() ? L"outside the global Explorer dialog scope" : outside);
+    }
     // WindowCapture and the renderer exchange physical pixel bounds.  The
     // injected process can be system-DPI-aware or DPI-unaware, so querying the
     // proxy from its inherited thread context would virtualize GetWindowRect
@@ -1369,6 +1382,10 @@ namespace {
 // GUI thread would stall every surface.  The title is diagnostics only, so one
 // that cannot be read inside the bound is reported as unavailable instead.
 std::wstring BoundedWindowTitle(HWND window) {
+    // A guest in Explorer sends nothing to a window it does not admit: the census holds
+    // every shell window (taskbar, desktop, folders), and each would get a WM_GETTEXT.
+    const HostScope& scope = ProcessHostScope();
+    if (!scope.MessagesForeignWindows() && !scope.ConsidersRoot(window)) return L"<not read: outside scope>";
     wchar_t title[96]{};
     DWORD_PTR handled = 0;
     if (SendMessageTimeoutW(window, WM_GETTEXT, std::size(title),
@@ -1605,8 +1622,7 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
     // covered by the fallback below or already fully native.  While its direct owner is
     // not a projection it waits without using its one attempt: a graph handed back to
     // native is projected again from its root, and the dialogs on it are offered after.
-    const bool nativeExplorerOwner = explorerDialogsOnly_ && directOwner &&
-        FluentShell::ExplorerNativeModalOwner(window, GetCurrentProcessId()) == directOwner;
+    const bool nativeExplorerOwner = directOwner && scope_.NativeModalOwner(window) == directOwner;
     if (directOwner && !nativeExplorerOwner) {
         const bool ownerProjected = !projectedOwners.empty() &&
             projectedOwners.front()->agent->Root() == directOwner;
@@ -1656,12 +1672,18 @@ RendererSession::DiscoveryDecision RendererSession::ClassifyTopLevel(
 }
 
 void RendererSession::DiscoverTopLevelWindows() {
-    if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant()) return;
+    if (!scope_.Active()) return;
     TopLevelCensus census = EnumerateTopLevels();
-    if (explorerDialogsOnly_) {
-        std::erase_if(census.candidates, [](HWND window) {
-            return !FluentShell::IsExplorerDialogWindow(window, GetCurrentProcessId());
-        });
+    // Inside Explorer only dialogs are candidates.  Which windows the projection may take
+    // and which windows are evidence about an owner graph are different questions, though:
+    // anything a candidate dialog owns -- a copy-progress window, a common item dialog, an
+    // elevated or out-of-process dialog -- inherits its projected owner's cloak, so the
+    // owner goes back to native while it is open.
+    std::unordered_map<HWND, HWND> heldByOwnedWindow;
+    if (scope_.IsExplorer()) {
+        std::erase_if(census.candidates, [this](HWND window) { return !scope_.ConsidersRoot(window); });
+        heldByOwnedWindow = RootsHoldingUnadmittedOwnedWindows(census.candidates);
+        HandProjectedOwnersOfUnadmittedWindowsToNative(heldByOwnedWindow);
     }
     LogDiscoveryCensus(census, discoveryCensusSignature_);
     PruneDiscoveryState();
@@ -1693,10 +1715,11 @@ void RendererSession::DiscoverTopLevelWindows() {
         // owned below the root, at any depth, counts: a Color chooser opened from a
         // property sheet holds the console as long as the sheet does.
         const bool ownsVisibleTopLevel = !EffectiveTopLevelOwner(window) &&
-            std::any_of(candidates.begin(), candidates.end(), [&](HWND candidate) {
+            (heldByOwnedWindow.contains(window) ||
+             std::any_of(candidates.begin(), candidates.end(), [&](HWND candidate) {
                 return candidate != window && IsOwnedBy(candidate, window) &&
                     holdsOwnerNative(candidate);
-            });
+            }));
         // A window gets one projection attempt, and attaching needs its GUI thread
         // to answer within 2 s. A thread busy with application work (RSoP's
         // processing dialog, a snap-in loading) would spend that attempt on a
@@ -1808,6 +1831,82 @@ void RendererSession::DiscoverTopLevelWindows() {
     }
 }
 
+// Visible top-level windows of any process, outside the scope's candidates, whose owner
+// chain reaches a candidate: each candidate root at the top of such a chain, mapped to
+// the owned window that holds it.  Read-only: GetWindow, visibility and rectangles, no
+// message to any window.
+std::unordered_map<HWND, HWND> RendererSession::RootsHoldingUnadmittedOwnedWindows(
+    const std::vector<HWND>& candidates) const {
+    std::unordered_map<HWND, HWND> held;
+    if (candidates.empty()) return held;
+    struct Context final {
+        const std::vector<HWND>* candidates;
+        std::unordered_map<HWND, HWND>* held;
+        DWORD rendererProcess;
+    } context{ &candidates, &held, rendererProcessId_ };
+    EnumWindows([](HWND window, LPARAM raw) -> BOOL {
+        auto& context = *reinterpret_cast<Context*>(raw);
+        RECT bounds{};
+        if (!IsWindowVisible(window) || !GetWindowRect(window, &bounds) || IsRectEmpty(&bounds)) return TRUE;
+        DWORD process = 0;
+        GetWindowThreadProcessId(window, &process);
+        // The renderer's own windows belong to the projection.
+        if (process == context.rendererProcess) return TRUE;
+        // Transient helpers of the dialog's own controls (a tooltip, a menu, a combo box's
+        // list, an IME window) come and go with the pointer and say nothing about the graph.
+        wchar_t className[64]{};
+        GetClassNameW(window, className, static_cast<int>(std::size(className)));
+        for (const wchar_t* helper : { L"tooltips_class32", L"#32768", L"ComboLBox", L"IME",
+                 L"MSCTFIME UI", L"SysShadow", L"Internet Explorer_Hidden" }) {
+            if (FluentShell::EqualsIgnoreCase(className, helper)) return TRUE;
+        }
+        const auto isCandidate = [&](HWND hwnd) {
+            return std::find(context.candidates->begin(), context.candidates->end(), hwnd) !=
+                context.candidates->end();
+        };
+        if (isCandidate(window)) return TRUE;
+        HWND top = nullptr;
+        HWND owner = GetWindow(window, GW_OWNER);
+        for (unsigned depth = 0; owner && depth < 256; ++depth) {
+            if (isCandidate(owner)) top = owner;
+            const HWND next = GetWindow(owner, GW_OWNER);
+            if (next == owner) break;
+            owner = next;
+        }
+        if (top) context.held->try_emplace(top, window);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&context));
+    return held;
+}
+
+void RendererSession::HandProjectedOwnersOfUnadmittedWindowsToNative(
+    const std::unordered_map<HWND, HWND>& held) {
+    for (const auto& [root, ownedWindow] : held) {
+        // The projected surfaces on the owned window's chain, whatever their depth.
+        std::vector<std::shared_ptr<Surface>> projected;
+        {
+            std::scoped_lock lock(surfacesMutex_);
+            for (HWND owner = GetWindow(ownedWindow, GW_OWNER); owner; owner = GetWindow(owner, GW_OWNER)) {
+                for (const auto& [_, surface] : surfaces_) {
+                    if (surface->virtualDialog || !surface->agent || surface->agent->Root() != owner) continue;
+                    std::scoped_lock surfaceLock(surface->mutex);
+                    if (surface->state == SurfaceState::Projected) projected.push_back(surface);
+                }
+                if (owner == root) break;
+            }
+        }
+        if (projected.empty()) continue;
+        wchar_t className[64]{};
+        GetClassNameW(ownedWindow, className, static_cast<int>(std::size(className)));
+        DWORD ownedProcess = 0;
+        GetWindowThreadProcessId(ownedWindow, &ownedProcess);
+        FluentShell::Log(std::wstring(L"A window the ") + scope_.Name() + L" scope does not project is owned by a "
+            L"projected dialog (" + Ipc::HwndToString(ownedWindow) + L" class='" + className + L"' process " +
+            std::to_wstring(ownedProcess) + L"); restoring the owner graph to native while it is open");
+        HandOwnerGraphToNative(projected);
+    }
+}
+
 void RendererSession::HandOwnerGraphToNative(
     const std::vector<std::shared_ptr<Surface>>& owners) {
     // The roots are read before the restore shuts their agents down.
@@ -1858,6 +1957,16 @@ void RendererSession::ScheduleDiscoveryRetry(HWND window) {
         auto& retry = discoveryRetries_[window];
         const uint64_t now = GetTickCount64();
         if (retry.attempts++ == 0) retry.firstTransient = now;
+        // Each attempt hooks the window's thread and can hold it for the whole capture
+        // deadline.  A guest in Explorer tries again once, then leaves the dialog native
+        // for its lifetime (its attempt stays used: no watch, no timer).
+        if (retry.attempts > scope_.TransientRetryLimit()) {
+            FluentShell::Log(L"Native window stays untranslated: the " + std::wstring(scope_.Name()) +
+                L" scope allows no further retry after a transient capture failure: " + DescribeTopLevel(window));
+            retry.attempts = 0;
+            retry.due = UINT64_MAX;
+            return;
+        }
         if (now - retry.firstTransient > kTransientRetryWindowMs) {
             FluentShell::Log(L"Native window stays untranslated after repeated transient capture failures; "
                 L"waiting for its view to change: " + DescribeTopLevel(window));
@@ -1953,8 +2062,15 @@ void RendererSession::ContinueReprojection(HWND root) noexcept {
 }
 
 bool RendererSession::OpenNativeWindow(HWND root) {
-    if (explorerDialogsOnly_ && (!FluentShell::CurrentExplorerDialogGrant() ||
-        !FluentShell::IsExplorerDialogWindow(root, GetCurrentProcessId()))) return false;
+    {
+        // Admission happens before Attach: a window the scope refuses never gets a hook.
+        std::wstring outside;
+        if (!scope_.AdmitsRoot(root, &outside)) {
+            FluentShell::Log(L"Native window stays outside the " + std::wstring(scope_.Name()) +
+                L" scope: " + outside);
+            return false;
+        }
+    }
     {
         // Discovery refuses suppressed roots before it gets here; this keeps every other way
         // into the projection honest as well.
@@ -1978,7 +2094,7 @@ bool RendererSession::OpenNativeWindow(HWND root) {
     const DirectUiWindowProfile* profile = nullptr;
     DirectUiAdmissionResult admission = DirectUiAdmissionResult::NotApplicable;
     if (agent->GenericDirectUiCandidate()) {
-        if (explorerDialogsOnly_) {
+        if (!scope_.AdmitsGenericDirectUi()) {
             if (!agent->Shutdown()) RetainSourceThreadAgent(agent);
             FluentShell::Log(L"Explorer dialog stays native: generic DirectUI is outside the dialog scope");
             return false;
@@ -2200,12 +2316,19 @@ void RendererSession::HandleAction(const ActionRequest& action) {
 }
 
 void RendererSession::AdmitAction(const ActionRequest& action, const std::shared_ptr<Surface>& surface) {
-    if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant()) {
+    if (!scope_.Active()) {
         RestoreSurface(surface, L"globalExplorerScopeEnded");
         return;
     }
     if (action.action == kRendererFaultRollback) {
         RestoreSurface(surface, L"rendererSurfaceFault");
+        return;
+    }
+    if (!scope_.AdmitsAction(action.action)) {
+        std::unique_lock canonicalLock(surface->canonicalMutex);
+        std::unique_lock lock(surface->mutex);
+        RejectAction(surface, lock, action, L"rejected",
+            L"the action is outside the " + std::wstring(scope_.Name()) + L" scope");
         return;
     }
     std::unique_lock canonicalLock(surface->canonicalMutex);
@@ -2779,7 +2902,7 @@ void RendererSession::HandleNativeAction(
             restoreTab = std::exchange(surface->taskbarTabHidden, false);
         }
         // The native window has the screen again (whatever the click does next).
-        if (restoreTab) TaskbarTabs::Instance().Request(agent->Root(), true);
+        if (restoreTab && scope_.ManagesTaskbarButtons()) TaskbarTabs::Instance().Request(agent->Root(), true);
         if (!agent->Shutdown()) {
             surface->agentRetained = true;
             RetainSourceThreadAgent(agent);
@@ -3723,7 +3846,7 @@ bool RendererSession::RestoreNativeWindow(const RestoreAttempt& attempt) {
         std::scoped_lock lock(attempt.surface->mutex);
         restoreTab = std::exchange(attempt.surface->taskbarTabHidden, false);
     }
-    if (restoreTab) TaskbarTabs::Instance().Request(attempt.nativeRoot, true);
+    if (restoreTab && scope_.ManagesTaskbarButtons()) TaskbarTabs::Instance().Request(attempt.nativeRoot, true);
     if (!restored) {
         // The source thread may be stalled.  DWM uncloak is the bounded emergency
         // path that keeps the target usable without it.
@@ -4146,7 +4269,7 @@ void RendererSession::RunSupervisor() {
     while (!stopping_.load() && !failed_.load()) {
         // Losing the per-process grant ends this restricted session; an ambient
         // watcher mutex alone must never keep Explorer projection alive.
-        if (explorerDialogsOnly_ && !FluentShell::CurrentExplorerDialogGrant()) break;
+        if (!scope_.Active()) break;
         // Dormancy: while the session's event is signaled, every window is native and discovery
         // and reconcile do nothing.  Entering restores what is projected.  Leaving offers every
         // window again, except the roots the user rolled back.
@@ -4177,7 +4300,9 @@ void RendererSession::RunSupervisor() {
         // Events follow projection even while dormant, so a root restored by dormancy stops advertising
         // itself.  A rollback request is serviced only while running.
         SyncRollbackEvents();
-        CheckWatchLease();
+        // A guest's revocation is its grant (checked above); it neither keeps nor sets the
+        // shared dormancy event.
+        if (scope_.FollowsDormancyAndLease()) CheckWatchLease();
         if (dormant_.load()) {
             Sleep(kReconcileTickMs);
             continue;
@@ -4321,7 +4446,7 @@ std::optional<int> RendererSession::ShowMessageBox(
     WORD,
     const DialogIconImage* customIcon) {
     owner = owner ? GetAncestor(owner, GA_ROOT) : nullptr;
-    if (explorerDialogsOnly_ || !IsReady() || !IsProjectedOwner(owner) ||
+    if (!scope_.TranslatesDialogs() || !IsReady() || !IsProjectedOwner(owner) ||
         (type & (MB_SERVICE_NOTIFICATION | MB_DEFAULT_DESKTOP_ONLY | MB_HELP)) != 0) {
         return std::nullopt;
     }
@@ -4349,7 +4474,7 @@ std::optional<int> RendererSession::ShowMessageBox(
 
 std::optional<TaskDialogResult> RendererSession::ShowTaskDialog(const TASKDIALOGCONFIG& config) {
     const HWND owner = config.hwndParent ? GetAncestor(config.hwndParent, GA_ROOT) : nullptr;
-    if (explorerDialogsOnly_ || !IsReady() || !IsProjectedOwner(owner)) return std::nullopt;
+    if (!scope_.TranslatesDialogs() || !IsReady() || !IsProjectedOwner(owner)) return std::nullopt;
     std::wstring reason;
     std::shared_ptr<VirtualTaskDialog> dialog = VirtualTaskDialog::Create(config, owner, reason);
     if (!dialog) {

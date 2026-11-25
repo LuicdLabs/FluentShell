@@ -1,6 +1,7 @@
 #include "WindowCapture.h"
 #include "CaptureTrace.h"
 #include "GuiThreadDispatch.h"
+#include "HostScope.h"
 #include "NativeDocument.h"
 
 #include "../../Common/FluentShell.h"
@@ -1053,6 +1054,13 @@ bool CaptureWindow(
         // command refreshes the contents only after meaningful application changes.
         ObserveMenuBarToolbar(root, context);
         if (context.menuBarToolbar) {
+            // Reading a menu-bar toolbar opens the application's real menus, which only the
+            // TrackPopupMenu detour keeps off screen; a host without it keeps the window native.
+            if (!ProcessHostScope().ReadsMenuBars()) {
+                rejectionReason = std::wstring(L"a menu-bar toolbar is outside the ") +
+                    ProcessHostScope().Name() + L" scope";
+                return false;
+            }
             if (GetMenu(root)) {
                 rejectionReason =
                     L"window has both an HMENU menu bar and a menu-bar toolbar";
